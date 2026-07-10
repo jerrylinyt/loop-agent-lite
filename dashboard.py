@@ -710,42 +710,64 @@ def stop_all_jobs():
 
 def load_config():
     """讀取團隊版 + 個人版；個人版只允許覆蓋 PERSONAL_CONFIG_KEYS。"""
-    if CONFIG_OVERRIDE:
-        if not PERSONAL_CONFIG_PATH.exists():
-            loop_mod.atomic_write_bytes(
-                PERSONAL_CONFIG_PATH,
-                json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2).encode("utf-8"),
-            )
+    def read_json(path, label):
         try:
-            return json.loads(PERSONAL_CONFIG_PATH.read_text(encoding="utf-8"))
+            raw = loop_mod.read_regular_text(path, label)
+        except FileNotFoundError:
+            return None, None
+        except (OSError, ValueError, UnicodeDecodeError) as e:
+            return None, f"{label}讀取失敗:{e}"
+        try:
+            value = json.loads(raw)
         except json.JSONDecodeError as e:
-            return {"error": f"覆寫設定檔 {PERSONAL_CONFIG_PATH} 解析失敗:{e}"}
+            return None, f"{label}解析失敗:{e}"
+        if not isinstance(value, dict):
+            return None, f"{label}頂層必須是 JSON object"
+        return value, None
+
+    if CONFIG_OVERRIDE:
+        personal, error = read_json(PERSONAL_CONFIG_PATH, f"覆寫設定檔 {PERSONAL_CONFIG_PATH.name}")
+        if error:
+            return {"error": error}
+        if personal is None:
+            try:
+                loop_mod.atomic_write_bytes(
+                    PERSONAL_CONFIG_PATH,
+                    json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2).encode("utf-8"),
+                )
+            except (OSError, ValueError) as e:
+                return {"error": f"覆寫設定檔無法建立:{e}"}
+            personal, error = read_json(PERSONAL_CONFIG_PATH, f"覆寫設定檔 {PERSONAL_CONFIG_PATH.name}")
+            if error:
+                return {"error": error}
+        return personal or {}
 
     project = dict(DEFAULT_CONFIG)
-    if PROJECT_CONFIG_PATH.exists():
-        try:
-            project.update(json.loads(PROJECT_CONFIG_PATH.read_text(encoding="utf-8")))
-        except json.JSONDecodeError as e:
-            return {"error": f"團隊設定檔 {PROJECT_CONFIG_PATH.name} 解析失敗:{e}"}
+    project_data, error = read_json(PROJECT_CONFIG_PATH, f"團隊設定檔 {PROJECT_CONFIG_PATH.name}")
+    if error:
+        return {"error": error}
+    if project_data is not None:
+        project.update(project_data)
 
-    if not PERSONAL_CONFIG_PATH.exists() and LEGACY_CONFIG_PATH.exists():
+    personal, error = read_json(PERSONAL_CONFIG_PATH, f"個人設定檔 {PERSONAL_CONFIG_PATH.name}")
+    if error:
+        return {"error": error}
+    legacy, legacy_error = read_json(LEGACY_CONFIG_PATH, f"舊個人設定檔 {LEGACY_CONFIG_PATH.name}")
+    if personal is None and legacy is not None:
         try:
-            legacy = json.loads(LEGACY_CONFIG_PATH.read_text(encoding="utf-8"))
             migrated = {key: legacy[key] for key in PERSONAL_CONFIG_KEYS if key in legacy}
             loop_mod.atomic_write_bytes(
                 PERSONAL_CONFIG_PATH,
                 json.dumps(migrated, ensure_ascii=False, indent=2).encode("utf-8"),
             )
+            personal = migrated
             print(f"已將舊個人設定遷移至:{PERSONAL_CONFIG_PATH}（舊檔保留）", flush=True)
-        except json.JSONDecodeError as e:
-            return {"error": f"舊個人設定檔 {LEGACY_CONFIG_PATH.name} 解析失敗:{e}"}
-
-    personal = {}
-    if PERSONAL_CONFIG_PATH.exists():
-        try:
-            personal = json.loads(PERSONAL_CONFIG_PATH.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as e:
-            return {"error": f"個人設定檔 {PERSONAL_CONFIG_PATH.name} 解析失敗:{e}"}
+        except (OSError, ValueError) as e:
+            return {"error": f"個人設定檔無法遷移:{e}"}
+    elif personal is None and legacy_error:
+        return {"error": legacy_error}
+    if personal is None:
+        personal = {}
     for key in PERSONAL_CONFIG_KEYS:
         if key in personal:
             project[key] = personal[key]
@@ -770,9 +792,15 @@ def config_projection(cfg):
 
 def save_personal_config(updates):
     """只寫個人檔；完整覆寫模式則保留 env 指定檔案的既有欄位。"""
-    current = {}
-    if PERSONAL_CONFIG_PATH.exists():
-        current = json.loads(PERSONAL_CONFIG_PATH.read_text(encoding="utf-8"))
+    try:
+        current_text = loop_mod.read_regular_text(PERSONAL_CONFIG_PATH, f"個人設定檔 {PERSONAL_CONFIG_PATH.name}")
+        current = json.loads(current_text)
+    except FileNotFoundError:
+        current = {}
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"個人設定檔無法讀取:{e}") from e
+    if not isinstance(current, dict):
+        raise ValueError("個人設定檔頂層必須是 JSON object")
     if CONFIG_OVERRIDE:
         current.update(updates)
     else:
@@ -1307,7 +1335,12 @@ class Handler(BaseHTTPRequestHandler):
             # goal.md 隨啟動自動 commit(gate#1:人選了檔=人審過)。檔名固定、指定 pathspec,
             # 內容與 HEAD 相同就不產生新 commit。
             if goal_content.strip():
-                (repo / "goal.md").write_text(goal_content, encoding="utf-8")
+                try:
+                    goal_path = loop_mod.repo_relative_path(repo, "goal.md")
+                    loop_mod.atomic_write_bytes(goal_path, goal_content.encode("utf-8"))
+                except (OSError, ValueError) as e:
+                    self._err(f"goal.md 不安全或無法寫入:{e}")
+                    return
                 r = subprocess.run(["git", "-C", str(repo), "add", "--", "goal.md"],
                                    capture_output=True, text=True)
                 if r.returncode != 0:
@@ -1785,7 +1818,11 @@ class Handler(BaseHTTPRequestHandler):
             if "error" in cfg:
                 self._err(cfg["error"])
                 return
-            save_personal_config({"agent_cmds": agents, "extra_path_dirs": paths})
+            try:
+                save_personal_config({"agent_cmds": agents, "extra_path_dirs": paths})
+            except ValueError as e:
+                self._err(str(e))
+                return
             cfg = load_config()
         self._out(200, json.dumps(config_projection(cfg), ensure_ascii=False))
 
@@ -1813,7 +1850,11 @@ class Handler(BaseHTTPRequestHandler):
             if "error" in cfg:
                 self._err(cfg["error"])
                 return
-            save_personal_config({"repo_roots": roots})
+            try:
+                save_personal_config({"repo_roots": roots})
+            except ValueError as e:
+                self._err(str(e))
+                return
             cfg = load_config()
         self._out(200, json.dumps(config_projection(cfg), ensure_ascii=False))
 
@@ -1835,7 +1876,11 @@ class Handler(BaseHTTPRequestHandler):
             if "error" in cfg:
                 self._err(cfg["error"])
                 return
-            save_personal_config({"notify_cmd": raw})
+            try:
+                save_personal_config({"notify_cmd": raw})
+            except ValueError as e:
+                self._err(str(e))
+                return
             cfg = load_config()
         self._out(200, json.dumps(config_projection(cfg), ensure_ascii=False))
 

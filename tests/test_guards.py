@@ -2077,6 +2077,73 @@ class TestFreshStartClearsRoundArtifacts(unittest.TestCase):
             self.assertFalse((wsd / "history.log.1").exists())
             self.assertTrue((wsd / "REPORT.md").exists())
             self.assertTrue((wsd / "prompts" / "round-0007.md").exists())
+class TestDashboardFileBoundaries(unittest.TestCase):
+    """Dashboard 的設定檔與 goal 匯入不應跟隨 symlink 讀寫外部檔案。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_config_symlink_is_rejected_for_read_and_write(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            outside = root / "outside-config.json"
+            outside.write_text(json.dumps({"notify_cmd": "secret"}), encoding="utf-8")
+            personal = root / "personal.json"
+            personal.symlink_to(outside)
+            old = (D.PERSONAL_CONFIG_PATH, D.PROJECT_CONFIG_PATH,
+                   D.LEGACY_CONFIG_PATH, D.CONFIG_OVERRIDE)
+            try:
+                D.PERSONAL_CONFIG_PATH = personal
+                D.PROJECT_CONFIG_PATH = root / "project.json"
+                D.LEGACY_CONFIG_PATH = root / "legacy.json"
+                D.CONFIG_OVERRIDE = True
+                cfg = D.load_config()
+                self.assertIn("error", cfg)
+                self.assertIn("symbolic link", cfg["error"])
+                with self.assertRaises(ValueError):
+                    D.save_personal_config({"notify_cmd": "changed"})
+                self.assertEqual(json.loads(outside.read_text(encoding="utf-8"))["notify_cmd"], "secret")
+            finally:
+                (D.PERSONAL_CONFIG_PATH, D.PROJECT_CONFIG_PATH,
+                 D.LEGACY_CONFIG_PATH, D.CONFIG_OVERRIDE) = old
+
+    def test_goal_import_rejects_symlink_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(td)
+            outside = root / "outside-goal.md"
+            outside.write_text("do not overwrite\n", encoding="utf-8")
+            goal = repo / "goal.md"
+            goal.unlink()
+            goal.symlink_to(outside)
+            workspace_root = root / "workspace"
+            old_values = (D.ROOT, L.WORKSPACE_ROOT, D.load_config)
+            try:
+                D.ROOT = workspace_root
+                L.WORKSPACE_ROOT = workspace_root
+                D.load_config = lambda: {
+                    "agent_cmds": [{"label": "true", "cmd": "true"}],
+                    "validate_cmds": [{"label": "true", "cmd": "true"}],
+                    "extra_path_dirs": [], "notify_cmd": "",
+                    "defaults": {"validate_timeout": 5},
+                }
+                handler = self.ResponseCapture()
+                D.Handler.api_launch(handler, {
+                    "repo": str(repo), "name": "goal-link", "agent_idx": 0,
+                    "validate_idx": 0, "goal_content": "must not escape\n",
+                })
+                self.assertEqual(handler.response[0], 400)
+                self.assertIn("goal.md 不安全", handler.response[1]["error"])
+                self.assertEqual(outside.read_text(encoding="utf-8"), "do not overwrite\n")
+                self.assertNotIn("goal-link", D.JOBS)
+            finally:
+                D.ROOT, L.WORKSPACE_ROOT, D.load_config = old_values
 
 
 if __name__ == "__main__":
