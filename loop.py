@@ -604,6 +604,16 @@ def validate_state_shape(state, label: str):
     for field in ("task_reset_counts", "config", "loop"):
         if field in state and not isinstance(state[field], dict):
             raise StateLoadError(f"{label} {field} 必須是 object")
+    if "loop" in state:
+        loop_state = state["loop"]
+        if "pid" in loop_state:
+            pid = loop_state["pid"]
+            if (pid is not None and
+                    (not isinstance(pid, int) or isinstance(pid, bool) or pid < 1)):
+                raise StateLoadError(f"{label} loop.pid 必須是正整數或 null")
+        for field in ("session_id", "started_at"):
+            if field in loop_state and not isinstance(loop_state[field], str):
+                raise StateLoadError(f"{label} loop.{field} 必須是字串")
     if "agent_backoff_seconds" in state:
         delay = state["agent_backoff_seconds"]
         if (isinstance(delay, bool) or not isinstance(delay, (int, float)) or
