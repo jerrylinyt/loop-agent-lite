@@ -63,6 +63,15 @@ python3 loop.py \
 
 Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace log。每輪都有獨立 token，舊輪殘留命令不會被下一輪誤收；CLI 主程序退出時也會清理同 process-group 的背景子行程。中斷後重新執行相同命令即可從 `state.json` 繼續。
 
+不開 Dashboard 也可以用唯讀 CLI 查詢同一份 coordinator truth：
+
+```bash
+python3 status.py --name <workspace>
+python3 status.py --name <workspace> --json   # 供 shell/CI 解析
+```
+
+`status.py` 不啟動 loop、不修復檔案；primary state 不可讀時只投影 checkpoint，找不到 workspace 或兩份 state 都損壞會以 exit code 1 結束。
+
 常用選項：
 
 ```text

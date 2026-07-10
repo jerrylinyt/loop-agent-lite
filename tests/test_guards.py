@@ -29,6 +29,7 @@ import dashboard as D  # noqa: E402
 
 WORK_PY = str(REPO_ROOT / "work.py")
 LOOP_PY = str(REPO_ROOT / "loop.py")
+STATUS_PY = str(REPO_ROOT / "status.py")
 WS_ROOT = REPO_ROOT / "workspace"
 
 
@@ -589,6 +590,7 @@ class TestWorkCliArtifactGuards(unittest.TestCase):
             self.assertIn("協調檔案不安全", result.stderr)
             self.assertEqual(outside.read_text(encoding="utf-8"), "outside secret\n")
 
+
             (workspace / "signal_plan_ok.tok").unlink()
             (workspace / "pending_issues.tok").symlink_to(outside)
             result = self.run_work(workspace, "tok", "issue", "must", "not", "escape")
@@ -612,6 +614,45 @@ class TestWorkCliArtifactGuards(unittest.TestCase):
                 L._CONSOLE_PATH = old_console
                 L.release_run_locks()
             self.assertEqual(outside.read_text(encoding="utf-8"), "outside secret\n")
+
+
+class TestStatusCli(unittest.TestCase):
+    """status.py 是純唯讀 projection，JSON 可供 shell/CI 消費。"""
+
+    def test_json_status_and_checkpoint_projection_do_not_repair(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = root / "workspace"
+                ws = L.Workspace("cli-status")
+                state = ws.fresh_state()
+                state.update(round=4, plan=[{"order": 1, "task": "one"}], current_order=1)
+                ws.save_state(state)
+                ws.state_path.write_text("{broken", encoding="utf-8")
+                before = ws.state_path.read_bytes()
+                env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
+                result = subprocess.run(
+                    [sys.executable, STATUS_PY, "--name", "cli-status", "--json"],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["round"], 4)
+                self.assertEqual(payload["plan_len"], 1)
+                self.assertTrue(payload["state_recovery_pending"])
+                self.assertEqual(ws.state_path.read_bytes(), before, "status CLI 不得修復 primary state")
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_missing_workspace_returns_machine_readable_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
+            result = subprocess.run(
+                [sys.executable, STATUS_PY, "--name", "missing", "--json"],
+                capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertIn("不存在", payload["error"])
 
 
 class TestLoopSignalIngestionGuards(unittest.TestCase):
