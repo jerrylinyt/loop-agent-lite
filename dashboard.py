@@ -37,6 +37,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 import loop as loop_mod          # 共用 Workspace/fresh_state,匯入計畫時建 state 不自己發明 schema
+from prompt_templates import prompt_template_projection
 from work import validate_plan  # 計畫校驗單一來源(create-plan / 匯入共用)
 
 HERE = Path(__file__).resolve().parent
@@ -1044,6 +1045,7 @@ def load_config():
 
 def config_projection(cfg):
     raw_paths, resolved_paths = configured_path_dirs(cfg)
+    prompt_templates, prompt_template_warnings = prompt_template_projection(cfg)
     return {"agent_cmds": cfg.get("agent_cmds", []),
             "validate_cmds": cfg.get("validate_cmds", []),
             "defaults": cfg.get("defaults") or {},
@@ -1055,7 +1057,9 @@ def config_projection(cfg):
             "config_override": bool(CONFIG_OVERRIDE),
             "notify_cmd": str(cfg.get("notify_cmd") or ""),
             "repo_roots": cfg.get("repo_roots", DEFAULT_CONFIG["repo_roots"]),
-            "repos": scan_repos(cfg)}
+            "repos": scan_repos(cfg),
+            "prompt_templates": prompt_templates,
+            "prompt_template_warnings": prompt_template_warnings}
 
 
 def save_personal_config(updates):

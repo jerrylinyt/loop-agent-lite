@@ -5,12 +5,16 @@ export default function PlanImportField({
   value,
   onChange,
   startPhase,
-  onStartPhaseChange
+  onStartPhaseChange,
+  onOpenPromptTemplate,
+  promptTemplateAvailable
 }: {
   value: string;
   onChange: (value: string) => void;
   startPhase: "plan" | "exec";
   onStartPhaseChange: (value: "plan" | "exec") => void;
+  onOpenPromptTemplate: () => void;
+  promptTemplateAvailable: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   const error = validatePlan(value);
@@ -25,7 +29,7 @@ export default function PlanImportField({
   };
   return (
     <div className="form-field">
-      <div className="field-label-row"><label htmlFor="plan-json">匯入 plan.json <span>選填</span></label><button type="button" className="text-button" onClick={copyTemplate}>{copied ? "✅ 已複製" : "複製範本"}</button></div>
+      <div className="field-label-row"><label htmlFor="plan-json">匯入 plan.json <span>選填</span></label><span className="field-actions"><button type="button" className="text-button" disabled={!promptTemplateAvailable} onClick={onOpenPromptTemplate}>產生 Plan Prompt</button><button type="button" className="text-button" onClick={copyTemplate}>{copied ? "✅ 已複製" : "複製 JSON 範本"}</button></span></div>
       <textarea id="plan-json" rows={5} value={value} onChange={(event) => onChange(event.target.value)} placeholder="留空＝沿用既有計畫或從零規劃" aria-invalid={!!error} aria-describedby={error ? "plan-error" : undefined} />
       {error && <p id="plan-error" className="field-error" role="alert">{error}</p>}
       {value.trim() && !error && (

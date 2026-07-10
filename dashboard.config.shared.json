@@ -31,6 +31,7 @@
     "~/bin"
   ],
   "notify_cmd": "",
+  "prompt_templates": [],
   "defaults": {
     "flag_threshold": 10,
     "done_threshold": 3,

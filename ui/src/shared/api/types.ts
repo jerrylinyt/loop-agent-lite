@@ -213,6 +213,16 @@ export interface SelectCommand {
   cmd: string;
 }
 
+export interface PromptTemplate {
+  id: string;
+  label: string;
+  category: string;
+  description: string;
+  instructions: string;
+  requirement_placeholder: string;
+  source: "builtin" | "team";
+}
+
 export interface ConfigResponse {
   error?: string;
   agent_cmds: SelectCommand[];
@@ -227,6 +237,8 @@ export interface ConfigResponse {
   config_override?: boolean;
   notify_cmd?: string;
   repo_roots?: string[];
+  prompt_templates?: PromptTemplate[];
+  prompt_template_warnings?: string[];
 }
 
 export interface JobInfo {

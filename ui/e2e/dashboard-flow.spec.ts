@@ -12,6 +12,47 @@ async function acceptConfirmation(page: Page, action: () => Promise<void>) {
   await dialog.getByRole("button", { name: /繼續|清空/ }).click();
 }
 
+test("Goal／Plan Prompt 模板可選類型、共用分析規則並下載", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "＋ 啟動第一個 loop" }).click();
+  const launcher = page.getByRole("dialog", { name: "啟動與管理" });
+
+  await launcher.getByRole("button", { name: "產生 Goal Prompt" }).click();
+  let promptTemplates = page.getByRole("dialog", { name: "外部 Agent Prompt 模板" });
+  await expect(promptTemplates).toBeVisible();
+  await expect(promptTemplates.getByRole("tab", { name: "Goal 分析模板" })).toHaveAttribute("aria-selected", "true");
+  const promptType = promptTemplates.getByRole("combobox", { name: "Prompt 任務類型" });
+  await promptType.selectOption("project-logic-analysis");
+  await promptTemplates.getByLabel("原始需求").fill("分析 Dashboard 啟動 loop 與 Overview 投影的完整資料流");
+  await promptTemplates.getByLabel(/專案／補充上下文/).fill("repo 可唯讀；重要結論需附檔案與行號");
+  const promptPreview = promptTemplates.getByTestId("prompt-template-preview");
+  await expect(promptPreview).toContainText("依需求產生 goal.md");
+  await expect(promptPreview).toContainText("分析專案架構／邏輯");
+  await expect(promptPreview).toContainText("共用分析規則");
+  await expect(promptPreview).toContainText("最終輸出契約：goal.md");
+
+  await promptType.selectOption("e2e-team-analysis");
+  await expect(promptTemplates.locator(".prompt-template-summary").getByText("E2E 團隊自訂模板", { exact: true })).toBeVisible();
+  await expect(promptTemplates.locator(".prompt-template-summary").getByText("團隊", { exact: true })).toBeVisible();
+  await expect(promptPreview).toContainText("追蹤 E2E 團隊狀態真相來源");
+  await promptTemplates.getByRole("tab", { name: "Plan 拆分模板" }).click();
+  await expect(promptPreview).toContainText("依需求產生 plan.json");
+  await expect(promptPreview).toContainText("只輸出一個合法 JSON array");
+  await expect(promptPreview).toContainText("只能有 `order`、`task`、選填的 `ref`");
+  const promptDownloadPromise = page.waitForEvent("download");
+  await promptTemplates.getByRole("button", { name: "下載 .md" }).click();
+  const promptDownload = await promptDownloadPromise;
+  expect(promptDownload.suggestedFilename()).toBe("e2e-team-analysis-plan-prompt.md");
+  await promptTemplates.getByRole("button", { name: "關閉", exact: true }).click();
+  await expect(promptTemplates).toBeHidden();
+
+  await launcher.getByRole("button", { name: "產生 Plan Prompt" }).click();
+  promptTemplates = page.getByRole("dialog", { name: "外部 Agent Prompt 模板" });
+  await expect(promptTemplates.getByRole("tab", { name: "Plan 拆分模板" })).toHaveAttribute("aria-selected", "true");
+  await promptTemplates.getByRole("button", { name: "關閉", exact: true }).click();
+  await launcher.getByRole("button", { name: "取消", exact: true }).click();
+});
+
 test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、phase 與進度", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "尚未建立 workspace" })).toBeVisible();

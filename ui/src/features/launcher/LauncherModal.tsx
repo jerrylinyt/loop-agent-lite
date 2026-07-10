@@ -5,8 +5,10 @@ import { getJson, postJson, waitForJobStartup } from "../../shared/api/client";
 import type { ConfigResponse, JobInfo, StartupResponse, WorkspaceState, WorkspaceSummary } from "../../shared/api/types";
 import PlanImportField from "./PlanImportField";
 import NotifyModal from "./NotifyModal";
+import PromptTemplateModal from "./PromptTemplateModal";
 import RepoRootsModal from "./RepoRootsModal";
 import { validatePlan } from "./planValidation";
+import type { PromptTemplateMode } from "./promptTemplateBuilder";
 
 interface RepoStatus { goal: "committed" | "modified" | "untracked" | "missing"; tree_clean: boolean; suggested_validate_cmd?: string | null; error?: string }
 interface ValidateResponse { ok?: boolean; rc?: number; timeout?: boolean; timeout_seconds?: number; tail?: string }
@@ -50,6 +52,7 @@ export default function LauncherModal({
   const [cliManagerOpen, setCliManagerOpen] = useState(false);
   const [repoRootsOpen, setRepoRootsOpen] = useState(false);
   const [notifyOpen, setNotifyOpen] = useState(false);
+  const [promptTemplateMode, setPromptTemplateMode] = useState<PromptTemplateMode | null>(null);
   const hydratedRepo = useRef("");
 
   const repo = repoChoice === "__custom__" ? customRepo.trim() : repoChoice;
@@ -250,10 +253,11 @@ export default function LauncherModal({
           {repoStatus && <div className={`repo-status${repoStatus.error || !repoStatus.tree_clean ? " warning" : ""}`}>
             {repoStatus.error ? `❌ ${repoStatus.error}` : <>goal.md {repoMark(repoStatus.goal)} · 工作樹 {repoStatus.tree_clean ? "✅ 乾淨" : "❌ 髒（preflight 會擋）"}{matchingWorkspace && ` · workspace「${matchingWorkspace.name}」已存在`}</>}
           </div>}
-          <label>goal.md <span className="label-help">留空＝沿用 repo 已 commit 的版本</span>
-            <input type="file" accept=".md,.markdown,.txt" onChange={(event) => setGoalFile(event.target.files?.[0] ?? null)} />
-          </label>
-          <PlanImportField value={planJson} onChange={setPlanJson} startPhase={startPhase} onStartPhaseChange={setStartPhase} />
+          <div className="form-field">
+            <div className="field-label-row"><label htmlFor="goal-file">goal.md <span className="label-help">留空＝沿用 repo 已 commit 的版本</span></label><button type="button" className="text-button" disabled={!config?.prompt_templates?.length} onClick={() => setPromptTemplateMode("goal")}>產生 Goal Prompt</button></div>
+            <input id="goal-file" type="file" accept=".md,.markdown,.txt" onChange={(event) => setGoalFile(event.target.files?.[0] ?? null)} />
+          </div>
+          <PlanImportField value={planJson} onChange={setPlanJson} startPhase={startPhase} onStartPhaseChange={setStartPhase} onOpenPromptTemplate={() => setPromptTemplateMode("plan")} promptTemplateAvailable={!!config?.prompt_templates?.length} />
           <label>Workspace 名稱 <span className="label-help">留空＝repo 目錄名</span><input value={name} onChange={(event) => setName(event.target.value)} /></label>
           <div className="form-columns command-columns">
             <div className="form-field agent-command-field"><span className="field-label-row"><span>Agent 命令</span></span><div className="command-select-row"><select aria-label="Agent 命令" value={agentIndex} onChange={(event) => setAgentIndex(event.target.value)}>{(config?.agent_cmds ?? []).map((agent, index) => <option key={agent.cmd} value={index}>{agent.label} — {agent.cmd}</option>)}</select><button type="button" className="icon-button cli-gear-button" aria-label="管理 Agent CLI" disabled={!config || !repo || !!repoStatus?.error} onClick={() => setCliManagerOpen(true)}>⚙</button></div></div>
@@ -299,6 +303,13 @@ export default function LauncherModal({
         if (repo !== "" && next.repos.includes(repo)) return;
         setRepoChoice(next.repos[0] ?? "__custom__");
       }} />}
+      {promptTemplateMode && config?.prompt_templates?.length && <PromptTemplateModal
+        templates={config.prompt_templates}
+        warnings={config.prompt_template_warnings}
+        projectConfigPath={config.project_config_path}
+        initialMode={promptTemplateMode}
+        onClose={() => setPromptTemplateMode(null)}
+      />}
     </Modal>
   );
 }

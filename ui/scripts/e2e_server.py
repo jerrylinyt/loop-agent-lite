@@ -74,6 +74,14 @@ def prepare_fixture():
         "validate_cmds": [{"label": "always green", "cmd": "true"}],
         "repo_roots": [str(repos)],
         "notify_cmd": "",
+        "prompt_templates": [{
+            "id": "e2e-team-analysis",
+            "label": "E2E 團隊流程分析",
+            "category": "團隊",
+            "description": "E2E 團隊自訂模板",
+            "requirement_placeholder": "請貼上 E2E 團隊需求",
+            "instructions": "- 追蹤 E2E 團隊狀態真相來源。\n- 列出自訂驗證邊界。",
+        }],
         "defaults": {
             "flag_threshold": 10,
             "done_threshold": 999,
