@@ -186,6 +186,24 @@ def sort_status_results(results, mode: str):
     return sorted(results, key=key)
 
 
+def filter_status_results(results, mode: str):
+    """篩選 fleet projection；只改輸出集合，不改完整 fleet 的 summary/check gate。"""
+    if mode == "all":
+        return list(results)
+    if mode == "attention":
+        return [result for result in results if projection_needs_attention(result)]
+    if mode == "error":
+        return [result for result in results if "error" in result]
+    valid = [result for result in results if "error" not in result]
+    if mode == "running":
+        return [result for result in valid if result.get("running")]
+    if mode == "stopped":
+        return [result for result in valid if not result.get("running")]
+    if mode == "done":
+        return [result for result in valid if result.get("phase") == "done"]
+    raise ValueError(f"未知 status filter:{mode}")
+
+
 def render_human(result, *, timestamp=False) -> None:
     phase = {"plan": "規劃期", "exec": "執行期", "done": "完成"}.get(result["phase"], result["phase"] or "未知")
     running = "執行中" if result["running"] else "⚠ PID 殘留" if result.get("stale_loop_pid") else "已停止"
@@ -233,6 +251,8 @@ def main(argv=None) -> int:
                         help="只查詢一次；state 錯誤或需關注時以 exit code 1 結束")
     parser.add_argument("--sort", choices=("name", "attention", "running", "phase", "round"),
                         default="name", help="--all 的排序方式（預設 name）")
+    parser.add_argument("--filter", choices=("all", "attention", "running", "stopped", "done", "error"),
+                        default="all", help="--all 的輸出篩選（預設 all；不縮小 --check 範圍）")
     args = parser.parse_args(argv)
     if bool(args.name) == args.all:
         parser.error("--name 與 --all 必須且只能選一個")
@@ -244,17 +264,23 @@ def main(argv=None) -> int:
         parser.error("--check 不可搭配 --watch")
     if args.sort != "name" and not args.all:
         parser.error("--sort 只有搭配 --all 才可使用")
+    if args.filter != "all" and not args.all:
+        parser.error("--filter 只有搭配 --all 才可使用")
     if args.workspace_root:
         loop.WORKSPACE_ROOT = Path(args.workspace_root).expanduser().resolve()
     previous_signature = None
     try:
         while True:
             if args.all:
-                results = sort_status_results(project_all_status(), args.sort)
-                summary = summarize_status(results)
+                all_results = project_all_status()
+                summary = summarize_status(all_results)
                 check_failed = summary["error_count"] > 0 or summary["attention"] > 0
+                results = sort_status_results(filter_status_results(all_results, args.filter), args.sort)
                 projection = {"schema_version": STATUS_SCHEMA_VERSION,
                               "summary": summary, "workspaces": results}
+                if args.filter != "all":
+                    projection["filter"] = args.filter
+                    projection["matched_count"] = len(results)
                 signature = json.dumps(projection, ensure_ascii=False, sort_keys=True,
                                        separators=(",", ":"))
                 changed = signature != previous_signature
@@ -265,8 +291,11 @@ def main(argv=None) -> int:
                 else:
                     if changed or not args.on_change:
                         render_fleet_summary(summary)
+                        if args.filter != "all":
+                            print(f"filter {args.filter}｜符合 {len(results)}/{summary['workspace_count']}", flush=True)
                         if not results:
-                            print("（沒有合法 workspace）", flush=True)
+                            print("（沒有符合篩選的 workspace）" if args.filter != "all" else "（沒有合法 workspace）",
+                                  flush=True)
                         for result in results:
                             if "error" in result:
                                 print(f"❌ {result['name']}｜{result['error']}", flush=True)

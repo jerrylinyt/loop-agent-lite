@@ -26,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 import loop as L  # noqa: E402
 import dashboard as D  # noqa: E402
+import status as S  # noqa: E402
 import work as W  # noqa: E402
 
 WORK_PY = str(REPO_ROOT / "work.py")
@@ -911,6 +912,68 @@ class TestStatusCli(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("只有搭配 --all", result.stderr)
 
+    def test_filter_modes_and_cli_keep_check_scoped_to_full_fleet(self):
+        sample = [
+            {"name": "alert", "running": False, "phase": "exec", "stall_rounds": 1},
+            {"name": "running", "running": True, "phase": "exec"},
+            {"name": "done", "running": False, "phase": "done"},
+            {"name": "broken", "error": "bad state"},
+        ]
+        self.assertEqual({item["name"] for item in S.filter_status_results(sample, "attention")},
+                         {"alert", "broken"})
+        self.assertEqual([item["name"] for item in S.filter_status_results(sample, "running")], ["running"])
+        self.assertEqual({item["name"] for item in S.filter_status_results(sample, "stopped")},
+                         {"alert", "done"})
+        self.assertEqual([item["name"] for item in S.filter_status_results(sample, "done")], ["done"])
+        self.assertEqual([item["name"] for item in S.filter_status_results(sample, "error")], ["broken"])
+
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d) / "workspace"
+                done = L.Workspace("done")
+                done_state = done.fresh_state()
+                done_state["phase"] = "done"
+                done.save_state(done_state)
+                alert = L.Workspace("alert")
+                alert_state = alert.fresh_state()
+                alert_state["stall_rounds"] = 1
+                alert.save_state(alert_state)
+                broken = L.Workspace("broken")
+                broken.state_path.write_text("{broken", encoding="utf-8")
+                env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
+
+                result = subprocess.run(
+                    [sys.executable, STATUS_PY, "--all", "--json", "--filter", "done", "--check"],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["filter"], "done")
+                self.assertEqual(payload["matched_count"], 1)
+                self.assertEqual([item["name"] for item in payload["workspaces"]], ["done"])
+                self.assertEqual(payload["summary"]["workspace_count"], 3)
+                self.assertEqual(payload["summary"]["attention"], 1)
+                self.assertEqual(payload["summary"]["error_count"], 1)
+
+                result = subprocess.run(
+                    [sys.executable, STATUS_PY, "--all", "--json", "--filter", "attention"],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["matched_count"], 2)
+                self.assertEqual([item["name"] for item in payload["workspaces"]], ["alert", "broken"])
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_filter_requires_all_mode(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
+            result = subprocess.run(
+                [sys.executable, STATUS_PY, "--name", "missing", "--filter", "attention"],
+                capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--filter 只有搭配 --all", result.stderr)
+
     def test_all_json_lists_fleet_without_starting_or_repairing(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -932,6 +995,7 @@ class TestStatusCli(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 payload = json.loads(result.stdout)
                 self.assertEqual(payload["schema_version"], 1)
+                self.assertNotIn("filter", payload)
                 self.assertEqual([item["name"] for item in payload["workspaces"]], ["alpha", "beta", "broken"])
                 self.assertEqual([item["round"] for item in payload["workspaces"] if "round" in item], [2, 5])
                 self.assertIn("error", payload["workspaces"][-1])

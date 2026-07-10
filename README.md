@@ -74,12 +74,14 @@ python3 status.py --name <workspace> --watch --on-change --interval 2
 python3 status.py --all --json                # 一次列出整個 workspace fleet
 python3 status.py --all --json --check        # 需關注或 state 錯誤時 exit 1
 python3 status.py --all --json --sort attention  # 將需關注項目排前
+python3 status.py --all --json --filter attention # 只輸出需關注／錯誤 workspace
 ```
 
 `status.py` 不啟動 loop、不修復檔案；`--all` 與 `--name` 擇一，`--watch` 只重複唯讀輪詢，`--on-change` 可抑制未變更 projection 的重複輸出，Ctrl-C 以 exit code 130 結束。primary state 不可讀時只投影 checkpoint，找不到 workspace 或兩份 state 都損壞會以 exit code 1 結束。
 JSON 輸出包含 `schema_version: 1`；單 workspace 直接帶狀態欄位，`--all --json` 另外輸出 `workspaces` 與 `summary`。摘要包含執行中、規劃／執行／完成數、需關注 workspace、issues 總數與未讀數、Agent 異常、state 復原、goal 變更、stale loop PID、任務完成率，以及 state 錯誤數，方便 shell／CI 直接判斷 fleet 健康度。
 `--check` 是一次性 gate：projection 仍照常輸出，但只要有 state 錯誤或需關注 workspace 就以 exit code 1 結束；不可與 `--watch` 同時使用。
 `--sort` 只作用於 `--all`，可選 `name`、`attention`、`running`、`phase`、`round`；預設 `name` 維持穩定的相容輸出。
+`--filter` 也只作用於 `--all`，可選 `all`、`attention`、`running`、`stopped`、`done`、`error`。篩選時 `workspaces` 只包含符合項目，另帶 `filter`／`matched_count`；`summary` 與 `--check` 始終涵蓋完整 fleet，避免篩選掩蓋其他 workspace 的異常。
 
 Dashboard 也提供唯讀 `GET /api/health`，回傳 `schema_version: 1`、`status`（`ok`／`degraded`／`error`）與 workspace、執行中、需關注、state 錯誤、issues、Agent 異常、state 復原、goal 變更及 stale PID 摘要；適合本機探針或外部監控。加上 `?strict=1` 時，`degraded`／`error` 會以 HTTP 503 回應，方便 readiness probe 直接判斷；預設仍維持 HTTP 200 並讓呼叫端讀取 status。瀏覽器頁首與即時 SSE 的 `health` event 使用同一份 projection，不會修復或改寫任何 workspace。
 
