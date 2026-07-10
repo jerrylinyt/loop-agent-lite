@@ -210,6 +210,25 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page.locator(".chip.status-pulse").filter({ hasText: /^done / })).toBeVisible();
   await page.getByRole("button", { name: "⏹ 停止" }).click();
   await expect(page.getByRole("button", { name: "▶ 運行" })).toBeVisible();
+
+  await page.getByRole("button", { name: "⚙ 設定" }).click();
+  settings = page.getByRole("dialog", { name: "Workspace 設定" });
+  await settings.getByLabel("done 收斂（≥）").fill("1");
+  await settings.getByRole("button", { name: "儲存設定" }).click();
+  await expect(settings).toBeHidden();
+
+  await page.getByRole("button", { name: "▶ 運行" }).click();
+  await expect(page.getByText("🏁 完成", { exact: true })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole("button", { name: "▶ 運行" })).toBeVisible();
+
+  await page.getByRole("button", { name: "📄 完成報告" }).click();
+  const reportModal = page.getByRole("dialog", { name: "完成報告" });
+  await expect(reportModal).toBeVisible();
+  await expect(reportModal).toContainText("loop-agent-lite RUN REPORT");
+  await expect(reportModal).toContainText("task-1");
+  await expect(reportModal).toContainText("task-2");
+  await reportModal.getByRole("button", { name: "關閉對話框" }).click();
+  await expect(reportModal).toBeHidden();
 });
 
 test("read-only instance 隱藏寫入控制並拒絕 POST", async ({ page, request }) => {

@@ -908,5 +908,23 @@ class TestTamperRoundVoided(unittest.TestCase):
         self.assertEqual(st["plan_version"], 1, "正常 create-plan 應推進 plan_version")
 
 
+class TestReportProjection(unittest.TestCase):
+    """REPORT.md 唯讀投影:存在回內容、不存在回明確 error,不寫任何 truth。"""
+
+    def test_missing_then_present(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            (root / "demo").mkdir(parents=True)
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                self.assertIn("error", D.read_report("demo"), "沒有 REPORT.md 應回明確 error")
+                report_text = "# loop-agent-lite RUN REPORT\n- task-1 @ abcd1234\n"
+                (root / "demo" / "REPORT.md").write_text(report_text, encoding="utf-8")
+                self.assertEqual(D.read_report("demo"), {"content": report_text})
+            finally:
+                D.ROOT = old_root
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

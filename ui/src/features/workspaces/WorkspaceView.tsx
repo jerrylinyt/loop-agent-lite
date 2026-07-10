@@ -8,6 +8,7 @@ import ConfigModal from "./ConfigModal";
 import HistoryModal from "./HistoryModal";
 import IssuesModal from "./IssuesModal";
 import PlanTable from "./PlanTable";
+import ReportModal from "./ReportModal";
 import useStatusPulse from "./useStatusPulse";
 
 const PHASE_NAMES = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
@@ -30,6 +31,7 @@ export default function WorkspaceView({
   const [configOpen, setConfigOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [issuesOpen, setIssuesOpen] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
   const [statusHeight, setStatusHeight] = useState(() => +(localStorage.getItem("status-console-height") || 220));
   const [statusCollapsed, setStatusCollapsed] = useState(() => localStorage.getItem("status-console-collapsed") === "1");
   const [busyAction, setBusyAction] = useState<"run" | "stop" | null>(null);
@@ -133,6 +135,7 @@ export default function WorkspaceView({
             {state.phase !== "plan" && total > 0 && <span key={`${completed}-${state.current_order}`} className={`chip${pulse.has("task") ? " status-pulse" : ""}`}>任務 {completed}/{total}</span>}
             {state.phase === "plan" && <span key={state.flag} className={`chip${pulse.has("flag") ? " status-pulse" : ""}`}>flag {state.flag} / &gt;{state.config?.flag_threshold ?? 10}</span>}
             {state.phase === "exec" && <span key={state.done_count} className={`chip${pulse.has("done") ? " status-pulse" : ""}`}>done {state.done_count} / ≥{state.config?.done_threshold ?? 3}</span>}
+            {state.phase === "done" && <button type="button" className="chip report-chip" onClick={() => setReportOpen(true)}>📄 完成報告</button>}
           </div>
           <div className="health-status">
             <span key={`${state.red_streak}-${state.stall_rounds}`} className={`chip subdued${state.phase === "plan" && state.plan_version >= 10 ? " warning" : ""}${pulse.has("health") ? " status-pulse" : ""}`}>紅連跳 {state.red_streak} · 停滯 {state.stall_rounds} · plan v{state.plan_version}{state.phase === "plan" && state.plan_version >= 10 ? " ⚠ 可能震盪" : ""}</span>
@@ -165,6 +168,7 @@ export default function WorkspaceView({
       </div>
       {issuesOpen && workspace && <IssuesModal workspace={workspace.name} issues={state.issues ?? []} readonly={readonly || workspace.running} onClose={() => setIssuesOpen(false)} onChanged={onRefresh} />}
       {historyOpen && workspace && <HistoryModal workspace={workspace.name} onClose={() => setHistoryOpen(false)} />}
+      {reportOpen && workspace && <ReportModal workspace={workspace.name} onClose={() => setReportOpen(false)} />}
       {configOpen && workspace && <ConfigModal workspace={workspace.name} config={state.config ?? {}} onClose={() => setConfigOpen(false)} onChanged={onRefresh} />}
       {dialog && <ActionDialog title={dialog.title} message={dialog.message} confirmLabel={dialog.confirmLabel} onClose={() => setDialog(null)} onConfirm={dialog.onConfirm} />}
     </section>

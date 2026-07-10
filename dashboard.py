@@ -324,6 +324,16 @@ def write_state(name, st):
     loop_mod.write_checkpointed_state(ROOT / name / "state.json", data)
 
 
+def read_report(name):
+    """REPORT.md 唯讀投影:只在全部任務收斂完成後由 loop 產生,不存在回明確 error。"""
+    try:
+        return {"content": (ROOT / name / "REPORT.md").read_text(encoding="utf-8")}
+    except FileNotFoundError:
+        return {"error": "REPORT.md 不存在——全部任務收斂完成後才會由 loop 產生"}
+    except OSError as e:
+        return {"error": f"REPORT.md 讀取失敗:{e}"}
+
+
 def workspace_console_log(name, message):
     """將 Dashboard 操作與 loop/Agent 寫進同一條 workspace console 時序。"""
     line = f"[{time.strftime('%H:%M:%S')}] 🖥️ Dashboard｜{message}"
@@ -731,6 +741,11 @@ class Handler(BaseHTTPRequestHandler):
                 off = int(q.get("offset", ["0"])[0])
                 self._out(200, json.dumps(
                     read_incremental(d / "history.log", off), ensure_ascii=False))
+            elif u.path == "/api/report":
+                d = self._ws_dir(q)
+                if d is None:
+                    return
+                self._out(200, json.dumps(read_report(d.name), ensure_ascii=False))
             else:
                 self._err("not found", 404)
         except (ValueError, BrokenPipeError, ConnectionResetError):

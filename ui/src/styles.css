@@ -169,6 +169,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .chip.warning { color: var(--warning); background: var(--warning-soft); }
 button.chip { border: 0; color: inherit; }
 .issue-chip { color: var(--danger); background: var(--danger-soft); }
+.report-chip { color: var(--success); background: var(--success-soft); }
+.report-content { margin: 0; color: var(--text); font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
 .goal-warning { margin-top: 8px; padding: 5px 9px; border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent); border-radius: 6px; color: var(--warning); background: var(--warning-soft); font-size: 12px; }
 .loading-state { display: grid; flex: 1; place-items: center; color: var(--muted); }
 .loading-state.error { color: var(--danger); }
