@@ -81,6 +81,7 @@ Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace 
 
 - 左側是 Loop 狀態；右側是 Agent 輸出，可切換 Agent／其他／全部。
 - 分隔線可拖曳調整欄寬；箭頭可收合，設定會保存在瀏覽器。
+- 啟動表單的「完整健檢」會檢查目前已 commit repo 的 git／鎖／乾淨工作樹／goal 與 Validate，不建 state、不啟動 Agent；待匯入 goal、plan、reset 或新 branch 時會停用，實際啟動仍會再驗一次。
 - 正常要停時用「本輪後停止」：目前 Agent、Validate 與 state/history 落盤完成後才停，不會啟動下一輪。
 - Agent CLI 卡死或明顯失控時用「立即停止」；它會中斷目前 round，state 可在下次運行時續用。
 - 停止後可編輯計畫、切換階段或修改 agent／validate 設定，再按 ▶ 運行。

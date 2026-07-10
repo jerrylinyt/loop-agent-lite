@@ -261,11 +261,13 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .form-grid textarea[aria-invalid="true"] { border-color: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
 .label-help, .field-label-row span { color: var(--muted); font-weight: normal; }
 .field-label-row { display: flex; align-items: center; justify-content: space-between; }
+.field-actions { display: inline-flex; align-items: center; gap: 5px; }
 .compact-button { min-height: 26px; padding: 2px 8px; color: var(--text); font-size: 12px; }
 .command-select-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; }
 .command-select-row select { min-width: 0; }
 .cli-gear-button { min-height: 32px; }
 .field-error { margin: 0; color: var(--danger); }
+.field-help { margin: -4px 0 0; color: var(--muted); font-size: 12px; }
 .validate-result { padding: 8px 9px; border-radius: 6px; background: var(--danger-soft); color: var(--danger); font-size: 12px; }
 .validate-result.success { background: var(--success-soft); color: var(--success); }
 .validate-result pre { max-height: 160px; margin: 6px 0 0; overflow: auto; color: var(--text); font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; }

@@ -43,11 +43,14 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await rootsManager.getByRole("button", { name: "取消" }).click();
   await launcher.locator(".validate-command-field").getByRole("button", { name: "執行確認" }).click();
   await expect(launcher.locator(".validate-result")).toContainText("Validate 通過");
+  await launcher.locator(".validate-command-field").getByRole("button", { name: "完整健檢" }).click();
+  await expect(launcher.getByRole("status").filter({ hasText: "完整啟動前健檢通過" })).toBeVisible();
 
   const plan = launcher.getByLabel("匯入 plan.json 選填");
   await plan.fill("not-json");
   await expect(launcher.getByRole("alert")).toContainText("JSON 解析失敗");
   await plan.fill(PLAN);
+  await expect(launcher.locator(".validate-command-field").getByRole("button", { name: "完整健檢" })).toBeDisabled();
   await launcher.getByLabel("直接執行期").check();
   await launcher.getByLabel("Workspace 名稱 留空＝repo 目錄名").fill("e2e-workspace");
   await launcher.locator('input[type="file"]').setInputFiles({

@@ -881,7 +881,7 @@ class TestDashboardStateLockCoverage(unittest.TestCase):
     """#3 run/launch 必須和 edit/phase 共用 workspace lock,不能在 stopped check 後競態。"""
 
     def test_all_workspace_mutations_are_decorated(self):
-        for method in ("api_launch", "api_run", "api_drain", "api_edit_state", "api_edit_config", "api_validate", "api_test_agent", "api_phase", "api_set_task"):
+        for method in ("api_launch", "api_run", "api_drain", "api_edit_state", "api_edit_config", "api_validate", "api_preflight", "api_test_agent", "api_phase", "api_set_task"):
             self.assertTrue(hasattr(getattr(D.Handler, method), "__wrapped__"), f"{method} 必須套 workspace lock")
 
     def test_launch_blank_name_locks_repo_basename(self):
@@ -1159,6 +1159,65 @@ class TestPromptProjection(unittest.TestCase):
                 self.assertEqual(result["file"], "round-0010.md")
             finally:
                 D.ROOT = old_root
+
+
+class TestDashboardPreflight(unittest.TestCase):
+    """Dashboard 必須復用唯一的 --preflight-only 實作，不誤建 coordinator state。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_green_and_held_lock_are_reported_without_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = make_repo(d)
+            workspace_root = Path(d) / "workspace"
+            old_root, old_workspace_root, old_load = D.ROOT, L.WORKSPACE_ROOT, D.load_config
+            old_env = os.environ.get("LOOP_AGENT_WORKSPACE_ROOT")
+            D.ROOT = workspace_root
+            L.WORKSPACE_ROOT = workspace_root
+            D.load_config = lambda: {
+                "validate_cmds": [{"label": "green", "cmd": "true"}],
+                "extra_path_dirs": [], "defaults": {"validate_timeout": 5},
+            }
+            os.environ["LOOP_AGENT_WORKSPACE_ROOT"] = str(workspace_root)
+            try:
+                body = {"repo": str(repo), "name": "dashboard-preflight", "validate_idx": 0,
+                        "validate_timeout": 5}
+                handler = self.ResponseCapture()
+                D.Handler.api_preflight(handler, body)
+                self.assertEqual(handler.response[0], 200)
+                self.assertTrue(handler.response[1]["ok"], handler.response)
+                workspace = workspace_root / "dashboard-preflight"
+                self.assertFalse((workspace / "state.json").exists())
+                self.assertFalse((workspace / "state.last-good.json").exists())
+                self.assertFalse((workspace / "dispatch.json").exists())
+                self.assertFalse(list((workspace / "snapshots").iterdir()))
+
+                import fcntl
+                holder = open(workspace / ".run.lock", "a+b")
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    handler = self.ResponseCapture()
+                    D.Handler.api_preflight(handler, body)
+                finally:
+                    fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+                    holder.close()
+                self.assertEqual(handler.response[0], 200)
+                self.assertFalse(handler.response[1]["ok"])
+                self.assertIn("單 writer 鎖", handler.response[1]["tail"])
+                self.assertFalse((workspace / "state.json").exists())
+            finally:
+                D.ROOT, L.WORKSPACE_ROOT, D.load_config = old_root, old_workspace_root, old_load
+                if old_env is None:
+                    os.environ.pop("LOOP_AGENT_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["LOOP_AGENT_WORKSPACE_ROOT"] = old_env
 
 
 if __name__ == "__main__":

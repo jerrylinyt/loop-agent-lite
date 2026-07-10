@@ -829,6 +829,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.api_edit_config(body)
             elif u.path == "/api/validate":
                 self.api_validate(body)
+            elif u.path == "/api/preflight":
+                self.api_preflight(body)
             elif u.path == "/api/test-agent":
                 self.api_test_agent(body)
             elif u.path == "/api/test-cli":
@@ -1224,6 +1226,50 @@ class Handler(BaseHTTPRequestHandler):
             self._err("validate_timeout 必須 > 0 秒")
         except FileNotFoundError:
             self._err(f"找不到 Validate 命令：{cmd[0]}")
+
+    @with_state_lock(repo_fallback=True)
+    def api_preflight(self, body):
+        """以 loop.py 的唯一 preflight 實作檢查目前已 commit 的 repo，不建立 state 或 Agent job。"""
+        cfg = load_config()
+        if "error" in cfg:
+            self._err(cfg["error"])
+            return
+        repo = Path(str(body.get("repo") or "")).expanduser()
+        if not (repo / ".git").exists():
+            self._err(f"{repo} 不是 git repo")
+            return
+        name = str(body.get("name") or "").strip() or repo.name
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            self._err(f"workspace 名稱 {name} 不合法,只允許英數 . _ -")
+            return
+        values = cfg.get("validate_cmds") or []
+        try:
+            validate_cmd = values[int(body.get("validate_idx"))]["cmd"]
+        except (TypeError, ValueError, IndexError, KeyError):
+            self._err(f"validate_idx 不合法,合法值 0..{len(values) - 1}（完整健檢只使用已儲存的 Validate 命令）")
+            return
+        command_problem = command_error(validate_cmd, "Validate 命令", cfg)
+        if command_problem:
+            self._err(command_problem)
+            return
+        try:
+            timeout = float(body.get("validate_timeout", (cfg.get("defaults") or {}).get("validate_timeout", 120)))
+            if not (0 < timeout < float("inf")):
+                raise ValueError
+        except (TypeError, ValueError):
+            self._err("validate_timeout 必須 > 0 秒")
+            return
+        command = [sys.executable, str(HERE / "loop.py"), "--repo", str(repo), "--name", name,
+                   "--validate-cmd", validate_cmd, "--validate-timeout", str(timeout), "--preflight-only"]
+        # loop.py 會自行以 validate_timeout 終止 validator；外層多留緩衝，只在意外卡住時清整群組。
+        rc, output, timed_out = run_command_check(command, repo, timeout=timeout + 15, env=command_env(cfg))
+        output = output.strip()
+        tail = "\n".join(output.splitlines()[-100:])[-30000:]
+        ok = rc == 0 and not timed_out
+        status = "通過" if ok else f"逾時 {timeout + 15:g} 秒" if timed_out else f"失敗 rc={rc}"
+        print(f"🖥️ Dashboard｜完整啟動前健檢｜{status}｜repo={repo}", flush=True)
+        self._out(200, json.dumps({"ok": ok, "rc": rc, "timeout": timed_out,
+                                   "timeout_seconds": timeout + 15, "tail": tail}, ensure_ascii=False))
 
     @with_state_lock(repo_fallback=True)
     def api_test_agent(self, body):

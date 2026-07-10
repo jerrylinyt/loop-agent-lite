@@ -9,6 +9,7 @@ import { validatePlan } from "./planValidation";
 
 interface RepoStatus { goal: "committed" | "modified" | "untracked" | "missing"; tree_clean: boolean; suggested_validate_cmd?: string | null; error?: string }
 interface ValidateResponse { ok?: boolean; rc?: number; timeout?: boolean; timeout_seconds?: number; tail?: string }
+interface PreflightResponse extends ValidateResponse { error?: string }
 
 export default function LauncherModal({
   workspaces,
@@ -42,7 +43,9 @@ export default function LauncherModal({
   const [message, setMessage] = useState("");
   const [launching, setLaunching] = useState(false);
   const [validating, setValidating] = useState(false);
+  const [preflighting, setPreflighting] = useState(false);
   const [validateResult, setValidateResult] = useState<{ ok: boolean; text: string; tail: string } | null>(null);
+  const [preflightResult, setPreflightResult] = useState<{ ok: boolean; text: string; tail: string } | null>(null);
   const [cliManagerOpen, setCliManagerOpen] = useState(false);
   const [repoRootsOpen, setRepoRootsOpen] = useState(false);
   const hydratedRepo = useRef("");
@@ -122,6 +125,10 @@ export default function LauncherModal({
     return () => window.clearInterval(interval);
   }, [tab]);
 
+  useEffect(() => {
+    setPreflightResult(null);
+  }, [repo, name, validateChoice, validateTimeout, goalFile, planJson, resetState, newBranch]);
+
   const launch = async () => {
     const planError = validatePlan(planJson);
     if (planError) return setMessage(`❌ plan.json 格式不對：${planError}`);
@@ -187,6 +194,35 @@ export default function LauncherModal({
     });
   };
 
+  const hasPendingLaunchMutation = !!goalFile || !!planJson.trim() || resetState || newBranch;
+  const preflightBlockedByDraft = hasPendingLaunchMutation || validateChoice === "__custom__";
+  const canPreflight = !preflighting && !!repo && !repoStatus?.error && !hasPendingLaunchMutation && validateChoice !== "__custom__";
+  const preflightHint = hasPendingLaunchMutation
+    ? "完整健檢只檢查目前已 commit 的 repo；先清除待匯入的 goal、plan、重置或新 branch 選項"
+    : validateChoice === "__custom__"
+      ? "完整健檢只使用已儲存的 Validate 命令；請先把手寫命令加入清單"
+      : "檢查目前 repo 的 git、單 writer lock、乾淨工作樹、已 commit 的 goal 與 Validate；不建立 state 或啟動 Agent";
+  const runPreflight = async () => {
+    setPreflighting(true);
+    setPreflightResult(null);
+    const response = await postJson<PreflightResponse>("/api/preflight", {
+      repo,
+      name: name.trim(),
+      validate_idx: +validateChoice,
+      validate_timeout: validateTimeout
+    });
+    setPreflighting(false);
+    if (response.error) {
+      setPreflightResult({ ok: false, text: `❌ ${response.error}`, tail: "" });
+      return;
+    }
+    setPreflightResult({
+      ok: !!response.ok,
+      text: response.timeout ? `❌ 完整健檢逾時（${response.timeout_seconds ?? validateTimeout + 15} 秒）` : response.ok ? "✅ 完整啟動前健檢通過" : `❌ 完整健檢未通過（exit ${response.rc ?? "?"}）`,
+      tail: response.tail ?? ""
+    });
+  };
+
   const repoMark = (value?: string) => value === "committed" ? "✅ 已 commit" : value === "modified" ? "⚠ 已修改未 commit" : value === "untracked" ? "⚠ 尚未 commit" : "❌ 缺少";
   const footer = tab === "launch" ? (
     <>
@@ -219,10 +255,12 @@ export default function LauncherModal({
           <label>Workspace 名稱 <span className="label-help">留空＝repo 目錄名</span><input value={name} onChange={(event) => setName(event.target.value)} /></label>
           <div className="form-columns command-columns">
             <div className="form-field agent-command-field"><span className="field-label-row"><span>Agent 命令</span></span><div className="command-select-row"><select aria-label="Agent 命令" value={agentIndex} onChange={(event) => setAgentIndex(event.target.value)}>{(config?.agent_cmds ?? []).map((agent, index) => <option key={agent.cmd} value={index}>{agent.label} — {agent.cmd}</option>)}</select><button type="button" className="icon-button cli-gear-button" aria-label="管理 Agent CLI" disabled={!config || !repo || !!repoStatus?.error} onClick={() => setCliManagerOpen(true)}>⚙</button></div></div>
-            <div className="form-field validate-command-field"><span className="field-label-row"><span>Validate 命令</span><button type="button" className="secondary-button compact-button" disabled={validating || !repo || !!repoStatus?.error || (validateChoice === "__custom__" && !customValidate.trim())} onClick={() => void verifyValidate()}>{validating ? "執行中…" : "執行確認"}</button></span><select aria-label="Validate 命令" value={validateChoice} onChange={(event) => { setValidateChoice(event.target.value); setValidateResult(null); }}>{(config?.validate_cmds ?? []).map((command, index) => <option key={command.cmd} value={index}>{command.label} — {command.cmd}</option>)}<option value="__custom__">手寫…</option></select></div>
+            <div className="form-field validate-command-field"><span className="field-label-row"><span>Validate 命令</span><span className="field-actions"><button type="button" className="secondary-button compact-button" disabled={validating || !repo || !!repoStatus?.error || (validateChoice === "__custom__" && !customValidate.trim())} onClick={() => void verifyValidate()}>{validating ? "執行中…" : "執行確認"}</button><button type="button" className="secondary-button compact-button" title={preflightHint} disabled={!canPreflight} onClick={() => void runPreflight()}>{preflighting ? "健檢中…" : "完整健檢"}</button></span></span><select aria-label="Validate 命令" value={validateChoice} onChange={(event) => { setValidateChoice(event.target.value); setValidateResult(null); }}>{(config?.validate_cmds ?? []).map((command, index) => <option key={command.cmd} value={index}>{command.label} — {command.cmd}</option>)}<option value="__custom__">手寫…</option></select></div>
           </div>
           {validateChoice === "__custom__" && <input value={customValidate} onChange={(event) => { setCustomValidate(event.target.value); setValidateResult(null); }} placeholder="mvn -q test" aria-label="自訂 Validate 命令" />}
+          {preflightBlockedByDraft && <p className="field-help">ℹ {preflightHint}</p>}
           {validateResult && <div className={`validate-result${validateResult.ok ? " success" : " error"}`} role="status"><strong>{validateResult.text}</strong>{validateResult.tail && <pre>{validateResult.tail}</pre>}</div>}
+          {preflightResult && <div className={`validate-result${preflightResult.ok ? " success" : " error"}`} role="status"><strong>{preflightResult.text}</strong>{preflightResult.tail && <pre>{preflightResult.tail}</pre>}</div>}
           <details className="advanced-settings">
             <summary>進階設定</summary>
             <div className="number-grid">
