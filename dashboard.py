@@ -13,6 +13,7 @@ stdlib only,綁 127.0.0.1。
 """
 import argparse
 import json
+import mimetypes
 import os
 import re
 import shlex
@@ -53,6 +54,12 @@ DEFAULT_CONFIG = {
 
 JOBS = {}          # name -> Job(由本 dashboard 啟動的 loop)
 JOBS_LOCK = threading.Lock()
+
+
+class DashboardServer(ThreadingHTTPServer):
+    """SSE 連線是長存 thread；設為 daemon 才不會阻擋 dashboard 優雅關閉。"""
+    daemon_threads = True
+    allow_reuse_address = True
 
 
 class Job:
@@ -205,635 +212,15 @@ def scan_repos(cfg):
     return found
 
 
-PAGE = r"""<!doctype html>
-<html lang="zh-Hant"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>loop-lite</title>
-<style>
-:root{color-scheme:dark}
-*{box-sizing:border-box;margin:0}
-html,body{height:100%;overflow:hidden} /* 頁面本身永不捲動:左右兩欄各自內部 scroll */
-body{display:grid;grid-template-rows:auto 1fr;
-     font:14px/1.5 -apple-system,"Noto Sans TC",sans-serif;background:#0d1117;color:#c9d1d9}
-#tabs{display:flex;gap:6px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid #30363d;background:#161b22;align-items:center}
-.tab{padding:2px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d;
-     color:#c9d1d9;font-size:12px;cursor:pointer;white-space:nowrap}
-.tab.active{border-color:#58a6ff;background:#1c2a3a}
-.tab .dot{margin-right:5px}
-#launchbtn{margin-left:auto;background:#238636;border-color:#2ea043}
-#main{display:grid;grid-template-columns:minmax(400px,44%) 1fr;min-height:0}
-#left{display:flex;flex-direction:column;border-right:1px solid #30363d;min-width:0;min-height:0;position:relative}
-#head{padding:10px 14px;border-bottom:1px solid #30363d;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-h1{font-size:15px;margin-right:6px}
-.chip{padding:1px 10px;border-radius:10px;background:#21262d;font-size:12px;white-space:nowrap}
-.phase-plan{background:#1f3a5f}.phase-exec{background:#5a4a1f}.phase-done{background:#1f5f2f}
-#tablewrap{flex:1;overflow:auto;min-height:0}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{padding:5px 10px;border-bottom:1px solid #21262d;text-align:left;vertical-align:top}
-th{position:sticky;top:0;background:#161b22;font-weight:600}
-td.st{white-space:nowrap}
-tr.ok td{color:#7ee787}
-tr.cur td{color:#f0c674;background:#1c1f26}
-td.task{white-space:pre-wrap;word-break:break-word}
-.ref{color:#8b949e;font-size:12px}
-#events{max-height:170px;overflow-y:auto;border-top:1px solid #30363d;padding:6px 10px;
-        font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:#8b949e;
-        white-space:pre-wrap;word-break:break-all}
-#right{display:flex;flex-direction:column;min-width:0;min-height:0;position:relative}
-#rhead{padding:10px 14px;border-bottom:1px solid #30363d;font-size:13px;color:#8b949e}
-#console{flex:1;overflow:auto;min-height:0;padding:10px 14px;white-space:pre-wrap;word-break:break-word;
-         font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
-#jump{position:absolute;right:18px;bottom:14px;background:#1f6feb;border:none;border-radius:14px;
-      color:#fff;padding:4px 14px;font-size:12px;cursor:pointer;box-shadow:0 2px 8px #0008}
-td.task .tt{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;cursor:pointer}
-tr.expand td.task .tt,tr.cur td.task .tt{display:block;-webkit-line-clamp:unset}
-tr.sum td{color:#7ee787;cursor:pointer;background:#12251a}
-.chip.alert{background:#5a1f1f;cursor:pointer}
-.chip.warn{background:#5a4a1f}
-#e_clr{background:#8b2626;border:none;border-radius:5px;color:#fff;padding:3px 10px;cursor:pointer}
-@keyframes flashbg{0%{background:#1f3a5f}100%{background:transparent}}
-tr.flash td{animation:flashbg 1.6s ease-out}
-.chip.flash{animation:flashbg 1.6s ease-out}
-.divider{color:#58a6ff}
-#overlay,#issoverlay,#cfgoverlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;justify-content:center;padding-top:6vh;z-index:10}
-[hidden]{display:none !important}
-#panel,#ispanel,#cfgpanel{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;width:min(680px,92vw);max-height:86vh;overflow:auto}
-#cfgpanel label{display:block;font-size:12px;color:#8b949e;margin:8px 0 2px}
-#cfgpanel select,#cfgpanel input{width:100%;padding:5px 8px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:13px}
-#cfg_close{float:right;width:auto;background:#21262d;border:1px solid #30363d;border-radius:5px;color:#c9d1d9;padding:1px 10px;cursor:pointer}
-#cfg_save{margin-top:12px;padding:6px 18px;background:#1f6feb;border:none;border-radius:6px;color:#fff;cursor:pointer}
-#ispanel{width:min(780px,94vw)}
-#iswrap{max-height:62vh;overflow:auto;border:1px solid #21262d;border-radius:8px;margin-top:8px}
-#is_close{float:right;width:auto;background:#21262d;border:1px solid #30363d;border-radius:5px;color:#c9d1d9;padding:1px 10px;cursor:pointer}
-#is_clear{background:#8b2626;border:none;border-radius:5px;color:#fff;padding:3px 12px;cursor:pointer}
-#jumpcur{position:absolute;right:16px;background:#1f6feb;border:none;border-radius:14px;
-         color:#fff;padding:4px 14px;font-size:12px;cursor:pointer;box-shadow:0 2px 8px #0008;z-index:5}
-#panel h2{font-size:14px;margin:10px 0 4px}
-#panel label{display:block;font-size:12px;color:#8b949e;margin:8px 0 2px}
-#panel select,#panel input,#panel textarea{width:100%;padding:5px 8px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:13px}
-#panel textarea{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical}
-#f_plan.bad{border-color:#f85149;outline:1px solid #f85149}
-#planerr{color:#f85149;font-size:12px;margin-top:4px;white-space:pre-wrap}
-#f_tpl{float:right;width:auto;background:#21262d;border:1px solid #30363d;border-radius:5px;
-       color:#c9d1d9;padding:1px 10px;font-size:11px;cursor:pointer}
-button.goto{background:#21262d;border:1px solid #30363d;border-radius:4px;color:#58a6ff;cursor:pointer;padding:0 6px;margin-left:6px;font-size:11px}
-.nums{display:flex;gap:10px}.nums label{flex:1}
-#f_go{padding:6px 18px;background:#238636;border:none;border-radius:6px;color:#fff;cursor:pointer;margin-top:12px}
-#f_import{padding:4px 14px;background:#1f6feb;border:none;border-radius:6px;color:#fff;cursor:pointer;margin-top:8px}
-#f_msg{font-size:12px;margin-left:8px}
-.job{border:1px solid #30363d;border-radius:8px;padding:8px 10px;margin:6px 0;font-size:12px}
-.job pre{margin-top:6px;color:#8b949e;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;max-height:120px;overflow:auto}
-.job button{background:#8b2626;border:none;border-radius:5px;color:#fff;padding:2px 10px;cursor:pointer;float:right}
-.hint{color:#8b949e;font-size:11px;margin-top:12px}
-textarea.edittask{width:100%;background:#0d1117;border:1px solid #58a6ff55;color:#c9d1d9;
-                  font:inherit;border-radius:6px;padding:4px 6px;resize:vertical}
-#editbar{display:flex;gap:8px;align-items:center;border-top:1px solid #30363d;padding:8px 10px;font-size:12px}
-#editbar[hidden]{display:none}
-#editbar input{width:70px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:3px 6px}
-#editbar button{background:#1f6feb;border:none;border-radius:5px;color:#fff;padding:3px 12px;cursor:pointer}
-#wsctl .run{background:#238636}#wsctl .stp{background:#8b2626}
-</style></head><body>
-<div id=tabs><button class=tab id=launchbtn>＋ 啟動 / 管理</button></div>
-<div id=main>
-<div id=left>
-  <div id=head>
-    <h1>loop-lite · <span id=wsname>…</span></h1>
-    <span class=chip id=phase>…</span><span class=chip id=round></span>
-    <span class=chip id=prog></span><span class=chip id=flag></span><span class=chip id=done></span>
-    <span class=chip id=extra></span><span class="chip alert" id=issues style="display:none"></span>
-    <span class="chip warn" id=goalwarn style="display:none"></span>
-    <span id=wsctl style="margin-left:auto;display:flex;gap:6px"></span>
-  </div>
-  <div id=tablewrap><table>
-    <thead><tr><th style="width:40px">#</th><th>任務</th><th style="width:140px">狀態</th></tr></thead>
-    <tbody id=rows><tr><td colspan=3 style="color:#8b949e">(等待資料…)</td></tr></tbody>
-  </table></div>
-  <div id=editbar hidden>
-    done 計數 <input id=e_done type=number min=0>
-    <button id=e_save>💾 儲存</button><span id=e_msg class=hint></span>
-  </div>
-  <div id=events></div>
-  <button id=jumpcur hidden>→ 回到執行中</button>
-</div>
-<div id=right>
-  <div id=rhead>agent console 直播(workspace logs/round-*.log)</div>
-  <div id=console></div>
-  <button id=jump hidden>⤓ 跟到最新</button>
-</div>
-</div>
-<div id=issoverlay hidden><div id=ispanel>
-  <h2>⚠ Issues(agent 回報的結構化問題,不影響計數)<button id=is_close>✕</button></h2>
-  <div id=iswrap><table>
-    <thead><tr><th style="width:56px">round</th><th style="width:86px">位置</th><th>內容</th><th style="width:150px">時間</th></tr></thead>
-    <tbody id=isrows></tbody>
-  </table></div>
-  <div style="margin-top:10px"><button id=is_clear>清空全部(停止時才可)</button><span id=is_msg class=hint></span></div>
-</div></div>
-<div id=cfgoverlay hidden><div id=cfgpanel>
-  <h2>⚙ 編輯設定(停止時才可;▶ 運行時生效)<button id=cfg_close>✕</button></h2>
-  <label>Agent 命令<select id=cfg_agent></select></label>
-  <label>Validate 命令<input id=cfg_validate placeholder="mvn -q test"></label>
-  <div class=nums>
-    <label>flag 收斂(>)<input id=cfg_flag type=number min=1></label>
-    <label>done 收斂(≥)<input id=cfg_done type=number min=1></label>
-    <label>單輪上限(分)<input id=cfg_timeout type=number min=0></label>
-  </div>
-  <div class=nums>
-    <label>紅燈連跳 reset<input id=cfg_red type=number min=1></label>
-    <label>HEAD 停滯 reset<input id=cfg_stall type=number min=1></label>
-  </div>
-  <div><button id=cfg_save>💾 儲存設定</button><span id=cfg_msg class=hint></span></div>
-</div></div>
-<div id=overlay hidden><div id=panel>
-  <h2>啟動新 loop</h2>
-  <label>Repo(config 的 repo_roots 掃出來的)<select id=f_repo></select></label>
-  <input id=f_repo_custom placeholder="/path/to/repo" hidden style="margin-top:4px">
-  <div id=repostatus class=hint style="margin-top:6px"></div>
-  <label>goal.md(選檔;gate#1=你審過的版本,啟動時自動 commit;留空=沿用 repo 已 commit 的)
-    <input type=file id=f_goalfile accept=".md,.markdown,.txt"></label>
-  <label>匯入 plan.json(選填,貼上即匯入)
-    <button id=f_tpl type=button>📋 複製範本</button>
-    <textarea id=f_plan rows=4 placeholder='留空=沿用既有計畫或從零規劃'></textarea></label>
-  <div id=planerr hidden></div>
-  <div id=planopts hidden class=hint>⚠️ 貼了 plan.json = 建全新 state(舊進度清除)。從哪個階段開跑:
-    <label style="display:inline"><input type=radio name=sp value=plan checked style="width:auto"> 規劃期(讓 agent 補完)</label>
-    <label style="display:inline"><input type=radio name=sp value=exec style="width:auto"> 直接執行期</label>
-  </div>
-  <label>Workspace 名稱(留空=repo 目錄名)<input id=f_name></label>
-  <label>Agent 命令(dashboard.config.json 固定選項)<select id=f_agent></select></label>
-  <label>Validate 命令<select id=f_validate></select></label>
-  <input id=f_validate_custom placeholder="mvn -q test" hidden style="margin-top:4px">
-  <div class=nums>
-    <label>flag 收斂(>)<input id=f_flag type=number value=10 min=1></label>
-    <label>done 收斂(≥)<input id=f_done type=number value=3 min=1></label>
-    <label>單輪上限(分)<input id=f_timeout type=number value=30 min=0></label>
-  </div>
-  <label style="display:flex;align-items:center;gap:6px;margin-top:8px;color:#c9d1d9">
-    <input type=checkbox id=f_reset style="width:auto">重置 workspace state(清掉舊進度從頭規劃;改過 goal/PLAN 後建議勾)
-  </label>
-  <label style="display:flex;align-items:center;gap:6px;margin-top:4px;color:#c9d1d9">
-    <input type=checkbox id=f_branch style="width:auto">在新 branch 跑(loop/&lt;workspace名&gt;;已存在就 checkout 續用,不弄髒主線)
-  </label>
-  <div><button id=f_go>▶ 啟動</button><span id=f_msg></span></div>
-  <h2>由本 dashboard 啟動的 loop</h2>
-  <div id=jobs>(無)</div>
-  <div class=hint>設定檔:dashboard.config.json(agent/validate 選項、repo 掃描根目錄)。
-  ⚠️ 關閉 dashboard 會停掉上面列的全部 loop(SIGINT 優雅收尾,state 已落地可續跑)。</div>
-</div></div>
-<script>
-const $=id=>document.getElementById(id);
-const PRESELECT='%%PRESELECT%%';
-const RO='%%RO%%'==='1';
-let WS='',wsList=[],curRound=0,sr=0,off=0,hOff=0,evLines=[],panelOpen=false,editing=false,lastState=null;
-let lastRowsKey='',pendingCur=false,expanded=new Set(),conLen=0,planFlashUntil=0;
-let showDone=localStorage.getItem('showdone')==='1';
-function chip(id,txt,show=true){const e=$(id);e.textContent=txt;e.style.display=show?'':'none';}
-function esc(x){return String(x).replace(/[&<>"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));}
-async function jget(u){try{const r=await fetch(u);return await r.json();}catch(e){return null;}}
-async function jpost(u,obj){try{const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});return await r.json();}catch(e){return {error:'連線失敗'};}}
-const DOT={plan:'#58a6ff',exec:'#f0c674',done:'#7ee787'};
-function renderTabs(){
-  const bar=$('tabs');
-  bar.querySelectorAll('.wstab').forEach(e=>e.remove());
-  const btn=$('launchbtn');
-  wsList.forEach(w=>{
-    const b=document.createElement('button');
-    b.className='tab wstab'+(w.name===WS?' active':'');
-    const dot=document.createElement('span');
-    dot.className='dot';dot.textContent='●';dot.style.color=DOT[w.phase]||'#8b949e';
-    b.appendChild(dot);
-    let info=w.name;
-    if(w.phase==='plan')info+=' · plan f'+w.flag+' r'+w.round;
-    else if(w.phase==='exec')info+=' · '+w.completed+'/'+w.plan_len+' r'+w.round;
-    else if(w.phase==='done')info+=' · 🏁';
-    b.appendChild(document.createTextNode((w.running?'▶ ':'')+info));
-    b.onclick=()=>switchWs(w.name);
-    bar.insertBefore(b,btn);
-  });
-  renderCtl();
+UI_DIST = HERE / "ui" / "dist"
+
+MIME_OVERRIDES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".svg": "image/svg+xml",
 }
-function wsEntry(){return wsList.find(w=>w.name===WS);}
-function renderCtl(){
-  const w=wsEntry();const box=$('wsctl');box.innerHTML='';
-  if(!w||RO)return; // 唯讀模式:不給任何操作鈕
-  if(w.running&&editing){editing=false;$('editbar').hidden=true;}
-  const b=document.createElement('button');
-  b.className='tab '+(w.running?'stp':'run');
-  b.textContent=w.running?'⏹ 停止':'▶ 運行';
-  b.onclick=async()=>{
-    b.disabled=true;
-    const r=await jpost(w.running?'/api/stop':'/api/run',{name:WS});
-    if(r.error)alert(r.error);
-    setTimeout(pollWorkspaces,900);
-  };
-  box.appendChild(b);
-  if(!w.running&&w.phase){
-    if(w.phase==='plan'&&w.plan_len>0){
-      const x=document.createElement('button');x.className='tab';x.textContent='⏩ 進執行期';
-      x.onclick=async()=>{
-        if(!confirm('直接進入執行期,從第一個任務開始。繼續?'))return;
-        const r=await jpost('/api/phase',{name:WS,phase:'exec'});
-        if(r.error)alert(r.error);
-        setTimeout(()=>{pollWorkspaces();pollState();},300);
-      };
-      box.appendChild(x);
-    }
-    if(w.phase==='exec'||w.phase==='done'){
-      const x=document.createElement('button');x.className='tab';x.textContent='⏪ 回規劃期';
-      x.onclick=async()=>{
-        if(!confirm('回到規劃期:執行進度(完成紀錄/計數)全部歸零,計畫保留。繼續?'))return;
-        const r=await jpost('/api/phase',{name:WS,phase:'plan'});
-        if(r.error)alert(r.error);
-        setTimeout(()=>{pollWorkspaces();pollState();},300);
-      };
-      box.appendChild(x);
-    }
-    const e=document.createElement('button');e.className='tab';
-    e.textContent=editing?'✕ 取消':'✎ 編輯計畫';
-    e.onclick=()=>{
-      editing=!editing;
-      lastRowsKey=''; // 進出編輯模式都強制重繪表格
-      if(editing)enterEdit();else{$('editbar').hidden=true;$('e_msg').textContent='';pollState();}
-      renderCtl();
-    };
-    box.appendChild(e);
-    const g=document.createElement('button');g.className='tab';g.textContent='⚙ 設定';
-    g.onclick=openCfgEdit;
-    box.appendChild(g);
-  }
-}
-async function openCfgEdit(){
-  const c=(lastState&&lastState.config)||{};
-  const cf=await jget('/api/config');
-  const as=$('cfg_agent');as.innerHTML='';
-  as.appendChild(new Option('(保持不變:'+(c.agent_cmd||'?')+')',''));
-  (cf&&cf.agent_cmds||[]).forEach((a,i)=>as.appendChild(new Option(a.label+' — '+a.cmd,i)));
-  $('cfg_validate').value=c.validate_cmd||'';
-  $('cfg_flag').value=c.flag_threshold??10;
-  $('cfg_done').value=c.done_threshold??3;
-  $('cfg_timeout').value=c.round_timeout??30;
-  $('cfg_red').value=c.red_limit??20;
-  $('cfg_stall').value=c.stall_limit??300;
-  $('cfg_msg').textContent='';$('cfgoverlay').hidden=false;
-}
-$('cfg_close').onclick=()=>{$('cfgoverlay').hidden=true;};
-$('cfgoverlay').onclick=e=>{if(e.target.id==='cfgoverlay')$('cfgoverlay').hidden=true;};
-$('cfg_save').onclick=async()=>{
-  const body={name:WS,validate_cmd:$('cfg_validate').value.trim(),
-    flag_threshold:+$('cfg_flag').value,done_threshold:+$('cfg_done').value,
-    round_timeout:+$('cfg_timeout').value,red_limit:+$('cfg_red').value,stall_limit:+$('cfg_stall').value};
-  if($('cfg_agent').value!=='')body.agent_idx=+$('cfg_agent').value; // 空=保持不變
-  $('cfg_msg').textContent='儲存中…';
-  const r=await jpost('/api/edit-config',body);
-  if(r.error){$('cfg_msg').textContent='❌ '+r.error;return;}
-  $('cfg_msg').textContent='✅ 已儲存 '+((r.changed||[]).join(', ')||'(無變更)');
-  setTimeout(()=>{$('cfgoverlay').hidden=true;pollState();},700);
-};
-async function gotoTask(order){
-  const s=lastState;if(!s)return;
-  const doneOrders=new Set((s.completed||[]).map(e=>e.order));
-  const skipped=(s.plan||[]).map(t=>t.order).filter(o=>o<order&&!doneOrders.has(o));
-  const msg=skipped.length
-    ?('跳到 task-'+order+':task '+skipped.join(', ')+' 會標記為「人工確認完成」,'
-      +'並先跑 validate(綠燈才放行,可能要等一下)。繼續?')
-    :('退回 task-'+order+' 重新執行:task-'+order+'(含)之後的完成紀錄會清除,'
-      +'code 不會動(由之後的輪次驗收/重做)。繼續?');
-  if(!confirm(msg))return;
-  const r=await jpost('/api/set-task',{name:WS,order});
-  if(r.error){alert(r.error);return;}
-  pollWorkspaces();pollState();
-}
-function enterEdit(){
-  const s=lastState;
-  if(!s||!(s.plan||[]).length){alert('這個 workspace 還沒有 plan 可編輯');editing=false;renderCtl();return;}
-  lastRowsKey='';
-  $('rows').innerHTML=(s.plan||[]).map(t=>
-    '<tr><td>'+t.order+'</td><td colspan=2><textarea class=edittask data-order="'+t.order+'" rows=2>'
-    +esc(t.task)+'</textarea></td></tr>').join('');
-  $('e_done').value=s.done_count||0;
-  $('editbar').hidden=false;$('e_msg').textContent='';
-}
-$('e_save').onclick=async()=>{
-  const tasks=[...document.querySelectorAll('textarea.edittask')].map(t=>({order:+t.dataset.order,task:t.value}));
-  $('e_msg').textContent='儲存中…';
-  const r=await jpost('/api/edit-state',{name:WS,tasks,done_count:+$('e_done').value});
-  if(r.error){$('e_msg').textContent='❌ '+r.error;return;}
-  $('e_msg').textContent='✅ 已儲存 '+((r.changed||[]).join(', ')||'(無變更)');
-  editing=false;lastRowsKey='';$('editbar').hidden=true;renderCtl();pollState();
-};
-let issOpen=false;
-function renderIssues(){ // modal 開著就跟著輪詢即時更新
-  if(!issOpen||!lastState)return;
-  const list=(lastState.issues||[]).slice().reverse(); // 最新在上
-  $('isrows').innerHTML=list.length?list.map(i=>
-    '<tr><td>'+i.round+'</td><td>'+esc(i.where||'')+'</td><td class=task>'+esc(i.text)
-    +'</td><td class=ref>'+esc((i.ts||'').replace('T',' '))+'</td></tr>').join('')
-    :'<tr><td colspan=4 style="color:#8b949e">(無)</td></tr>';
-}
-$('issues').onclick=()=>{issOpen=true;$('issoverlay').hidden=false;$('is_msg').textContent='';renderIssues();};
-$('is_close').onclick=()=>{issOpen=false;$('issoverlay').hidden=true;};
-$('issoverlay').onclick=e=>{if(e.target.id==='issoverlay'){issOpen=false;$('issoverlay').hidden=true;}};
-$('is_clear').onclick=async()=>{
-  if(!confirm('清空全部 issues?'))return;
-  const r=await jpost('/api/edit-state',{name:WS,clear_issues:true});
-  $('is_msg').textContent=r.error?('❌ '+r.error):'✅ 已清空';
-  await pollState();renderIssues();
-};
-if(RO)$('is_clear').style.display='none';
-function updateJumpCur(){ // 當前任務捲出視野才出現「回到執行中」
-  const b=$('jumpcur');
-  const cr=document.querySelector('#rows tr.cur');
-  if(!cr||editing){b.hidden=true;return;}
-  const tw=$('tablewrap');
-  const r=cr.getBoundingClientRect(),wr=tw.getBoundingClientRect();
-  b.style.bottom=($('events').offsetHeight+10)+'px';
-  b.hidden=!(r.bottom<wr.top||r.top>wr.bottom);
-}
-$('tablewrap').onscroll=updateJumpCur;
-$('jumpcur').onclick=()=>{
-  const cr=document.querySelector('#rows tr.cur');
-  if(cr)cr.scrollIntoView({block:'center'});
-  $('jumpcur').hidden=true;
-};
-$('console').onscroll=()=>{
-  const c=$('console');
-  $('jump').hidden=c.scrollTop+c.clientHeight>=c.scrollHeight-60;
-};
-$('jump').onclick=()=>{const c=$('console');c.scrollTop=c.scrollHeight;$('jump').hidden=true;};
-if(RO){$('launchbtn').style.display='none';}
-function switchWs(n){
-  if(!n||n===WS)return;
-  WS=n;localStorage.setItem('ws',n);location.hash=n;document.title='loop-lite · '+n;
-  $('wsname').textContent=n;
-  curRound=0;sr=0;off=0;hOff=0;evLines=[];lastState=null;conLen=0;
-  lastRowsKey='';pendingCur=true;expanded=new Set();
-  editing=false;$('editbar').hidden=true;
-  issOpen=false;$('issoverlay').hidden=true;$('cfgoverlay').hidden=true;$('jumpcur').hidden=true;
-  $('console').textContent='';$('events').textContent='';
-  $('rows').innerHTML='<tr><td colspan=3 style="color:#8b949e">(載入中…)</td></tr>';
-  renderTabs();pollState();
-}
-async function pollWorkspaces(){
-  const l=await jget('/api/workspaces');
-  if(!l||!Array.isArray(l))return;
-  wsList=l;renderTabs();
-  if(!WS&&l.length){
-    const h=decodeURIComponent((location.hash||'').replace('#',''));
-    const cand=[h,PRESELECT,localStorage.getItem('ws')].find(n=>n&&l.some(w=>w.name===n));
-    switchWs(cand||l[0].name);
-  }
-}
-function render(s){
-  if(!s){chip('phase','連線失敗');return;}
-  if(s.error){chip('phase',s.error==='busy'?'…':s.error);return;}
-  const c=s.config||{};
-  curRound=s.round;
-  const prev=lastState;lastState=s;
-  if(editing)return; // 編輯模式:表格凍結,不讓輪詢蓋掉輸入中的內容(console 直播照常)
-  // plan 動態更新提示(v4 動態樹的極簡版):版本跳了 → 變動的列亮一閃 + plan chip 閃
-  let flashSet=null;
-  if(prev&&!prev.error&&(s.plan_version||0)>(prev.plan_version||0)){
-    planFlashUntil=Date.now()+1600;
-    flashSet=new Set();
-    const old=new Map((prev.plan||[]).map(t=>[t.order,t.task+'|'+(t.ref||'')]));
-    (s.plan||[]).forEach(t=>{if(old.get(t.order)!==t.task+'|'+(t.ref||''))flashSet.add(t.order);});
-  }
-  const names={plan:'規劃期',exec:'執行期',done:'🏁 完成'};
-  const ph=$('phase');ph.textContent=names[s.phase]||s.phase;ph.className='chip phase-'+s.phase;
-  chip('round','round '+s.round);
-  chip('flag','flag '+s.flag+' / >'+(c.flag_threshold??10),s.phase==='plan');
-  chip('done','done '+s.done_count+' / ≥'+(c.done_threshold??3),s.phase==='exec');
-  const ex=$('extra');
-  ex.textContent='紅連跳 '+s.red_streak+' · 停滯 '+s.stall_rounds+' · plan v'+s.plan_version
-    +((s.phase==='plan'&&s.plan_version>=10)?' ⚠ 可能震盪':'');
-  ex.className='chip'+((s.phase==='plan'&&s.plan_version>=10)?' warn':'')
-    +(Date.now()<planFlashUntil?' flash':'');
-  const iss=(s.issues||[]).length;
-  const ic=$('issues');ic.style.display=iss?'':'none';
-  if(iss)ic.textContent='⚠ issues '+iss;
-  renderIssues();
-  chip('goalwarn','⚠ goal 已變更,建議 ⏪ 回規劃期重新收斂',!!s.goal_changed);
-  const done=new Map((s.completed||[]).map(e=>[e.order,e]));
-  const we=wsEntry();
-  const canGoto=!RO&&we&&!we.running&&(s.phase==='exec'||s.phase==='done');
-  const total=(s.plan||[]).length,doneCnt=done.size;
-  chip('prog','任務 '+doneCnt+'/'+total,s.phase!=='plan'&&total>0);
-  const rows=[];
-  if(doneCnt)rows.push('<tr class=sum><td colspan=3>'+(showDone
-    ?'▾ 已完成 '+doneCnt+' 條顯示中(點擊收合)'
-    :'✔ 已完成 '+doneCnt+' 條(點擊展開)')+'</td></tr>');
-  (s.plan||[]).forEach(t=>{
-    const e=done.get(t.order);
-    if(e&&!showDone)return; // 完成的預設收合,首屏留給進行中與待辦
-    let st='·',cls='';
-    if(e){st='✔ '+(e.human?'人工':e.sha.slice(0,8));cls='ok';}
-    else if(s.phase!=='plan'&&t.order===s.current_order){st='→ 進行中';cls='cur';}
-    const rs=(s.task_reset_counts||{})[String(t.order)];
-    if(rs)st+=' ⟲'+rs;
-    if(canGoto&&t.order!==s.current_order)
-      st+='<button class=goto data-order="'+t.order+'" title="把進度設到這裡(往前跳會先跑 validate)">⏵</button>';
-    if(expanded.has(t.order))cls+=' expand';
-    rows.push('<tr class="'+cls+'" data-order="'+t.order+'"><td>'+t.order+'</td><td class=task><div class=tt>'
-      +esc(t.task)+'</div>'+(t.ref?'<div class=ref>ref: '+esc(t.ref)+'</div>':'')+'</td><td class=st>'+st+'</td></tr>');
-  });
-  const html=rows.length?rows.join('')
-    :'<tr><td colspan=3 style="color:#8b949e">(規劃期:計畫尚未建立)</td></tr>';
-  if(html!==lastRowsKey){ // 內容沒變就不重繪:保住使用者的捲動位置
-    lastRowsKey=html;
-    const tw=$('tablewrap');const sp=tw.scrollTop;
-    $('rows').innerHTML=html;
-    tw.scrollTop=sp;
-    document.querySelectorAll('#rows .goto').forEach(b=>{
-      b.onclick=ev=>{ev.stopPropagation();gotoTask(+b.dataset.order);};});
-    document.querySelectorAll('#rows tr.sum').forEach(r=>{
-      r.onclick=()=>{showDone=!showDone;localStorage.setItem('showdone',showDone?'1':'0');
-        lastRowsKey='';render(lastState);};});
-    document.querySelectorAll('#rows td.task .tt').forEach(d=>{ // 點文字展開/收合 3 行 clamp
-      d.onclick=()=>{const o=+d.closest('tr').dataset.order;
-        if(expanded.has(o))expanded.delete(o);else expanded.add(o);
-        lastRowsKey='';render(lastState);};});
-    if(flashSet)flashSet.forEach(o=>{ // 本次更新有變動的列亮一閃
-      const fr=document.querySelector('#rows tr[data-order="'+o+'"]');
-      if(fr)fr.classList.add('flash');
-    });
-  }
-  if(pendingCur){ // 切進 workspace 時自動捲到進行中任務
-    const cr=document.querySelector('#rows tr.cur');
-    if(cr)cr.scrollIntoView({block:'center'});
-    if(cr||total)pendingCur=false;
-  }
-  updateJumpCur();
-}
-function addConsole(text,cls){
-  const con=$('console');
-  const atBottom=con.scrollTop+con.clientHeight>=con.scrollHeight-60;
-  const sp=document.createElement('span');
-  if(cls)sp.className=cls;
-  sp.textContent=text;
-  con.appendChild(sp);
-  conLen+=text.length;
-  while(conLen>300000&&con.childNodes.length>1){ // 凍結 console 長度:超過就丟最舊的
-    conLen-=con.firstChild.textContent.length;
-    con.removeChild(con.firstChild);
-  }
-  if(atBottom)con.scrollTop=con.scrollHeight; // 在底部就跟著 tail,永遠看得到最新 print
-  $('jump').hidden=con.scrollTop+con.clientHeight>=con.scrollHeight-60;
-}
-async function pollState(){
-  if(!WS)return;
-  const my=WS;
-  const s=await jget('/api/state?ws='+encodeURIComponent(my));
-  if(my!==WS)return;
-  render(s);
-  const h=await jget('/api/history?ws='+encodeURIComponent(my)+'&offset='+hOff);
-  if(my!==WS)return;
-  if(h&&h.data){
-    hOff=h.size;
-    evLines=evLines.concat(h.data.split('\n').filter(Boolean)).slice(-10);
-    $('events').textContent=evLines.join('\n');
-    $('events').scrollTop=$('events').scrollHeight;
-  }
-}
-async function pollTail(){
-  if(WS&&curRound>0){
-    const my=WS;
-    if(sr===0){sr=curRound;off=-1;addConsole('── round '+sr+' ──\n','divider');} // -1=首抓直接 tail 尾段
-    const j=await jget('/api/tail?ws='+encodeURIComponent(my)+'&round='+sr+'&offset='+off);
-    if(my===WS){
-      if(j){if(j.data)addConsole(j.data);off=j.size;}
-      if(curRound>sr){sr=curRound;off=0;addConsole('\n── round '+sr+' ──\n','divider');}
-    }
-  }
-  setTimeout(pollTail,600);
-}
-$('launchbtn').onclick=()=>{panelOpen=$('overlay').hidden;$('overlay').hidden=!panelOpen;if(panelOpen){loadConfig();pollJobs();}};
-$('overlay').onclick=e=>{if(e.target.id==='overlay'){panelOpen=false;$('overlay').hidden=true;}};
-async function loadConfig(){
-  const c=await jget('/api/config');
-  if(!c){$('f_msg').textContent='❌ 設定載入失敗,關掉面板再開一次';return;}
-  if(c.error){$('f_msg').textContent='❌ '+c.error;return;}
-  $('f_msg').textContent='';
-  const rs=$('f_repo');rs.innerHTML='';
-  (c.repos||[]).forEach(r=>rs.appendChild(new Option(r,r)));
-  rs.appendChild(new Option('手動輸入…','__custom__'));
-  rs.onchange=()=>{$('f_repo_custom').hidden=rs.value!=='__custom__';refreshRepoStatus();};
-  $('f_repo_custom').onchange=refreshRepoStatus;
-  rs.onchange();
-  const as=$('f_agent');as.innerHTML='';
-  (c.agent_cmds||[]).forEach((a,i)=>as.appendChild(new Option(a.label+' — '+a.cmd,i)));
-  const vs=$('f_validate');vs.innerHTML='';
-  (c.validate_cmds||[]).forEach((v,i)=>vs.appendChild(new Option(v.label+' — '+v.cmd,i)));
-  vs.appendChild(new Option('手寫…','__custom__'));
-  vs.onchange=()=>{$('f_validate_custom').hidden=vs.value!=='__custom__';};
-  vs.onchange();
-  const df=c.defaults||{}; // 預設值統一住 dashboard.config.json,表單只是覆蓋
-  $('f_flag').value=df.flag_threshold??10;
-  $('f_done').value=df.done_threshold??3;
-  $('f_timeout').value=df.round_timeout??30;
-}
-function curRepo(){return $('f_repo').value==='__custom__'?$('f_repo_custom').value.trim():$('f_repo').value;}
-async function refreshRepoStatus(){
-  const repo=curRepo();
-  if(!repo){$('repostatus').textContent='';return;}
-  const s=await jget('/api/repo-status?repo='+encodeURIComponent(repo));
-  if(!s||s.error){$('repostatus').textContent=s?('❌ '+s.error):'';return;}
-  const mark=v=>v==='committed'?'✅ 已commit':v==='modified'?'⚠️ 改了沒commit':v==='untracked'?'⚠️ 沒commit':'❌ 缺';
-  let line='goal.md '+mark(s.goal)+' · 工作樹 '+(s.tree_clean?'✅ 乾淨':'❌ 髒(preflight 會擋)');
-  const w=wsList.find(x=>x.repo===repo);
-  if(w)line+=' · ⚠️ workspace「'+w.name+'」已存在('+(w.phase||'?')+' r'+(w.round||0)+'),沿用會續跑舊進度';
-  $('repostatus').textContent=line;
-}
-async function readFile(inp){
-  if(!inp.files||!inp.files.length)return null;
-  return await inp.files[0].text();
-}
-const PLAN_TPL=JSON.stringify([
-  {order:1,task:'任務描述:寫到一個無前後文的工程師能直接動工,含驗收標準(DoD)',ref:'docs/analysis.md#段落(選填)'},
-  {order:2,task:'第二個任務,依依賴順序排列',ref:null},
-  {order:3,task:'ref 可整個省略'}
-],null,2);
-$('f_tpl').onclick=async()=>{
-  try{await navigator.clipboard.writeText(PLAN_TPL);$('f_tpl').textContent='✅ 已複製';}
-  catch(e){ // clipboard 被擋就直接填進去
-    if(!$('f_plan').value.trim()){$('f_plan').value=PLAN_TPL;$('f_plan').dispatchEvent(new Event('input'));}
-    $('f_tpl').textContent='已填入範本';
-  }
-  setTimeout(()=>{$('f_tpl').textContent='📋 複製範本';},1500);
-};
-function planLintErr(text){ // 與後端 validate_plan 一比一鏡射,貼上當下即時警告
-  if(!text.trim())return '';
-  let p;
-  try{p=JSON.parse(text);}catch(e){return 'JSON 解析失敗:'+e.message;}
-  if(!Array.isArray(p)||!p.length)return '必須是非空的物件陣列';
-  const orders=[];
-  for(let i=0;i<p.length;i++){
-    const t=p[i];
-    if(typeof t!=='object'||t===null||Array.isArray(t))return '第 '+i+' 項不是物件';
-    const extra=Object.keys(t).filter(k=>!['order','task','ref'].includes(k));
-    if(extra.length)return '第 '+i+' 項有未知欄位 '+extra.join(', ')+'(只允許 order/task/ref)';
-    if(!Number.isInteger(t.order))return '第 '+i+' 項 order 必須是 int';
-    if(typeof t.task!=='string'||!t.task.trim())return '第 '+i+' 項 task 必須是非空字串';
-    if('ref' in t&&t.ref!==null&&typeof t.ref!=='string')return '第 '+i+' 項 ref 必須是字串或 null';
-    orders.push(t.order);
-  }
-  const dup=[...new Set(orders.filter((o,i)=>orders.indexOf(o)!==i))];
-  if(dup.length)return 'order 重複:'+dup.join(', ');
-  const sorted=[...orders].sort((a,b)=>a-b);
-  for(let i=0;i<sorted.length;i++)if(sorted[i]!==i+1)return 'order 必須從 1 連續遞增至 '+orders.length;
-  return '';
-}
-$('f_plan').oninput=()=>{
-  const v=$('f_plan').value;
-  $('planopts').hidden=!v.trim();
-  const err=planLintErr(v);
-  $('f_plan').classList.toggle('bad',!!err);
-  $('planerr').hidden=!err;
-  $('planerr').textContent=err;
-};
-$('f_go').onclick=async()=>{
-  const lintErr=planLintErr($('f_plan').value);
-  if(lintErr){$('f_msg').textContent='❌ plan.json 格式不對:'+lintErr;return;}
-  const repo=curRepo();
-  const body={repo,name:$('f_name').value.trim(),agent_idx:+$('f_agent').value,
-    flag_threshold:+$('f_flag').value,done_threshold:+$('f_done').value,round_timeout:+$('f_timeout').value,
-    reset_state:$('f_reset').checked,new_branch:$('f_branch').checked,plan_json:$('f_plan').value,
-    start_phase:(document.querySelector('input[name=sp]:checked')||{}).value||'plan'};
-  const g=await readFile($('f_goalfile'));
-  if(g!==null)body.goal_content=g;  // 啟動時自動 commit,不用另外按匯入
-  if($('f_validate').value==='__custom__')body.validate_custom=$('f_validate_custom').value.trim();
-  else body.validate_idx=+$('f_validate').value;
-  $('f_msg').textContent='啟動中…';
-  const r=await jpost('/api/launch',body);
-  $('f_msg').textContent=r.error?('❌ '+r.error):('✅ 已啟動 '+r.name+'(pid '+r.pid+')');
-  if(!r.error){
-    $('f_goalfile').value='';$('f_plan').value='';$('planopts').hidden=true;refreshRepoStatus();
-    panelOpen=false;$('overlay').hidden=true;      // 啟動成功 → 關閉彈窗
-    switchWs(r.name);setTimeout(()=>switchWs(r.name),50);  // 跳到剛啟動的 workspace 看直播
-  }
-  setTimeout(()=>{pollJobs();pollWorkspaces();},600);
-};
-async function pollJobs(){
-  if(!panelOpen)return;
-  const l=await jget('/api/jobs');if(!l)return;
-  const box=$('jobs');box.innerHTML='';
-  if(!l.length){box.textContent='(無)';return;}
-  l.forEach(j=>{
-    const d=document.createElement('div');d.className='job';
-    d.innerHTML=(j.alive?'<button>⏹ 停止</button>':'')
-      +'<b>'+esc(j.name)+'</b> · pid '+j.pid+' · '+(j.alive?'🟢 執行中':'⚪ 已結束 rc='+j.rc)
-      +'<div style="color:#8b949e">'+esc(j.repo)+'</div><pre></pre>';
-    d.querySelector('pre').textContent=j.tail||'';
-    const b=d.querySelector('button');
-    if(b)b.onclick=async()=>{b.disabled=true;await jpost('/api/stop',{name:j.name});setTimeout(pollJobs,800);};
-    box.appendChild(d);
-  });
-}
-setInterval(pollState,1000);
-setInterval(pollWorkspaces,3000);
-setInterval(pollJobs,2000);
-pollWorkspaces();pollTail();loadConfig();
-</script></body></html>
-"""
+
 
 
 def list_workspaces():
@@ -885,11 +272,18 @@ def read_incremental(path: Path, offset: int):
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     preselect = ""
     readonly = False
 
     def log_message(self, *a):
         pass
+
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
 
     def _out(self, code, body, ctype="application/json; charset=utf-8"):
         data = body.encode("utf-8") if isinstance(body, str) else body
@@ -897,11 +291,35 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self'; "
+                         "connect-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'")
         self.end_headers()
         self.wfile.write(data)
 
     def _err(self, msg, code=400):
         self._out(code, json.dumps({"error": msg}, ensure_ascii=False))
+
+    def _serve_ui(self, relative_path):
+        """提供 Vite build 產物；production runtime 不需要 Node 或外部 CDN。"""
+        root = UI_DIST.resolve()
+        target = (UI_DIST / relative_path).resolve()
+        if target != root and root not in target.parents:
+            self._err("not found", 404)
+            return
+        if not target.is_file():
+            if relative_path == "index.html":
+                body = ("<!doctype html><meta charset=utf-8><title>UI 尚未 build</title>"
+                        "<style>body{font:16px system-ui;padding:40px}</style>"
+                        "<h1>Dashboard UI 尚未 build</h1>"
+                        "<p>請執行 <code>cd ui &amp;&amp; npm install &amp;&amp; npm run build</code>。</p>")
+                self._out(503, body, "text/html; charset=utf-8")
+                return
+            self._err("not found", 404)
+            return
+        ctype = MIME_OVERRIDES.get(target.suffix) or mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        self._out(200, target.read_bytes(), ctype)
 
     def _ws_dir(self, q):
         name = q.get("ws", [""])[0]
@@ -911,14 +329,87 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return ROOT / name
 
+    def _serve_events(self, q):
+        """SSE:主畫面單向推送 fleet/state/history/console 增量；寫入操作仍走 REST。"""
+        workspace = q.get("ws", [""])[0]
+        if workspace and not re.fullmatch(r"[A-Za-z0-9._-]+", workspace):
+            self._err("workspace 名稱不合法")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+
+        def emit(event, payload):
+            data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            self.wfile.write(f"event: {event}\ndata: {data}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
+        fleet_sig = state_sig = None
+        fleet_at = keepalive_at = 0.0
+        history_offset = -1
+        tail_offset = -1
+        current_round = 0
+        try:
+            while True:
+                now = time.monotonic()
+                if now >= fleet_at:
+                    fleet = list_workspaces()
+                    sig = json.dumps(fleet, ensure_ascii=False, sort_keys=True)
+                    if sig != fleet_sig:
+                        emit("workspaces", fleet)
+                        fleet_sig = sig
+                    fleet_at = now + 3
+
+                if workspace:
+                    state, err = read_state(workspace)
+                    projected = {"error": err} if err else state
+                    sig = json.dumps(projected, ensure_ascii=False, sort_keys=True)
+                    if sig != state_sig:
+                        emit("state", projected)
+                        state_sig = sig
+                    if state:
+                        rnd = int(state.get("round") or 0)
+                        if rnd > 0 and rnd != current_round:
+                            current_round = rnd
+                            tail_offset = -1
+                            emit("round", {"round": rnd})
+                        history = read_incremental(ROOT / workspace / "history.log", history_offset)
+                        history_offset = history["size"]
+                        if history["data"]:
+                            emit("history", {"data": history["data"]})
+                        if current_round > 0:
+                            tail = read_incremental(ROOT / workspace / "logs" / f"round-{current_round:04d}.log",
+                                                    tail_offset)
+                            tail_offset = tail["size"]
+                            if tail["data"]:
+                                emit("tail", {"data": tail["data"]})
+
+                if now >= keepalive_at:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    keepalive_at = now + 15
+                time.sleep(0.6)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+
     # ---------- GET ----------
     def do_GET(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         try:
             if u.path == "/":
-                self._out(200, PAGE.replace("%%PRESELECT%%", self.preselect)
-                          .replace("%%RO%%", "1" if self.readonly else ""), "text/html; charset=utf-8")
+                self._serve_ui("index.html")
+            elif u.path.startswith("/assets/"):
+                self._serve_ui(u.path.lstrip("/"))
+            elif u.path == "/api/bootstrap":
+                self._out(200, json.dumps({"preselect": self.preselect,
+                                           "readonly": self.readonly}, ensure_ascii=False))
+            elif u.path == "/api/events":
+                self._serve_events(q)
             elif u.path == "/api/workspaces":
                 self._out(200, json.dumps(list_workspaces(), ensure_ascii=False))
             elif u.path == "/api/config":
@@ -1436,7 +927,7 @@ def main():
     srv = None
     for _ in range(20):
         try:
-            srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            srv = DashboardServer(("127.0.0.1", port), Handler)
             break
         except OSError:
             port += 1
@@ -1448,6 +939,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        srv.server_close()
         stop_all_jobs()
         print("dashboard 已關閉。", flush=True)
 

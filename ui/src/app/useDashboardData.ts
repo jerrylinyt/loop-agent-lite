@@ -1,0 +1,114 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { getJson } from "../shared/api/client";
+import type { BootstrapResponse, WorkspaceState, WorkspaceSummary } from "../shared/api/types";
+
+const CONSOLE_LIMIT = 300_000;
+
+export default function useDashboardData() {
+  const [bootstrap, setBootstrap] = useState<BootstrapResponse>({ readonly: true, preselect: "" });
+  const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
+  const [selected, setSelected] = useState("");
+  const [state, setState] = useState<WorkspaceState | null>(null);
+  const [consoleText, setConsoleText] = useState("");
+  const [events, setEvents] = useState<string[]>([]);
+  const [initialized, setInitialized] = useState(false);
+  const selectedRef = useRef("");
+  const bootstrapRef = useRef(bootstrap);
+  const streamRound = useRef(0);
+
+  useEffect(() => { selectedRef.current = selected; }, [selected]);
+  useEffect(() => { bootstrapRef.current = bootstrap; }, [bootstrap]);
+
+  const selectWorkspace = useCallback((name: string) => {
+    if (!name || name === selectedRef.current) return;
+    setSelected(name);
+    setState(null);
+    setConsoleText("");
+    setEvents([]);
+    streamRound.current = 0;
+    localStorage.setItem("workspace", name);
+    history.replaceState(null, "", `#${encodeURIComponent(name)}`);
+    document.title = `loop-lite · ${name}`;
+  }, []);
+
+  const applyWorkspaces = useCallback((list: WorkspaceSummary[]) => {
+    setWorkspaces(list);
+    if (!list.length) {
+      setSelected("");
+      setState(null);
+      document.title = "loop-lite";
+      return;
+    }
+    if (!selectedRef.current || !list.some((workspace) => workspace.name === selectedRef.current)) {
+      const hash = decodeURIComponent(location.hash.replace(/^#/, ""));
+      const preferred = [hash, bootstrapRef.current.preselect, localStorage.getItem("workspace")]
+        .find((name) => name && list.some((workspace) => workspace.name === name));
+      selectWorkspace(preferred || list[0].name);
+    }
+  }, [selectWorkspace]);
+
+  const refreshWorkspaces = useCallback(async () => {
+    const list = await getJson<WorkspaceSummary[]>("/api/workspaces");
+    if (list) applyWorkspaces(list);
+  }, [applyWorkspaces]);
+
+  const refreshState = useCallback(async () => {
+    const workspace = selectedRef.current;
+    if (!workspace) return;
+    const next = await getJson<WorkspaceState>(`/api/state?ws=${encodeURIComponent(workspace)}`);
+    if (workspace === selectedRef.current && next) setState(next);
+  }, []);
+
+  useEffect(() => {
+    void (async () => {
+      const value = await getJson<BootstrapResponse>("/api/bootstrap");
+      if (value) {
+        bootstrapRef.current = value;
+        setBootstrap(value);
+      }
+      await refreshWorkspaces();
+      setInitialized(true);
+    })();
+  }, [refreshWorkspaces]);
+
+  useEffect(() => {
+    if (!initialized) return;
+    const source = new EventSource(`/api/events${selected ? `?ws=${encodeURIComponent(selected)}` : ""}`);
+    source.onopen = () => {
+      streamRound.current = 0;
+      setConsoleText("");
+      setEvents([]);
+    };
+    source.addEventListener("workspaces", (event) => applyWorkspaces(JSON.parse(event.data) as WorkspaceSummary[]));
+    source.addEventListener("state", (event) => setState(JSON.parse(event.data) as WorkspaceState));
+    source.addEventListener("round", (event) => {
+      const { round } = JSON.parse(event.data) as { round: number };
+      setConsoleText((text) => streamRound.current === 0
+        ? `── round ${round} ──\n`
+        : `${text}\n── round ${round} ──\n`.slice(-CONSOLE_LIMIT));
+      streamRound.current = round;
+    });
+    source.addEventListener("tail", (event) => {
+      const { data } = JSON.parse(event.data) as { data: string };
+      setConsoleText((text) => (text + data).slice(-CONSOLE_LIMIT));
+    });
+    source.addEventListener("history", (event) => {
+      const { data } = JSON.parse(event.data) as { data: string };
+      setEvents((lines) => [...lines, ...data.split("\n").filter(Boolean)].slice(-10));
+    });
+    return () => source.close();
+  }, [applyWorkspaces, initialized, selected]);
+
+  return {
+    initialized,
+    bootstrap,
+    workspaces,
+    selected,
+    state,
+    consoleText,
+    events,
+    selectWorkspace,
+    refreshState,
+    refreshWorkspaces
+  };
+}

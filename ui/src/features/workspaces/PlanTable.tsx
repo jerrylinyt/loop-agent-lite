@@ -1,0 +1,176 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { PlanTask, WorkspaceState } from "../../shared/api/types";
+
+export default function PlanTable({
+  state,
+  canEdit,
+  onSave,
+  onGoto
+}: {
+  state: WorkspaceState;
+  canEdit: boolean;
+  onSave: (tasks: PlanTask[], doneCount: number) => Promise<string>;
+  onGoto: (order: number) => void;
+}) {
+  const [showDone, setShowDone] = useState(() => localStorage.getItem("showdone") === "1");
+  const [expanded, setExpanded] = useState<Set<number>>(new Set());
+  const [editing, setEditing] = useState(false);
+  const [drafts, setDrafts] = useState<PlanTask[]>([]);
+  const [doneCount, setDoneCount] = useState(0);
+  const [message, setMessage] = useState("");
+  const [currentOffscreen, setCurrentOffscreen] = useState(false);
+  const [flashOrders, setFlashOrders] = useState<Set<number>>(new Set());
+  const previous = useRef<WorkspaceState | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!previous.current || state.plan_version <= previous.current.plan_version) {
+      previous.current = state;
+      return;
+    }
+    const old = new Map((previous.current.plan ?? []).map((task) => [task.order, `${task.task}|${task.ref ?? ""}`]));
+    const changed = new Set((state.plan ?? [])
+      .filter((task) => old.get(task.order) !== `${task.task}|${task.ref ?? ""}`)
+      .map((task) => task.order));
+    setFlashOrders(changed);
+    previous.current = state;
+    const timeout = window.setTimeout(() => setFlashOrders(new Set()), 1600);
+    return () => window.clearTimeout(timeout);
+  }, [state]);
+
+  useEffect(() => {
+    const current = scrollRef.current?.querySelector<HTMLElement>("tr.current");
+    current?.scrollIntoView({ block: "center" });
+  }, [state.current_order]);
+
+  const completed = useMemo(
+    () => new Map((state.completed ?? []).map((entry) => [entry.order, entry])),
+    [state.completed]
+  );
+
+  const startEditing = () => {
+    setDrafts((state.plan ?? []).map((task) => ({ ...task })));
+    setDoneCount(state.done_count ?? 0);
+    setMessage("");
+    setEditing(true);
+  };
+
+  const save = async () => {
+    setMessage("儲存中…");
+    const result = await onSave(drafts, doneCount);
+    setMessage(result);
+    if (result.startsWith("✅")) setEditing(false);
+  };
+
+  const checkCurrentVisibility = () => {
+    const wrap = scrollRef.current;
+    const row = wrap?.querySelector<HTMLElement>("tr.current");
+    if (!wrap || !row) return setCurrentOffscreen(false);
+    const bounds = wrap.getBoundingClientRect();
+    const current = row.getBoundingClientRect();
+    setCurrentOffscreen(current.bottom < bounds.top || current.top > bounds.bottom);
+  };
+
+  if (editing) {
+    return (
+      <section className="plan-pane">
+        <header className="pane-header">
+          <div><strong>編輯計畫</strong><span>停止時才可修改</span></div>
+          <button type="button" className="secondary-button" onClick={() => setEditing(false)}>取消</button>
+        </header>
+        <div className="edit-plan-list">
+          {drafts.map((task, index) => (
+            <label key={task.order}>
+              <span>task-{task.order}</span>
+              <textarea
+                rows={3}
+                value={task.task}
+                onChange={(event) => setDrafts((items) => items.map((item, itemIndex) =>
+                  itemIndex === index ? { ...item, task: event.target.value } : item
+                ))}
+              />
+            </label>
+          ))}
+        </div>
+        <footer className="edit-plan-footer">
+          <label>done 計數<input type="number" min={0} value={doneCount} onChange={(event) => setDoneCount(+event.target.value)} /></label>
+          <button type="button" className="primary-button" onClick={save}>💾 儲存</button>
+          <span className="inline-message" role="status">{message}</span>
+        </footer>
+      </section>
+    );
+  }
+
+  const plan = state.plan ?? [];
+  const visibleTasks = plan.filter((task) => showDone || !completed.has(task.order));
+  return (
+    <section className="plan-pane">
+      <header className="pane-header plan-header">
+        <div><strong>任務計畫</strong><span>{completed.size}/{plan.length} 已完成</span></div>
+        {canEdit && plan.length > 0 && <button type="button" className="secondary-button" onClick={startEditing}>✎ 編輯計畫</button>}
+      </header>
+      <div className="table-scroll" ref={scrollRef} onScroll={checkCurrentVisibility}>
+        <table>
+          <thead><tr><th className="number-column">#</th><th>任務</th><th className="status-column">狀態</th></tr></thead>
+          <tbody>
+            {completed.size > 0 && (
+              <tr className="completed-summary"><td colSpan={3}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !showDone;
+                    setShowDone(next);
+                    localStorage.setItem("showdone", next ? "1" : "0");
+                  }}
+                  aria-expanded={showDone}
+                >
+                  {showDone ? "▾" : "▸"} 已完成 {completed.size} 條
+                </button>
+              </td></tr>
+            )}
+            {visibleTasks.map((task) => {
+              const done = completed.get(task.order);
+              const current = state.phase !== "plan" && task.order === state.current_order && !done;
+              const resetCount = state.task_reset_counts?.[String(task.order)];
+              return (
+                <tr
+                  key={task.order}
+                  data-order={task.order}
+                  className={`${done ? "completed" : ""}${current ? " current" : ""}${flashOrders.has(task.order) ? " flash" : ""}`}
+                >
+                  <td>{task.order}</td>
+                  <td className="task-cell">
+                    <button
+                      type="button"
+                      className={`task-toggle${expanded.has(task.order) || current ? " expanded" : ""}`}
+                      aria-expanded={expanded.has(task.order) || current}
+                      onClick={() => setExpanded((orders) => {
+                        const next = new Set(orders);
+                        if (next.has(task.order)) next.delete(task.order); else next.add(task.order);
+                        return next;
+                      })}
+                    >{task.task}</button>
+                    {task.ref && <div className="task-ref">ref: {task.ref}</div>}
+                  </td>
+                  <td className="task-status">
+                    {done ? `✔ ${done.human ? "人工" : done.sha.slice(0, 8)}` : current ? "→ 進行中" : "·"}
+                    {resetCount ? ` ⟲${resetCount}` : ""}
+                    {canEdit && (state.phase === "exec" || state.phase === "done") && task.order !== state.current_order && (
+                      <button type="button" className="goto-button" onClick={() => onGoto(task.order)} aria-label={`把進度設到 task-${task.order}`}>⏵</button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+            {!plan.length && <tr><td colSpan={3} className="table-empty">規劃期：計畫尚未建立</td></tr>}
+          </tbody>
+        </table>
+      </div>
+      {currentOffscreen && (
+        <button type="button" className="floating-button current-jump" onClick={() => {
+          scrollRef.current?.querySelector<HTMLElement>("tr.current")?.scrollIntoView({ block: "center" });
+        }}>→ 回到執行中</button>
+      )}
+    </section>
+  );
+}

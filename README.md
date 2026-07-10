@@ -62,16 +62,36 @@ agent 的 stdout/stderr 逐行直播在 console(前綴 `│`),同時落 `workspa
 python3 dashboard.py            # 一個進程管 workspace/ 底下全部;--name 只是預選;--port 8765 起自動找
 ```
 
-頂部 tabs = fleet 總覽(每個 workspace 的 phase 色點+進度,每 3 秒刷新),點擊即切換(支援 #hash 深連結)。
+Dashboard 前端是獨立的 React + TypeScript + Vite 專案，原始碼在 `ui/src/`；
+`dashboard.py` 只提供既有 `/api/*` 與本機 `ui/dist/` 靜態資源。Production 不需要 Node、
+不連 CDN，也不會在執行時下載字型、icon 或其他資源。重新 build 前端:
+
+```bash
+cd ui
+npm install
+npm run build
+```
+
+前端 build 需要 Node.js 20.19 以上；這項需求只存在開發／建置機。
+`ui/dist/` 會進版控，讓只有 Python 的內網環境可直接執行 dashboard。開發模式可先跑
+`python3 dashboard.py --port 8765`，再於另一個 terminal 執行 `cd ui && npm run dev`；
+Vite 會把 `/api` proxy 到本機 dashboard。
+
+介面提供深色／淺色／跟隨系統三種主題，偏好、左右欄寬、完成任務與事件區塊的展開狀態
+都只存在瀏覽器 `localStorage`，不會修改 workspace truth。
+
+頂部 tabs = fleet 總覽(每個 workspace 的 phase 色點+進度),點擊即切換(支援 #hash 深連結)。
+主畫面的 fleet/state/history/console 由單向 SSE (`/api/events`) 增量推送；瀏覽器斷線會自動重連，
+寫入操作仍使用既有 REST POST。只有「執行中的 jobs」面板在打開時每 2 秒查詢一次。
 **版面鎖 100vh**:頁面永不捲動,左(計畫表格)右(console)兩欄各自內部 scroll。
 多個 loop 同時跑各自 workspace,開一個 dashboard 就夠;`--read-only` 起唯讀實例分享給別人看。
 
 左欄(計畫表格):
 - 已完成任務預設收合成一行(點擊展開/收合,記憶偏好);切進 workspace 自動捲到進行中任務;
-- 任務文字 clamp 3 行(點擊展開;進行中任務不縮);內容沒變不重繪,你的捲動位置不會被輪詢打斷;
+- 任務文字 clamp 3 行(點擊展開;進行中任務不縮);React 保留未變區塊與你的捲動位置;
   捲離進行中任務時出現「→ 回到執行中」浮鈕一鍵跳回;
 - header 有 任務 n/N 進度、⚠ issues 紅章——點擊開**彈窗表格**(round/位置/內容/時間,最新在上、
-  可捲動、開著會跟輪詢即時更新,內含清空鈕);issues 來自 agent 的 `work.py issue` 結構化回報;
+  可捲動、開著會隨 SSE 即時更新,內含清空鈕);issues 來自 agent 的 `work.py issue` 結構化回報;
 - 規劃期 plan 更新時**變動的列亮一閃+plan chip 閃**(v4 動態樹的極簡版),
   plan 版本異常增長(≥10)標黃提示可能震盪。
 

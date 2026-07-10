@@ -1,0 +1,93 @@
+export type Phase = "plan" | "exec" | "done";
+
+export interface WorkspaceSummary {
+  name: string;
+  phase: Phase | null;
+  running: boolean;
+  round?: number;
+  flag?: number;
+  completed?: number;
+  plan_len?: number;
+  done_count?: number;
+  repo?: string;
+}
+
+export interface PlanTask {
+  order: number;
+  task: string;
+  ref?: string | null;
+}
+
+export interface CompletedTask {
+  order: number;
+  sha: string;
+  human?: boolean;
+}
+
+export interface Issue {
+  round: number;
+  where?: string;
+  text: string;
+  ts?: string;
+}
+
+export interface DashboardConfig {
+  repo?: string;
+  agent_cmd?: string;
+  validate_cmd?: string;
+  flag_threshold?: number;
+  done_threshold?: number;
+  round_timeout?: number;
+  red_limit?: number;
+  stall_limit?: number;
+}
+
+export interface WorkspaceState {
+  error?: string;
+  phase: Phase;
+  round: number;
+  flag: number;
+  done_count: number;
+  red_streak: number;
+  stall_rounds: number;
+  plan_version: number;
+  current_order?: number;
+  goal_changed?: boolean;
+  plan?: PlanTask[];
+  completed?: CompletedTask[];
+  issues?: Issue[];
+  task_reset_counts?: Record<string, number>;
+  config?: DashboardConfig;
+}
+
+export interface SelectCommand {
+  label: string;
+  cmd: string;
+}
+
+export interface ConfigResponse {
+  error?: string;
+  agent_cmds: SelectCommand[];
+  validate_cmds: SelectCommand[];
+  repos: string[];
+  defaults: DashboardConfig;
+}
+
+export interface JobInfo {
+  name: string;
+  repo: string;
+  pid: number;
+  alive: boolean;
+  rc?: number | null;
+  tail?: string;
+}
+
+export interface IncrementalResponse {
+  size: number;
+  data: string;
+}
+
+export interface BootstrapResponse {
+  readonly: boolean;
+  preselect: string;
+}
