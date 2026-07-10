@@ -714,7 +714,8 @@ def validate_state_shape(state, label: str):
             raise StateLoadError(f"{label} last_round_seconds 必須是有限非負數")
     if "last_round_timed_out" in state and not isinstance(state["last_round_timed_out"], bool):
         raise StateLoadError(f"{label} last_round_timed_out 必須是 boolean")
-    for field in ("agent_backoff_until", "last_state_recovery"):
+    for field in ("agent_backoff_until", "last_state_recovery", "round_started_at",
+                  "round_deadline_at", "round_interrupted_at"):
         if field in state and state[field] is not None and not isinstance(state[field], str):
             raise StateLoadError(f"{label} {field} 必須是字串或 null")
     if "goal_changed" in state and not isinstance(state["goal_changed"], bool):
@@ -861,6 +862,8 @@ class Workspace:
             "agent_failure_streak": 0, "agent_backoff_seconds": 0,
             "agent_backoff_until": None,
             "last_round_seconds": 0, "last_round_timed_out": False,
+            "round_started_at": None, "round_deadline_at": None,
+            "round_interrupted_at": None,
             "state_recovery_count": 0, "last_state_recovery": None,
             "task_reset_counts": {},    # {order(str): 次數}
             "notes": [],
@@ -1370,6 +1373,8 @@ def main():
         # 若「本輪後停止」後又立刻按立即停止，或程序在輪末競態退出，不把請求留給下次 session。
         stop_after_round_requested(ws.dir, os.getpid(), session_id, consume=True)
         clear_stop_after_round_claimed(ws.dir, os.getpid(), session_id)
+        if state.get("round_started_at") and not state.get("round_interrupted_at"):
+            state["round_interrupted_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
         state["loop"]["pid"] = None  # 正常/Ctrl-C 退出都清 pid;被 SIGKILL 留殘值,由 dashboard ps 檢查兜底
         ws.save_state(state)
     atexit.register(_mark_stopped)
@@ -1464,6 +1469,11 @@ def main():
         ws.clear_signals()
         round_token = uuid.uuid4().hex
         ws.write_dispatch(phase, task_id, round_token)
+        round_started = datetime.now().astimezone()
+        state["round_started_at"] = round_started.isoformat(timespec="seconds")
+        state["round_deadline_at"] = ((round_started + timedelta(seconds=args.round_timeout * 60))
+                                      .isoformat(timespec="seconds")) if args.round_timeout else None
+        state["round_interrupted_at"] = None
         ws.save_state(state)  # spawn 前先落地:agent 讀得到最新 round/phase,tamper 基準同步更新
 
         notes_text = "\n\n".join(notes) if notes else "(無)"
@@ -1515,6 +1525,9 @@ def main():
                                         args.round_timeout * 60, on_started=mark_startup_ready)
         state["last_round_seconds"] = round(secs, 3)
         state["last_round_timed_out"] = bool(timed_out)
+        state["round_started_at"] = None
+        state["round_deadline_at"] = None
+        state["round_interrupted_at"] = None
         log(f"🤖 Agent 結束｜exit code={rc}｜耗時 {secs:.0f} 秒" + "｜超時，已強制終止" * timed_out)
         if timed_out:
             state["notes"].append(f"⚠️ 上一輪 agent 超過 {args.round_timeout:g} 分鐘被強制終止,"

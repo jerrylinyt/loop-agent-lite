@@ -84,6 +84,10 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page.getByRole("img", { name: /^健康度：紅連跳 \d+\/\d+ · 停滯 \d+\/\d+/ })).toBeVisible();
   await expect(page.getByRole("button", { name: "⏹ 立即停止" })).toBeVisible();
   await expect(page.getByRole("button", { name: "⏸ 本輪後停止" })).toBeVisible();
+  const roundTimer = page.getByTestId("round-timer");
+  await expect(roundTimer).toBeVisible();
+  await expect(roundTimer).toContainText("本輪");
+  await expect(roundTimer).toContainText("剩");
   await expect(page).toHaveTitle(/^🟢 e2e-workspace · r\d+/);
   const faviconHref = await page.evaluate(() => document.querySelector('link[rel="icon"]')?.getAttribute("href") ?? "");
   expect(faviconHref.startsWith("data:image/png")).toBeTruthy();
@@ -106,6 +110,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   const fleetCard = overview.locator(".fleet-card", { hasText: "e2e-workspace" });
   await expect(fleetCard).toBeVisible();
   await expect(fleetCard.locator(".breathing-dot")).toBeVisible();
+  await expect(fleetCard.locator(".round-timer")).toContainText("本輪");
   await expect(fleetCard.locator(".fleet-card-task")).toContainText("task-1");
   const eventFeed = overview.getByRole("complementary", { name: "事件推播" });
   await expect(eventFeed.locator(".fleet-event", { hasText: "▶ 開始 task-1" }).first()).toBeVisible();
@@ -151,6 +156,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page.getByRole("button", { name: "▶ 運行" })).toBeVisible();
   await expect(loopConsole).toContainText("已依要求停止");
   await expect(page).toHaveTitle(/^⚪ e2e-workspace/);
+  await expect(roundTimer).toBeHidden();
 
   await page.getByRole("button", { name: "🕒 輪次紀錄" }).click();
   const historyModal = page.getByRole("dialog", { name: "輪次紀錄" });

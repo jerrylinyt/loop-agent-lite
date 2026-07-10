@@ -182,6 +182,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .health-status { justify-content: flex-end; }
 .chip.subdued { color: var(--muted); }
 .chip.warning { color: var(--warning); background: var(--warning-soft); }
+.round-timer { color: var(--muted); font-variant-numeric: tabular-nums; }
+.round-timer.warning { color: var(--warning); }
 button.chip { border: 0; color: inherit; }
 .issue-chip { color: var(--danger); background: var(--danger-soft); }
 .report-chip { color: var(--success); background: var(--success-soft); }

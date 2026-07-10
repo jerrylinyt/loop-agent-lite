@@ -21,6 +21,9 @@ export interface WorkspaceSummary {
   agent_backoff_seconds?: number;
   last_round_seconds?: number;
   last_round_timed_out?: boolean;
+  round_started_at?: string | null;
+  round_deadline_at?: string | null;
+  round_interrupted_at?: string | null;
   state_recovery_count?: number;
   state_recovery_pending?: boolean;
   goal_changed?: boolean;
@@ -138,6 +141,9 @@ export interface WorkspaceState {
   agent_backoff_until?: string | null;
   last_round_seconds?: number;
   last_round_timed_out?: boolean;
+  round_started_at?: string | null;
+  round_deadline_at?: string | null;
+  round_interrupted_at?: string | null;
   state_recovery_count?: number;
   last_state_recovery?: string | null;
   state_recovery_pending?: boolean;

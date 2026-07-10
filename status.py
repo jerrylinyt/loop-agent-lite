@@ -8,11 +8,50 @@ import stat
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import loop
 
 STATUS_SCHEMA_VERSION = 1
+
+
+def _parse_timestamp(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def round_timing_projection(started_at, deadline_at=None, interrupted_at=None, *, now=None):
+    """將 state 的靜態時間戳投影為 elapsed/remaining；壞格式不讓唯讀 status 崩潰。"""
+    started = _parse_timestamp(started_at)
+    if started is None:
+        return {"round_elapsed_seconds": None, "round_remaining_seconds": None}
+    interrupted = _parse_timestamp(interrupted_at)
+    if now is None:
+        now = datetime.now(started.tzinfo) if started.tzinfo else datetime.now()
+    end = interrupted or now
+    if end.tzinfo != started.tzinfo:
+        end = now
+    elapsed = max(0, round((end - started).total_seconds()))
+    deadline = _parse_timestamp(deadline_at)
+    remaining = None
+    if deadline is not None and deadline.tzinfo == end.tzinfo:
+        remaining = round((deadline - end).total_seconds())
+    return {"round_elapsed_seconds": elapsed, "round_remaining_seconds": remaining}
+
+
+def format_clock(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
 
 def pid_is_loop_alive(pid) -> bool:
     """確認 state 記錄的 pid 仍是 loop.py，避免 pid reuse 誤報執行中。"""
@@ -51,6 +90,10 @@ def project_status(name: str, metrics_limit=0):
                          if isinstance(task, dict) and task.get("order") == current_order), "")
     if len(current_task) > 160:
         current_task = current_task[:160] + "…"
+    round_started_at = state.get("round_started_at")
+    round_deadline_at = state.get("round_deadline_at")
+    round_interrupted_at = state.get("round_interrupted_at")
+    round_timing = round_timing_projection(round_started_at, round_deadline_at, round_interrupted_at)
     projection = {
         "name": name,
         "workspace": str(directory),
@@ -69,6 +112,12 @@ def project_status(name: str, metrics_limit=0):
         "agent_backoff_seconds": state.get("agent_backoff_seconds", 0),
         "last_round_seconds": state.get("last_round_seconds", 0),
         "last_round_timed_out": bool(state.get("last_round_timed_out")),
+        "round_started_at": round_started_at,
+        "round_deadline_at": round_deadline_at,
+        "round_interrupted_at": round_interrupted_at,
+        "round_active": bool(round_started_at and running),
+        "round_interrupted": bool(round_started_at and not running),
+        **round_timing,
         "state_recovery_count": state.get("state_recovery_count", 0),
         "last_state_recovery": state.get("last_state_recovery"),
         "goal_changed": bool(state.get("goal_changed")),
@@ -234,6 +283,17 @@ def render_human(result, *, timestamp=False) -> None:
         print(f"🛟 state 復原 {result['state_recovery_count']}", flush=True)
     if result.get("goal_changed"):
         print("⚠ goal 已變更，建議回規劃期重新收斂", flush=True)
+    if result.get("round_started_at") and result.get("round_elapsed_seconds") is not None:
+        elapsed = format_clock(result["round_elapsed_seconds"])
+        remaining = result.get("round_remaining_seconds")
+        if result.get("round_active"):
+            deadline = ("｜無 timeout" if remaining is None else
+                        f"｜timeout 已超過 {format_clock(-remaining)}" if remaining < 0 else
+                        f"｜timeout 剩 {format_clock(remaining)}")
+            print(f"⏱ 本輪進行 {elapsed}{deadline}", flush=True)
+        else:
+            qualifier = "至少 " if not result.get("round_interrupted_at") else ""
+            print(f"⏸ round {result['round']} 中斷｜已進行 {qualifier}{elapsed}", flush=True)
     metrics = result.get("round_metrics")
     if metrics is not None:
         if metrics["sample_count"]:

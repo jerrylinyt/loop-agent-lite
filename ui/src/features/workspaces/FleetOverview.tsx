@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import type { FleetHistoryEntry, WorkspaceSummary } from "../../shared/api/types";
 import { deriveFleetEvents } from "./fleetEvents";
+import { deriveRoundTiming, useRoundNow } from "./roundTiming";
 
 const PHASE_NAMES: Record<string, string> = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
 type FleetFilter = "all" | "attention" | "running" | "done";
@@ -48,6 +49,8 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
   onSelect: (name: string) => void;
 }) {
   const events = useMemo(() => deriveFleetEvents(fleetHistory), [fleetHistory]);
+  const roundNow = useRoundNow(workspaces.some((workspace) =>
+    Boolean(workspace.round_started_at && !workspace.round_interrupted_at)));
   const [filter, setFilter] = useState<FleetFilter>(initialFleetFilter);
   const [search, setSearch] = useState(() => localStorage.getItem("fleet-search") ?? "");
 
@@ -117,6 +120,7 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
             const alert = needsAttention(workspace);
             const unreadIssues = workspace.unread_issues ?? workspace.issues ?? 0;
             const activity = currentActivity(workspace);
+            const roundTiming = deriveRoundTiming(workspace, workspace.running, roundNow);
             return (
               <button key={workspace.name} type="button" className={`fleet-card phase-${workspace.phase ?? "unknown"}${workspace.running ? " running" : ""}`} onClick={() => onSelect(workspace.name)}>
                 <div className="fleet-card-head">
@@ -128,6 +132,7 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
                   <span className="muted">round {workspace.round ?? 0}</span>
                   {workspace.phase === "plan" && <span className="muted">flag {workspace.flag ?? 0}</span>}
                   {workspace.phase === "exec" && <span className="muted">done {workspace.done_count ?? 0}</span>}
+                  {roundTiming && <span className={`round-timer${roundTiming.warning || roundTiming.interrupted ? " warning" : ""}`}>{roundTiming.label}</span>}
                   {(workspace.last_round_seconds ?? 0) > 0 && <span className="muted">⏱ {workspace.last_round_seconds}s</span>}
                 </div>
                 {total > 0 && workspace.phase !== "plan" && (

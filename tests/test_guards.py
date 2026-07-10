@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -341,6 +342,9 @@ class TestRoundTelemetry(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertGreater(state["last_round_seconds"], 0)
             self.assertFalse(state["last_round_timed_out"])
+            self.assertIsNone(state["round_started_at"])
+            self.assertIsNone(state["round_deadline_at"])
+            self.assertIsNone(state["round_interrupted_at"])
             self.assertRegex(history, r" secs=\d+\.\d{3} timeout=False ")
 
     def test_timed_out_round_records_timeout(self):
@@ -350,7 +354,90 @@ class TestRoundTelemetry(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertGreater(state["last_round_seconds"], 0)
             self.assertTrue(state["last_round_timed_out"])
+            self.assertIsNone(state["round_started_at"])
+            self.assertIsNone(state["round_deadline_at"])
+            self.assertIsNone(state["round_interrupted_at"])
             self.assertIn("timeout=True", history)
+
+
+class TestLiveRoundTiming(unittest.TestCase):
+    """進行中 round 可觀測；正常輪末清除，立即停止則保留凍結的中斷上下文。"""
+
+    def test_status_timing_projection_handles_deadline_and_invalid_timestamp(self):
+        started = datetime.now().replace(microsecond=0)
+        projection = S.round_timing_projection(
+            started.isoformat(),
+            (started + timedelta(seconds=90)).isoformat(),
+            (started + timedelta(seconds=30)).isoformat(),
+            now=started + timedelta(seconds=60),
+        )
+        self.assertEqual(projection["round_elapsed_seconds"], 30)
+        self.assertEqual(projection["round_remaining_seconds"], 60)
+        self.assertEqual(S.round_timing_projection("not-a-time"), {
+            "round_elapsed_seconds": None, "round_remaining_seconds": None})
+
+    def test_interrupt_preserves_started_deadline_and_frozen_elapsed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            state_path = workspace_root / "live-round" / "state.json"
+            agent = root / "slow_agent.py"
+            agent.write_text("import time\ntime.sleep(10)\n")
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            process = subprocess.Popen(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "live-round",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--round-timeout", "1",
+                 "--agent-backoff-max", "0", "--max-rounds", "1"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                observed = None
+                while time.monotonic() < deadline:
+                    try:
+                        candidate = json.loads(state_path.read_text())
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        time.sleep(0.02)
+                        continue
+                    if candidate.get("round_started_at") and candidate.get("loop", {}).get("pid"):
+                        observed = candidate
+                        break
+                    time.sleep(0.02)
+                self.assertIsNotNone(observed, "Agent spawn 前必須先公開 round 計時")
+                started_at = datetime.fromisoformat(observed["round_started_at"])
+                deadline_at = datetime.fromisoformat(observed["round_deadline_at"])
+                self.assertGreaterEqual((deadline_at - started_at).total_seconds(), 59)
+
+                live = subprocess.run(
+                    [sys.executable, STATUS_PY, "--name", "live-round", "--json"],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(live.returncode, 0, live.stdout + live.stderr)
+                live_projection = json.loads(live.stdout)
+                self.assertTrue(live_projection["round_active"])
+                self.assertFalse(live_projection["round_interrupted"])
+                self.assertGreaterEqual(live_projection["round_elapsed_seconds"], 0)
+                self.assertGreater(live_projection["round_remaining_seconds"], 0)
+
+                process.send_signal(signal.SIGINT)
+                output, _ = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 130, output)
+                stopped = json.loads(state_path.read_text())
+                self.assertEqual(stopped["round_started_at"], observed["round_started_at"])
+                self.assertEqual(stopped["round_deadline_at"], observed["round_deadline_at"])
+                self.assertIsNotNone(stopped["round_interrupted_at"])
+                self.assertIsNone(stopped["loop"]["pid"])
+
+                stopped_status = subprocess.run(
+                    [sys.executable, STATUS_PY, "--name", "live-round"],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(stopped_status.returncode, 0, stopped_status.stdout + stopped_status.stderr)
+                self.assertIn("round 1 中斷", stopped_status.stdout)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
 
 
 class TestRoundMetrics(unittest.TestCase):
@@ -647,6 +734,21 @@ class TestStateSchemaGuard(unittest.TestCase):
                     ws.state_path.write_text(json.dumps(invalid), encoding="utf-8")
                     ws.checkpoint_path.write_text(json.dumps(invalid), encoding="utf-8")
                     with self.subTest(fields=invalid_fields), self.assertRaises(L.StateLoadError):
+                        ws.load_state()
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_invalid_round_lifecycle_timestamp_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d)
+                for index, field in enumerate(("round_started_at", "round_deadline_at", "round_interrupted_at")):
+                    ws = L.Workspace(f"schema-round-time-{index}")
+                    invalid = {"phase": "plan", field: 123}
+                    ws.state_path.write_text(json.dumps(invalid), encoding="utf-8")
+                    ws.checkpoint_path.write_text(json.dumps(invalid), encoding="utf-8")
+                    with self.subTest(field=field), self.assertRaises(L.StateLoadError):
                         ws.load_state()
             finally:
                 L.WORKSPACE_ROOT = old_root
@@ -3028,6 +3130,9 @@ class TestFleetHistoryProjection(unittest.TestCase):
             (root / "alpha" / "history.log").write_text(line + "\n", encoding="utf-8")
             (root / "alpha" / "state.json").write_text(json.dumps({
                 "phase": "exec", "current_order": 2,
+                "round_started_at": "2026-07-10T10:00:00",
+                "round_deadline_at": "2026-07-10T10:30:00",
+                "round_interrupted_at": None,
                 "plan": [{"order": 1, "task": "第一項", "ref": None},
                          {"order": 2, "task": "第二項很長" + "x" * 200, "ref": None}],
             }), encoding="utf-8")
@@ -3042,6 +3147,9 @@ class TestFleetHistoryProjection(unittest.TestCase):
                 self.assertEqual(alpha["current_order"], 2)
                 self.assertTrue(alpha["current_task"].startswith("第二項很長"))
                 self.assertLessEqual(len(alpha["current_task"]), 121, "任務文字應截斷")
+                self.assertEqual(alpha["round_started_at"], "2026-07-10T10:00:00")
+                self.assertEqual(alpha["round_deadline_at"], "2026-07-10T10:30:00")
+                self.assertIsNone(alpha["round_interrupted_at"])
             finally:
                 D.ROOT = old_root
 
