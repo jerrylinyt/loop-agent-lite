@@ -15,6 +15,11 @@ export interface WorkspaceSummary {
   red_streak?: number;
   stall_rounds?: number;
   issues?: number;
+  agent_failure_streak?: number;
+  agent_backoff_seconds?: number;
+  state_recovery_count?: number;
+  state_recovery_pending?: boolean;
+  goal_changed?: boolean;
   current_order?: number | null;
   current_task?: string;
 }

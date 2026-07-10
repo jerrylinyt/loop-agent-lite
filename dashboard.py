@@ -879,7 +879,16 @@ def list_workspaces():
                 state_files.append(artifact)
         if not state_files:
             continue
-        info = {"name": d.name, "phase": None, "running": False}
+        info = {
+            "name": d.name,
+            "phase": None,
+            "running": False,
+            "agent_failure_streak": 0,
+            "agent_backoff_seconds": 0,
+            "state_recovery_count": 0,
+            "state_recovery_pending": False,
+            "goal_changed": False,
+        }
         st, err = read_state(d.name, repair=False)
         if not err:
             c = st.get("config") or {}
@@ -897,6 +906,11 @@ def list_workspaces():
                         done_count=st.get("done_count", 0), repo=c.get("repo"),
                         red_streak=st.get("red_streak", 0), stall_rounds=st.get("stall_rounds", 0),
                         issues=len(st.get("issues") or []),
+                        agent_failure_streak=st.get("agent_failure_streak", 0),
+                        agent_backoff_seconds=st.get("agent_backoff_seconds", 0),
+                        state_recovery_count=st.get("state_recovery_count", 0),
+                        state_recovery_pending=bool(st.get("state_recovery_pending")),
+                        goal_changed=bool(st.get("goal_changed")),
                         current_order=current_order, current_task=current_task,
                         running=running,
                         draining=drain_claimed or (running and loop_mod.stop_after_round_requested(

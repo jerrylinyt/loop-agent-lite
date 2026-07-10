@@ -1041,7 +1041,11 @@ class TestWorkspaceFleetValidity(unittest.TestCase):
             (root / "ghost" / "console.log").write_text("failed\n")
             valid = root / "valid"
             valid.mkdir()
-            (valid / "state.json").write_text(json.dumps(L.Workspace.__new__(L.Workspace).fresh_state()))
+            valid_state = L.Workspace.__new__(L.Workspace).fresh_state()
+            valid_state.update(agent_failure_streak=2, agent_backoff_seconds=4,
+                               state_recovery_count=3, state_recovery_pending=True,
+                               goal_changed=True)
+            (valid / "state.json").write_text(json.dumps(valid_state))
             checkpoint_only = root / "checkpoint-only"
             checkpoint_only.mkdir()
             checkpoint_state = L.Workspace.__new__(L.Workspace).fresh_state()
@@ -1053,6 +1057,12 @@ class TestWorkspaceFleetValidity(unittest.TestCase):
                 fleet = D.list_workspaces()
                 self.assertEqual([item["name"] for item in fleet], ["checkpoint-only", "valid"])
                 self.assertEqual(fleet[0]["round"], 8)
+                valid_item = fleet[1]
+                self.assertEqual(valid_item["agent_failure_streak"], 2)
+                self.assertEqual(valid_item["agent_backoff_seconds"], 4)
+                self.assertEqual(valid_item["state_recovery_count"], 3)
+                self.assertTrue(valid_item["state_recovery_pending"])
+                self.assertTrue(valid_item["goal_changed"])
                 self.assertFalse((checkpoint_only / "state.json").exists(), "fleet 掃描必須保持唯讀")
             finally:
                 D.ROOT = old_root

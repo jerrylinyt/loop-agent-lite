@@ -31,7 +31,15 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
   const executing = workspaces.filter((workspace) => workspace.phase === "exec").length;
   const totalTasks = workspaces.reduce((sum, workspace) => sum + (workspace.plan_len ?? 0), 0);
   const doneTasks = workspaces.reduce((sum, workspace) => sum + (workspace.completed ?? 0), 0);
-  const alerts = workspaces.filter((workspace) => (workspace.red_streak ?? 0) > 0 || (workspace.issues ?? 0) > 0).length;
+  const alerts = workspaces.filter((workspace) => (
+    (workspace.red_streak ?? 0) > 0 ||
+    (workspace.stall_rounds ?? 0) > 0 ||
+    (workspace.issues ?? 0) > 0 ||
+    (workspace.agent_failure_streak ?? 0) > 0 ||
+    (workspace.state_recovery_count ?? 0) > 0 ||
+    workspace.state_recovery_pending ||
+    workspace.goal_changed
+  )).length;
   const taskPct = totalTasks > 0 ? Math.round((doneTasks / totalTasks) * 100) : 0;
 
   return (
@@ -51,7 +59,15 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
         <div className="fleet-grid">
           {workspaces.map((workspace) => {
             const { done: cardDone, total, pct } = progress(workspace);
-            const alert = (workspace.red_streak ?? 0) > 0 || (workspace.stall_rounds ?? 0) > 0 || (workspace.issues ?? 0) > 0;
+            const alert = (
+              (workspace.red_streak ?? 0) > 0 ||
+              (workspace.stall_rounds ?? 0) > 0 ||
+              (workspace.issues ?? 0) > 0 ||
+              (workspace.agent_failure_streak ?? 0) > 0 ||
+              (workspace.state_recovery_count ?? 0) > 0 ||
+              workspace.state_recovery_pending ||
+              workspace.goal_changed
+            );
             const activity = currentActivity(workspace);
             return (
               <button key={workspace.name} type="button" className={`fleet-card phase-${workspace.phase ?? "unknown"}${workspace.running ? " running" : ""}`} onClick={() => onSelect(workspace.name)}>
@@ -77,6 +93,10 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
                     {(workspace.red_streak ?? 0) > 0 && <span className="chip warning">紅連跳 {workspace.red_streak}</span>}
                     {(workspace.stall_rounds ?? 0) > 0 && <span className="chip subdued">停滯 {workspace.stall_rounds}</span>}
                     {(workspace.issues ?? 0) > 0 && <span className="chip issue-chip">issues {workspace.issues}</span>}
+                    {(workspace.agent_failure_streak ?? 0) > 0 && <span className="chip warning">Agent 異常 {workspace.agent_failure_streak}</span>}
+                    {(workspace.state_recovery_count ?? 0) > 0 && <span className="chip warning">🛟 state 復原 {workspace.state_recovery_count}</span>}
+                    {workspace.state_recovery_pending && <span className="chip warning">🛟 checkpoint</span>}
+                    {workspace.goal_changed && <span className="chip warning">goal 已變更</span>}
                   </div>
                 )}
                 {workspace.repo && <div className="fleet-card-repo" title={workspace.repo}>{workspace.repo}</div>}
