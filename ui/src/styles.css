@@ -363,3 +363,31 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .ansi-bg-bright-white { background: color-mix(in srgb, var(--ansi-bright-white) 30%, transparent); }
 .ansi-bold { font-weight: 700; } .ansi-dim { opacity: .65; }
 .ansi-italic { font-style: italic; } .ansi-underline { text-decoration: underline; }
+
+/* Fleet 總覽電視牆 */
+.fleet-overview { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 14px; overflow: auto; padding: 16px 20px; }
+.fleet-stats { display: flex; flex-wrap: wrap; gap: 10px; }
+.fleet-stat { display: flex; min-width: 120px; flex-direction: column; gap: 2px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-raised); }
+.fleet-stat strong { font-size: 20px; font-variant-numeric: tabular-nums; }
+.fleet-stat strong em { margin-left: 4px; color: var(--muted); font-size: 12px; font-style: normal; }
+.fleet-stat span { color: var(--muted); font-size: 12px; }
+.fleet-stat.running strong { color: var(--success); }
+.fleet-stat.warning strong { color: var(--warning); }
+.fleet-stat.tasks { min-width: 200px; }
+.fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; align-content: start; }
+.fleet-card { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border: 1px solid var(--border); border-left: 4px solid var(--muted); border-radius: 10px; background: var(--surface-raised); color: inherit; text-align: left; cursor: pointer; transition: border-color .15s, transform .1s; }
+.fleet-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+.fleet-card.phase-plan { border-left-color: var(--accent); }
+.fleet-card.phase-exec { border-left-color: var(--warning); }
+.fleet-card.phase-done { border-left-color: var(--success); }
+.fleet-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.fleet-card-head strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.breathing-dot { width: 9px; height: 9px; flex: none; border-radius: 50%; background: var(--success); animation: breathe 1.6s ease-in-out infinite; }
+@keyframes breathe { 0%, 100% { opacity: .35; transform: scale(.85); } 50% { opacity: 1; transform: scale(1.1); } }
+.fleet-card-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; }
+.fleet-progress { position: relative; height: 14px; overflow: hidden; border-radius: 999px; background: var(--surface-subtle); }
+.fleet-progress-fill { height: 100%; border-radius: 999px; background: var(--success-strong); transition: width .4s; }
+.fleet-progress-text { position: absolute; inset: 0; display: grid; place-items: center; color: var(--text); font-size: 10px; font-variant-numeric: tabular-nums; }
+.fleet-card-alerts { display: flex; flex-wrap: wrap; gap: 6px; }
+.fleet-card-repo { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.active-toggle { outline: 2px solid var(--accent); }

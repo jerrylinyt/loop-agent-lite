@@ -4,6 +4,7 @@ import Splitter from "../features/layout/Splitter";
 import LauncherModal from "../features/launcher/LauncherModal";
 import ThemePicker from "../features/theme/ThemePicker";
 import ArchivesModal from "../features/workspaces/ArchivesModal";
+import FleetOverview from "../features/workspaces/FleetOverview";
 import WorkspaceTabs from "../features/workspaces/WorkspaceTabs";
 import WorkspaceView from "../features/workspaces/WorkspaceView";
 import useDashboardData from "./useDashboardData";
@@ -13,6 +14,7 @@ export default function App() {
   const dashboard = useDashboardData();
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [archivesOpen, setArchivesOpen] = useState(false);
+  const [overviewOpen, setOverviewOpen] = useState(() => localStorage.getItem("fleet-overview") === "1");
   const [leftWidth, setLeftWidth] = useState(() => +(localStorage.getItem("left-pane-width") || Math.round(window.innerWidth * 0.44)));
   const [rightCollapsed, setRightCollapsed] = useState(() => localStorage.getItem("agent-console-collapsed") === "1");
   const workspace = useMemo(
@@ -40,6 +42,17 @@ export default function App() {
     await dashboard.refreshWorkspaces();
     setArchivesOpen(false);
   };
+  const toggleOverview = () => {
+    setOverviewOpen((value) => {
+      localStorage.setItem("fleet-overview", value ? "0" : "1");
+      return !value;
+    });
+  };
+  const selectFromOverview = (name: string) => {
+    dashboard.selectWorkspace(name);
+    setOverviewOpen(false);
+    localStorage.setItem("fleet-overview", "0");
+  };
 
   return (
     <>
@@ -48,6 +61,7 @@ export default function App() {
           <WorkspaceTabs workspaces={dashboard.workspaces} selected={dashboard.selected} onSelect={dashboard.selectWorkspace} />
           <div className="toolbar-actions">
             <ThemePicker />
+            <button type="button" className={`secondary-button${overviewOpen ? " active-toggle" : ""}`} aria-pressed={overviewOpen} onClick={toggleOverview}>📺 總覽</button>
             <button type="button" className="secondary-button" onClick={() => setArchivesOpen(true)}>🗃 已封存</button>
             {!dashboard.bootstrap.readonly && <button type="button" className="success-button" onClick={() => setLauncherOpen(true)}>＋ 啟動／管理</button>}
           </div>
@@ -64,6 +78,8 @@ export default function App() {
             <p>啟動第一個 loop 後，任務計畫、執行狀態與完整流程紀錄會顯示在這裡。</p>
             {!dashboard.bootstrap.readonly && <button type="button" className="primary-button" onClick={() => setLauncherOpen(true)}>＋ 啟動第一個 loop</button>}
           </main>
+        ) : overviewOpen ? (
+          <FleetOverview workspaces={dashboard.workspaces} onSelect={selectFromOverview} />
         ) : (
           <main className="dashboard-grid" style={{ gridTemplateColumns: `${leftWidth}px 6px ${rightCollapsed ? "42px" : "minmax(0, 1fr)"}` }}>
             <WorkspaceView key={dashboard.selected} workspace={workspace} state={dashboard.state} consoleText={dashboard.consoleText} readonly={dashboard.bootstrap.readonly} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} />

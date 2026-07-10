@@ -787,6 +787,8 @@ def list_workspaces():
             info.update(phase=st.get("phase"), round=st.get("round", 0), flag=st.get("flag", 0),
                         completed=len(st.get("completed") or []), plan_len=len(st.get("plan") or []),
                         done_count=st.get("done_count", 0), repo=c.get("repo"),
+                        red_streak=st.get("red_streak", 0), stall_rounds=st.get("stall_rounds", 0),
+                        issues=len(st.get("issues") or []),
                         running=running,
                         draining=drain_claimed or (running and loop_mod.stop_after_round_requested(
                             d, loop_state.get("pid"), loop_state.get("session_id"))),

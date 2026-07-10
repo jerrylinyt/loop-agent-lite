@@ -12,6 +12,9 @@ export interface WorkspaceSummary {
   plan_len?: number;
   done_count?: number;
   repo?: string;
+  red_streak?: number;
+  stall_rounds?: number;
+  issues?: number;
 }
 
 export interface PlanTask {

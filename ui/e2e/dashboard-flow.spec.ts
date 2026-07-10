@@ -84,6 +84,17 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page).toHaveTitle(/^🟢 e2e-workspace · r\d+/);
   const faviconHref = await page.evaluate(() => document.querySelector('link[rel="icon"]')?.getAttribute("href") ?? "");
   expect(faviconHref.startsWith("data:image/png")).toBeTruthy();
+
+  await page.getByRole("button", { name: "📺 總覽" }).click();
+  const overview = page.getByRole("main", { name: "Fleet 總覽" });
+  await expect(overview).toBeVisible();
+  await expect(overview.getByText("執行中", { exact: true })).toBeVisible();
+  const fleetCard = overview.locator(".fleet-card", { hasText: "e2e-workspace" });
+  await expect(fleetCard).toBeVisible();
+  await expect(fleetCard.locator(".breathing-dot")).toBeVisible();
+  await fleetCard.click();
+  await expect(overview).toBeHidden();
+  await expect(page.getByRole("heading", { name: "e2e-workspace" })).toBeVisible();
   const agentConsole = page.getByRole("region", { name: "Agent 執行輸出", exact: true });
   const loopConsole = page.getByRole("region", { name: "Loop 狀態紀錄", exact: true });
   await expect(agentConsole).toContainText("E2E fake agent started");
