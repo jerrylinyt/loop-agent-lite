@@ -426,6 +426,41 @@ class TestAgentFailureBackoff(unittest.TestCase):
                     process.wait()
 
 
+class TestStateSchemaGuard(unittest.TestCase):
+    """合法 JSON 但核心欄位錯型時，應 fail-closed 或由合法 checkpoint 復原。"""
+
+    def test_invalid_primary_shape_recovers_valid_checkpoint(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d)
+                ws = L.Workspace("schema-recover")
+                state = ws.fresh_state()
+                state["round"] = 12
+                ws.save_state(state)
+                ws.state_path.write_text(json.dumps({"phase": "not-a-phase", "round": "12"}), encoding="utf-8")
+                resumed = L.Workspace("schema-recover")
+                loaded = resumed.load_state()
+                self.assertTrue(resumed.state_recovered)
+                self.assertEqual(loaded["round"], 12)
+                self.assertEqual(json.loads(resumed.state_path.read_text())["round"], 12)
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_invalid_primary_and_checkpoint_fail_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d)
+                ws = L.Workspace("schema-broken")
+                ws.state_path.write_text(json.dumps({"phase": "exec", "plan": {}}), encoding="utf-8")
+                ws.checkpoint_path.write_text(json.dumps({"phase": "done", "issues": "bad"}), encoding="utf-8")
+                with self.assertRaises(L.StateLoadError):
+                    ws.load_state()
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+
 class TestConsoleRotation(unittest.TestCase):
     """完整 console 必須在上限前輪替，且按新舊順序保留固定份數。"""
 

@@ -552,6 +552,42 @@ def state_checkpoint_path(state_path: Path) -> Path:
     return state_path.with_name("state.last-good.json")
 
 
+def validate_state_shape(state, label: str):
+    """檢查 state 的核心欄位型別；允許舊版省略欄位，但不接受錯型真相。"""
+    if "phase" in state and state["phase"] not in ("plan", "exec", "done"):
+        raise StateLoadError(f"{label} phase 不合法:{state['phase']!r}")
+    integer_fields = ("round", "flag", "plan_version", "done_count", "red_streak",
+                      "stall_rounds", "agent_failure_streak", "state_recovery_count")
+    for field in integer_fields:
+        value = state.get(field)
+        if field in state and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+            raise StateLoadError(f"{label} {field} 必須是非負整數")
+    if "current_order" in state and state["current_order"] is not None:
+        value = state["current_order"]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise StateLoadError(f"{label} current_order 必須是非負整數或 null")
+    for field in ("plan", "completed", "notes", "issues"):
+        if field in state and not isinstance(state[field], list):
+            raise StateLoadError(f"{label} {field} 必須是陣列")
+    if "plan" in state:
+        for index, task in enumerate(state["plan"]):
+            if (not isinstance(task, dict) or
+                    not isinstance(task.get("order"), int) or isinstance(task.get("order"), bool) or
+                    not isinstance(task.get("task"), str) or not task["task"].strip()):
+                raise StateLoadError(f"{label} plan[{index}] 必須含有合法 order/task")
+    for field in ("task_reset_counts", "config", "loop"):
+        if field in state and not isinstance(state[field], dict):
+            raise StateLoadError(f"{label} {field} 必須是 object")
+    if "agent_backoff_seconds" in state:
+        delay = state["agent_backoff_seconds"]
+        if (isinstance(delay, bool) or not isinstance(delay, (int, float)) or
+                not math.isfinite(delay) or delay < 0):
+            raise StateLoadError(f"{label} agent_backoff_seconds 必須是有限非負數")
+    if "goal_changed" in state and not isinstance(state["goal_changed"], bool):
+        raise StateLoadError(f"{label} goal_changed 必須是 boolean")
+    return state
+
+
 def decode_state_bytes(data: bytes, label: str):
     try:
         state = json.loads(data)
@@ -559,7 +595,7 @@ def decode_state_bytes(data: bytes, label: str):
         raise StateLoadError(f"{label} JSON 損壞:{e}") from e
     if not isinstance(state, dict):
         raise StateLoadError(f"{label} 頂層必須是 JSON object,實得 {type(state).__name__}")
-    return state
+    return validate_state_shape(state, label)
 
 
 def write_checkpointed_state(state_path: Path, data: bytes) -> None:
