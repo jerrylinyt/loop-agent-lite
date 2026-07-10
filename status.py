@@ -129,6 +129,20 @@ def summarize_status(results):
     }
 
 
+def projection_needs_attention(result) -> bool:
+    """判斷單一 projection 是否應讓 --check 以非零結束。"""
+    return bool(
+        "error" in result or
+        result.get("red_streak", 0) > 0 or
+        result.get("stall_rounds", 0) > 0 or
+        result.get("issues", 0) > 0 or
+        result.get("agent_failure_streak", 0) > 0 or
+        result.get("state_recovery_count", 0) > 0 or
+        result.get("state_recovery_pending") or
+        result.get("goal_changed")
+    )
+
+
 def render_human(result, *, timestamp=False) -> None:
     phase = {"plan": "規劃期", "exec": "執行期", "done": "完成"}.get(result["phase"], result["phase"] or "未知")
     running = "執行中" if result["running"] else "已停止"
@@ -161,6 +175,8 @@ def main(argv=None) -> int:
     parser.add_argument("--interval", type=float, default=2.0, help="--watch 輪詢秒數（預設 2）")
     parser.add_argument("--on-change", action="store_true",
                         help="搭配 --watch：只有 projection 改變時才輸出")
+    parser.add_argument("--check", action="store_true",
+                        help="只查詢一次；state 錯誤或需關注時以 exit code 1 結束")
     args = parser.parse_args(argv)
     if bool(args.name) == args.all:
         parser.error("--name 與 --all 必須且只能選一個")
@@ -168,6 +184,8 @@ def main(argv=None) -> int:
         parser.error("--interval 必須是有限正數")
     if args.on_change and not args.watch:
         parser.error("--on-change 必須搭配 --watch")
+    if args.check and args.watch:
+        parser.error("--check 不可搭配 --watch")
     if args.workspace_root:
         loop.WORKSPACE_ROOT = Path(args.workspace_root).expanduser().resolve()
     previous_signature = None
@@ -176,6 +194,7 @@ def main(argv=None) -> int:
             if args.all:
                 results = project_all_status()
                 summary = summarize_status(results)
+                check_failed = summary["error_count"] > 0 or summary["attention"] > 0
                 projection = {"summary": summary, "workspaces": results}
                 signature = json.dumps(projection, ensure_ascii=False, sort_keys=True,
                                        separators=(",", ":"))
@@ -196,6 +215,7 @@ def main(argv=None) -> int:
                                 render_human(result, timestamp=args.watch)
             else:
                 result = project_status(args.name)
+                check_failed = projection_needs_attention(result)
                 signature = json.dumps(result, ensure_ascii=False, sort_keys=True,
                                        separators=(",", ":"))
                 changed = signature != previous_signature
@@ -207,7 +227,7 @@ def main(argv=None) -> int:
                     if changed or not args.on_change:
                         render_human(result, timestamp=args.watch)
             if not args.watch:
-                return 0
+                return 1 if args.check and check_failed else 0
             time.sleep(args.interval)
     except KeyboardInterrupt:
         return 130

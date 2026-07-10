@@ -725,6 +725,36 @@ class TestStatusCli(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("必須搭配 --watch", result.stderr)
 
+    def test_check_returns_nonzero_for_attention_but_keeps_json_projection(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = root / "workspace"
+                ws = L.Workspace("check-status")
+                state = ws.fresh_state()
+                state["stall_rounds"] = 1
+                ws.save_state(state)
+                env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
+                result = subprocess.run(
+                    [sys.executable, STATUS_PY, "--all", "--json", "--check"],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["summary"]["attention"], 1)
+                self.assertEqual(payload["summary"]["error_count"], 0)
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_check_rejects_watch_mode(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
+            result = subprocess.run(
+                [sys.executable, STATUS_PY, "--name", "missing", "--check", "--watch"],
+                capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("不可搭配 --watch", result.stderr)
+
     def test_all_json_lists_fleet_without_starting_or_repairing(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
