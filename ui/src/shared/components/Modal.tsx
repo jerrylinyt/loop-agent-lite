@@ -8,6 +8,7 @@ export interface ModalProps {
   children: ReactNode;
   footer?: ReactNode;
   wide?: boolean;
+  compact?: boolean;
 }
 
 const FOCUSABLE = [
@@ -19,17 +20,22 @@ const FOCUSABLE = [
   "[tabindex]:not([tabindex='-1'])"
 ].join(",");
 
-export default function Modal({ title, description, onClose, children, footer, wide }: ModalProps) {
+const modalStack: symbol[] = [];
+
+export default function Modal({ title, description, onClose, children, footer, wide, compact }: ModalProps) {
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
   const onCloseRef = useRef(onClose);
+  const modalId = useRef(Symbol("modal"));
 
   useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
 
   useEffect(() => {
     previousFocus.current = document.activeElement as HTMLElement | null;
     const shell = document.getElementById("app-shell");
+    const id = modalId.current;
+    modalStack.push(id);
     shell?.setAttribute("inert", "");
     const panel = panelRef.current;
     const initial = panel?.querySelector<HTMLElement>("[data-autofocus]")
@@ -37,6 +43,7 @@ export default function Modal({ title, description, onClose, children, footer, w
     initial?.focus();
 
     const onKeyDown = (event: KeyboardEvent) => {
+      if (modalStack[modalStack.length - 1] !== id) return;
       if (event.key === "Escape") {
         event.preventDefault();
         onCloseRef.current();
@@ -59,7 +66,9 @@ export default function Modal({ title, description, onClose, children, footer, w
     document.addEventListener("keydown", onKeyDown);
     return () => {
       document.removeEventListener("keydown", onKeyDown);
-      shell?.removeAttribute("inert");
+      const index = modalStack.lastIndexOf(id);
+      if (index >= 0) modalStack.splice(index, 1);
+      if (modalStack.length === 0) shell?.removeAttribute("inert");
       previousFocus.current?.focus();
     };
   }, []);
@@ -69,7 +78,7 @@ export default function Modal({ title, description, onClose, children, footer, w
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div
         ref={panelRef}
-        className={`modal${wide ? " modal-wide" : ""}`}
+        className={`modal${wide ? " modal-wide" : ""}${compact ? " modal-compact" : ""}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}

@@ -1,0 +1,44 @@
+{
+  "agent_cmds": [
+    {
+      "label": "claude",
+      "cmd": "claude -p"
+    }
+  ],
+  "validate_cmds": [
+    {
+      "label": "python unittest",
+      "cmd": "python3 -m unittest discover -s tests -t . -q"
+    },
+    {
+      "label": "mvn compile",
+      "cmd": "mvn -q compile"
+    },
+    {
+      "label": "mvn test",
+      "cmd": "mvn -q test"
+    },
+    {
+      "label": "react build+test+e2e",
+      "cmd": "sh -c 'npm run build && npm test -- --run && npx playwright test'"
+    }
+  ],
+  "repo_roots": [
+    "~/IdeaProjects"
+  ],
+  "extra_path_dirs": [
+    "~/.local/bin",
+    "~/bin"
+  ],
+  "notify_cmd": "",
+  "defaults": {
+    "flag_threshold": 10,
+    "done_threshold": 3,
+    "round_timeout": 30,
+    "validate_timeout": 120,
+    "red_limit": 20,
+    "stall_limit": 300,
+    "stuck_stop": false,
+    "stuck_stop_count": 100
+  }
+}

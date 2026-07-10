@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -151,11 +152,342 @@ class TestConsoleRotation(unittest.TestCase):
             self.assertFalse((Path(d) / "console.log.3").exists())
 
 
+class TestPreflightConsole(unittest.TestCase):
+    """preflight 立刻失敗時，原因仍必須落進 dashboard 正在看的 console.log。"""
+
+    def test_dirty_repo_failure_is_visible_in_workspace_console(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = make_repo(d)
+            (repo / "wip.txt").write_text("dirty\n")
+            workspace_root = Path(d) / "workspace"
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            result = subprocess.run(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "preflight-console",
+                 "--agent-cmd", "true", "--validate-cmd", "true", "--max-rounds", "1"],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            console = (workspace_root / "preflight-console" / "console.log").read_text()
+            self.assertIn("流程停止｜preflight：工作樹不乾淨", console)
+
+
+class TestTransactionalReset(unittest.TestCase):
+    """reset 必須等 preflight 綠才取代 state，失敗不得留下無 state 的 workspace。"""
+
+    def test_failed_reset_preserves_previous_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            workspace = workspace_root / "reset-safe"
+            workspace.mkdir(parents=True)
+            (workspace / "snapshots").mkdir()
+            snapshot_path = workspace / "snapshots" / "goal.md"
+            snapshot_path.write_text("old snapshot\n")
+            snapshot_before = snapshot_path.read_bytes()
+            previous = L.Workspace.__new__(L.Workspace).fresh_state()
+            previous["round"] = 77
+            previous["plan"] = [{"order": 1, "task": "must survive failed reset"}]
+            previous["plan_version"] = 9
+            state_path = workspace / "state.json"
+            state_path.write_text(json.dumps(previous))
+            before = state_path.read_bytes()
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+
+            result = subprocess.run(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "reset-safe",
+                 "--agent-cmd", "true", "--validate-cmd", "false", "--reset-state", "--max-rounds", "1"],
+                capture_output=True, text=True, env=env,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(state_path.read_bytes(), before, "validate 失敗時舊 state 必須原封不動")
+            self.assertEqual(snapshot_path.read_bytes(), snapshot_before,
+                             "Validate 失敗時舊 protected snapshot 也必須保留")
+            self.assertIn("啟動前檢查通過後才會正式清除", result.stdout)
+
+    def test_successful_reset_replaces_previous_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            workspace = workspace_root / "reset-success"
+            workspace.mkdir(parents=True)
+            prompts = workspace / "prompts"
+            prompts.mkdir()
+            for round_number in range(34, 39):
+                (prompts / f"round-{round_number:04d}.md").write_text("old prompt\n")
+            (workspace / "pending_issues").write_text("old crashed issue\n")
+            previous = L.Workspace.__new__(L.Workspace).fresh_state()
+            previous["round"] = 77
+            previous["plan"] = [{"order": 1, "task": "must be cleared"}]
+            previous["plan_version"] = 9
+            (workspace / "state.json").write_text(json.dumps(previous))
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+
+            result = subprocess.run(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "reset-success",
+                 "--agent-cmd", "true", "--validate-cmd", "true", "--reset-state", "--max-rounds", "1"],
+                capture_output=True, text=True, env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            current = json.loads((workspace / "state.json").read_text())
+            self.assertEqual(current["plan"], [])
+            self.assertEqual(current["plan_version"], 0)
+            self.assertEqual(current["round"], 1)
+            self.assertTrue((workspace / "prompts" / "round-0001.md").is_file(),
+                            "reset 後的當前 prompt 不得被舊高輪號 prompt 清理掉")
+            self.assertEqual(current["issues"], [], "reset 不得把舊 session pending issue 算進新 round")
+            self.assertFalse((workspace / "pending_issues").exists())
+            marker = json.loads((workspace / "startup_ready.json").read_text())
+            self.assertIsInstance(marker.get("pid"), int)
+
+
+class TestValidateTimeout(unittest.TestCase):
+    """正式 preflight validator 必須有 timeout，不能讓 starting 永久卡住。"""
+
+    def test_preflight_validator_timeout_stops_process_group(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            slow = shlex.join([sys.executable, "-c", "import time; time.sleep(10)"])
+            started = time.monotonic()
+            result = subprocess.run(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "validate-timeout",
+                 "--agent-cmd", "true", "--validate-cmd", slow,
+                 "--validate-timeout", "0.1", "--max-rounds", "1"],
+                capture_output=True, text=True, env=env, timeout=3,
+            )
+            elapsed = time.monotonic() - started
+            self.assertNotEqual(result.returncode, 0)
+            self.assertLess(elapsed, 2)
+            self.assertIn("逾時 0.1 秒", result.stdout)
+
+
+class TestStartupHandshake(unittest.TestCase):
+    """啟動狀態以 ready marker/process exit 為準，不再用固定 0.6 秒猜測。"""
+
+    def test_slow_failure_transitions_from_starting_to_failed(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = D.ROOT
+            name = "slow-startup-failure"
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(0.8); raise SystemExit(7)"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            try:
+                D.ROOT = Path(d)
+                (D.ROOT / name).mkdir()
+                D.JOBS[name] = D.Job(name, d, process)
+                self.assertEqual(D.job_startup_status(name, process.pid)["status"], "starting")
+                process.wait(timeout=2)
+                status = D.job_startup_status(name, process.pid)
+                self.assertEqual(status["status"], "failed")
+                self.assertEqual(status["rc"], 7)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                D.JOBS.pop(name, None)
+                D.ROOT = old_root
+
+    def test_matching_ready_marker_reports_ready(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = D.ROOT
+            name = "startup-ready"
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(2)"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            try:
+                D.ROOT = Path(d)
+                workspace = D.ROOT / name
+                workspace.mkdir()
+                (workspace / "startup_ready.json").write_text(json.dumps({"pid": process.pid}))
+                D.JOBS[name] = D.Job(name, d, process)
+                self.assertEqual(D.job_startup_status(name, process.pid)["status"], "ready")
+            finally:
+                process.kill()
+                process.wait()
+                D.JOBS.pop(name, None)
+                D.ROOT = old_root
+
+
+class TestTransactionalDashboardPlanImport(unittest.TestCase):
+    """Dashboard plan import 也必須等 loop preflight 綠才取代舊 state。"""
+
+    def test_failed_import_launch_preserves_old_state(self):
+        class ResponseCapture:
+            response = None
+
+            def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+                self.response = code, json.loads(body)
+
+            def _err(self, msg, code=400):
+                self._out(code, json.dumps({"error": msg}, ensure_ascii=False))
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            workspace = workspace_root / "import-safe"
+            workspace.mkdir(parents=True)
+            previous = L.Workspace.__new__(L.Workspace).fresh_state()
+            previous["round"] = 77
+            previous["plan"] = [{"order": 1, "task": "old plan survives"}]
+            previous["plan_version"] = 4
+            state_path = workspace / "state.json"
+            state_path.write_text(json.dumps(previous))
+            before = state_path.read_bytes()
+            (workspace / "snapshots").mkdir()
+            snapshot_path = workspace / "snapshots" / "goal.md"
+            snapshot_path.write_text("old snapshot\n")
+            snapshot_before = snapshot_path.read_bytes()
+            config = {
+                "agent_cmds": [{"label": "true", "cmd": "true"}],
+                "validate_cmds": [{"label": "false", "cmd": "false"}],
+                "extra_path_dirs": [],
+                "notify_cmd": "",
+                "defaults": {"validate_timeout": 1},
+            }
+            old_values = (D.ROOT, L.WORKSPACE_ROOT, D.load_config, os.environ.get("LOOP_AGENT_WORKSPACE_ROOT"))
+            try:
+                D.ROOT = workspace_root
+                L.WORKSPACE_ROOT = workspace_root
+                D.load_config = lambda: config
+                os.environ["LOOP_AGENT_WORKSPACE_ROOT"] = str(workspace_root)
+                handler = ResponseCapture()
+                D.Handler.api_launch(handler, {
+                    "repo": str(repo), "name": "import-safe", "agent_idx": 0, "validate_idx": 0,
+                    "plan_json": '[{"order":1,"task":"new imported plan"}]', "start_phase": "plan",
+                })
+                self.assertEqual(handler.response[0], 200)
+                job = D.JOBS["import-safe"]
+                job.popen.wait(timeout=3)
+                job.reader.join(timeout=1)
+                self.assertEqual(D.job_startup_status("import-safe", job.popen.pid)["status"], "failed")
+                self.assertEqual(state_path.read_bytes(), before, "失敗 import 不得覆寫舊 state")
+                self.assertEqual(snapshot_path.read_bytes(), snapshot_before,
+                                 "失敗 import 不得覆寫舊 protected snapshot")
+            finally:
+                job = D.JOBS.pop("import-safe", None)
+                if job and job.alive():
+                    job.stop(wait=True)
+                D.ROOT, L.WORKSPACE_ROOT, D.load_config = old_values[:3]
+                if old_values[3] is None:
+                    os.environ.pop("LOOP_AGENT_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["LOOP_AGENT_WORKSPACE_ROOT"] = old_values[3]
+
+
+class TestWorkspaceFleetValidity(unittest.TestCase):
+    """只有 log、沒有 state.json 的失敗啟動目錄不應顯示成可操作 workspace。"""
+
+    def test_state_less_directory_is_not_listed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "ghost").mkdir()
+            (root / "ghost" / "console.log").write_text("failed\n")
+            valid = root / "valid"
+            valid.mkdir()
+            (valid / "state.json").write_text(json.dumps(L.Workspace.__new__(L.Workspace).fresh_state()))
+            old_root = D.ROOT
+            try:
+                D.ROOT = root
+                self.assertEqual([item["name"] for item in D.list_workspaces()], ["valid"])
+            finally:
+                D.ROOT = old_root
+
+
+class TestStopIdempotency(unittest.TestCase):
+    """fleet 狀態稍舊時重複 stop 不應報「沒有在執行中」。"""
+
+    def test_already_stopped_returns_success(self):
+        class ResponseCapture:
+            response = None
+
+            def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+                self.response = code, json.loads(body)
+
+        handler = ResponseCapture()
+        D.Handler.api_stop(handler, {"name": "verifytmp-not-running"})
+        self.assertEqual(handler.response[0], 200)
+        self.assertTrue(handler.response[1]["already_stopped"])
+
+
+class TestPortableDashboardConfig(unittest.TestCase):
+    """GUI/IDE 沒載入 shell profile 時，個人 PATH 與團隊/個人分層仍應生效。"""
+
+    def test_home_relative_extra_path_finds_cli(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            bindir = home / ".local" / "bin"
+            bindir.mkdir(parents=True)
+            cli = bindir / "portable-cli"
+            cli.write_text("#!/bin/sh\necho portable-ok\n")
+            cli.chmod(0o755)
+            old_home, old_path = os.environ.get("HOME"), os.environ.get("PATH")
+            try:
+                os.environ["HOME"] = str(home)
+                os.environ["PATH"] = "/usr/bin:/bin"
+                env = D.command_env({"extra_path_dirs": ["~/.local/bin"]})
+                result = subprocess.run(["portable-cli"], capture_output=True, text=True, env=env)
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("portable-ok", result.stdout)
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+                if old_path is None:
+                    os.environ.pop("PATH", None)
+                else:
+                    os.environ["PATH"] = old_path
+
+    def test_personal_save_never_rewrites_project_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            project_path = root / "dashboard.config.shared.json"
+            personal_path = root / "dashboard.config.local.json"
+            legacy_path = root / "dashboard.config.json"
+            project = {
+                "agent_cmds": [{"label": "shared", "cmd": "shared-cli"}],
+                "validate_cmds": [{"label": "green", "cmd": "true"}],
+                "repo_roots": ["~/shared"],
+                "defaults": {"flag_threshold": 7},
+            }
+            project_path.write_text(json.dumps(project))
+            original = project_path.read_bytes()
+            old_values = (D.CONFIG_OVERRIDE, D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH,
+                          D.LEGACY_CONFIG_PATH, D.CONFIG_PATH)
+            try:
+                D.CONFIG_OVERRIDE = None
+                D.PROJECT_CONFIG_PATH = project_path
+                D.PERSONAL_CONFIG_PATH = personal_path
+                D.LEGACY_CONFIG_PATH = legacy_path
+                D.CONFIG_PATH = personal_path
+                D.save_personal_config({
+                    "agent_cmds": [{"label": "mine", "cmd": "my-cli"}],
+                    "extra_path_dirs": ["~/.local/bin"],
+                })
+                effective = D.load_config()
+                self.assertEqual(project_path.read_bytes(), original)
+                self.assertEqual(effective["validate_cmds"], project["validate_cmds"])
+                self.assertEqual(effective["agent_cmds"][0]["cmd"], "my-cli")
+                self.assertEqual(set(json.loads(personal_path.read_text())),
+                                 {"agent_cmds", "extra_path_dirs"})
+            finally:
+                (D.CONFIG_OVERRIDE, D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH,
+                 D.LEGACY_CONFIG_PATH, D.CONFIG_PATH) = old_values
+
+
 class TestDashboardStateLockCoverage(unittest.TestCase):
     """#3 run/launch 必須和 edit/phase 共用 workspace lock,不能在 stopped check 後競態。"""
 
     def test_all_workspace_mutations_are_decorated(self):
-        for method in ("api_launch", "api_run", "api_edit_state", "api_edit_config", "api_phase", "api_set_task"):
+        for method in ("api_launch", "api_run", "api_edit_state", "api_edit_config", "api_validate", "api_test_agent", "api_phase", "api_set_task"):
             self.assertTrue(hasattr(getattr(D.Handler, method), "__wrapped__"), f"{method} 必須套 workspace lock")
 
     def test_launch_blank_name_locks_repo_basename(self):

@@ -40,6 +40,9 @@ def prepare_fixture():
         "import json, os, subprocess, sys, time\n"
         "from pathlib import Path\n"
         "sys.stdin.read()\n"
+        "if 'LOOP_WS' not in os.environ:\n"
+        "    print('E2E Agent CLI test result', flush=True)\n"
+        "    raise SystemExit(0)\n"
         "ws = Path(os.environ['LOOP_WS'])\n"
         "phase = (ws / 'phase').read_text().strip()\n"
         "task = (ws / 'current_task').read_text().strip()\n"
@@ -71,6 +74,7 @@ def prepare_fixture():
             "flag_threshold": 10,
             "done_threshold": 999,
             "round_timeout": 1,
+            "validate_timeout": 10,
             "red_limit": 20,
             "stall_limit": 300,
             "stuck_stop": False,

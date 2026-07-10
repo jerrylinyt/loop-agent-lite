@@ -11,6 +11,7 @@ export default function App() {
   const dashboard = useDashboardData();
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [leftWidth, setLeftWidth] = useState(() => +(localStorage.getItem("left-pane-width") || Math.round(window.innerWidth * 0.44)));
+  const [rightCollapsed, setRightCollapsed] = useState(() => localStorage.getItem("agent-console-collapsed") === "1");
   const workspace = useMemo(
     () => dashboard.workspaces.find((item) => item.name === dashboard.selected),
     [dashboard.workspaces, dashboard.selected]
@@ -23,6 +24,12 @@ export default function App() {
     setLauncherOpen(false);
     dashboard.selectWorkspace(name);
     void dashboard.refreshWorkspaces();
+  };
+  const toggleRight = () => {
+    setRightCollapsed((value) => {
+      localStorage.setItem("agent-console-collapsed", value ? "0" : "1");
+      return !value;
+    });
   };
 
   return (
@@ -48,10 +55,10 @@ export default function App() {
             {!dashboard.bootstrap.readonly && <button type="button" className="primary-button" onClick={() => setLauncherOpen(true)}>＋ 啟動第一個 loop</button>}
           </main>
         ) : (
-          <main className="dashboard-grid" style={{ gridTemplateColumns: `${leftWidth}px 6px minmax(0, 1fr)` }}>
-            <WorkspaceView key={dashboard.selected} workspace={workspace} state={dashboard.state} readonly={dashboard.bootstrap.readonly} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} />
+          <main className="dashboard-grid" style={{ gridTemplateColumns: `${leftWidth}px 6px ${rightCollapsed ? "42px" : "minmax(0, 1fr)"}` }}>
+            <WorkspaceView key={dashboard.selected} workspace={workspace} state={dashboard.state} consoleText={dashboard.consoleText} readonly={dashboard.bootstrap.readonly} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} />
             <Splitter onResize={resize} />
-            <ConsolePane text={dashboard.consoleText} round={dashboard.state?.round ?? 0} running={workspace?.running ?? false} hasWorkspace={!!dashboard.selected} />
+            <ConsolePane text={dashboard.consoleText} round={dashboard.state?.round ?? 0} running={workspace?.running ?? false} hasWorkspace={!!dashboard.selected} collapsed={rightCollapsed} onToggleCollapse={toggleRight} />
           </main>
         )}
       </div>

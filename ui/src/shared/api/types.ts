@@ -38,8 +38,26 @@ export interface DashboardConfig {
   flag_threshold?: number;
   done_threshold?: number;
   round_timeout?: number;
+  validate_timeout?: number;
   red_limit?: number;
   stall_limit?: number;
+}
+
+export interface StartupResponse {
+  ok?: boolean;
+  starting?: boolean;
+  name?: string;
+  pid?: number;
+  startup_timeout?: number;
+  error?: string;
+}
+
+export interface StartupStatus {
+  status?: "starting" | "ready" | "failed";
+  pid?: number;
+  rc?: number | null;
+  error?: string;
+  tail?: string;
 }
 
 export interface WorkspaceState {
@@ -71,6 +89,13 @@ export interface ConfigResponse {
   validate_cmds: SelectCommand[];
   repos: string[];
   defaults: DashboardConfig;
+  extra_path_dirs?: string[];
+  resolved_extra_path_dirs?: string[];
+  config_path?: string;
+  personal_config_path?: string;
+  project_config_path?: string;
+  config_override?: boolean;
+  repo_roots?: string[];
 }
 
 export interface JobInfo {
