@@ -56,6 +56,7 @@ VALIDATE_TAIL = 50                     # 驗證失敗餵給下一輪的輸出尾
 TASK_LIST_TRUNC = 80                   # prompt 任務總覽單行截斷長度
 CONSOLE_MAX_BYTES = 5 * 1024 * 1024   # console.log 單檔 5 MiB
 CONSOLE_BACKUPS = 3                    # 保留 console.log.1～.3
+STOP_AFTER_ROUND_FILE = "stop-after-round.json"
 
 _CONSOLE_PATH = None
 _CONSOLE_LOCK = threading.Lock()
@@ -228,6 +229,36 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
+def stop_after_round_requested(workspace_dir: Path, pid, session_id, *, consume=False) -> bool:
+    """檢查本 session 的「本輪後停止」控制檔；consume 時連壞檔/舊 session 一併清掉。"""
+    path = Path(workspace_dir) / STOP_AFTER_ROUND_FILE
+    read_path = path
+    claimed = None
+    if consume:
+        # 先原子 claim 再讀：若 Dashboard 恰在讀取後寫入新請求，不會被這次 unlink 誤刪。
+        claimed = path.with_name(f".{path.name}.consume.{os.getpid()}.{uuid.uuid4().hex}")
+        try:
+            os.replace(path, claimed)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+        read_path = claimed
+    try:
+        request = json.loads(read_path.read_text(encoding="utf-8"))
+        matches = (int(request.get("pid")) == int(pid) and
+                   bool(session_id) and request.get("session_id") == session_id)
+    except (AttributeError, FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        matches = False
+    finally:
+        if claimed is not None:
+            try:
+                claimed.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return matches
+
+
 class StateLoadError(RuntimeError):
     """主 state 與 recovery checkpoint 都存在但無法安全解碼。"""
 
@@ -315,6 +346,7 @@ class Workspace:
         self.state_path = self.dir / "state.json"
         self.checkpoint_path = state_checkpoint_path(self.state_path)
         self.history = self.dir / "history.log"
+        self.stop_after_round_path = self.dir / STOP_AFTER_ROUND_FILE
         self._state_hash = None  # 本 session 內偵測 agent 直接改 state.json 用
         self._checkpoint_hash = None
         self.state_recovered = False
@@ -407,6 +439,10 @@ class Workspace:
         atomic_write_bytes(self.dir / "dispatch.json", payload)
         atomic_write_bytes(self.dir / "phase", phase.encode("utf-8"))
         atomic_write_bytes(self.dir / "current_task", task_id.encode("utf-8"))
+
+    def take_stop_after_round(self, pid, session_id) -> bool:
+        """消耗控制檔；只有精確命中目前 session 才回傳 True。"""
+        return stop_after_round_requested(self.dir, pid, session_id, consume=True)
 
     # ---- 受保護檔案快照(goal / 初步規劃書) ----
     def snapshot_protected(self, repo, rel_paths):
@@ -749,9 +785,17 @@ def main():
                        "repo": str(repo), "agent_cmd": shlex.join(agent_cmd),
                        "validate_cmd": shlex.join(validate_cmd),
                        "goal": args.goal, "plan_doc": args.plan_doc}
-    state["loop"] = {"pid": os.getpid(), "started_at": datetime.now().isoformat(timespec="seconds")}
+    # 舊 session 的停止請求不可跨重啟生效；先清掉，再公開新 pid/session_id。
+    ws.stop_after_round_path.unlink(missing_ok=True)
+    for orphan in ws.dir.glob(f".{STOP_AFTER_ROUND_FILE}.consume.*"):
+        orphan.unlink(missing_ok=True)
+    session_id = uuid.uuid4().hex
+    state["loop"] = {"pid": os.getpid(), "session_id": session_id,
+                     "started_at": datetime.now().isoformat(timespec="seconds")}
 
     def _mark_stopped():
+        # 若「本輪後停止」後又立刻按立即停止，或程序在輪末競態退出，不把請求留給下次 session。
+        stop_after_round_requested(ws.dir, os.getpid(), session_id, consume=True)
         state["loop"]["pid"] = None  # 正常/Ctrl-C 退出都清 pid;被 SIGKILL 留殘值,由 dashboard ps 檢查兜底
         ws.save_state(state)
     atexit.register(_mark_stopped)
@@ -793,6 +837,13 @@ def main():
     goal_text = (repo / args.goal).read_text(encoding="utf-8")
 
     while state["phase"] != "done":
+        # 接住「上一輪落盤後、下一輪 while 開始前」送達的請求，不再 spawn 新 Agent。
+        if ws.take_stop_after_round(os.getpid(), session_id):
+            state["agent_backoff_seconds"] = 0
+            state["agent_backoff_until"] = None
+            ws.save_state(state)
+            log(f"⏸ 已依要求停止｜完整保留至 round {state['round']}，未啟動下一輪")
+            break
         if args.max_rounds and state["round"] >= args.max_rounds:
             log(f"⏹ 達測試用輪數上限 {args.max_rounds},停止")
             break
@@ -1101,14 +1152,30 @@ def main():
             log(f"⏳ Agent CLI 連續異常 {state['agent_failure_streak']} 輪｜{retry_delay:g} 秒後重試"
                 f"（上限 {args.agent_backoff_max:g} 秒）")
         ws.save_state(state)
-        if retry_delay:
+        stop_after_round = ws.take_stop_after_round(os.getpid(), session_id)
+        if retry_delay and not stop_after_round:
             try:
-                time.sleep(retry_delay)
+                # 退避已位於兩輪之間；此時收到請求應立即停，不必等完退避，更不能再開一輪。
+                deadline = time.monotonic() + retry_delay
+                while True:
+                    if ws.take_stop_after_round(os.getpid(), session_id):
+                        stop_after_round = True
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.2, remaining))
             finally:
                 # Ctrl-C/正常醒來都清掉 UI 的等待狀態；failure streak 留到下一輪成功才歸零。
                 state["agent_backoff_seconds"] = 0
                 state["agent_backoff_until"] = None
                 ws.save_state(state)
+        if stop_after_round:
+            state["agent_backoff_seconds"] = 0
+            state["agent_backoff_until"] = None
+            ws.save_state(state)
+            log(f"⏸ 已依要求停止｜round {rnd} 已完整處理並落盤，未啟動下一輪")
+            break
 
     if state["phase"] == "done":
         report = (f"# loop-agent-lite RUN REPORT\n\n"

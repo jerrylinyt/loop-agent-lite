@@ -80,6 +80,8 @@ Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace 
 
 - 左側是 Loop 狀態；右側是 Agent 輸出，可切換 Agent／其他／全部。
 - 分隔線可拖曳調整欄寬；箭頭可收合，設定會保存在瀏覽器。
+- 正常要停時用「本輪後停止」：目前 Agent、Validate 與 state/history 落盤完成後才停，不會啟動下一輪。
+- Agent CLI 卡死或明顯失控時用「立即停止」；它會中斷目前 round，state 可在下次運行時續用。
 - 停止後可編輯計畫、切換階段或修改 agent／validate 設定，再按 ▶ 運行。
 - 「重置 workspace state」會保留舊 state，直到新流程通過 preflight。
 - 「匯入 plan」會建立全新的 state；可選擇從規劃期或執行期開始。
@@ -98,6 +100,7 @@ Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace 
 workspace/<name>/
 ├── state.json       目前進度與執行設定
 ├── state.last-good.json  最近一次合法 state 的復原副本（主檔不可讀時才使用）
+├── stop-after-round.json  暫時的 session-scoped 平順停止請求（loop 消耗後刪除）
 ├── console.log      完整流程紀錄
 ├── logs/             每輪 Agent 原始輸出
 ├── prompts/          最近幾輪送出的 prompt

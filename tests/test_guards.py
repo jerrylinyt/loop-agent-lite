@@ -726,6 +726,91 @@ class TestStopIdempotency(unittest.TestCase):
         self.assertTrue(handler.response[1]["already_stopped"])
 
 
+class TestGracefulRoundStop(unittest.TestCase):
+    """平順停止必須封完目前 round，且控制檔不可跨 session 誤觸發。"""
+
+    def test_request_finishes_current_round_before_stopping(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            marker = root / "agent-started"
+            agent = root / "slow_agent.py"
+            agent.write_text(
+                "import sys, time\n"
+                "from pathlib import Path\n"
+                "sys.stdin.read()\n"
+                f"Path({str(marker)!r}).write_text('started')\n"
+                "time.sleep(0.45)\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            process = subprocess.Popen(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "graceful-stop",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--max-rounds", "5"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+            )
+            try:
+                state_path = workspace_root / "graceful-stop" / "state.json"
+                deadline = time.monotonic() + 3
+                state = None
+                while time.monotonic() < deadline:
+                    try:
+                        candidate = json.loads(state_path.read_text())
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        time.sleep(0.02)
+                        continue
+                    if marker.exists() and (candidate.get("loop") or {}).get("session_id"):
+                        state = candidate
+                        break
+                    time.sleep(0.02)
+                self.assertIsNotNone(state, "Agent 啟動後應公開本次 loop session")
+                loop_state = state["loop"]
+                request = {"pid": loop_state["pid"], "session_id": loop_state["session_id"]}
+                L.atomic_write_bytes(
+                    workspace_root / "graceful-stop" / L.STOP_AFTER_ROUND_FILE,
+                    json.dumps(request).encode(),
+                )
+                requested_at = time.monotonic()
+                self.assertIsNone(process.poll(), "本輪後停止不得立刻殺掉仍在執行的 Agent")
+                output, _ = process.communicate(timeout=3)
+
+                self.assertEqual(process.returncode, 0, output)
+                self.assertGreaterEqual(time.monotonic() - requested_at, 0.25)
+                stopped = json.loads(state_path.read_text())
+                self.assertEqual(stopped["round"], 1)
+                self.assertIsNone(stopped["loop"]["pid"])
+                history = (workspace_root / "graceful-stop" / "history.log").read_text().splitlines()
+                self.assertEqual(len(history), 1, "完整落盤目前 round 後不得再 spawn 下一輪")
+                self.assertIn("已依要求停止", output)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+    def test_stale_request_does_not_stop_new_session(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            workspace = workspace_root / "stale-stop"
+            workspace.mkdir(parents=True)
+            (workspace / L.STOP_AFTER_ROUND_FILE).write_text(
+                json.dumps({"pid": os.getpid(), "session_id": "old-session"})
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            result = subprocess.run(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "stale-stop",
+                 "--agent-cmd", "true", "--validate-cmd", "true", "--max-rounds", "1"],
+                capture_output=True, text=True, env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            state = json.loads((workspace / "state.json").read_text())
+            self.assertEqual(state["round"], 1)
+            self.assertFalse((workspace / L.STOP_AFTER_ROUND_FILE).exists())
+
+
 class TestPortableDashboardConfig(unittest.TestCase):
     """GUI/IDE 沒載入 shell profile 時，個人 PATH 與團隊/個人分層仍應生效。"""
 
@@ -796,7 +881,7 @@ class TestDashboardStateLockCoverage(unittest.TestCase):
     """#3 run/launch 必須和 edit/phase 共用 workspace lock,不能在 stopped check 後競態。"""
 
     def test_all_workspace_mutations_are_decorated(self):
-        for method in ("api_launch", "api_run", "api_edit_state", "api_edit_config", "api_validate", "api_test_agent", "api_phase", "api_set_task"):
+        for method in ("api_launch", "api_run", "api_drain", "api_edit_state", "api_edit_config", "api_validate", "api_test_agent", "api_phase", "api_set_task"):
             self.assertTrue(hasattr(getattr(D.Handler, method), "__wrapped__"), f"{method} 必須套 workspace lock")
 
     def test_launch_blank_name_locks_repo_basename(self):
