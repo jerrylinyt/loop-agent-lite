@@ -525,11 +525,14 @@ def job_startup_status(name, pid):
                 "tail": "\n".join(list(job.out)[-80:])}
     try:
         ready = safe_workspace_dir(name) / "startup_ready.json"
+        loop_mod.workspace_file(ready, "startup marker")
     except ValueError as e:
         return {"status": "failed", "error": str(e)}
     try:
-        marker = json.loads(ready.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+        fd = loop_mod._open_regular(ready, os.O_RDONLY)
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=True) as stream:
+            marker = json.load(stream)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
         return {"status": "starting"}
     if marker.get("pid") == expected_pid:
         return {"status": "ready", "pid": expected_pid}
@@ -548,6 +551,8 @@ def read_state(name, *, repair=True):
         state, _data, recovered = loop_mod.load_checkpointed_state(state_path, repair=repair)
     except FileNotFoundError:
         return None, f"workspace {name} 不存在(沒有 state.json/checkpoint)"
+    except ValueError as e:
+        return None, f"workspace artifact 不安全:{e}"
     except loop_mod.StateLoadError as e:
         return None, f"state.json 與 recovery checkpoint 都無法讀取:{e}"
     if recovered:
@@ -574,7 +579,10 @@ def read_report(name):
     if not loop_mod.valid_workspace_name(name):
         return {"error": f"workspace 名稱不合法：{loop_mod.WORKSPACE_NAME_RULE}"}
     try:
-        return {"content": (safe_workspace_dir(name) / "REPORT.md").read_text(encoding="utf-8")}
+        report = loop_mod.workspace_file(safe_workspace_dir(name) / "REPORT.md", "REPORT.md")
+        fd = loop_mod._open_regular(report, os.O_RDONLY)
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=True) as stream:
+            return {"content": stream.read()}
     except FileNotFoundError:
         return {"error": "REPORT.md 不存在——全部任務收斂完成後才會由 loop 產生"}
     except (OSError, ValueError) as e:
@@ -613,11 +621,19 @@ def read_prompt(name):
         return int(m.group(1)) if m else -1
 
     try:
-        latest = max((safe_workspace_dir(name) / "prompts").glob("round-*.md"),
+        prompts_dir = loop_mod.workspace_directory(safe_workspace_dir(name) / "prompts", "prompts")
+        if prompts_dir is None:
+            return {"error": "尚無 prompt 紀錄——loop 送出第一輪後才會出現"}
+        candidates = (path for path in prompts_dir.glob("round-*.md")
+                      if loop_mod.workspace_file(path, "round prompt") is not None)
+        latest = max(candidates,
                      key=round_num, default=None)
         if latest is None:
             return {"error": "尚無 prompt 紀錄——loop 送出第一輪後才會出現"}
-        return {"content": latest.read_text(encoding="utf-8"),
+        fd = loop_mod._open_regular(latest, os.O_RDONLY)
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=True) as stream:
+            content = stream.read()
+        return {"content": content,
                 "round": round_num(latest), "file": latest.name}
     except (OSError, ValueError) as e:
         return {"error": f"prompt 讀取失敗:{e}"}
@@ -631,7 +647,7 @@ def workspace_console_log(name, message):
         return
     try:
         workspace_dir = safe_workspace_dir(name)
-        workspace_dir.mkdir(parents=True, exist_ok=True)
+        loop_mod.ensure_real_directory(workspace_dir, "workspace 目錄")
         loop_mod.append_console(workspace_dir / "console.log", line)
     except (OSError, ValueError) as e:
         print(f"⚠ console.log 寫入失敗:{e}", flush=True)
@@ -774,7 +790,17 @@ def list_workspaces():
     for d in sorted(ROOT.iterdir()):
         if not loop_mod.valid_workspace_name(d.name) or d.is_symlink() or not d.is_dir():
             continue
-        if not ((d / "state.json").is_file() or (d / "state.last-good.json").is_file()):
+        state_files = []
+        for artifact in (d / "state.json", d / "state.last-good.json"):
+            try:
+                info = artifact.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                state_files.append(artifact)
+        if not state_files:
             continue
         info = {"name": d.name, "phase": None, "running": False}
         st, err = read_state(d.name, repair=False)
@@ -801,26 +827,30 @@ TAIL_INIT = 64 * 1024  # offset<0(首抓)時只回檔案尾段,超長 log 秒開
 
 
 def read_incremental(path: Path, offset: int):
-    if not path.exists():
-        return {"size": 0, "data": ""}
-    size = path.stat().st_size
-    if offset < 0:  # 首抓:直接跳到尾段,從下一個完整行開始
-        offset = max(0, size - TAIL_INIT)
-        with open(path, "rb") as f:
+    try:
+        path = loop_mod.workspace_file(path, "workspace log")
+        fd = loop_mod._open_regular(path, os.O_RDONLY)
+        with os.fdopen(fd, "rb", closefd=True) as f:
+            size = os.fstat(f.fileno()).st_size
+            if offset < 0:  # 首抓:直接跳到尾段,從下一個完整行開始
+                offset = max(0, size - TAIL_INIT)
+                f.seek(offset)
+                data = f.read(MAX_CHUNK)
+                if offset > 0:
+                    nl = data.find(b"\n")
+                    if nl != -1:
+                        offset += nl + 1
+                        data = data[nl + 1:]
+                return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace")}
+            if offset > size:
+                offset = 0
             f.seek(offset)
             data = f.read(MAX_CHUNK)
-        if offset > 0:
-            nl = data.find(b"\n")
-            if nl != -1:
-                offset += nl + 1
-                data = data[nl + 1:]
         return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace")}
-    if offset > size:
-        offset = 0
-    with open(path, "rb") as f:
-        f.seek(offset)
-        data = f.read(MAX_CHUNK)
-    return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace")}
+    except FileNotFoundError:
+        return {"size": 0, "data": ""}
+    except (OSError, ValueError) as e:
+        return {"size": 0, "data": "", "error": f"workspace log 不安全:{e}"}
 
 
 class Handler(BaseHTTPRequestHandler):

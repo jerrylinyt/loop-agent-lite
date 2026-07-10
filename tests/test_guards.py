@@ -441,6 +441,82 @@ class TestConsoleRotation(unittest.TestCase):
             self.assertFalse((Path(d) / "console.log.3").exists())
 
 
+class TestWorkspaceArtifactGuards(unittest.TestCase):
+    """workspace 內部的 python-owned artifact 不得藉 symlink 逸出或讀取外部內容。"""
+
+    def test_workspace_constructor_rejects_symlinked_internal_directories(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            workspace_root = root / "workspace"
+            outside = root / "outside"
+            outside.mkdir()
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = workspace_root
+                L.Workspace("safe")
+                for child in ("logs", "prompts", "snapshots"):
+                    path = workspace_root / "safe" / child
+                    shutil.rmtree(path)
+                    path.symlink_to(outside, target_is_directory=True)
+                    with self.subTest(child=child), self.assertRaises(ValueError):
+                        L.Workspace("safe")
+                    self.assertFalse((outside / "round-0001.md").exists())
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_state_console_report_and_stream_reads_reject_symlinks(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            workspace_root = root / "workspace"
+            workspace = workspace_root / "safe"
+            workspace.mkdir(parents=True)
+            outside = root / "outside"
+            outside.write_text("outside secret\n", encoding="utf-8")
+            old_values = L.WORKSPACE_ROOT, D.ROOT
+            try:
+                L.WORKSPACE_ROOT = workspace_root
+                D.ROOT = workspace_root
+                ws = L.Workspace("safe")
+                ws.save_state(ws.fresh_state())
+
+                ws.state_path.unlink()
+                ws.state_path.symlink_to(outside)
+                with self.assertRaises(ValueError):
+                    L.Workspace("safe")
+                state, error = D.read_state("safe", repair=False)
+                self.assertIsNone(state)
+                self.assertIn("不安全", error)
+                self.assertNotIn("outside secret", error)
+
+                (workspace / "console.log").symlink_to(outside)
+                D.workspace_console_log("safe", "must not escape")
+                self.assertEqual(outside.read_text(encoding="utf-8"), "outside secret\n")
+
+                (workspace / "REPORT.md").symlink_to(outside)
+                report = D.read_report("safe")
+                self.assertIn("error", report)
+                self.assertNotIn("outside secret", json.dumps(report, ensure_ascii=False))
+
+                prompts = workspace / "prompts"
+                (prompts / "round-0001.md").symlink_to(outside)
+                prompt = D.read_prompt("safe")
+                self.assertIn("error", prompt)
+                self.assertNotIn("outside secret", json.dumps(prompt, ensure_ascii=False))
+
+                logs = workspace / "logs"
+                (logs / "round-0001.log").symlink_to(outside)
+                tail = D.read_incremental(logs / "round-0001.log", -1)
+                self.assertIn("error", tail)
+                self.assertNotIn("outside secret", json.dumps(tail, ensure_ascii=False))
+
+                (workspace / "history.log").symlink_to(outside)
+                history = D.read_incremental(workspace / "history.log", -1)
+                self.assertIn("error", history)
+                self.assertNotIn("outside secret", json.dumps(history, ensure_ascii=False))
+            finally:
+                L.WORKSPACE_ROOT, D.ROOT = old_values
+
+
 class TestPreflightConsole(unittest.TestCase):
     """preflight 立刻失敗時，原因仍必須落進 dashboard 正在看的 console.log。"""
 

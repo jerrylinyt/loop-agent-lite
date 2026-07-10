@@ -24,6 +24,7 @@
 
 import argparse
 import atexit
+import errno
 import fcntl
 import hashlib
 import json
@@ -96,6 +97,94 @@ def workspace_path(root: Path, name: str) -> Path:
     if stat.S_ISLNK(mode):
         raise ValueError("workspace 目錄不可為 symbolic link（避免逸出 workspace root）")
     return path
+
+
+def workspace_directory(path: Path, label: str = "workspace 目錄", *, create=False):
+    """驗證實體目錄；create=True 時才建立，讀取投影不會藉機改 workspace。"""
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if not create:
+            return None
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            info = path.lstat()
+        except OSError as e:
+            raise ValueError(f"{label}無法建立:{e}") from e
+    except OSError as e:
+        raise ValueError(f"{label}無法檢查:{e}") from e
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"{label}不可為 symbolic link")
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"{label}必須是目錄")
+    return path
+
+
+def ensure_real_directory(path: Path, label: str = "workspace 目錄") -> Path:
+    """建立或驗證實體目錄；任何 symlink/非目錄都 fail-closed。"""
+    return workspace_directory(path, label, create=True)
+
+
+def workspace_file(path: Path, label: str = "workspace 檔案") -> Path:
+    """驗證 workspace artifact 是 regular file；檔案不存在時保留建立語意。"""
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return path
+    except OSError as e:
+        raise ValueError(f"{label}無法檢查:{e}") from e
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"{label}不可為 symbolic link")
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"{label}必須是 regular file")
+    return path
+
+
+def _open_regular(path: Path, flags: int, mode: int = 0o600):
+    """以 O_NOFOLLOW 開啟 regular file，避免檔案在 workspace 內被換成連結/FIFO。"""
+    path = Path(path)
+    parent = path.parent
+    try:
+        parent_info = parent.lstat()
+    except FileNotFoundError as e:
+        raise ValueError(f"workspace artifact 父目錄不存在:{parent}") from e
+    except OSError as e:
+        raise ValueError(f"workspace artifact 父目錄無法檢查:{e}") from e
+    if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+        raise ValueError("workspace artifact 父目錄必須是實體目錄")
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ValueError("此系統不支援安全的 O_NOFOLLOW 檔案操作")
+    try:
+        fd = os.open(path, flags | nofollow, mode)
+    except OSError as e:
+        if e.errno == getattr(errno, "ENOENT", 2):
+            raise FileNotFoundError(path) from e
+        raise ValueError(f"無法安全開啟 {path.name}:{e}") from e
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError(f"{path.name}必須是單一 regular file")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def append_regular_text(path: Path, text: str) -> None:
+    """安全追加 UTF-8 文字；供 history/console 共用。"""
+    ensure_real_directory(Path(path).parent, "workspace artifact 父目錄")
+    fd = _open_regular(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    try:
+        with os.fdopen(fd, "a", encoding="utf-8", closefd=True) as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        # fdopen 接手後例外會由 context manager 關閉；這裡只讓原例外上拋。
+        raise
 
 
 def repo_relative_path(repo: Path, rel: str) -> Path:
@@ -200,20 +289,24 @@ def configure_console(path: Path) -> None:
     """將 loop 與 agent 的所有輸出追加到 workspace 共用 console。"""
     global _CONSOLE_PATH
     _CONSOLE_PATH = path
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_real_directory(path.parent, "console 父目錄")
     append_console(path, f"\n[{now_ts()}] ━━━ 新的 loop session ━━━")
 
 
 def append_console(path: Path, line: str, *, max_bytes: int = CONSOLE_MAX_BYTES,
                    backups: int = CONSOLE_BACKUPS) -> None:
     """跨 process 鎖定後追加 console；超過大小時輪替 .1～.N。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_real_directory(path.parent, "console 父目錄")
     encoded = (line + "\n").encode("utf-8")
     lock_path = path.with_name(f".{path.name}.lock")
-    with _CONSOLE_LOCK, open(lock_path, "a+b") as lock_file:
+    lock_fd = _open_regular(lock_path, os.O_RDWR | os.O_CREAT)
+    with _CONSOLE_LOCK, os.fdopen(lock_fd, "a+b", closefd=True) as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
-            current_size = path.stat().st_size if path.exists() else 0
+            try:
+                current_size = workspace_file(path, "console.log").lstat().st_size
+            except FileNotFoundError:
+                current_size = 0
             if max_bytes > 0 and current_size > 0 and current_size + len(encoded) > max_bytes:
                 if backups > 0:
                     oldest = path.with_name(f"{path.name}.{backups}")
@@ -225,9 +318,11 @@ def append_console(path: Path, line: str, *, max_bytes: int = CONSOLE_MAX_BYTES,
                     os.replace(path, path.with_name(f"{path.name}.1"))
                 else:
                     path.unlink(missing_ok=True)
-            with open(path, "ab") as console:
+            console_fd = _open_regular(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            with os.fdopen(console_fd, "ab", closefd=True) as console:
                 console.write(encoded)
                 console.flush()
+                os.fsync(console.fileno())
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
@@ -348,6 +443,9 @@ def sha256_bytes(data: bytes) -> str:
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     """原子寫:同目錄 tmp → fsync → os.replace。避免 SIGKILL/磁碟滿留下半截檔。
     唯一真相(state.json)不能寫到一半——這是跑整夜必備的 correctness 防線。"""
+    path = Path(path)
+    ensure_real_directory(path.parent, "原子寫入父目錄")
+    workspace_file(path, "原子寫入目標")
     # tmp 名帶 uuid:同 process 多執行緒(dashboard ThreadingHTTPServer)並發寫同一 state.json
     # 時不再共用 tmp,避免互相 truncate 或 replace 後對方拿到 FileNotFoundError(#3)。
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
@@ -360,7 +458,10 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
 
 def _stop_after_round_marker_matches(path: Path, pid, session_id) -> bool:
     try:
-        request = json.loads(path.read_text(encoding="utf-8"))
+        path = workspace_file(path, "stop marker")
+        fd = _open_regular(path, os.O_RDONLY)
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=True) as stream:
+            request = json.load(stream)
         return (int(request.get("pid")) == int(pid) and
                 bool(session_id) and request.get("session_id") == session_id)
     except (AttributeError, FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -457,10 +558,13 @@ def load_checkpointed_state(state_path: Path, *, repair: bool = True):
     primary 合法時永遠以它為準並刷新 checkpoint；只有 primary 不可讀時才採 checkpoint。
     repair=False 供唯讀 Dashboard 使用：可顯示 checkpoint，但不修改任何檔案。
     """
-    checkpoint = state_checkpoint_path(state_path)
+    state_path = workspace_file(state_path, "state.json")
+    checkpoint = workspace_file(state_checkpoint_path(state_path), "state.last-good.json")
     primary_error = None
     try:
-        primary_data = state_path.read_bytes()
+        fd = _open_regular(state_path, os.O_RDONLY)
+        with os.fdopen(fd, "rb", closefd=True) as stream:
+            primary_data = stream.read()
         state = decode_state_bytes(primary_data, "state.json")
     except FileNotFoundError as e:
         primary_error = e
@@ -469,7 +573,9 @@ def load_checkpointed_state(state_path: Path, *, repair: bool = True):
     else:
         if repair:
             try:
-                checkpoint_matches = checkpoint.read_bytes() == primary_data
+                checkpoint_fd = _open_regular(checkpoint, os.O_RDONLY)
+                with os.fdopen(checkpoint_fd, "rb", closefd=True) as stream:
+                    checkpoint_matches = stream.read() == primary_data
             except OSError:
                 checkpoint_matches = False
             if not checkpoint_matches:
@@ -477,7 +583,9 @@ def load_checkpointed_state(state_path: Path, *, repair: bool = True):
         return state, primary_data, False
 
     try:
-        checkpoint_data = checkpoint.read_bytes()
+        checkpoint_fd = _open_regular(checkpoint, os.O_RDONLY)
+        with os.fdopen(checkpoint_fd, "rb", closefd=True) as stream:
+            checkpoint_data = stream.read()
         state = decode_state_bytes(checkpoint_data, "state.last-good.json")
     except FileNotFoundError:
         if isinstance(primary_error, FileNotFoundError):
@@ -510,14 +618,24 @@ class Workspace:
         self.name = require_workspace_name(name)
         with workspace_operation_lock(WORKSPACE_ROOT, self.name):
             self.dir = workspace_path(WORKSPACE_ROOT, self.name)
-            (self.dir / "logs").mkdir(parents=True, exist_ok=True)
-            (self.dir / "prompts").mkdir(parents=True, exist_ok=True)
-            (self.dir / "snapshots").mkdir(parents=True, exist_ok=True)
+            ensure_real_directory(self.dir, "workspace 目錄")
+            for child in ("logs", "prompts", "snapshots"):
+                ensure_real_directory(self.dir / child, f"workspace/{child}")
         self.state_path = self.dir / "state.json"
         self.checkpoint_path = state_checkpoint_path(self.state_path)
         self.history = self.dir / "history.log"
         self.stop_after_round_path = self.dir / STOP_AFTER_ROUND_FILE
         self.stop_after_round_claimed_path = self.dir / STOP_AFTER_ROUND_CLAIMED_FILE
+        for path, label in (
+            (self.state_path, "state.json"),
+            (self.checkpoint_path, "state.last-good.json"),
+            (self.history, "history.log"),
+            (self.stop_after_round_path, "stop marker"),
+            (self.stop_after_round_claimed_path, "claimed stop marker"),
+            (self.dir / "console.log", "console.log"),
+            (self.dir / "REPORT.md", "REPORT.md"),
+        ):
+            workspace_file(path, label)
         self._state_hash = None  # 本 session 內偵測 agent 直接改 state.json 用
         self._checkpoint_hash = None
         self.state_recovered = False
@@ -564,10 +682,15 @@ class Workspace:
         """回傳 True 表示 agent 在本輪繞過 work.py 直接改了主 state 或 recovery copy。"""
         if self._state_hash is None:
             return False
-        if not self.state_path.exists() or not self.checkpoint_path.exists():
+        try:
+            workspace_file(self.state_path, "state.json")
+            workspace_file(self.checkpoint_path, "state.last-good.json")
+            primary_data = self.state_path.read_bytes()
+            checkpoint_data = self.checkpoint_path.read_bytes()
+        except (FileNotFoundError, OSError, ValueError):
             return True
-        return (sha256_bytes(self.state_path.read_bytes()) != self._state_hash or
-                sha256_bytes(self.checkpoint_path.read_bytes()) != self._checkpoint_hash)
+        return (sha256_bytes(primary_data) != self._state_hash or
+                sha256_bytes(checkpoint_data) != self._checkpoint_hash)
 
     # ---- 輪間訊號(work.py 寫、loop 讀) ----
     def clear_signals(self):
@@ -619,13 +742,14 @@ class Workspace:
     def snapshot_protected(self, repo, rel_paths):
         for rel in rel_paths:
             target = repo_relative_path(repo, rel)
-            (self.dir / "snapshots" / rel.replace("/", "__")).write_bytes(target.read_bytes())
+            snap = workspace_file(self.dir / "snapshots" / rel.replace("/", "__"), "protected snapshot")
+            snap.write_bytes(target.read_bytes())
 
     def protected_changed(self, repo, rel_paths):
         """純偵測:回傳被刪或被改的受保護檔案清單(空 = 沒人亂動)。不寫回。"""
         hit = []
         for rel in rel_paths:
-            snap = (self.dir / "snapshots" / rel.replace("/", "__")).read_bytes()
+            snap = workspace_file(self.dir / "snapshots" / rel.replace("/", "__"), "protected snapshot").read_bytes()
             try:
                 target = repo_relative_path(repo, rel)
             except ValueError:
@@ -639,7 +763,7 @@ class Workspace:
         """把受保護檔案寫回快照(供 reset 後補正,green sha 版本理應相同故多為 no-op)。
         寫回前先建父目錄:green 不含該子目錄時 write_bytes 會 FileNotFoundError(#1)。"""
         for rel in rel_paths:
-            snap = (self.dir / "snapshots" / rel.replace("/", "__")).read_bytes()
+            snap = workspace_file(self.dir / "snapshots" / rel.replace("/", "__"), "protected snapshot").read_bytes()
             target = repo_relative_path(repo, rel)
             if (not target.exists()) or target.read_bytes() != snap:
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -653,7 +777,10 @@ def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs, on_started=No
     回傳 (rc, 秒數, 是否逾時)。"""
     t0 = time.monotonic()
     timed_out = False
-    with open(log_path, "w", encoding="utf-8") as lf, open(prompt_path, "rb") as pin:
+    log_fd = _open_regular(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    prompt_fd = _open_regular(prompt_path, os.O_RDONLY)
+    with os.fdopen(log_fd, "w", encoding="utf-8", closefd=True) as lf, \
+            os.fdopen(prompt_fd, "rb", closefd=True) as pin:
         p = subprocess.Popen(cmd, cwd=str(repo), env=env, stdin=pin,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              start_new_session=True)
@@ -1135,7 +1262,8 @@ def main():
                 "NOTES": notes_text,
             })
         prompt_path = ws.dir / "prompts" / f"round-{rnd:04d}.md"
-        prompt_path.write_text(prompt, encoding="utf-8")
+        workspace_file(prompt_path, "round prompt")
+        atomic_write_bytes(prompt_path, prompt.encode("utf-8"))
         # reset 後 rnd 會回到 1，但目錄可能仍有 round-0034..0038。若只按檔名排序取
         # 最後五個，剛寫好的 round-0001 會立刻被當成「最舊」刪掉，接著 spawn Agent
         # 就 FileNotFoundError。當前 prompt 永遠保留，另外最多留四份舊稽核檔。
@@ -1377,8 +1505,7 @@ def main():
                 f"agent_failures={state['agent_failure_streak']} backoff={retry_delay:g}s validate={validate_note} "
                 f"flag={state['flag']} done={state['done_count']}"
                 + (f"  << {event}" if event else ""))
-        with open(ws.history, "a", encoding="utf-8") as hf:
-            hf.write(line + "\n")
+        append_regular_text(ws.history, line + "\n")
         log(f"📊 第 {rnd} 輪結束｜變更={'有' if changed else '無'}｜驗證={validate_note}｜"
             f"flag={state['flag']}｜done={state['done_count']}" + (f"｜{event}" if event else ""))
         if retry_delay:
@@ -1419,7 +1546,8 @@ def main():
                             for e in state["completed"])
                   + f"- reset 統計: {state['task_reset_counts'] or '無'}\n"
                   f"- 逐輪紀錄: {ws.history}\n")
-        (ws.dir / "REPORT.md").write_text(report, encoding="utf-8")
+        report_path = workspace_file(ws.dir / "REPORT.md", "REPORT.md")
+        atomic_write_bytes(report_path, report.encode("utf-8"))
         log(f"🏁 全部任務收斂。報告:{ws.dir / 'REPORT.md'}")
         notify(args.notify_cmd, "completed", ws.dir.name)
 
