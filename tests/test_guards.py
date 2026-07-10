@@ -862,6 +862,36 @@ class TestStateSchemaGuard(unittest.TestCase):
             finally:
                 L.WORKSPACE_ROOT = old_root
 
+    def test_invalid_plan_and_completed_entries_fail_closed(self):
+        invalid_states = [
+            {"phase": "plan", "plan": [{"order": 0, "task": "bad"}]},
+            {"phase": "plan", "plan": [
+                {"order": 1, "task": "one"}, {"order": 1, "task": "duplicate"},
+            ]},
+            {"phase": "plan", "plan": [{"order": 1, "task": "bad ref", "ref": 3}]},
+            {"phase": "exec", "completed": [None]},
+            {"phase": "exec", "completed": [{"order": 1, "round": 1}]},
+            {"phase": "exec", "completed": [{
+                "order": 1, "sha": "a" * 40, "round": "1",
+            }]},
+            {"phase": "exec", "completed": [
+                {"order": 1, "sha": "a" * 40, "round": 1},
+                {"order": 1, "sha": "b" * 40, "round": 2},
+            ]},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d)
+                for index, invalid in enumerate(invalid_states):
+                    ws = L.Workspace(f"schema-plan-completed-{index}")
+                    ws.state_path.write_text(json.dumps(invalid), encoding="utf-8")
+                    ws.checkpoint_path.write_text(json.dumps(invalid), encoding="utf-8")
+                    with self.subTest(state=invalid), self.assertRaises(L.StateLoadError):
+                        ws.load_state()
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
 
 class TestConsoleRotation(unittest.TestCase):
     """完整 console 必須在上限前輪替，且按新舊順序保留固定份數。"""

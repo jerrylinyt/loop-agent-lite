@@ -770,11 +770,34 @@ def validate_state_shape(state, label: str):
         if field in state and not isinstance(state[field], list):
             raise StateLoadError(f"{label} {field} 必須是陣列")
     if "plan" in state:
+        plan_orders = []
         for index, task in enumerate(state["plan"]):
             if (not isinstance(task, dict) or
                     not isinstance(task.get("order"), int) or isinstance(task.get("order"), bool) or
-                    not isinstance(task.get("task"), str) or not task["task"].strip()):
+                    task["order"] < 1 or
+                    not isinstance(task.get("task"), str) or not task["task"].strip() or
+                    ("ref" in task and task["ref"] is not None and
+                     not isinstance(task["ref"], str))):
                 raise StateLoadError(f"{label} plan[{index}] 必須含有合法 order/task")
+            plan_orders.append(task["order"])
+        if plan_orders and plan_orders != list(range(1, len(plan_orders) + 1)):
+            raise StateLoadError(f"{label} plan.order 必須從 1 依序連續遞增")
+    if "completed" in state:
+        completed_orders = []
+        for index, entry in enumerate(state["completed"]):
+            if (not isinstance(entry, dict) or
+                    not isinstance(entry.get("order"), int) or isinstance(entry.get("order"), bool) or
+                    entry["order"] < 1 or
+                    not isinstance(entry.get("sha"), str) or
+                    re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", entry["sha"]) is None or
+                    not isinstance(entry.get("round"), int) or isinstance(entry.get("round"), bool) or
+                    entry["round"] < 0 or
+                    ("human" in entry and not isinstance(entry["human"], bool))):
+                raise StateLoadError(
+                    f"{label} completed[{index}] 必須含有合法 order/sha/round")
+            completed_orders.append(entry["order"])
+        if len(completed_orders) != len(set(completed_orders)):
+            raise StateLoadError(f"{label} completed.order 不可重複")
     for field in ("task_reset_counts", "config", "loop"):
         if field in state and not isinstance(state[field], dict):
             raise StateLoadError(f"{label} {field} 必須是 object")
