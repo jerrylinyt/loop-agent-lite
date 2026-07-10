@@ -1252,6 +1252,18 @@ class TestFleetHealthProjection(unittest.TestCase):
                 self.assertEqual(handler.response[0], 200)
                 self.assertEqual(handler.response[1]["schema_version"], 1)
                 self.assertEqual(handler.response[1]["status"], "error")
+
+                strict = self.ResponseCapture()
+                strict.path = "/api/health?strict=1"
+                D.Handler.do_GET(strict)
+                self.assertEqual(strict.response[0], 503)
+                self.assertEqual(strict.response[1]["status"], "error")
+
+                invalid = self.ResponseCapture()
+                invalid.path = "/api/health?strict=maybe"
+                D.Handler.do_GET(invalid)
+                self.assertEqual(invalid.response[0], 400)
+                self.assertIn("0 或 1", invalid.response[1]["error"])
             finally:
                 D.ROOT = old_root
 

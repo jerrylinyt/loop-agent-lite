@@ -1196,7 +1196,13 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/api/events":
                 self._serve_events(q)
             elif u.path == "/api/health":
-                self._out(200, json.dumps(fleet_health_projection(), ensure_ascii=False))
+                strict = q.get("strict", ["0"])[0]
+                if strict not in ("0", "1"):
+                    self._err("health strict 必須是 0 或 1")
+                    return
+                health = fleet_health_projection()
+                code = 503 if strict == "1" and health["status"] != "ok" else 200
+                self._out(code, json.dumps(health, ensure_ascii=False))
             elif u.path == "/api/workspaces":
                 self._out(200, json.dumps(list_workspaces(), ensure_ascii=False))
             elif u.path == "/api/archives":

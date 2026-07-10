@@ -81,7 +81,7 @@ JSON 輸出包含 `schema_version: 1`；單 workspace 直接帶狀態欄位，`-
 `--check` 是一次性 gate：projection 仍照常輸出，但只要有 state 錯誤或需關注 workspace 就以 exit code 1 結束；不可與 `--watch` 同時使用。
 `--sort` 只作用於 `--all`，可選 `name`、`attention`、`running`、`phase`、`round`；預設 `name` 維持穩定的相容輸出。
 
-Dashboard 也提供唯讀 `GET /api/health`，回傳 `schema_version: 1`、`status`（`ok`／`degraded`／`error`）與 workspace、執行中、需關注、state 錯誤、issues、Agent 異常、state 復原、goal 變更及 stale PID 摘要；適合本機探針或外部監控。瀏覽器頁首與即時 SSE 的 `health` event 使用同一份 projection，不會修復或改寫任何 workspace。
+Dashboard 也提供唯讀 `GET /api/health`，回傳 `schema_version: 1`、`status`（`ok`／`degraded`／`error`）與 workspace、執行中、需關注、state 錯誤、issues、Agent 異常、state 復原、goal 變更及 stale PID 摘要；適合本機探針或外部監控。加上 `?strict=1` 時，`degraded`／`error` 會以 HTTP 503 回應，方便 readiness probe 直接判斷；預設仍維持 HTTP 200 並讓呼叫端讀取 status。瀏覽器頁首與即時 SSE 的 `health` event 使用同一份 projection，不會修復或改寫任何 workspace。
 
 常用選項：
 
