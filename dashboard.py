@@ -344,9 +344,24 @@ def list_archives():
     archives.sort(key=lambda item: item["id"], reverse=True)
     return {"archives": archives}
 
+MAX_FINISHED_JOBS = 50  # 長跑 dashboard 只保留最近已結束 job；活躍 job 不受限制
 JOBS = {}          # name -> Job(由本 dashboard 啟動的 loop)
 JOBS_LOCK = threading.Lock()
 CONFIG_LOCK = threading.Lock()
+
+
+def _prune_finished_jobs_locked(max_finished=MAX_FINISHED_JOBS):
+    """呼叫端須持 JOBS_LOCK；保留活躍 job 與最近 N 個已結束 job。"""
+    finished = [name for name, job in JOBS.items() if not job.alive()]
+    excess = max(0, len(finished) - max(0, int(max_finished)))
+    for name in finished[:excess]:
+        JOBS.pop(name, None)
+
+
+def prune_finished_jobs(max_finished=MAX_FINISHED_JOBS):
+    """限制 dashboard 進程內 job tail 記憶體；不影響 workspace state 或可重跑性。"""
+    with JOBS_LOCK:
+        _prune_finished_jobs_locked(max_finished)
 
 # per-workspace state lock:ThreadingHTTPServer 下,兩個並發 POST(雙擊/多分頁/操作重疊)對同一
 # workspace 做 read-modify-write 會 lost update,且共用 state.json 的原子寫 tmp——用每個 name 一把鎖
@@ -484,6 +499,7 @@ def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout
         (workspace_dir / "import-plan.pending.json").unlink(missing_ok=True)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, bufsize=1, start_new_session=True, env=env)
+    _prune_finished_jobs_locked()
     JOBS[name] = Job(name, str(repo), p)
     return p
 
@@ -1092,6 +1108,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._out(200, json.dumps(config_projection(cfg), ensure_ascii=False))
             elif u.path == "/api/jobs":
                 with JOBS_LOCK:
+                    _prune_finished_jobs_locked()
                     self._out(200, json.dumps([j.info() for j in JOBS.values()], ensure_ascii=False))
             elif u.path == "/api/job-startup":
                 name = q.get("name", [""])[0]

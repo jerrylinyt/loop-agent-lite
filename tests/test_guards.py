@@ -2146,5 +2146,30 @@ class TestDashboardFileBoundaries(unittest.TestCase):
                 D.ROOT, L.WORKSPACE_ROOT, D.load_config = old_values
 
 
+class TestJobHistoryRetention(unittest.TestCase):
+    """Dashboard 長跑時只保留有限已結束 job，活躍 job 與 workspace 真相不受影響。"""
+
+    class DummyJob:
+        def __init__(self, alive):
+            self._alive = alive
+
+        def alive(self):
+            return self._alive
+
+    def test_prunes_oldest_finished_but_keeps_active(self):
+        old_jobs = D.JOBS
+        try:
+            D.JOBS = {
+                "active": self.DummyJob(True),
+                "finished-1": self.DummyJob(False),
+                "finished-2": self.DummyJob(False),
+                "finished-3": self.DummyJob(False),
+            }
+            D.prune_finished_jobs(max_finished=2)
+            self.assertEqual(list(D.JOBS), ["active", "finished-2", "finished-3"])
+        finally:
+            D.JOBS = old_jobs
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
