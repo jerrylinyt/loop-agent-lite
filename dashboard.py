@@ -16,6 +16,7 @@ import difflib
 import fcntl
 import functools
 import json
+import math
 import mimetypes
 import os
 import errno
@@ -82,6 +83,22 @@ DEFAULT_CONFIG = {
 }
 
 PERSONAL_CONFIG_KEYS = {"agent_cmds", "extra_path_dirs", "repo_roots", "notify_cmd"}
+
+
+def parse_numeric_setting(value, *, integer: bool, minimum: float):
+    """解析 Dashboard 數值欄位；拒絕 bool、非有限值與會被 int() 靜默截斷的小數。"""
+    if isinstance(value, bool):
+        raise ValueError
+    if integer and isinstance(value, float) and not value.is_integer():
+        raise ValueError
+    parsed = int(value) if integer else float(value)
+    try:
+        finite = math.isfinite(float(parsed))
+    except OverflowError as e:
+        raise ValueError from e
+    if not finite or parsed < minimum:
+        raise ValueError
+    return parsed
 
 
 def configured_path_dirs(cfg):
@@ -1721,18 +1738,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         d = cfg.get("defaults") or {}
         try:
-            ft = int(body.get("flag_threshold") or d.get("flag_threshold", 10))
-            dt = int(body.get("done_threshold") or d.get("done_threshold", 3))
-            rt = float(body.get("round_timeout") if body.get("round_timeout") is not None
-                       else d.get("round_timeout", 30))
-            ab = float(body.get("agent_backoff_max") if body.get("agent_backoff_max") is not None
-                       else d.get("agent_backoff_max", 60))
-            vt = float(body.get("validate_timeout") if body.get("validate_timeout") is not None
-                       else d.get("validate_timeout", 120))
-            rl = int(body.get("red_limit") or d.get("red_limit", 20))
-            sl = int(body.get("stall_limit") or d.get("stall_limit", 300))
-            if ft < 1 or dt < 1 or rt < 0 or ab < 0 or vt <= 0 or rl < 1 or sl < 1:
-                raise ValueError
+            requested = lambda key, default: body[key] if body.get(key) is not None else d.get(key, default)
+            ft = parse_numeric_setting(requested("flag_threshold", 10), integer=True, minimum=1)
+            dt = parse_numeric_setting(requested("done_threshold", 3), integer=True, minimum=1)
+            rt = parse_numeric_setting(requested("round_timeout", 30), integer=False, minimum=0)
+            ab = parse_numeric_setting(requested("agent_backoff_max", 60), integer=False, minimum=0)
+            vt = parse_numeric_setting(requested("validate_timeout", 120), integer=False, minimum=1e-300)
+            rl = parse_numeric_setting(requested("red_limit", 20), integer=True, minimum=1)
+            sl = parse_numeric_setting(requested("stall_limit", 300), integer=True, minimum=1)
         except (TypeError, ValueError):
             self._err("flag/done/red/stall 必須 ≥1，round_timeout/agent_backoff_max 必須 ≥0，"
                       "validate_timeout 必須 >0 秒")
@@ -1876,6 +1889,24 @@ class Handler(BaseHTTPRequestHandler):
         if loop_pid_alive((st.get("loop") or {}).get("pid")):
             self._err(f"{name} 已在執行中")
             return
+        d = cfg.get("defaults") or {}
+        try:
+            ft = parse_numeric_setting(c.get("flag_threshold", 10), integer=True, minimum=1)
+            dt = parse_numeric_setting(c.get("done_threshold", 3), integer=True, minimum=1)
+            rt = parse_numeric_setting(c.get("round_timeout", 30), integer=False, minimum=0)
+            vt = parse_numeric_setting(
+                c.get("validate_timeout", d.get("validate_timeout", 120)), integer=False,
+                minimum=1e-300)
+            rl = parse_numeric_setting(
+                c.get("red_limit", d.get("red_limit", 20)), integer=True, minimum=1)
+            sl = parse_numeric_setting(
+                c.get("stall_limit", d.get("stall_limit", 300)), integer=True, minimum=1)
+            ab = parse_numeric_setting(
+                c.get("agent_backoff_max", d.get("agent_backoff_max", 60)), integer=False,
+                minimum=0)
+        except (TypeError, ValueError):
+            self._err("workspace 執行設定含非法數值，請先用設定視窗修正")
+            return
         with JOBS_LOCK:
             j = JOBS.get(name)
             if j is not None and j.alive():
@@ -1885,20 +1916,18 @@ class Handler(BaseHTTPRequestHandler):
                 if jj.alive() and Path(jj.repo) == Path(repo):
                     self._err(f"repo {repo} 已有 loop 在跑({jj.name})")
                     return
-            d = cfg.get("defaults") or {}
             p = spawn_loop(name, repo, agent_cmd, validate_cmd,
-                           c.get("flag_threshold", 10), c.get("done_threshold", 3),
-                           c.get("round_timeout", 30),
-                           validate_timeout=c.get("validate_timeout", d.get("validate_timeout", 120)),
+                           ft, dt, rt,
+                           validate_timeout=vt,
                            notify_cmd=str(cfg.get("notify_cmd") or ""),
-                           red_limit=c.get("red_limit", d.get("red_limit", 20)),
-                           stall_limit=c.get("stall_limit", d.get("stall_limit", 300)),
-                           agent_backoff_max=c.get("agent_backoff_max", d.get("agent_backoff_max", 60)),
+                           red_limit=rl,
+                           stall_limit=sl,
+                           agent_backoff_max=ab,
                            stuck_stop=bool(d.get("stuck_stop")),
                            stuck_count=int(d.get("stuck_stop_count", 100)),
                            env=command_env(cfg))
         workspace_console_log(name, f"繼續運行 loop｜pid={p.pid}")
-        startup_timeout = float(c.get("validate_timeout", d.get("validate_timeout", 120))) + 15
+        startup_timeout = vt + 15
         self._out(200, json.dumps({"ok": True, "starting": True, "name": name, "pid": p.pid,
                                    "startup_timeout": startup_timeout}, ensure_ascii=False))
 
@@ -1983,9 +2012,9 @@ class Handler(BaseHTTPRequestHandler):
             if body.get(k) is None:
                 continue
             try:
-                v = float(body[k]) if k in ("round_timeout", "agent_backoff_max", "validate_timeout") else int(body[k])
-                if v < lo:
-                    raise ValueError
+                v = parse_numeric_setting(
+                    body[k], integer=k not in ("round_timeout", "agent_backoff_max", "validate_timeout"),
+                    minimum=lo)
             except (TypeError, ValueError):
                 self._err(f"{k} 不合法(round_timeout/agent_backoff_max 需 ≥0；"
                           "validate_timeout 需 ≥1 秒；其餘需 ≥1)")

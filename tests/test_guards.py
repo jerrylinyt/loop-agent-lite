@@ -2840,6 +2840,96 @@ class TestCliArgumentGuards(unittest.TestCase):
             self.assertFalse(marker.exists(), "零門檻不得有機會繞過 work.py done 共識")
 
 
+class TestDashboardNumericGuards(unittest.TestCase):
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_launch_rejects_zero_nonfinite_bool_and_fractional_integer_before_spawn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            config = {
+                "agent_cmds": [{"label": "true", "cmd": "true"}],
+                "validate_cmds": [{"label": "true", "cmd": "true"}],
+                "extra_path_dirs": [], "notify_cmd": "", "defaults": {},
+            }
+            old_values = D.ROOT, L.WORKSPACE_ROOT, D.load_config
+            D.ROOT, L.WORKSPACE_ROOT = workspace_root, workspace_root
+            D.load_config = lambda: config
+            cases = [
+                ("flag_threshold", 0), ("done_threshold", 0),
+                ("red_limit", 0), ("stall_limit", 0),
+                ("flag_threshold", 1.5), ("done_threshold", True),
+                ("round_timeout", float("nan")),
+                ("agent_backoff_max", float("inf")),
+                ("validate_timeout", 0),
+            ]
+            try:
+                for index, (field, value) in enumerate(cases):
+                    name = f"dashboard-bad-number-{index}"
+                    handler = self.ResponseCapture()
+                    D.Handler.api_launch(handler, {
+                        "repo": str(repo), "name": name, "agent_idx": 0, "validate_idx": 0,
+                        field: value,
+                    })
+                    with self.subTest(field=field, value=value):
+                        self.assertEqual(handler.response[0], 400)
+                        self.assertNotIn(name, D.JOBS)
+                        self.assertFalse((workspace_root / name).exists())
+            finally:
+                D.ROOT, L.WORKSPACE_ROOT, D.load_config = old_values
+
+    def test_edit_and_run_reject_nonfinite_workspace_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            config = {
+                "agent_cmds": [{"label": "true", "cmd": "true"}],
+                "validate_cmds": [{"label": "true", "cmd": "true"}],
+                "extra_path_dirs": [], "notify_cmd": "", "defaults": {},
+            }
+            old_values = D.ROOT, L.WORKSPACE_ROOT, D.load_config
+            D.ROOT, L.WORKSPACE_ROOT = workspace_root, workspace_root
+            D.load_config = lambda: config
+            try:
+                ws = L.Workspace("bad-saved-number")
+                state = ws.fresh_state()
+                state["config"] = {
+                    "repo": str(repo), "agent_cmd": "true", "validate_cmd": "true",
+                    "round_timeout": 30,
+                }
+                ws.save_state(state)
+
+                edit = self.ResponseCapture()
+                D.Handler.api_edit_config(edit, {
+                    "name": "bad-saved-number", "round_timeout": float("nan"),
+                })
+                self.assertEqual(edit.response[0], 400)
+                saved = json.loads(ws.state_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["config"]["round_timeout"], 30)
+
+                saved["config"]["round_timeout"] = float("inf")
+                ws.save_state(saved)
+                run = self.ResponseCapture()
+                D.Handler.api_run(run, {"name": "bad-saved-number"})
+                self.assertEqual(run.response[0], 400)
+                self.assertIn("非法數值", run.response[1]["error"])
+                self.assertNotIn("bad-saved-number", D.JOBS)
+            finally:
+                job = D.JOBS.pop("bad-saved-number", None)
+                if job and job.alive():
+                    job.stop(wait=True)
+                D.ROOT, L.WORKSPACE_ROOT, D.load_config = old_values
+
+
 class TestWorkspaceNameGuards(unittest.TestCase):
     """workspace 名稱是 coordinator root 的安全邊界，dot-leading 不得逸出或碰保留目錄。"""
 
