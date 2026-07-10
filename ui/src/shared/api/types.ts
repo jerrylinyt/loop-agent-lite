@@ -5,6 +5,7 @@ export interface WorkspaceSummary {
   phase: Phase | null;
   running: boolean;
   draining?: boolean;
+  drain_claimed?: boolean;
   round?: number;
   flag?: number;
   completed?: number;

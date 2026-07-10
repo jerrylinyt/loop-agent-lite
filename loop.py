@@ -57,6 +57,7 @@ TASK_LIST_TRUNC = 80                   # prompt 任務總覽單行截斷長度
 CONSOLE_MAX_BYTES = 5 * 1024 * 1024   # console.log 單檔 5 MiB
 CONSOLE_BACKUPS = 3                    # 保留 console.log.1～.3
 STOP_AFTER_ROUND_FILE = "stop-after-round.json"
+STOP_AFTER_ROUND_CLAIMED_FILE = "stop-after-round.claimed.json"
 
 _CONSOLE_PATH = None
 _CONSOLE_LOCK = threading.Lock()
@@ -229,6 +230,15 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
+def _stop_after_round_marker_matches(path: Path, pid, session_id) -> bool:
+    try:
+        request = json.loads(path.read_text(encoding="utf-8"))
+        return (int(request.get("pid")) == int(pid) and
+                bool(session_id) and request.get("session_id") == session_id)
+    except (AttributeError, FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def stop_after_round_requested(workspace_dir: Path, pid, session_id, *, consume=False) -> bool:
     """檢查本 session 的「本輪後停止」控制檔；consume 時連壞檔/舊 session 一併清掉。"""
     path = Path(workspace_dir) / STOP_AFTER_ROUND_FILE
@@ -245,11 +255,7 @@ def stop_after_round_requested(workspace_dir: Path, pid, session_id, *, consume=
             return False
         read_path = claimed
     try:
-        request = json.loads(read_path.read_text(encoding="utf-8"))
-        matches = (int(request.get("pid")) == int(pid) and
-                   bool(session_id) and request.get("session_id") == session_id)
-    except (AttributeError, FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
-        matches = False
+        matches = _stop_after_round_marker_matches(read_path, pid, session_id)
     finally:
         if claimed is not None:
             try:
@@ -257,6 +263,40 @@ def stop_after_round_requested(workspace_dir: Path, pid, session_id, *, consume=
             except OSError:
                 pass
     return matches
+
+
+def stop_after_round_claimed(workspace_dir: Path, pid, session_id) -> bool:
+    """loop 已原子接手本輪後停止請求的可觀測標記；接手後不再允許撤銷。"""
+    return _stop_after_round_marker_matches(
+        Path(workspace_dir) / STOP_AFTER_ROUND_CLAIMED_FILE, pid, session_id)
+
+
+def claim_stop_after_round(workspace_dir: Path, pid, session_id) -> bool:
+    """把 pending 請求原子搬成 claimed marker；成功後 marker 保留到本 session 退出。"""
+    workspace_dir = Path(workspace_dir)
+    pending = workspace_dir / STOP_AFTER_ROUND_FILE
+    claimed = workspace_dir / STOP_AFTER_ROUND_CLAIMED_FILE
+    try:
+        os.replace(pending, claimed)
+    except (FileNotFoundError, OSError):
+        return False
+    if stop_after_round_claimed(workspace_dir, pid, session_id):
+        return True
+    try:
+        claimed.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return False
+
+
+def clear_stop_after_round_claimed(workspace_dir: Path, pid, session_id) -> None:
+    """只刪除目前 session 的 claimed marker，避免誤碰別人剛寫入的控制檔。"""
+    path = Path(workspace_dir) / STOP_AFTER_ROUND_CLAIMED_FILE
+    if stop_after_round_claimed(workspace_dir, pid, session_id):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 class StateLoadError(RuntimeError):
@@ -347,6 +387,7 @@ class Workspace:
         self.checkpoint_path = state_checkpoint_path(self.state_path)
         self.history = self.dir / "history.log"
         self.stop_after_round_path = self.dir / STOP_AFTER_ROUND_FILE
+        self.stop_after_round_claimed_path = self.dir / STOP_AFTER_ROUND_CLAIMED_FILE
         self._state_hash = None  # 本 session 內偵測 agent 直接改 state.json 用
         self._checkpoint_hash = None
         self.state_recovered = False
@@ -441,8 +482,8 @@ class Workspace:
         atomic_write_bytes(self.dir / "current_task", task_id.encode("utf-8"))
 
     def take_stop_after_round(self, pid, session_id) -> bool:
-        """消耗控制檔；只有精確命中目前 session 才回傳 True。"""
-        return stop_after_round_requested(self.dir, pid, session_id, consume=True)
+        """原子接手控制檔；成功時留下 session-bound marker，供 Dashboard 誠實顯示不可撤銷狀態。"""
+        return claim_stop_after_round(self.dir, pid, session_id)
 
     # ---- 受保護檔案快照(goal / 初步規劃書) ----
     def snapshot_protected(self, repo, rel_paths):
@@ -806,6 +847,7 @@ def main():
                        "goal": args.goal, "plan_doc": args.plan_doc}
     # 舊 session 的停止請求不可跨重啟生效；先清掉，再公開新 pid/session_id。
     ws.stop_after_round_path.unlink(missing_ok=True)
+    ws.stop_after_round_claimed_path.unlink(missing_ok=True)
     for orphan in ws.dir.glob(f".{STOP_AFTER_ROUND_FILE}.consume.*"):
         orphan.unlink(missing_ok=True)
     session_id = uuid.uuid4().hex
@@ -815,6 +857,7 @@ def main():
     def _mark_stopped():
         # 若「本輪後停止」後又立刻按立即停止，或程序在輪末競態退出，不把請求留給下次 session。
         stop_after_round_requested(ws.dir, os.getpid(), session_id, consume=True)
+        clear_stop_after_round_claimed(ws.dir, os.getpid(), session_id)
         state["loop"]["pid"] = None  # 正常/Ctrl-C 退出都清 pid;被 SIGKILL 留殘值,由 dashboard ps 檢查兜底
         ws.save_state(state)
     atexit.register(_mark_stopped)

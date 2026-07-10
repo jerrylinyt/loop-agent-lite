@@ -87,6 +87,7 @@ Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace 
 - 啟動表單進階設定內的「🔔 管理終態通知」可編輯、儲存並以 `status=test` 實測 `notify_cmd`（佔位符 `{status}`、`{name}`）。
 - 啟動表單的「完整健檢」會檢查目前已 commit repo 的 git／鎖／乾淨工作樹／goal 與 Validate，不建 state、不啟動 Agent；待匯入 goal、plan、reset 或新 branch 時會停用，實際啟動仍會再驗一次。
 - 正常要停時用「本輪後停止」：目前 Agent、Validate 與 state/history 落盤完成後才停，不會啟動下一輪。
+- 本輪尚未結束前按「↩ 繼續運行」可撤銷平順停止；如果 loop 已取走請求，會明確告知這一輪仍會收尾停止。
 - Agent CLI 卡死或明顯失控時用「立即停止」；它會中斷目前 round，state 可在下次運行時續用。
 - 停止後可編輯計畫、切換階段或修改 agent／validate 設定，再按 ▶ 運行。
 - 「重置 workspace state」會保留舊 state，直到新流程通過 preflight。

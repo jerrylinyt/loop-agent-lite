@@ -89,6 +89,12 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(loopConsole).toContainText("✅ 驗證通過");
   await expect(agentConsole).not.toContainText("📨 Agent 指令｜done task-1");
 
+  await page.getByRole("button", { name: "⏸ 本輪後停止" }).click();
+  await expect(page.getByRole("button", { name: "↩ 繼續運行" })).toBeVisible();
+  await page.getByRole("button", { name: "↩ 繼續運行" }).click();
+  await expect(page.getByRole("button", { name: "⏸ 本輪後停止" })).toBeVisible();
+  await expect(loopConsole).toContainText("已撤銷本輪後停止");
+
   await agentConsole.getByRole("button", { name: "其他", exact: true }).click();
   await expect(agentConsole).toContainText("📨 Agent 指令｜done task-1");
   await expect(agentConsole).not.toContainText("🤖 Agent｜E2E fake agent started");

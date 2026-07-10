@@ -729,6 +729,15 @@ class TestStopIdempotency(unittest.TestCase):
 class TestGracefulRoundStop(unittest.TestCase):
     """平順停止必須封完目前 round，且控制檔不可跨 session 誤觸發。"""
 
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
     def test_request_finishes_current_round_before_stopping(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -780,6 +789,7 @@ class TestGracefulRoundStop(unittest.TestCase):
                 stopped = json.loads(state_path.read_text())
                 self.assertEqual(stopped["round"], 1)
                 self.assertIsNone(stopped["loop"]["pid"])
+                self.assertFalse((workspace_root / "graceful-stop" / L.STOP_AFTER_ROUND_CLAIMED_FILE).exists())
                 history = (workspace_root / "graceful-stop" / "history.log").read_text().splitlines()
                 self.assertEqual(len(history), 1, "完整落盤目前 round 後不得再 spawn 下一輪")
                 self.assertIn("已依要求停止", output)
@@ -798,6 +808,9 @@ class TestGracefulRoundStop(unittest.TestCase):
             (workspace / L.STOP_AFTER_ROUND_FILE).write_text(
                 json.dumps({"pid": os.getpid(), "session_id": "old-session"})
             )
+            (workspace / L.STOP_AFTER_ROUND_CLAIMED_FILE).write_text(
+                json.dumps({"pid": os.getpid(), "session_id": "old-session"})
+            )
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             result = subprocess.run(
                 [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "stale-stop",
@@ -809,6 +822,126 @@ class TestGracefulRoundStop(unittest.TestCase):
             state = json.loads((workspace / "state.json").read_text())
             self.assertEqual(state["round"], 1)
             self.assertFalse((workspace / L.STOP_AFTER_ROUND_FILE).exists())
+            self.assertFalse((workspace / L.STOP_AFTER_ROUND_CLAIMED_FILE).exists())
+
+    def test_claim_marker_is_session_bound(self):
+        with tempfile.TemporaryDirectory() as d:
+            workspace = Path(d)
+            L.atomic_write_bytes(
+                workspace / L.STOP_AFTER_ROUND_FILE,
+                json.dumps({"pid": 123, "session_id": "this-session"}).encode(),
+            )
+            self.assertTrue(L.claim_stop_after_round(workspace, 123, "this-session"))
+            self.assertFalse((workspace / L.STOP_AFTER_ROUND_FILE).exists())
+            self.assertTrue(L.stop_after_round_claimed(workspace, 123, "this-session"))
+            self.assertFalse(L.stop_after_round_claimed(workspace, 123, "other-session"))
+            L.clear_stop_after_round_claimed(workspace, 123, "this-session")
+            self.assertFalse((workspace / L.STOP_AFTER_ROUND_CLAIMED_FILE).exists())
+
+    def test_cancel_request_allows_the_next_round_to_start(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            agent = root / "counting_agent.py"
+            agent.write_text(
+                "import os, time\n"
+                "from pathlib import Path\n"
+                "ws = Path(os.environ['LOOP_WS'])\n"
+                "marker = ws / 'agent-count'\n"
+                "count = int(marker.read_text()) if marker.exists() else 0\n"
+                "marker.write_text(str(count + 1))\n"
+                "time.sleep(0.6)\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            process = subprocess.Popen(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "cancel-drain",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--max-rounds", "2"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+            )
+            old_root = D.ROOT
+            D.ROOT = workspace_root
+            try:
+                state_path = workspace_root / "cancel-drain" / "state.json"
+                marker = workspace_root / "cancel-drain" / "agent-count"
+                deadline = time.monotonic() + 3
+                state = None
+                while time.monotonic() < deadline:
+                    try:
+                        candidate = json.loads(state_path.read_text())
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        time.sleep(0.02)
+                        continue
+                    if marker.exists() and (candidate.get("loop") or {}).get("session_id"):
+                        state = candidate
+                        break
+                    time.sleep(0.02)
+                self.assertIsNotNone(state, "Agent 啟動後必須能由 Dashboard 看見目前 session")
+
+                handler = self.ResponseCapture()
+                D.Handler.api_drain(handler, {"name": "cancel-drain"})
+                self.assertEqual(handler.response[0], 200, handler.response)
+                self.assertTrue(handler.response[1]["requested"])
+                request_path = workspace_root / "cancel-drain" / L.STOP_AFTER_ROUND_FILE
+                self.assertTrue(request_path.exists())
+
+                handler = self.ResponseCapture()
+                D.Handler.api_cancel_drain(handler, {"name": "cancel-drain"})
+                self.assertEqual(handler.response[0], 200, handler.response)
+                self.assertTrue(handler.response[1]["cancelled"])
+                self.assertFalse(request_path.exists())
+
+                output, _ = process.communicate(timeout=4)
+                self.assertEqual(process.returncode, 0, output)
+                stopped = json.loads(state_path.read_text())
+                self.assertEqual(stopped["round"], 2)
+                self.assertEqual(marker.read_text(), "2", "撤銷後必須真的 spawn 下一輪")
+                self.assertNotIn("已依要求停止", output)
+            finally:
+                D.ROOT = old_root
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+
+class TestClaimedDrainProjection(unittest.TestCase):
+    """loop 接手後的 marker 必須讓 fleet 與取消 API 明確顯示「太晚」。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_claimed_marker_projects_and_refuses_cancel(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            workspace = root / "demo"
+            workspace.mkdir()
+            (workspace / "state.json").write_text(json.dumps({
+                "phase": "plan", "loop": {"pid": 4242, "session_id": "current-session"},
+            }))
+            L.atomic_write_bytes(
+                workspace / L.STOP_AFTER_ROUND_CLAIMED_FILE,
+                json.dumps({"pid": 4242, "session_id": "current-session"}).encode(),
+            )
+            old_root, old_alive = D.ROOT, D.loop_pid_alive
+            D.ROOT = root
+            D.loop_pid_alive = lambda _pid: True
+            try:
+                fleet = D.list_workspaces()
+                self.assertTrue(fleet[0]["draining"])
+                self.assertTrue(fleet[0]["drain_claimed"])
+                handler = self.ResponseCapture()
+                D.Handler.api_cancel_drain(handler, {"name": "demo"})
+                self.assertEqual(handler.response[0], 409)
+                self.assertIn("已被 loop 取走", handler.response[1]["error"])
+            finally:
+                D.ROOT, D.loop_pid_alive = old_root, old_alive
 
 
 class TestPortableDashboardConfig(unittest.TestCase):
@@ -881,7 +1014,7 @@ class TestDashboardStateLockCoverage(unittest.TestCase):
     """#3 run/launch 必須和 edit/phase 共用 workspace lock,不能在 stopped check 後競態。"""
 
     def test_all_workspace_mutations_are_decorated(self):
-        for method in ("api_launch", "api_run", "api_drain", "api_edit_state", "api_edit_config", "api_validate", "api_preflight", "api_test_agent", "api_phase", "api_set_task"):
+        for method in ("api_launch", "api_run", "api_drain", "api_cancel_drain", "api_edit_state", "api_edit_config", "api_validate", "api_preflight", "api_test_agent", "api_phase", "api_set_task"):
             self.assertTrue(hasattr(getattr(D.Handler, method), "__wrapped__"), f"{method} 必須套 workspace lock")
 
     def test_launch_blank_name_locks_repo_basename(self):

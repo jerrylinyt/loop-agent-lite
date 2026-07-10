@@ -61,7 +61,7 @@ def prepare_fixture():
         f"        subprocess.run([sys.executable, {str(work_py)!r}, 'plan-ok'], env=os.environ, check=True)\n"
         "elif task:\n"
         f"    subprocess.run([sys.executable, {str(work_py)!r}, 'done', task], env=os.environ, check=True)\n"
-        "time.sleep(0.45)\n",
+        "time.sleep(0.6)\n",
         encoding="utf-8"
     )
 

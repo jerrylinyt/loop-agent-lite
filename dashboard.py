@@ -530,12 +530,15 @@ def list_workspaces():
             c = st.get("config") or {}
             loop_state = st.get("loop") or {}
             running = ws_running(d.name, st)
+            drain_claimed = running and loop_mod.stop_after_round_claimed(
+                d, loop_state.get("pid"), loop_state.get("session_id"))
             info.update(phase=st.get("phase"), round=st.get("round", 0), flag=st.get("flag", 0),
                         completed=len(st.get("completed") or []), plan_len=len(st.get("plan") or []),
                         done_count=st.get("done_count", 0), repo=c.get("repo"),
                         running=running,
-                        draining=running and loop_mod.stop_after_round_requested(
-                            d, loop_state.get("pid"), loop_state.get("session_id")))
+                        draining=drain_claimed or (running and loop_mod.stop_after_round_requested(
+                            d, loop_state.get("pid"), loop_state.get("session_id"))),
+                        drain_claimed=drain_claimed)
         out.append(info)
     return out
 
@@ -820,6 +823,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.api_launch(body)
             elif u.path == "/api/drain":
                 self.api_drain(body)
+            elif u.path == "/api/cancel-drain":
+                self.api_cancel_drain(body)
             elif u.path == "/api/stop":
                 self.api_stop(body)
             elif u.path == "/api/run":
@@ -1656,6 +1661,10 @@ class Handler(BaseHTTPRequestHandler):
         if job is not None and job.alive() and int(pid) != job.popen.pid:
             self._err(f"{name} 尚在啟動中，請等待執行狀態就緒後再要求本輪後停止")
             return
+        if loop_mod.stop_after_round_claimed(ROOT / name, pid, session_id):
+            self._out(200, json.dumps({"ok": True, "name": name, "pid": pid,
+                                       "requested": True, "claimed": True}, ensure_ascii=False))
+            return
         if loop_mod.stop_after_round_requested(ROOT / name, pid, session_id):
             self._out(200, json.dumps({"ok": True, "name": name, "pid": pid,
                                        "requested": True, "already_requested": True},
@@ -1670,6 +1679,45 @@ class Handler(BaseHTTPRequestHandler):
         workspace_console_log(name, f"已要求本輪完整結束後停止｜pid={pid}")
         self._out(200, json.dumps({"ok": True, "name": name, "pid": pid,
                                    "requested": True}, ensure_ascii=False))
+
+    @with_state_lock
+    def api_cancel_drain(self, body):
+        """撤銷尚未被 loop 取走的本輪後停止請求；claim 競態輸家必須明確回報太晚。"""
+        name = str(body.get("name") or "")
+        st, err = read_state(name)
+        if err:
+            self._err(err)
+            return
+        loop_state = st.get("loop") or {}
+        pid = loop_state.get("pid")
+        session_id = loop_state.get("session_id")
+        if not loop_pid_alive(pid):
+            self._out(200, json.dumps({"ok": True, "name": name, "already_stopped": True},
+                                      ensure_ascii=False))
+            return
+        if not session_id:
+            self._err(f"{name} 是由舊版 loop 啟動，請先立即停止並用目前版本重新運行")
+            return
+        if loop_mod.stop_after_round_claimed(ROOT / name, pid, session_id):
+            self._err(f"{name} 的停止請求已被 loop 取走，這一輪會在完成後停止，無法再撤銷", 409)
+            return
+        # 先無副作用確認，才以 consume=True 原子 claim。loop 若先 claim，絕不假裝已撤銷。
+        if not loop_mod.stop_after_round_requested(ROOT / name, pid, session_id):
+            if loop_mod.stop_after_round_claimed(ROOT / name, pid, session_id):
+                self._err(f"{name} 的停止請求已被 loop 取走，這一輪會在完成後停止，無法再撤銷", 409)
+                return
+            self._out(200, json.dumps({"ok": True, "name": name, "not_requested": True},
+                                      ensure_ascii=False))
+            return
+        if not loop_mod.stop_after_round_requested(ROOT / name, pid, session_id, consume=True):
+            if not loop_mod.stop_after_round_claimed(ROOT / name, pid, session_id):
+                self._err(f"{name} 的停止請求狀態剛變更，請重新整理後確認是否仍在收尾", 409)
+                return
+            self._err(f"{name} 的停止請求已被 loop 取走，這一輪會在完成後停止，無法再撤銷", 409)
+            return
+        workspace_console_log(name, f"已撤銷本輪後停止｜pid={pid}")
+        self._out(200, json.dumps({"ok": True, "name": name, "pid": pid,
+                                   "cancelled": True}, ensure_ascii=False))
 
     def api_stop(self, body):
         name = str(body.get("name") or "")
