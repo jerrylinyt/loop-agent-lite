@@ -779,6 +779,36 @@ class TestStatusCli(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("不可搭配 --watch", result.stderr)
 
+    def test_all_sort_attention_places_alerts_first(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = root / "workspace"
+                for name, stalled in (("alpha", 0), ("beta", 1)):
+                    ws = L.Workspace(name)
+                    state = ws.fresh_state()
+                    state["stall_rounds"] = stalled
+                    ws.save_state(state)
+                env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
+                result = subprocess.run(
+                    [sys.executable, STATUS_PY, "--all", "--json", "--sort", "attention"],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual([item["name"] for item in payload["workspaces"]], ["beta", "alpha"])
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_sort_requires_all_mode(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
+            result = subprocess.run(
+                [sys.executable, STATUS_PY, "--name", "missing", "--sort", "round"],
+                capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("只有搭配 --all", result.stderr)
+
     def test_all_json_lists_fleet_without_starting_or_repairing(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

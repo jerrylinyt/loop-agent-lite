@@ -159,6 +159,28 @@ def projection_needs_attention(result) -> bool:
     )
 
 
+def sort_status_results(results, mode: str):
+    """排序 fleet projection；錯誤 workspace 永遠排在有效 projection 前。"""
+    if mode == "name":
+        return sorted(results, key=lambda result: result.get("name", ""))
+    phase_order = {"plan": 0, "exec": 1, "done": 2}
+
+    def key(result):
+        if "error" in result:
+            return (0, 0, result.get("name", ""))
+        if mode == "attention":
+            value = 0 if projection_needs_attention(result) else 1
+        elif mode == "running":
+            value = 0 if result.get("running") else 1
+        elif mode == "phase":
+            value = phase_order.get(result.get("phase"), 3)
+        else:  # round
+            value = -result.get("round", 0)
+        return (1, value, result.get("name", ""))
+
+    return sorted(results, key=key)
+
+
 def render_human(result, *, timestamp=False) -> None:
     phase = {"plan": "規劃期", "exec": "執行期", "done": "完成"}.get(result["phase"], result["phase"] or "未知")
     running = "執行中" if result["running"] else "⚠ PID 殘留" if result.get("stale_loop_pid") else "已停止"
@@ -193,6 +215,8 @@ def main(argv=None) -> int:
                         help="搭配 --watch：只有 projection 改變時才輸出")
     parser.add_argument("--check", action="store_true",
                         help="只查詢一次；state 錯誤或需關注時以 exit code 1 結束")
+    parser.add_argument("--sort", choices=("name", "attention", "running", "phase", "round"),
+                        default="name", help="--all 的排序方式（預設 name）")
     args = parser.parse_args(argv)
     if bool(args.name) == args.all:
         parser.error("--name 與 --all 必須且只能選一個")
@@ -202,13 +226,15 @@ def main(argv=None) -> int:
         parser.error("--on-change 必須搭配 --watch")
     if args.check and args.watch:
         parser.error("--check 不可搭配 --watch")
+    if args.sort != "name" and not args.all:
+        parser.error("--sort 只有搭配 --all 才可使用")
     if args.workspace_root:
         loop.WORKSPACE_ROOT = Path(args.workspace_root).expanduser().resolve()
     previous_signature = None
     try:
         while True:
             if args.all:
-                results = project_all_status()
+                results = sort_status_results(project_all_status(), args.sort)
                 summary = summarize_status(results)
                 check_failed = summary["error_count"] > 0 or summary["attention"] > 0
                 projection = {"summary": summary, "workspaces": results}
