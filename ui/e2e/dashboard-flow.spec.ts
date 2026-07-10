@@ -15,8 +15,8 @@ async function acceptConfirmation(page: Page, action: () => Promise<void>) {
 test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、phase 與進度", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "尚未建立 workspace" })).toBeVisible();
-  await expect(page.locator(".connection-status.connected")).toContainText("即時連線");
-  await expect(page.locator(".fleet-health.ok")).toContainText("Fleet 正常");
+  await expect(page.locator(".connection-status")).toHaveCount(0);
+  await expect(page.locator(".fleet-health")).toHaveCount(0);
 
   const theme = page.getByRole("combobox", { name: "介面主題" });
   await theme.selectOption("light");
@@ -93,7 +93,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   expect(faviconHref.startsWith("data:image/png")).toBeTruthy();
 
   await page.getByRole("button", { name: "📺 總覽" }).click();
-  const overview = page.getByRole("main", { name: "Fleet 總覽" });
+  const overview = page.getByRole("main", { name: "工作區總覽" });
   await expect(overview).toBeVisible();
   await expect(overview.getByText("執行中", { exact: true })).toBeVisible();
   const runningFilter = overview.getByRole("button", { name: /^執行中 \d+$/ });
@@ -112,6 +112,13 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(fleetCard.locator(".breathing-dot")).toBeVisible();
   await expect(fleetCard.locator(".round-timer")).toContainText("本輪");
   await expect(fleetCard.locator(".fleet-card-task")).toContainText("task-1");
+  const fleetAnalysis = fleetCard.getByLabel(/近期 \d+ 輪效能/);
+  await expect(fleetAnalysis).toBeVisible();
+  await expect(fleetAnalysis).toContainText("平均");
+  await expect(fleetAnalysis).toContainText("P50");
+  await expect(fleetAnalysis).toContainText("P95");
+  await expect(fleetAnalysis).toContainText("最慢");
+  await expect(fleetAnalysis).toContainText("逾時");
   const eventFeed = overview.getByRole("complementary", { name: "事件推播" });
   await expect(eventFeed.locator(".fleet-event", { hasText: "▶ 開始 task-1" }).first()).toBeVisible();
   await expect(eventFeed.locator(".fleet-event-ws", { hasText: "e2e-workspace" }).first()).toBeVisible();
@@ -152,6 +159,16 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await consoleSearch.fill("");
   await expect(page.getByRole("button", { name: /issues/ })).toBeVisible();
 
+  const attentionButton = page.getByRole("button", { name: /工作區需處理/ });
+  await expect(attentionButton).toBeVisible();
+  await attentionButton.click();
+  await expect(overview).toBeVisible();
+  await expect(overview.getByRole("button", { name: /^需關注 \d+$/ })).toHaveAttribute("aria-pressed", "true");
+  const attentionCard = overview.locator(".fleet-card", { hasText: "e2e-workspace" });
+  await expect(attentionCard.locator(".fleet-card-alerts")).toContainText("issues 未讀");
+  await attentionCard.click();
+  await expect(overview).toBeHidden();
+
   await page.getByRole("button", { name: "⏸ 本輪後停止" }).click();
   await expect(page.getByRole("button", { name: "▶ 運行" })).toBeVisible();
   await expect(loopConsole).toContainText("已依要求停止");
@@ -167,12 +184,6 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(firstHistoryRow).toContainText("done");
   await expect(firstHistoryRow).toContainText("✅");
   await expect(firstHistoryRow).toContainText("秒");
-  const roundMetrics = historyModal.getByRole("list", { name: "輪次效能摘要" });
-  await expect(roundMetrics).toBeVisible();
-  await expect(roundMetrics).toContainText("平均");
-  await expect(roundMetrics).toContainText("P95");
-  await expect(roundMetrics).toContainText("最慢");
-  await expect(roundMetrics).toContainText("逾時率");
   await expect(historyModal).not.toContainText("檔案較大，僅顯示最近的紀錄");
   await historyModal.getByRole("button", { name: "重新整理" }).click();
   await expect(firstHistoryRow).toContainText("task-1");

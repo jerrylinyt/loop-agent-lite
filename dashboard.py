@@ -634,11 +634,13 @@ def read_report(name):
 
 
 FLEET_HISTORY_TAIL = 16 * 1024  # 每個 workspace 事件流尾段上限
+FLEET_METRICS_TAIL = 128 * 1024  # 同一次 bounded read 投影 Overview 近期效能
+FLEET_METRICS_LIMIT = 100
 FLEET_HISTORY_SSE_INTERVAL = 2.0  # 事件流只在歷史有變時推送，避免每圈重送整段尾端
 
 
 def read_fleet_history():
-    """全 fleet history.log 尾段的唯讀投影;總覽事件流由前端解析推導,不動任何 truth。"""
+    """投影各 workspace 的事件尾段與 Overview 效能摘要，不動任何 truth。"""
     out = []
     if not ROOT.is_dir():
         return out
@@ -651,17 +653,26 @@ def read_fleet_history():
             with os.fdopen(fd, "rb", closefd=True) as stream:
                 stream.seek(0, os.SEEK_END)
                 size = stream.tell()
-                stream.seek(max(0, size - FLEET_HISTORY_TAIL))
-                data = stream.read(FLEET_HISTORY_TAIL)
+                metrics_start = max(0, size - FLEET_METRICS_TAIL)
+                stream.seek(metrics_start)
+                metrics_data = stream.read(FLEET_METRICS_TAIL)
         except FileNotFoundError:
             continue
         except (OSError, ValueError):
             continue
-        tail = data.decode("utf-8", errors="replace")
+        if metrics_start:
+            newline = metrics_data.find(b"\n")
+            metrics_data = metrics_data[newline + 1:] if newline >= 0 else b""
+        metrics_text = metrics_data.decode("utf-8", errors="replace")
+        event_data = metrics_data[-FLEET_HISTORY_TAIL:]
+        tail = event_data.decode("utf-8", errors="replace")
         if size > FLEET_HISTORY_TAIL:
             newline = tail.find("\n")
             tail = tail[newline + 1:] if newline != -1 else tail
-        out.append({"name": d.name, "data": tail})
+        metrics = loop_mod.round_metrics_from_history(
+            metrics_text, FLEET_METRICS_LIMIT, history_truncated=metrics_start > 0)
+        metrics.pop("samples", None)  # Overview 只需摘要，避免 SSE 重送逐輪樣本
+        out.append({"name": d.name, "data": tail, "metrics": metrics})
     return out
 
 
@@ -1010,20 +1021,23 @@ def list_workspaces():
 
 
 def _workspace_needs_attention(info):
-    """以 Dashboard fleet projection 的欄位判斷需關注項目；不讀寫 workspace。"""
+    """以 Dashboard projection 判斷目前仍需處理的項目；不讀寫 workspace。"""
     if info.get("error"):
         return True
     unread_issues = info.get("unread_issues", info.get("issues", 0)) or 0
+    completed = info.get("phase") == "done"
     return bool(
-        (info.get("red_streak") or 0) > 0 or
-        (info.get("stall_rounds") or 0) > 0 or
         unread_issues > 0 or
-        (info.get("agent_failure_streak") or 0) > 0 or
-        info.get("last_round_timed_out") or
-        (info.get("state_recovery_count") or 0) > 0 or
         info.get("state_recovery_pending") or
         info.get("goal_changed") or
-        info.get("stale_loop_pid")
+        info.get("stale_loop_pid") or
+        (not completed and (
+            (info.get("red_streak") or 0) > 0 or
+            (info.get("stall_rounds") or 0) > 0 or
+            (info.get("agent_failure_streak") or 0) > 0 or
+            info.get("last_round_timed_out") or
+            (info.get("state_recovery_count") or 0) > 0
+        ))
     )
 
 

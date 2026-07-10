@@ -1677,6 +1677,10 @@ def main():
                             if t["order"] > state["current_order"]), None)
                 if nxt is None:
                     state["phase"] = "done"
+                    # 最後一個任務通常需要數輪無變更的 done 共識，stall_rounds
+                    # 會自然大於零；完成後清掉暫態健康計數，避免成功收斂被誤報。
+                    state["red_streak"] = 0
+                    state["stall_rounds"] = 0
                 else:
                     state["current_order"] = nxt
 

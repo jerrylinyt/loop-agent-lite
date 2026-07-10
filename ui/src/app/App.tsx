@@ -15,6 +15,7 @@ export default function App() {
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [archivesOpen, setArchivesOpen] = useState(false);
   const [overviewOpen, setOverviewOpen] = useState(() => localStorage.getItem("fleet-overview") === "1");
+  const [attentionRequest, setAttentionRequest] = useState(0);
   const [leftWidth, setLeftWidth] = useState(() => +(localStorage.getItem("left-pane-width") || Math.round(window.innerWidth * 0.44)));
   const [rightCollapsed, setRightCollapsed] = useState(() => localStorage.getItem("agent-console-collapsed") === "1");
   const workspace = useMemo(
@@ -23,7 +24,7 @@ export default function App() {
   );
   useStatusFavicon(workspace, dashboard.state, dashboard.selected);
   const health = dashboard.health;
-  const healthText = !health ? "Fleet 狀態載入中" : health.status === "error" ? "Fleet state 錯誤" : health.status === "degraded" ? "Fleet 需關注" : "Fleet 正常";
+  const healthText = !health ? "工作區狀態載入中" : health.status === "error" ? "工作區狀態錯誤" : health.status === "degraded" ? "工作區需處理" : "工作區正常";
   const healthLabel = health
     ? `${healthText}：${health.workspace_count} 個 workspace，${health.attention} 項需關注`
     : healthText;
@@ -58,6 +59,13 @@ export default function App() {
     setOverviewOpen(false);
     localStorage.setItem("fleet-overview", "0");
   };
+  const showAttention = () => {
+    localStorage.setItem("fleet-filter", "attention");
+    localStorage.setItem("fleet-search", "");
+    localStorage.setItem("fleet-overview", "1");
+    setAttentionRequest((value) => value + 1);
+    setOverviewOpen(true);
+  };
 
   return (
     <>
@@ -65,13 +73,13 @@ export default function App() {
         <header className="app-toolbar">
           <WorkspaceTabs workspaces={dashboard.workspaces} selected={dashboard.selected} onSelect={dashboard.selectWorkspace} />
           <div className="toolbar-actions">
-            <span className={`connection-status ${dashboard.connection}`} role="status" aria-live="polite" aria-label={dashboard.connection === "connected" ? "即時連線" : dashboard.connection === "reconnecting" ? "重連中" : "連線中"} title={dashboard.connection === "connected" ? "Dashboard 即時事件串流已連線" : dashboard.connection === "reconnecting" ? "Dashboard 正在重新連線；狀態會自動恢復" : "Dashboard 正在建立即時事件串流"}>
+            {dashboard.connection !== "connected" && <span className={`connection-status ${dashboard.connection}`} role="status" aria-live="polite" aria-label={dashboard.connection === "reconnecting" ? "本機連線中斷" : "連線中"} title={dashboard.connection === "reconnecting" ? "Dashboard 與本機服務的事件串流中斷，正在重新連線" : "Dashboard 正在連接本機事件串流"}>
               <span aria-hidden="true">●</span>
-              {dashboard.connection === "connected" ? "即時連線" : dashboard.connection === "reconnecting" ? "重連中…" : "連線中…"}
-            </span>
-            <span className={`fleet-health${health ? ` ${health.status}` : " unknown"}`} role="status" aria-label={healthLabel} title={healthLabel}>
-              <span aria-hidden="true">●</span>{healthText}{health && health.attention > 0 ? ` · ${health.attention}` : ""}
-            </span>
+              {dashboard.connection === "reconnecting" ? "本機連線中斷，重試中…" : "連線中…"}
+            </span>}
+            {health && health.status !== "ok" && <button type="button" className={`fleet-health ${health.status}`} aria-label={`${healthLabel}；點擊查看問題`} title="點擊查看需處理的工作區" onClick={showAttention}>
+              <span aria-hidden="true">●</span>{healthText}{health.attention > 0 ? ` · ${health.attention}` : ""}
+            </button>}
             <ThemePicker />
             <button type="button" className={`secondary-button${overviewOpen ? " active-toggle" : ""}`} aria-pressed={overviewOpen} onClick={toggleOverview}>📺 總覽</button>
             <button type="button" className="secondary-button" onClick={() => setArchivesOpen(true)}>🗃 已封存</button>
@@ -91,7 +99,7 @@ export default function App() {
             {!dashboard.bootstrap.readonly && <button type="button" className="primary-button" onClick={() => setLauncherOpen(true)}>＋ 啟動第一個 loop</button>}
           </main>
         ) : overviewOpen ? (
-          <FleetOverview workspaces={dashboard.workspaces} fleetHistory={dashboard.fleetHistory} onSelect={selectFromOverview} />
+          <FleetOverview workspaces={dashboard.workspaces} fleetHistory={dashboard.fleetHistory} attentionRequest={attentionRequest} onSelect={selectFromOverview} />
         ) : (
           <main className="dashboard-grid" style={{ gridTemplateColumns: `${leftWidth}px 6px ${rightCollapsed ? "42px" : "minmax(0, 1fr)"}` }}>
             <WorkspaceView key={dashboard.selected} workspace={workspace} state={dashboard.state} consoleText={dashboard.consoleText} readonly={dashboard.bootstrap.readonly} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} />

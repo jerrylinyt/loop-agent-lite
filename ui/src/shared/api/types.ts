@@ -54,6 +54,7 @@ export interface FleetHealth {
 export interface FleetHistoryEntry {
   name: string;
   data: string;
+  metrics?: Omit<RoundMetrics, "samples">;
 }
 
 export interface RoundTelemetrySample {

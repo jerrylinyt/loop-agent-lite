@@ -147,9 +147,9 @@ export default function WorkspaceView({
   const unreadIssues = issues.filter((issue) => !Number.isInteger(issue.round) || issue.round > issuesAcknowledgedRound).length;
   const redLimit = state.config?.red_limit ?? 20;
   const stallLimit = state.config?.stall_limit ?? 300;
-  const healthIntensity = Math.min(1, Math.max((state.red_streak ?? 0) / redLimit, (state.stall_rounds ?? 0) / stallLimit));
+  const healthIntensity = state.phase === "done" ? 0 : Math.min(1, Math.max((state.red_streak ?? 0) / redLimit, (state.stall_rounds ?? 0) / stallLimit));
   const healthHue = Math.round(120 * (1 - healthIntensity));
-  const healthLabel = `健康度：紅連跳 ${state.red_streak}/${redLimit} · 停滯 ${state.stall_rounds}/${stallLimit}（越紅越接近 reset 防線）`;
+  const healthLabel = state.phase === "done" ? "健康度：工作區已完成" : `健康度：紅連跳 ${state.red_streak}/${redLimit} · 停滯 ${state.stall_rounds}/${stallLimit}（越紅越接近 reset 防線）`;
   const roundTiming = deriveRoundTiming(state, workspace?.running ?? false, roundNow);
   return (
     <section className="workspace-pane">
@@ -183,7 +183,7 @@ export default function WorkspaceView({
           </div>
           <div className="health-status">
             {state.round > 0 && workspace && <RoundSparkline workspace={workspace.name} round={state.round} onOpen={() => setHistoryOpen(true)} />}
-            <span key={`${state.red_streak}-${state.stall_rounds}`} className={`chip subdued${state.phase === "plan" && state.plan_version >= 10 ? " warning" : ""}${pulse.has("health") ? " status-pulse" : ""}`}>紅連跳 {state.red_streak} · 停滯 {state.stall_rounds} · plan v{state.plan_version}{state.phase === "plan" && state.plan_version >= 10 ? " ⚠ 可能震盪" : ""}</span>
+            {state.phase !== "done" && <span key={`${state.red_streak}-${state.stall_rounds}`} className={`chip subdued${state.phase === "plan" && state.plan_version >= 10 ? " warning" : ""}${pulse.has("health") ? " status-pulse" : ""}`}>紅連跳 {state.red_streak} · 停滯 {state.stall_rounds} · plan v{state.plan_version}{state.phase === "plan" && state.plan_version >= 10 ? " ⚠ 可能震盪" : ""}</span>}
             {!!state.agent_failure_streak && <span key={`${state.agent_failure_streak}-${state.agent_backoff_seconds}`} className={`chip warning${pulse.has("health") ? " status-pulse" : ""}`}>Agent 異常 {state.agent_failure_streak}{state.agent_backoff_seconds ? ` · ${state.agent_backoff_seconds} 秒後重試` : ""}</span>}
             {roundTiming && <span data-testid="round-timer" className={`chip round-timer ${roundTiming.warning || roundTiming.interrupted ? "warning" : "subdued"}`} title={`開始 ${state.round_started_at}${state.round_deadline_at ? ` · deadline ${state.round_deadline_at}` : ""}`}>{roundTiming.label}</span>}
             {(state.last_round_seconds ?? 0) > 0 && <span className={`chip ${state.last_round_timed_out ? "warning" : "subdued"}`}>⏱ 上輪 {state.last_round_seconds} 秒{state.last_round_timed_out ? " · 逾時" : ""}</span>}

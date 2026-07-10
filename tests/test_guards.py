@@ -1229,7 +1229,8 @@ class TestStatusCli(unittest.TestCase):
         sample = [
             {"name": "alert", "running": False, "phase": "exec", "stall_rounds": 1},
             {"name": "running", "running": True, "phase": "exec"},
-            {"name": "done", "running": False, "phase": "done"},
+            {"name": "done", "running": False, "phase": "done", "stall_rounds": 2,
+             "red_streak": 1, "last_round_timed_out": True, "state_recovery_count": 1},
             {"name": "broken", "error": "bad state"},
         ]
         self.assertEqual({item["name"] for item in S.filter_status_results(sample, "attention")},
@@ -1246,7 +1247,8 @@ class TestStatusCli(unittest.TestCase):
                 L.WORKSPACE_ROOT = Path(d) / "workspace"
                 done = L.Workspace("done")
                 done_state = done.fresh_state()
-                done_state["phase"] = "done"
+                done_state.update(phase="done", stall_rounds=2, red_streak=1,
+                                  last_round_timed_out=True, state_recovery_count=1)
                 done.save_state(done_state)
                 alert = L.Workspace("alert")
                 alert_state = alert.fresh_state()
@@ -1661,7 +1663,9 @@ class TestFleetHealthProjection(unittest.TestCase):
             root = Path(td)
             healthy = root / "healthy"
             healthy.mkdir()
-            (healthy / "state.json").write_text(json.dumps({"phase": "done"}), encoding="utf-8")
+            (healthy / "state.json").write_text(json.dumps({
+                "phase": "done", "stall_rounds": 2, "red_streak": 1,
+            }), encoding="utf-8")
             attention = root / "attention"
             attention.mkdir()
             (attention / "state.json").write_text(json.dumps({
@@ -3125,8 +3129,9 @@ class TestFleetHistoryProjection(unittest.TestCase):
             root = Path(td) / "workspace"
             (root / "alpha").mkdir(parents=True)
             (root / "beta").mkdir(parents=True)
-            line = ("2026-07-10T10:00:00 round=1 phase=exec task=task-1 rc=0 changed=False "
-                    "signal=done tamper=False agent_ok=True validate=PASS flag=0 done=1")
+            line = ("2026-07-10T10:00:00 round=1 phase=exec task=task-1 rc=0 secs=2.500 "
+                    "timeout=False changed=False signal=done tamper=False agent_ok=True "
+                    "validate=PASS flag=0 done=1")
             (root / "alpha" / "history.log").write_text(line + "\n", encoding="utf-8")
             (root / "alpha" / "state.json").write_text(json.dumps({
                 "phase": "exec", "current_order": 2,
@@ -3142,6 +3147,10 @@ class TestFleetHistoryProjection(unittest.TestCase):
                 entries = D.read_fleet_history()
                 self.assertEqual([e["name"] for e in entries], ["alpha"], "沒 history 的 beta 應跳過")
                 self.assertIn("task=task-1", entries[0]["data"])
+                self.assertEqual(entries[0]["metrics"]["sample_count"], 1)
+                self.assertEqual(entries[0]["metrics"]["average_seconds"], 2.5)
+                self.assertEqual(entries[0]["metrics"]["p50_seconds"], 2.5)
+                self.assertEqual(entries[0]["metrics"]["p95_seconds"], 2.5)
                 fleet = D.list_workspaces()
                 alpha = next(w for w in fleet if w["name"] == "alpha")
                 self.assertEqual(alpha["current_order"], 2)

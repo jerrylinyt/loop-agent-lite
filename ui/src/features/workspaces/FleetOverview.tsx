@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { FleetHistoryEntry, WorkspaceSummary } from "../../shared/api/types";
 import { deriveFleetEvents } from "./fleetEvents";
 import { deriveRoundTiming, useRoundNow } from "./roundTiming";
@@ -13,18 +13,26 @@ function initialFleetFilter(): FleetFilter {
 }
 
 function needsAttention(workspace: WorkspaceSummary): boolean {
+  const completed = workspace.phase === "done";
   return !!(
     workspace.error ||
-    (workspace.red_streak ?? 0) > 0 ||
-    (workspace.stall_rounds ?? 0) > 0 ||
     (workspace.unread_issues ?? workspace.issues ?? 0) > 0 ||
-    (workspace.agent_failure_streak ?? 0) > 0 ||
-    workspace.last_round_timed_out ||
-    (workspace.state_recovery_count ?? 0) > 0 ||
     workspace.state_recovery_pending ||
     workspace.goal_changed ||
-    workspace.stale_loop_pid
+    workspace.stale_loop_pid ||
+    (!completed && (
+      (workspace.red_streak ?? 0) > 0 ||
+      (workspace.stall_rounds ?? 0) > 0 ||
+      (workspace.agent_failure_streak ?? 0) > 0 ||
+      workspace.last_round_timed_out ||
+      (workspace.state_recovery_count ?? 0) > 0
+    ))
   );
+}
+
+function formatMetric(seconds: number | null): string {
+  if (seconds === null) return "—";
+  return `${seconds < 1 ? seconds.toFixed(2) : seconds.toFixed(1)}s`;
 }
 
 function progress(workspace: WorkspaceSummary): { done: number; total: number; pct: number } {
@@ -43,16 +51,30 @@ function currentActivity(workspace: WorkspaceSummary): string {
 
 /** 監控電視牆:聚合統計 + 全 fleet 即時卡片 + 事件推播。
  * 卡片與歷史事件都走同一條 SSE；事件流仍由前端從 history 尾段推導。 */
-export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
+export default function FleetOverview({ workspaces, fleetHistory, attentionRequest, onSelect }: {
   workspaces: WorkspaceSummary[];
   fleetHistory: FleetHistoryEntry[];
+  attentionRequest: number;
   onSelect: (name: string) => void;
 }) {
   const events = useMemo(() => deriveFleetEvents(fleetHistory), [fleetHistory]);
+  const metricsByWorkspace = useMemo(
+    () => new Map(fleetHistory.map((entry) => [entry.name, entry.metrics])),
+    [fleetHistory]
+  );
   const roundNow = useRoundNow(workspaces.some((workspace) =>
     Boolean(workspace.round_started_at && !workspace.round_interrupted_at)));
   const [filter, setFilter] = useState<FleetFilter>(initialFleetFilter);
   const [search, setSearch] = useState(() => localStorage.getItem("fleet-search") ?? "");
+
+  useEffect(() => {
+    if (attentionRequest > 0) {
+      setFilter("attention");
+      setSearch("");
+      localStorage.setItem("fleet-filter", "attention");
+      localStorage.setItem("fleet-search", "");
+    }
+  }, [attentionRequest]);
 
   const changeFilter = (next: FleetFilter) => {
     setFilter(next);
@@ -88,8 +110,8 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
   const taskPct = totalTasks > 0 ? Math.round((doneTasks / totalTasks) * 100) : 0;
 
   return (
-    <main className="fleet-overview" aria-label="Fleet 總覽">
-      <div className="fleet-stats" role="list" aria-label="Fleet 統計">
+    <main className="fleet-overview" aria-label="工作區總覽">
+      <div className="fleet-stats" role="list" aria-label="工作區統計">
         <div className="fleet-stat" role="listitem"><strong>{workspaces.length}</strong><span>workspaces</span></div>
         <div className="fleet-stat running" role="listitem"><strong>{running}</strong><span>執行中</span></div>
         <div className="fleet-stat" role="listitem"><strong>{planning} / {executing} / {done}</strong><span>規劃 / 執行 / 完成</span></div>
@@ -121,6 +143,7 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
             const unreadIssues = workspace.unread_issues ?? workspace.issues ?? 0;
             const activity = currentActivity(workspace);
             const roundTiming = deriveRoundTiming(workspace, workspace.running, roundNow);
+            const metrics = metricsByWorkspace.get(workspace.name);
             return (
               <button key={workspace.name} type="button" className={`fleet-card phase-${workspace.phase ?? "unknown"}${workspace.running ? " running" : ""}`} onClick={() => onSelect(workspace.name)}>
                 <div className="fleet-card-head">
@@ -142,6 +165,18 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
                   </div>
                 )}
                 {activity && <div className="fleet-card-task" title={activity}>{workspace.phase === "exec" ? "→ " : ""}{activity}</div>}
+                {metrics && metrics.sample_count > 0 ? (
+                  <div className="fleet-card-analysis" aria-label={`近期 ${metrics.sample_count} 輪效能`}>
+                    <div className="fleet-card-analysis-head"><strong>近期 {metrics.sample_count} 輪</strong><span>效能</span></div>
+                    <div className="fleet-card-analysis-grid">
+                      <span><small>平均</small><strong>{formatMetric(metrics.average_seconds)}</strong></span>
+                      <span><small>P50</small><strong>{formatMetric(metrics.p50_seconds)}</strong></span>
+                      <span><small>P95</small><strong>{formatMetric(metrics.p95_seconds)}</strong></span>
+                      <span><small>最慢</small><strong>{formatMetric(metrics.max_seconds)}</strong></span>
+                      <span className={metrics.timeout_count ? "warning" : ""}><small>逾時</small><strong>{metrics.timeout_rate_pct}%</strong></span>
+                    </div>
+                  </div>
+                ) : <div className="fleet-card-analysis-empty">尚無輪次效能資料</div>}
                 {alert && (
                   <div className="fleet-card-alerts">
                     {(workspace.red_streak ?? 0) > 0 && <span className="chip warning">紅連跳 {workspace.red_streak}</span>}

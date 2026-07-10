@@ -110,7 +110,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .connection-status.connected > span { color: var(--success); }
 .connection-status.reconnecting { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
 .connection-status.reconnecting > span { color: var(--warning); animation: connection-pulse 1.2s ease-in-out infinite; }
-.fleet-health { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 7px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.fleet-health { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 7px; background: transparent; color: var(--muted); font-size: 12px; white-space: nowrap; }
 .fleet-health > span { color: var(--muted); font-size: 11px; }
 .fleet-health.ok { color: var(--success); border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
 .fleet-health.ok > span { color: var(--success); }
@@ -286,11 +286,6 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .segmented-tabs button { min-height: 30px; padding: 4px 12px; border: 0; border-radius: 6px; background: transparent; }
 .segmented-tabs button.active { background: var(--surface-raised); color: var(--accent); box-shadow: 0 1px 3px rgba(0, 0, 0, .15); }
 .history-run-tabs { margin-bottom: 10px; }
-.history-metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; margin-bottom: 10px; }
-.history-metric { display: grid; min-height: 66px; align-content: center; padding: 7px 9px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--surface-subtle); }
-.history-metric span, .history-metric small { color: var(--muted); font-size: 11px; }
-.history-metric strong { font-size: 14px; font-variant-numeric: tabular-nums; }
-.history-metric.warning strong, .history-metric.warning small { color: var(--warning); }
 .modal-table-scroll { max-height: 58vh; overflow: auto; border: 1px solid var(--border-soft); border-radius: 8px; }
 .archive-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
@@ -417,6 +412,16 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .fleet-body { display: flex; min-height: 0; flex: 1; gap: 14px; align-items: stretch; }
 .fleet-grid { display: grid; flex: 1; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; align-content: start; overflow: auto; }
 .fleet-card-task { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; color: var(--text); font-size: 12px; line-height: 1.45; }
+.fleet-card-analysis { padding: 8px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--surface-subtle); }
+.fleet-card-analysis-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 5px; }
+.fleet-card-analysis-head strong { font-size: 12px; }
+.fleet-card-analysis-head span, .fleet-card-analysis-empty { color: var(--muted); font-size: 11px; }
+.fleet-card-analysis-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; }
+.fleet-card-analysis-grid > span { display: grid; min-width: 0; }
+.fleet-card-analysis-grid small { color: var(--muted); font-size: 10px; }
+.fleet-card-analysis-grid strong { overflow: hidden; font-size: 11px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; }
+.fleet-card-analysis-grid .warning strong { color: var(--warning); }
+.fleet-card-analysis-empty { padding: 7px 8px; border-radius: 7px; background: var(--surface-subtle); }
 .fleet-events { display: flex; width: 320px; flex: none; flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-raised); }
 .fleet-events-head { display: flex; flex: none; align-items: baseline; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
 .fleet-events-list { min-height: 0; flex: 1; overflow: auto; padding: 6px; }

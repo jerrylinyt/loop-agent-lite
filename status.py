@@ -182,16 +182,7 @@ def summarize_status(results):
         "planning": sum(1 for result in valid if result.get("phase") == "plan"),
         "executing": sum(1 for result in valid if result.get("phase") == "exec"),
         "done": sum(1 for result in valid if result.get("phase") == "done"),
-        "attention": sum(1 for result in valid if (
-            result.get("red_streak", 0) > 0 or
-            result.get("stall_rounds", 0) > 0 or
-            result.get("unread_issues", result.get("issues", 0)) > 0 or
-            result.get("agent_failure_streak", 0) > 0 or
-            result.get("last_round_timed_out") or
-            result.get("state_recovery_count", 0) > 0 or
-            result.get("state_recovery_pending") or
-            result.get("goal_changed") or
-            result.get("stale_loop_pid"))),
+        "attention": sum(1 for result in valid if projection_needs_attention(result)),
         "issues": sum(result.get("issues", 0) for result in valid),
         "unread_issues": sum(result.get("unread_issues", result.get("issues", 0)) for result in valid),
         "agent_failures": sum(result.get("agent_failure_streak", 0) for result in valid),
@@ -206,18 +197,26 @@ def summarize_status(results):
 
 
 def projection_needs_attention(result) -> bool:
-    """判斷單一 projection 是否應讓 --check 以非零結束。"""
+    """判斷單一 projection 是否有目前仍需處理的狀況。
+
+    完成前的紅燈、停滯、Agent 異常、逾時與 state 復原次數保留作稽核，
+    但不能讓已完成 workspace 永久停在需關注；真正未處理的 issue、
+    checkpoint、goal 變更與 stale PID 仍然會告警。
+    """
+    completed = result.get("phase") == "done"
     return bool(
         "error" in result or
-        result.get("red_streak", 0) > 0 or
-        result.get("stall_rounds", 0) > 0 or
         result.get("unread_issues", result.get("issues", 0)) > 0 or
-        result.get("agent_failure_streak", 0) > 0 or
-        result.get("last_round_timed_out") or
-        result.get("state_recovery_count", 0) > 0 or
         result.get("state_recovery_pending") or
         result.get("goal_changed") or
-        result.get("stale_loop_pid")
+        result.get("stale_loop_pid") or
+        (not completed and (
+            result.get("red_streak", 0) > 0 or
+            result.get("stall_rounds", 0) > 0 or
+            result.get("agent_failure_streak", 0) > 0 or
+            result.get("last_round_timed_out") or
+            result.get("state_recovery_count", 0) > 0
+        ))
     )
 
 
