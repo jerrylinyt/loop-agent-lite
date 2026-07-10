@@ -104,6 +104,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .status-dot.phase-exec { background: var(--warning); }
 .status-dot.phase-done { background: var(--success); }
 .toolbar-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.connection-status { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 7px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.connection-status > span { color: var(--muted); font-size: 11px; }
+.connection-status.connected { color: var(--success); border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
+.connection-status.connected > span { color: var(--success); }
+.connection-status.reconnecting { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.connection-status.reconnecting > span { color: var(--warning); animation: connection-pulse 1.2s ease-in-out infinite; }
+@keyframes connection-pulse { 50% { opacity: .3; } }
 .theme-picker {
   display: flex;
   align-items: center;

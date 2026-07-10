@@ -3,6 +3,7 @@ import { getJson } from "../shared/api/client";
 import type { BootstrapResponse, WorkspaceState, WorkspaceSummary } from "../shared/api/types";
 
 const CONSOLE_LIMIT = 300_000;
+export type ConnectionStatus = "connecting" | "connected" | "reconnecting";
 
 export default function useDashboardData() {
   const [bootstrap, setBootstrap] = useState<BootstrapResponse>({ readonly: true, preselect: "" });
@@ -11,6 +12,7 @@ export default function useDashboardData() {
   const [state, setState] = useState<WorkspaceState | null>(null);
   const [consoleText, setConsoleText] = useState("");
   const [initialized, setInitialized] = useState(false);
+  const [connection, setConnection] = useState<ConnectionStatus>("connecting");
   const selectedRef = useRef("");
   const bootstrapRef = useRef(bootstrap);
 
@@ -67,10 +69,13 @@ export default function useDashboardData() {
 
   useEffect(() => {
     if (!initialized) return;
+    setConnection("connecting");
     const source = new EventSource(`/api/events${selected ? `?ws=${encodeURIComponent(selected)}` : ""}`);
     source.onopen = () => {
+      setConnection("connected");
       setConsoleText("");
     };
+    source.onerror = () => setConnection("reconnecting");
     source.addEventListener("workspaces", (event) => applyWorkspaces(JSON.parse(event.data) as WorkspaceSummary[]));
     source.addEventListener("state", (event) => setState(JSON.parse(event.data) as WorkspaceState));
     source.addEventListener("console", (event) => {
@@ -82,6 +87,7 @@ export default function useDashboardData() {
 
   return {
     initialized,
+    connection,
     bootstrap,
     workspaces,
     selected,

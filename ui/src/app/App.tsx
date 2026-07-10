@@ -60,6 +60,10 @@ export default function App() {
         <header className="app-toolbar">
           <WorkspaceTabs workspaces={dashboard.workspaces} selected={dashboard.selected} onSelect={dashboard.selectWorkspace} />
           <div className="toolbar-actions">
+            <span className={`connection-status ${dashboard.connection}`} role="status" aria-live="polite" aria-label={dashboard.connection === "connected" ? "即時連線" : dashboard.connection === "reconnecting" ? "重連中" : "連線中"} title={dashboard.connection === "connected" ? "Dashboard 即時事件串流已連線" : dashboard.connection === "reconnecting" ? "Dashboard 正在重新連線；狀態會自動恢復" : "Dashboard 正在建立即時事件串流"}>
+              <span aria-hidden="true">●</span>
+              {dashboard.connection === "connected" ? "即時連線" : dashboard.connection === "reconnecting" ? "重連中…" : "連線中…"}
+            </span>
             <ThemePicker />
             <button type="button" className={`secondary-button${overviewOpen ? " active-toggle" : ""}`} aria-pressed={overviewOpen} onClick={toggleOverview}>📺 總覽</button>
             <button type="button" className="secondary-button" onClick={() => setArchivesOpen(true)}>🗃 已封存</button>
