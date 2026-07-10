@@ -2933,6 +2933,14 @@ class TestGoalProjection(unittest.TestCase):
                 self.assertEqual(result["content"], "GOAL v1\n")
                 self.assertTrue(result["goal_changed"])
                 self.assertIn("舊版", result["diff_error"])
+                # goal 被換成 symlink → 拒絕(路徑驗證 + O_NOFOLLOW 開檔雙防線),不得讀出連結目標
+                secret = Path(td) / "secret.txt"
+                secret.write_text("secret-content", encoding="utf-8")
+                (repo / "goal.md").unlink()
+                (repo / "goal.md").symlink_to(secret)
+                result = D.read_goal("demo")
+                self.assertIn("error", result)
+                self.assertNotIn("secret-content", json.dumps(result, ensure_ascii=False))
                 # goal 檔被移走 → 明確 error,不 crash
                 (repo / "goal.md").unlink()
                 self.assertIn("goal 檔不存在", D.read_goal("demo")["error"])

@@ -741,10 +741,15 @@ def read_goal(name):
     except ValueError as e:
         return {"error": f"goal 路徑不合法:{e}"}
     try:
-        content = goal_path.read_text(encoding="utf-8")
+        # repo_relative_path 只驗證不開檔;驗證與 read 之間 goal 可能被換成 symlink(TOCTOU)。
+        # 與 read_report 相同用 O_NOFOLLOW 開檔,把驗證與讀取收斂到同一個 syscall。
+        # UnicodeDecodeError 是 ValueError 子類,一併涵蓋。
+        fd = loop_mod._open_regular(goal_path, os.O_RDONLY)
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=True) as stream:
+            content = stream.read()
     except FileNotFoundError:
         return {"error": f"goal 檔不存在:{goal_path}(repo 被移走或 goal 被刪?)"}
-    except (OSError, UnicodeDecodeError) as e:
+    except (OSError, ValueError) as e:
         return {"error": f"goal 讀取失敗:{e}"}
     projection = {"content": content, "path": str(goal_path),
                   "goal_changed": bool(st.get("goal_changed"))}
