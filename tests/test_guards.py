@@ -1838,7 +1838,8 @@ class TestFleetHealthProjection(unittest.TestCase):
             attention = root / "attention"
             attention.mkdir()
             (attention / "state.json").write_text(json.dumps({
-                "phase": "exec", "red_streak": 2, "issues": [{"text": "a"}, {"text": "b"}],
+                "phase": "exec", "red_streak": 2,
+                "issues": [{"round": 1, "text": "a"}, {"round": 2, "text": "b"}],
                 "agent_failure_streak": 3, "state_recovery_count": 4,
                 "last_round_seconds": 60.2, "last_round_timed_out": True,
                 "state_recovery_pending": True, "goal_changed": True,
