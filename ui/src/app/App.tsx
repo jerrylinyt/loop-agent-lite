@@ -7,6 +7,7 @@ import ArchivesModal from "../features/workspaces/ArchivesModal";
 import WorkspaceTabs from "../features/workspaces/WorkspaceTabs";
 import WorkspaceView from "../features/workspaces/WorkspaceView";
 import useDashboardData from "./useDashboardData";
+import useStatusFavicon from "./useStatusFavicon";
 
 export default function App() {
   const dashboard = useDashboardData();
@@ -18,6 +19,7 @@ export default function App() {
     () => dashboard.workspaces.find((item) => item.name === dashboard.selected),
     [dashboard.workspaces, dashboard.selected]
   );
+  useStatusFavicon(workspace, dashboard.state, dashboard.selected);
   const resize = (pixels: number) => {
     setLeftWidth(pixels);
     localStorage.setItem("left-pane-width", String(pixels));

@@ -24,7 +24,6 @@ export default function useDashboardData() {
     setConsoleText("");
     localStorage.setItem("workspace", name);
     history.replaceState(null, "", `#${encodeURIComponent(name)}`);
-    document.title = `loop-lite · ${name}`;
   }, []);
 
   const applyWorkspaces = useCallback((list: WorkspaceSummary[]) => {
@@ -32,7 +31,6 @@ export default function useDashboardData() {
     if (!list.length) {
       setSelected("");
       setState(null);
-      document.title = "loop-lite";
       return;
     }
     if (!selectedRef.current || !list.some((workspace) => workspace.name === selectedRef.current)) {
