@@ -65,7 +65,9 @@ def prepare_fixture():
         "counter = ws / '.e2e-agent-count'\n"
         "count = int(counter.read_text()) + 1 if counter.exists() else 1\n"
         "counter.write_text(str(count))\n"
-        "time.sleep(2 if count == 2 else 0.45)\n",
+        # 第一輪快速產生 history、第二輪涵蓋 live timing；第三輪保留足夠時間，
+        # 讓 E2E 穩定驗證「要求本輪後停止 → 撤銷」而不會和輪末競速。
+        "time.sleep(5 if count == 3 else 2 if count == 2 else 0.45)\n",
         encoding="utf-8"
     )
 
