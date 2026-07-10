@@ -2435,9 +2435,27 @@ class Handler(BaseHTTPRequestHandler):
             if not (repo and vcmd):
                 self._err("state 缺 repo/validate 設定,無法驗證——先用啟動表單跑過一次")
                 return
-            r = subprocess.run(shlex.split(vcmd), cwd=repo, capture_output=True, text=True)
-            if r.returncode != 0:
-                tail = "\n".join(((r.stdout or "") + "\n" + (r.stderr or "")).strip().splitlines()[-15:])
+            cfg = load_config()
+            if "error" in cfg:
+                self._err(cfg["error"])
+                return
+            try:
+                timeout = float(c.get("validate_timeout", 120))
+                if not (0 < timeout < float("inf")):
+                    raise ValueError
+                command = shlex.split(vcmd)
+                if not command:
+                    raise ValueError
+                rc, output, timed_out = run_command_check(
+                    command, repo, timeout=timeout, env=command_env(cfg))
+            except (OSError, ValueError) as e:
+                self._err(f"validate 設定無法執行,不能往後跳:{e}")
+                return
+            tail = "\n".join(output.strip().splitlines()[-15:])
+            if timed_out:
+                self._err(f"validate 逾時 {timeout:g} 秒,不能往後跳(同 preflight 原則):\n{tail}")
+                return
+            if rc != 0:
                 self._err(f"validate 未過,不能往後跳(同 preflight 原則):\n{tail}")
                 return
             head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],

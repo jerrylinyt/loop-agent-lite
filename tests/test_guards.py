@@ -2228,6 +2228,59 @@ class TestPortableDashboardConfig(unittest.TestCase):
                  D.LEGACY_CONFIG_PATH, D.CONFIG_PATH) = old_values
 
 
+class TestManualTaskProgressValidation(unittest.TestCase):
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_forward_jump_honors_validate_timeout_without_changing_progress(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            old_roots = L.WORKSPACE_ROOT, D.ROOT
+            L.WORKSPACE_ROOT = workspace_root
+            D.ROOT = workspace_root
+            try:
+                ws = L.Workspace("manual-progress")
+                state = ws.fresh_state()
+                state.update({
+                    "phase": "exec",
+                    "plan": [
+                        {"order": 1, "task": "first", "ref": None},
+                        {"order": 2, "task": "second", "ref": None},
+                    ],
+                    "current_order": 1,
+                    "config": {
+                        "repo": str(repo),
+                        "validate_cmd": shlex.join([
+                            sys.executable, "-c", "import time; time.sleep(1)",
+                        ]),
+                        "validate_timeout": 0.05,
+                    },
+                })
+                ws.save_state(state)
+
+                handler = self.ResponseCapture()
+                started = time.monotonic()
+                D.Handler.api_set_task(handler, {"name": "manual-progress", "order": 2})
+                elapsed = time.monotonic() - started
+
+                self.assertEqual(handler.response[0], 400)
+                self.assertIn("validate 逾時", handler.response[1]["error"])
+                self.assertLess(elapsed, 0.8, "任務跳轉不得被卡住的 validator 長時間阻塞")
+                saved = json.loads(ws.state_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["current_order"], 1)
+                self.assertEqual(saved["completed"], [])
+            finally:
+                L.WORKSPACE_ROOT, D.ROOT = old_roots
+
+
 class TestDashboardStateLockCoverage(unittest.TestCase):
     """#3 run/launch 必須和 edit/phase 共用 workspace lock,不能在 stopped check 後競態。"""
 
