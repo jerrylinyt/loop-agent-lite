@@ -140,9 +140,17 @@ export default function WorkspaceView({
 
   const completed = (state.completed ?? []).length;
   const total = (state.plan ?? []).length;
+  const redLimit = state.config?.red_limit ?? 20;
+  const stallLimit = state.config?.stall_limit ?? 300;
+  const healthIntensity = Math.min(1, Math.max((state.red_streak ?? 0) / redLimit, (state.stall_rounds ?? 0) / stallLimit));
+  const healthHue = Math.round(120 * (1 - healthIntensity));
+  const healthLabel = `健康度：紅連跳 ${state.red_streak}/${redLimit} · 停滯 ${state.stall_rounds}/${stallLimit}（越紅越接近 reset 防線）`;
   return (
     <section className="workspace-pane">
       <header className="workspace-header">
+        <div className="health-strip" role="img" aria-label={healthLabel} title={healthLabel}>
+          <div className="health-strip-fill" style={{ background: `hsl(${healthHue} 72% 42%)`, opacity: 0.3 + healthIntensity * 0.7 }} />
+        </div>
         <div className="workspace-title-row">
           <div className="workspace-title"><h1>{workspace?.name ?? "workspace"}</h1><span key={state.phase} className={`phase-badge phase-${state.phase}${pulse.has("phase") ? " status-pulse" : ""}`}>{PHASE_NAMES[state.phase]}</span></div>
           {!readonly && workspace && <div className="workspace-actions">

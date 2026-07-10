@@ -79,6 +79,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
 
   await expect(launcher).toBeHidden();
   await expect(page.getByRole("heading", { name: "e2e-workspace" })).toBeVisible();
+  await expect(page.getByRole("img", { name: /^健康度：紅連跳 \d+\/\d+ · 停滯 \d+\/\d+/ })).toBeVisible();
   await expect(page.getByRole("button", { name: "⏹ 立即停止" })).toBeVisible();
   await expect(page.getByRole("button", { name: "⏸ 本輪後停止" })).toBeVisible();
   await expect(page).toHaveTitle(/^🟢 e2e-workspace · r\d+/);
