@@ -79,8 +79,12 @@ Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace 
 
 ## Dashboard 操作
 
-- 左側是 Loop 狀態；右側是 Agent 輸出，可切換 Agent／其他／全部。
+- 左側是 Loop 狀態；右側是 Agent 輸出，可切換 Agent／其他／全部，並可用「過濾…」輸入框對長 log 做文字過濾。
 - 分隔線可拖曳調整欄寬；箭頭可收合，設定會保存在瀏覽器。
+- 狀態列的「🎯 goal」「🕒 輪次紀錄」「📨 prompt」chips 分別顯示目前 goal 內容、history.log 逐輪判定，以及最近一輪送給 Agent 的完整 prompt（全部唯讀）。
+- 全部任務收斂後，狀態列出現「📄 完成報告」直接檢視 REPORT.md。
+- 停止狀態可「🗄 封存」workspace：整個目錄移到 `workspace/.archive/<名稱>-<時間戳>`，target repo 不受影響，手動搬回即可還原；執行中一律拒絕。
+- 啟動表單進階設定內的「🔔 管理終態通知」可編輯、儲存並以 `status=test` 實測 `notify_cmd`（佔位符 `{status}`、`{name}`）。
 - 啟動表單的「完整健檢」會檢查目前已 commit repo 的 git／鎖／乾淨工作樹／goal 與 Validate，不建 state、不啟動 Agent；待匯入 goal、plan、reset 或新 branch 時會停用，實際啟動仍會再驗一次。
 - 正常要停時用「本輪後停止」：目前 Agent、Validate 與 state/history 落盤完成後才停，不會啟動下一輪。
 - Agent CLI 卡死或明顯失控時用「立即停止」；它會中斷目前 round，state 可在下次運行時續用。
@@ -118,6 +122,10 @@ workspace/<name>/
 **validate 失敗或逾時**
 
 先在 target repo 手動執行同一個 command，確認工作目錄與依賴正確，再回 Dashboard 修改命令或 timeout。逾時會終止 validator 的整個 process group。
+
+**封存錯 workspace 想要還原**
+
+從 `workspace/.archive/` 把對應目錄搬回 `workspace/<原名稱>` 即可；封存不會動 target repo 或程式碼。
 
 **workspace 顯示沒有 state.json**
 
