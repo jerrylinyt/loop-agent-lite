@@ -192,6 +192,12 @@ def render_human(result, *, timestamp=False) -> None:
           f"紅連跳 {result['red_streak']}｜停滯 {result['stall_rounds']}｜issues {result['issues']}", flush=True)
     if result["state_recovery_pending"]:
         print("🛟 primary state 不可讀，目前只投影 last-good checkpoint（未修改檔案）", flush=True)
+    if result.get("agent_failure_streak", 0):
+        print(f"⚠ Agent 異常 {result['agent_failure_streak']}｜退避 {result.get('agent_backoff_seconds', 0):g} 秒", flush=True)
+    if result.get("state_recovery_count", 0):
+        print(f"🛟 state 復原 {result['state_recovery_count']}", flush=True)
+    if result.get("goal_changed"):
+        print("⚠ goal 已變更，建議回規劃期重新收斂", flush=True)
 
 
 def render_fleet_summary(summary) -> None:
@@ -199,6 +205,8 @@ def render_fleet_summary(summary) -> None:
     print(f"fleet｜workspaces {summary['workspace_count']}｜執行中 {summary['running']}｜"
           f"規劃/執行/完成 {summary['planning']}/{summary['executing']}/{summary['done']}｜"
           f"需關注 {summary['attention']}｜issues {summary['issues']}｜"
+          f"Agent 異常 {summary['agent_failures']}｜state 復原 {summary['state_recoveries']}｜"
+          f"goal 變更 {summary['goal_changes']}｜stale PID {summary['stale_loops']}｜"
           f"任務 {summary['tasks_completed']}/{summary['tasks_total']} "
           f"({summary['task_completion_pct']}%)｜錯誤 {summary['error_count']}", flush=True)
 

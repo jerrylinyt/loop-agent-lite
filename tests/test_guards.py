@@ -816,6 +816,28 @@ class TestStatusCli(unittest.TestCase):
             finally:
                 L.WORKSPACE_ROOT = old_root
 
+    def test_human_status_shows_attention_context(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = root / "workspace"
+                ws = L.Workspace("human-status")
+                state = ws.fresh_state()
+                state.update(agent_failure_streak=2, agent_backoff_seconds=4,
+                             state_recovery_count=1, goal_changed=True)
+                ws.save_state(state)
+                env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
+                result = subprocess.run(
+                    [sys.executable, STATUS_PY, "--name", "human-status"],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Agent 異常 2", result.stdout)
+                self.assertIn("state 復原 1", result.stdout)
+                self.assertIn("goal 已變更", result.stdout)
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
     def test_sort_requires_all_mode(self):
         with tempfile.TemporaryDirectory() as d:
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
