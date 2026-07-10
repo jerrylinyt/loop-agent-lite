@@ -4,6 +4,12 @@ import { deriveFleetEvents } from "./fleetEvents";
 
 const PHASE_NAMES: Record<string, string> = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
 type FleetFilter = "all" | "attention" | "running" | "done";
+const FLEET_FILTERS: FleetFilter[] = ["all", "attention", "running", "done"];
+
+function initialFleetFilter(): FleetFilter {
+  const saved = localStorage.getItem("fleet-filter") as FleetFilter | null;
+  return saved && FLEET_FILTERS.includes(saved) ? saved : "all";
+}
 
 function needsAttention(workspace: WorkspaceSummary): boolean {
   return !!(
@@ -39,8 +45,17 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
   onSelect: (name: string) => void;
 }) {
   const events = useMemo(() => deriveFleetEvents(fleetHistory), [fleetHistory]);
-  const [filter, setFilter] = useState<FleetFilter>("all");
-  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState<FleetFilter>(initialFleetFilter);
+  const [search, setSearch] = useState(() => localStorage.getItem("fleet-search") ?? "");
+
+  const changeFilter = (next: FleetFilter) => {
+    setFilter(next);
+    localStorage.setItem("fleet-filter", next);
+  };
+  const changeSearch = (next: string) => {
+    setSearch(next);
+    localStorage.setItem("fleet-search", next);
+  };
 
   const running = workspaces.filter((workspace) => workspace.running).length;
   const done = workspaces.filter((workspace) => workspace.phase === "done").length;
@@ -83,13 +98,13 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
         <div className="fleet-filters" role="group" aria-label="Workspace 篩選">
           {filters.map((item) => (
             <button key={item.id} type="button" className={filter === item.id ? "active" : ""}
-              aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}>
+              aria-pressed={filter === item.id} onClick={() => changeFilter(item.id)}>
               {item.label} <span>{item.count}</span>
             </button>
           ))}
         </div>
         <input className="fleet-search" type="search" aria-label="搜尋 workspace" placeholder="搜尋 workspace…"
-          value={search} onChange={(event) => setSearch(event.target.value)} />
+          value={search} onChange={(event) => changeSearch(event.target.value)} />
         <span className="muted">顯示 {visibleWorkspaces.length} / {workspaces.length}</span>
       </div>
       <div className="fleet-body">
