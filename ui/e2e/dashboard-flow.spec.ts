@@ -161,6 +161,13 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(firstHistoryRow).toContainText("done");
   await expect(firstHistoryRow).toContainText("✅");
   await expect(firstHistoryRow).toContainText("秒");
+  const roundMetrics = historyModal.getByRole("list", { name: "輪次效能摘要" });
+  await expect(roundMetrics).toBeVisible();
+  await expect(roundMetrics).toContainText("平均");
+  await expect(roundMetrics).toContainText("P95");
+  await expect(roundMetrics).toContainText("最慢");
+  await expect(roundMetrics).toContainText("逾時率");
+  await expect(historyModal).not.toContainText("檔案較大，僅顯示最近的紀錄");
   await historyModal.getByRole("button", { name: "重新整理" }).click();
   await expect(firstHistoryRow).toContainText("task-1");
   await historyModal.getByRole("tab", { name: "上一個 run" }).click();

@@ -353,6 +353,107 @@ class TestRoundTelemetry(unittest.TestCase):
             self.assertIn("timeout=True", history)
 
 
+class TestRoundMetrics(unittest.TestCase):
+    """history metrics 只聚合有效近期樣本，並維持 bounded/safe read。"""
+
+    HISTORY = (
+        "2026-07-10T10:00:00 round=1 phase=plan task=- changed=False\n"
+        "2026-07-10T10:01:00 round=1 phase=plan task=- secs=1.000 timeout=False changed=False\n"
+        "2026-07-10T10:02:00 round=9 phase=exec task=- secs=nan timeout=True changed=False\n"
+        "2026-07-10T10:03:00 round=2 phase=exec task=task-1 secs=4.000 timeout=True changed=False\n"
+        "2026-07-10T10:04:00 round=3 phase=exec task=task-1 secs=2.000 timeout=False changed=False\n"
+        "2026-07-10T10:05:00 round=4 phase=exec task=task-1 secs=8.000 timeout=False changed=False\n"
+    )
+
+    class ResponseCapture:
+        response = None
+        _ws_dir = D.Handler._ws_dir
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_recent_metrics_skip_old_and_invalid_rows(self):
+        metrics = L.round_metrics_from_history(self.HISTORY, 3)
+        self.assertEqual([sample["round"] for sample in metrics["samples"]], [2, 3, 4])
+        self.assertEqual(metrics["sample_count"], 3)
+        self.assertEqual(metrics["average_seconds"], 4.667)
+        self.assertEqual(metrics["p50_seconds"], 4)
+        self.assertEqual(metrics["p95_seconds"], 8)
+        self.assertEqual(metrics["slowest_round"], 4)
+        self.assertEqual(metrics["timeout_count"], 1)
+        self.assertEqual(metrics["timeout_rate_pct"], 33.3)
+
+    def test_reader_is_bounded_and_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            history = root / "history.log"
+            history.write_text("x" * 256 + "\n" + self.HISTORY)
+            old_scan = L.ROUND_METRICS_SCAN_BYTES
+            try:
+                L.ROUND_METRICS_SCAN_BYTES = 220
+                metrics = L.read_round_metrics(history, 2)
+            finally:
+                L.ROUND_METRICS_SCAN_BYTES = old_scan
+            self.assertTrue(metrics["history_truncated"])
+            self.assertEqual([sample["round"] for sample in metrics["samples"]], [3, 4])
+            outside = root / "outside.log"
+            outside.write_text(self.HISTORY)
+            history.unlink()
+            history.symlink_to(outside)
+            with self.assertRaises(ValueError):
+                L.read_round_metrics(history, 10)
+
+    def test_dashboard_endpoint_supports_runs_and_rejects_unsafe_input(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            workspace = root / "metrics"
+            workspace.mkdir()
+            (workspace / "history.log").write_text(self.HISTORY)
+            (workspace / "history.log.1").write_text(self.HISTORY.splitlines()[1] + "\n")
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                current = self.ResponseCapture()
+                current.path = "/api/round-metrics?ws=metrics&limit=3"
+                D.Handler.do_GET(current)
+                self.assertEqual(current.response[0], 200)
+                self.assertEqual(current.response[1]["run"], "current")
+                self.assertEqual(current.response[1]["sample_count"], 3)
+
+                previous = self.ResponseCapture()
+                previous.path = "/api/round-metrics?ws=metrics&run=previous&limit=10"
+                D.Handler.do_GET(previous)
+                self.assertEqual(previous.response[0], 200)
+                self.assertEqual(previous.response[1]["run"], "previous")
+                self.assertEqual(previous.response[1]["sample_count"], 1)
+
+                for path in (
+                    "/api/round-metrics?ws=metrics&limit=0",
+                    "/api/round-metrics?ws=metrics&limit=bad",
+                    "/api/round-metrics?ws=metrics&run=ancient",
+                ):
+                    invalid = self.ResponseCapture()
+                    invalid.path = path
+                    D.Handler.do_GET(invalid)
+                    with self.subTest(path=path):
+                        self.assertEqual(invalid.response[0], 400)
+
+                outside = root / "outside.log"
+                outside.write_text(self.HISTORY)
+                (workspace / "history.log").unlink()
+                (workspace / "history.log").symlink_to(outside)
+                unsafe = self.ResponseCapture()
+                unsafe.path = "/api/round-metrics?ws=metrics"
+                D.Handler.do_GET(unsafe)
+                self.assertEqual(unsafe.response[0], 400)
+                self.assertIn("symbolic link", unsafe.response[1]["error"])
+            finally:
+                D.ROOT = old_root
+
+
 class TestAbnormalRoundVoided(unittest.TestCase):
     """Agent crash 前打出的共識訊號不得被採信。"""
 
@@ -970,6 +1071,49 @@ class TestStatusCli(unittest.TestCase):
             finally:
                 L.WORKSPACE_ROOT = old_root
 
+    def test_metrics_option_projects_recent_history_for_json_and_humans(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d) / "workspace"
+                ws = L.Workspace("metrics-status")
+                ws.save_state(ws.fresh_state())
+                ws.history.write_text(
+                    "2026-07-10T10:00:00 round=1 phase=exec task=- secs=1.000 timeout=False\n"
+                    "2026-07-10T10:01:00 round=2 phase=exec task=- secs=3.000 timeout=True\n"
+                    "2026-07-10T10:02:00 round=3 phase=exec task=- secs=2.000 timeout=False\n")
+                env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
+                result = subprocess.run(
+                    [sys.executable, STATUS_PY, "--name", "metrics-status", "--metrics", "2", "--json"],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                metrics = json.loads(result.stdout)["round_metrics"]
+                self.assertEqual(metrics["sample_count"], 2)
+                self.assertEqual([sample["round"] for sample in metrics["samples"]], [2, 3])
+                self.assertEqual(metrics["average_seconds"], 2.5)
+                self.assertEqual(metrics["timeout_rate_pct"], 50)
+
+                human = subprocess.run(
+                    [sys.executable, STATUS_PY, "--name", "metrics-status", "--metrics", "2"],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(human.returncode, 0, human.stdout + human.stderr)
+                self.assertIn("效能 2 輪", human.stdout)
+                self.assertIn("P95 3", human.stdout)
+                self.assertIn("逾時 1（50%）", human.stdout)
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_metrics_option_rejects_out_of_range_values_before_reading_workspace(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
+            for value in ("-1", str(L.ROUND_METRICS_MAX_SAMPLES + 1), "bad"):
+                result = subprocess.run(
+                    [sys.executable, STATUS_PY, "--name", "missing", "--metrics", value],
+                    capture_output=True, text=True, env=env)
+                with self.subTest(value=value):
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("--metrics", result.stderr)
+
     def test_sort_requires_all_mode(self):
         with tempfile.TemporaryDirectory() as d:
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
@@ -1488,6 +1632,22 @@ class TestHistoryRetention(unittest.TestCase):
             self.assertIn("round=5", current)
             self.assertNotIn("round=0", current)
             self.assertEqual(previous.read_text(encoding="utf-8"), "previous-run\n")
+
+    def test_incremental_projection_reports_actual_tail_truncation(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "history.log"
+            path.write_text("中文輪次\n", encoding="utf-8")
+            self.assertFalse(D.read_incremental(path, -1)["truncated"],
+                             "UTF-8 byte size 不等於 JS 字數時也不得誤報裁切")
+            path.write_text("old-line-1234567890\nnew-line-1234567890\n", encoding="utf-8")
+            old_tail = D.TAIL_INIT
+            try:
+                D.TAIL_INIT = 24
+                projection = D.read_incremental(path, -1)
+            finally:
+                D.TAIL_INIT = old_tail
+            self.assertTrue(projection["truncated"])
+            self.assertIn("new-line", projection["data"])
 
 
 class TestIssueRetention(unittest.TestCase):

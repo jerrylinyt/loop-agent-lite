@@ -1056,6 +1056,7 @@ def read_incremental(path: Path, offset: int):
             size = os.fstat(f.fileno()).st_size
             if offset < 0:  # 首抓:直接跳到尾段,從下一個完整行開始
                 offset = max(0, size - TAIL_INIT)
+                truncated = offset > 0
                 f.seek(offset)
                 data = f.read(MAX_CHUNK)
                 if offset > 0:
@@ -1063,7 +1064,8 @@ def read_incremental(path: Path, offset: int):
                     if nl != -1:
                         offset += nl + 1
                         data = data[nl + 1:]
-                return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace")}
+                return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace"),
+                        "truncated": truncated}
             if offset > size:
                 offset = 0
             f.seek(offset)
@@ -1331,6 +1333,30 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 history_name = "history.log" if run == "current" else "history.log.1"
                 projection = read_incremental(d / history_name, off)
+                projection["run"] = run
+                self._out(200, json.dumps(projection, ensure_ascii=False))
+            elif u.path == "/api/round-metrics":
+                d = self._ws_dir(q)
+                if d is None:
+                    return
+                run = q.get("run", ["current"])[0]
+                if run not in ("current", "previous"):
+                    self._err("round metrics run 必須是 current 或 previous")
+                    return
+                try:
+                    limit = int(q.get("limit", ["50"])[0])
+                except (TypeError, ValueError):
+                    self._err(f"round metrics limit 必須介於 1～{loop_mod.ROUND_METRICS_MAX_SAMPLES}")
+                    return
+                if not 1 <= limit <= loop_mod.ROUND_METRICS_MAX_SAMPLES:
+                    self._err(f"round metrics limit 必須介於 1～{loop_mod.ROUND_METRICS_MAX_SAMPLES}")
+                    return
+                history_name = "history.log" if run == "current" else "history.log.1"
+                try:
+                    projection = loop_mod.read_round_metrics(d / history_name, limit)
+                except ValueError as e:
+                    self._err(str(e))
+                    return
                 projection["run"] = run
                 self._out(200, json.dumps(projection, ensure_ascii=False))
             elif u.path == "/api/report":

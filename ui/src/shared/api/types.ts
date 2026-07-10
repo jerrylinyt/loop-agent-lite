@@ -53,6 +53,29 @@ export interface FleetHistoryEntry {
   data: string;
 }
 
+export interface RoundTelemetrySample {
+  round: number;
+  seconds: number;
+  timed_out: boolean;
+  timestamp: string;
+}
+
+export interface RoundMetrics {
+  error?: string;
+  run?: "current" | "previous";
+  limit: number;
+  sample_count: number;
+  average_seconds: number | null;
+  p50_seconds: number | null;
+  p95_seconds: number | null;
+  max_seconds: number | null;
+  slowest_round: number | null;
+  timeout_count: number;
+  timeout_rate_pct: number;
+  history_truncated: boolean;
+  samples: RoundTelemetrySample[];
+}
+
 export interface PlanTask {
   order: number;
   task: string;
@@ -162,6 +185,7 @@ export interface JobInfo {
 export interface IncrementalResponse {
   size: number;
   data: string;
+  truncated?: boolean;
   run?: "current" | "previous";
   error?: string;
 }

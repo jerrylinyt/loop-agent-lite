@@ -75,6 +75,7 @@ python3 status.py --all --json                # 一次列出整個 workspace fle
 python3 status.py --all --json --check        # 需關注或 state 錯誤時 exit 1
 python3 status.py --all --json --sort attention  # 將需關注項目排前
 python3 status.py --all --json --filter attention # 只輸出需關注／錯誤 workspace
+python3 status.py --name <workspace> --metrics 100 # 聚合近期輪次效能
 ```
 
 `status.py` 不啟動 loop、不修復檔案；`--all` 與 `--name` 擇一，`--watch` 只重複唯讀輪詢，`--on-change` 可抑制未變更 projection 的重複輸出，Ctrl-C 以 exit code 130 結束。輸出也包含最近一輪 Agent 耗時與逾時狀態；primary state 不可讀時只投影 checkpoint，找不到 workspace 或兩份 state 都損壞會以 exit code 1 結束。
@@ -82,8 +83,10 @@ JSON 輸出包含 `schema_version: 1`；單 workspace 直接帶狀態欄位，`-
 `--check` 是一次性 gate：projection 仍照常輸出，但只要有 state 錯誤或需關注 workspace 就以 exit code 1 結束；不可與 `--watch` 同時使用。
 `--sort` 只作用於 `--all`，可選 `name`、`attention`、`running`、`phase`、`round`；預設 `name` 維持穩定的相容輸出。
 `--filter` 也只作用於 `--all`，可選 `all`、`attention`、`running`、`stopped`、`done`、`error`。篩選時 `workspaces` 只包含符合項目，另帶 `filter`／`matched_count`；`summary` 與 `--check` 始終涵蓋完整 fleet，避免篩選掩蓋其他 workspace 的異常。
+`--metrics N` 可搭配單一或全部 workspace，唯讀掃描每份 `history.log` 尾端最多 2 MiB，聚合最近 N 輪（上限 200）的平均、P50、P95、最慢輪與逾時率；未指定時完全不掃 history。
 
 Dashboard 也提供唯讀 `GET /api/health`，回傳 `schema_version: 1`、`status`（`ok`／`degraded`／`error`）與 workspace、執行中、需關注、state 錯誤、issues、Agent 異常、最近一輪逾時、state 復原、goal 變更及 stale PID 摘要；適合本機探針或外部監控。加上 `?strict=1` 時，`degraded`／`error` 會以 HTTP 503 回應，方便 readiness probe 直接判斷；預設仍維持 HTTP 200 並讓呼叫端讀取 status。瀏覽器頁首與即時 SSE 的 `health` event 使用同一份 projection，不會修復或改寫任何 workspace。
+`GET /api/round-metrics?ws=<name>&run=current&limit=100` 使用同一套 bounded/safe history reader，供 Dashboard 與外部觀測工具取得近期效能摘要及逐輪樣本；`run=previous` 可分析保留的上一個 run。
 
 常用選項：
 
@@ -116,7 +119,7 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 - workspace header 有輪次 sparkline（綠紅灰橙＝驗證綠／紅／規劃／reset，點擊開逐輪判定）與頂部健康色帶（越紅越接近 reset 防線）；若 loop 被強制終止後留下 stale PID，詳細頁也會保留警示。
 - 工具列「📺 總覽」切換電視牆模式：聚合統計（執行中／完成／任務完成率）＋全 fleet 即時卡片，點卡片切入；卡片與事件推播共用 SSE，不另開輪詢；可用名稱搜尋與「全部／需關注／執行中／已完成」篩選卡片，選擇會保存在瀏覽器；紅連跳、停滯、issues、Agent 異常／逾時、checkpoint 復原、goal 變更與 state 錯誤都會在卡片上標示；搭配 `--read-only` 適合掛牆監控。
 - 分隔線可拖曳調整欄寬；箭頭可收合，設定會保存在瀏覽器。
-- 狀態列的「🎯 goal」「🕒 輪次紀錄」「📨 prompt」chips 分別顯示目前 goal 內容、history.log 逐輪判定（含 Agent 耗時／逾時），以及最近一輪送給 Agent 的完整 prompt（全部唯讀）；goal 在停機期間變更時，Goal 視窗會用保存的計畫基準 hash 從 Git 歷史重建並顯示 unified diff。
+- 狀態列的「🎯 goal」「🕒 輪次紀錄」「📨 prompt」chips 分別顯示目前 goal 內容、history.log 逐輪判定（含 Agent 耗時／逾時與最近 100 輪的平均、P95、最慢輪、逾時率），以及最近一輪送給 Agent 的完整 prompt（全部唯讀）；goal 在停機期間變更時，Goal 視窗會用保存的計畫基準 hash 從 Git 歷史重建並顯示 unified diff。
 - Issues 視窗可「標記已讀」而不刪除稽核紀錄；只有未讀 issues 會讓 fleet 顯示需關注，仍可用「清空全部」永久移除紀錄。
 - 全部任務收斂後，狀態列出現「📄 完成報告」直接檢視 REPORT.md。
 - 停止狀態可「🗄 封存」workspace：整個目錄以 UUID 封存 ID 移到 `workspace/.archive/`，target repo 不受影響；工具列的「🗃 已封存」可列出、安全還原或在雙重確認後永久刪除，還原不會自動啟動 loop。執行中、鎖定中、symlink 或目標名稱已存在時一律拒絕；永久刪除只作用於封存目錄，不會碰 target repo。

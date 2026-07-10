@@ -29,7 +29,7 @@ def pid_is_loop_alive(pid) -> bool:
     return "loop.py" in command
 
 
-def project_status(name: str):
+def project_status(name: str, metrics_limit=0):
     """讀取主 state 或 checkpoint；repair=False 保證 CLI 是純唯讀投影。"""
     loop.require_workspace_name(name)
     directory = loop.workspace_path(loop.WORKSPACE_ROOT, name)
@@ -51,7 +51,7 @@ def project_status(name: str):
                          if isinstance(task, dict) and task.get("order") == current_order), "")
     if len(current_task) > 160:
         current_task = current_task[:160] + "…"
-    return {
+    projection = {
         "name": name,
         "workspace": str(directory),
         "phase": state.get("phase"),
@@ -83,13 +83,16 @@ def project_status(name: str):
         "stale_loop_pid": pid is not None and not running,
         "state_recovery_pending": recovered,
     }
+    if metrics_limit:
+        projection["round_metrics"] = loop.read_round_metrics(directory / "history.log", metrics_limit)
+    return projection
 
 
 def stat_is_directory(mode: int) -> bool:
     return stat.S_ISDIR(mode) and not stat.S_ISLNK(mode)
 
 
-def project_all_status():
+def project_all_status(metrics_limit=0):
     """投影 workspace root 下所有合法 workspace；單一壞 workspace 不阻斷其他結果。"""
     root = Path(loop.WORKSPACE_ROOT)
     try:
@@ -111,7 +114,7 @@ def project_all_status():
             if not any(path.exists() or path.is_symlink()
                        for path in (entry / "state.json", entry / "state.last-good.json")):
                 continue
-            results.append(project_status(entry.name))
+            results.append(project_status(entry.name, metrics_limit))
         except (FileNotFoundError, OSError, ValueError, loop.StateLoadError) as e:
             results.append({"name": entry.name, "error": str(e)})
     return results
@@ -231,6 +234,16 @@ def render_human(result, *, timestamp=False) -> None:
         print(f"🛟 state 復原 {result['state_recovery_count']}", flush=True)
     if result.get("goal_changed"):
         print("⚠ goal 已變更，建議回規劃期重新收斂", flush=True)
+    metrics = result.get("round_metrics")
+    if metrics is not None:
+        if metrics["sample_count"]:
+            truncated = "｜history 尾端樣本" if metrics.get("history_truncated") else ""
+            print(f"⏱ 效能 {metrics['sample_count']} 輪｜平均 {metrics['average_seconds']:g} 秒｜"
+                  f"P50 {metrics['p50_seconds']:g} 秒｜P95 {metrics['p95_seconds']:g} 秒｜"
+                  f"最慢 r{metrics['slowest_round']} {metrics['max_seconds']:g} 秒｜"
+                  f"逾時 {metrics['timeout_count']}（{metrics['timeout_rate_pct']:g}%）{truncated}", flush=True)
+        else:
+            print("⏱ 尚無含耗時 telemetry 的輪次", flush=True)
 
 
 def render_fleet_summary(summary) -> None:
@@ -262,6 +275,8 @@ def main(argv=None) -> int:
                         default="name", help="--all 的排序方式（預設 name）")
     parser.add_argument("--filter", choices=("all", "attention", "running", "stopped", "done", "error"),
                         default="all", help="--all 的輸出篩選（預設 all；不縮小 --check 範圍）")
+    parser.add_argument("--metrics", type=int, default=0, metavar="N",
+                        help=f"聚合最近 N 輪效能（1～{loop.ROUND_METRICS_MAX_SAMPLES}；預設不掃 history）")
     args = parser.parse_args(argv)
     if bool(args.name) == args.all:
         parser.error("--name 與 --all 必須且只能選一個")
@@ -275,13 +290,15 @@ def main(argv=None) -> int:
         parser.error("--sort 只有搭配 --all 才可使用")
     if args.filter != "all" and not args.all:
         parser.error("--filter 只有搭配 --all 才可使用")
+    if not 0 <= args.metrics <= loop.ROUND_METRICS_MAX_SAMPLES:
+        parser.error(f"--metrics 必須是 0～{loop.ROUND_METRICS_MAX_SAMPLES} 的整數")
     if args.workspace_root:
         loop.WORKSPACE_ROOT = Path(args.workspace_root).expanduser().resolve()
     previous_signature = None
     try:
         while True:
             if args.all:
-                all_results = project_all_status()
+                all_results = project_all_status(args.metrics)
                 summary = summarize_status(all_results)
                 check_failed = summary["error_count"] > 0 or summary["attention"] > 0
                 results = sort_status_results(filter_status_results(all_results, args.filter), args.sort)
@@ -311,7 +328,7 @@ def main(argv=None) -> int:
                             else:
                                 render_human(result, timestamp=args.watch)
             else:
-                result = project_status(args.name)
+                result = project_status(args.name, args.metrics)
                 check_failed = projection_needs_attention(result)
                 projection = {"schema_version": STATUS_SCHEMA_VERSION, **result}
                 signature = json.dumps(projection, ensure_ascii=False, sort_keys=True,

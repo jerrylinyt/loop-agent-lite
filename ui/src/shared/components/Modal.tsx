@@ -8,6 +8,7 @@ export interface ModalProps {
   children: ReactNode;
   footer?: ReactNode;
   wide?: boolean;
+  extraWide?: boolean;
   compact?: boolean;
 }
 
@@ -22,7 +23,7 @@ const FOCUSABLE = [
 
 const modalStack: symbol[] = [];
 
-export default function Modal({ title, description, onClose, children, footer, wide, compact }: ModalProps) {
+export default function Modal({ title, description, onClose, children, footer, wide, extraWide, compact }: ModalProps) {
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
@@ -78,7 +79,7 @@ export default function Modal({ title, description, onClose, children, footer, w
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div
         ref={panelRef}
-        className={`modal${wide ? " modal-wide" : ""}${compact ? " modal-compact" : ""}`}
+        className={`modal${wide ? " modal-wide" : ""}${extraWide ? " modal-extra-wide" : ""}${compact ? " modal-compact" : ""}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}

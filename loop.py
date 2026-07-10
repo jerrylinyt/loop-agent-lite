@@ -64,6 +64,8 @@ TASK_LIST_TRUNC = 80                   # prompt 任務總覽單行截斷長度
 CONSOLE_MAX_BYTES = 5 * 1024 * 1024   # console.log 單檔 5 MiB
 CONSOLE_BACKUPS = 3                    # 保留 console.log.1～.3
 HISTORY_MAX_BYTES = 10 * 1024 * 1024  # history.log 當前 run 上限；只保留最新完整尾段
+ROUND_METRICS_SCAN_BYTES = 2 * 1024 * 1024  # 效能投影只掃尾端，避免讀完整長 history
+ROUND_METRICS_MAX_SAMPLES = 200       # API/CLI 單次最多聚合的近期輪數
 ISSUE_MAX_CHARS = 2000                # 單一 issue 文字上限
 ISSUES_MAX_PENDING = 100              # 單一 round 最多 ingest 的 issue 行數
 ISSUES_MAX_COUNT = 200                # state 保留最新 issue 數量
@@ -226,6 +228,85 @@ def read_regular_bytes(path: Path, label: str = "workspace 檔案") -> bytes:
 
 def read_regular_text(path: Path, label: str = "workspace 檔案") -> str:
     return read_regular_bytes(path, label).decode("utf-8")
+
+
+def round_metrics_from_history(data: str, limit: int = 50, *, history_truncated=False):
+    """從 history 文字投影近期 Agent round 效能；未知／舊格式欄位安全忽略。"""
+    if (not isinstance(limit, int) or isinstance(limit, bool) or
+            not 1 <= limit <= ROUND_METRICS_MAX_SAMPLES):
+        raise ValueError(f"round metrics limit 必須介於 1～{ROUND_METRICS_MAX_SAMPLES}")
+    samples = []
+    for line in reversed(data.splitlines()):
+        head = line.split("  << ", 1)[0]
+        tokens = head.split()
+        if len(tokens) < 2:
+            continue
+        fields = {}
+        for token in tokens[1:]:
+            key, separator, value = token.partition("=")
+            if separator and key:
+                fields[key] = value
+        try:
+            round_number = int(fields["round"])
+            seconds = float(fields["secs"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if round_number < 0 or not math.isfinite(seconds) or seconds < 0:
+            continue
+        samples.append({
+            "round": round_number,
+            "seconds": round(seconds, 3),
+            "timed_out": fields.get("timeout") == "True",
+            "timestamp": tokens[0],
+        })
+        if len(samples) >= limit:
+            break
+    samples.reverse()
+    durations = sorted(sample["seconds"] for sample in samples)
+
+    def percentile(ratio):
+        if not durations:
+            return None
+        index = max(0, math.ceil(len(durations) * ratio) - 1)
+        return durations[index]
+
+    timeout_count = sum(1 for sample in samples if sample["timed_out"])
+    slowest = max(samples, key=lambda sample: (sample["seconds"], sample["round"])) if samples else None
+    return {
+        "limit": limit,
+        "sample_count": len(samples),
+        "average_seconds": round(sum(durations) / len(durations), 3) if durations else None,
+        "p50_seconds": percentile(0.50),
+        "p95_seconds": percentile(0.95),
+        "max_seconds": slowest["seconds"] if slowest else None,
+        "slowest_round": slowest["round"] if slowest else None,
+        "timeout_count": timeout_count,
+        "timeout_rate_pct": round(timeout_count / len(samples) * 100, 1) if samples else 0,
+        "history_truncated": bool(history_truncated),
+        "samples": samples,
+    }
+
+
+def read_round_metrics(path: Path, limit: int = 50):
+    """以 O_NOFOLLOW bounded tail read 投影 history metrics；檔案不存在視為無樣本。"""
+    if (not isinstance(limit, int) or isinstance(limit, bool) or
+            not 1 <= limit <= ROUND_METRICS_MAX_SAMPLES):
+        raise ValueError(f"round metrics limit 必須介於 1～{ROUND_METRICS_MAX_SAMPLES}")
+    path = workspace_file(path, "history.log")
+    try:
+        fd = _open_regular(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return round_metrics_from_history("", limit)
+    with os.fdopen(fd, "rb", closefd=True) as stream:
+        size = os.fstat(stream.fileno()).st_size
+        start = max(0, size - ROUND_METRICS_SCAN_BYTES)
+        stream.seek(start)
+        data = stream.read(ROUND_METRICS_SCAN_BYTES)
+    if start:
+        newline = data.find(b"\n")
+        data = data[newline + 1:] if newline >= 0 else b""
+    return round_metrics_from_history(
+        data.decode("utf-8", errors="replace"), limit, history_truncated=start > 0)
 
 
 def repo_relative_path(repo: Path, rel: str) -> Path:
