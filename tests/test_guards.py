@@ -137,6 +137,106 @@ class TestAtomicWriteConcurrency(unittest.TestCase):
             json.loads(target.read_bytes())  # 最終檔完整、未被 truncate
 
 
+class TestStateCheckpointRecovery(unittest.TestCase):
+    """主 state 不可讀時由 last-good 復原；兩份都壞必須 fail-closed。"""
+
+    def test_workspace_recovers_corrupt_primary_and_protects_checkpoint(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d)
+                ws = L.Workspace("recover")
+                state = ws.fresh_state()
+                state["round"] = 17
+                ws.save_state(state)
+                self.assertEqual(ws.state_path.read_bytes(), ws.checkpoint_path.read_bytes())
+                ws.state_path.write_text("{broken")
+
+                resumed = L.Workspace("recover")
+                loaded = resumed.load_state()
+
+                self.assertTrue(resumed.state_recovered)
+                self.assertEqual(loaded["round"], 17)
+                self.assertEqual(loaded["state_recovery_count"], 1)
+                self.assertEqual(resumed.state_path.read_bytes(), resumed.checkpoint_path.read_bytes())
+                json.loads(resumed.state_path.read_text())
+                resumed.checkpoint_path.write_text("{}")
+                self.assertTrue(resumed.state_tampered(), "agent 動 recovery copy 也必須使該輪作廢")
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_missing_primary_recovers_but_both_corrupt_raise(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d)
+                ws = L.Workspace("missing")
+                state = ws.fresh_state()
+                state["round"] = 9
+                ws.save_state(state)
+                ws.state_path.unlink()
+                self.assertEqual(L.Workspace("missing").load_state()["round"], 9)
+
+                broken = L.Workspace("broken")
+                broken.state_path.write_text("[]")
+                broken.checkpoint_path.write_text("not-json")
+                with self.assertRaises(L.StateLoadError):
+                    broken.load_state()
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_dashboard_readonly_falls_back_without_repair_then_writable_repairs(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_values = (L.WORKSPACE_ROOT, D.ROOT)
+            try:
+                L.WORKSPACE_ROOT = Path(d)
+                D.ROOT = Path(d)
+                ws = L.Workspace("dashboard-recover")
+                state = ws.fresh_state()
+                state["round"] = 23
+                ws.save_state(state)
+                ws.state_path.write_text("broken")
+
+                readonly, err = D.read_state("dashboard-recover", repair=False)
+                self.assertIsNone(err)
+                self.assertEqual(readonly["round"], 23)
+                self.assertTrue(readonly["state_recovery_pending"])
+                self.assertEqual(ws.state_path.read_text(), "broken", "唯讀 Dashboard 不得修檔")
+
+                repaired, err = D.read_state("dashboard-recover", repair=True)
+                self.assertIsNone(err)
+                self.assertEqual(repaired["state_recovery_count"], 1)
+                self.assertEqual(json.loads(ws.state_path.read_text())["round"], 23)
+                again, err = D.read_state("dashboard-recover", repair=True)
+                self.assertIsNone(err)
+                self.assertEqual(again["state_recovery_count"], 1, "同一事故不得重複計數")
+                self.assertIn("state.json 已從 last-good checkpoint 復原",
+                              (ws.dir / "console.log").read_text())
+            finally:
+                L.WORKSPACE_ROOT, D.ROOT = old_values
+
+    def test_loop_resume_recovers_checkpoint_and_continues(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            common = [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "resume-recover",
+                      "--agent-cmd", "true", "--validate-cmd", "true"]
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            seeded = subprocess.run(common + ["--max-rounds", "1"], capture_output=True, text=True, env=env)
+            self.assertEqual(seeded.returncode, 0, seeded.stdout + seeded.stderr)
+            state_path = workspace_root / "resume-recover" / "state.json"
+            state_path.write_text("{truncated")
+
+            resumed = subprocess.run(common + ["--max-rounds", "2"], capture_output=True, text=True, env=env)
+
+            self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+            state = json.loads(state_path.read_text())
+            self.assertEqual(state["round"], 2)
+            self.assertEqual(state["state_recovery_count"], 1)
+            self.assertIn("state.json 已從 last-good checkpoint 復原", resumed.stdout)
+
+
 class TestRoundIsolation(unittest.TestCase):
     """舊 round 的延遲 coordinator 命令/訊號不得污染目前 round。"""
 
@@ -381,6 +481,9 @@ class TestTransactionalReset(unittest.TestCase):
             state_path = workspace / "state.json"
             state_path.write_text(json.dumps(previous))
             before = state_path.read_bytes()
+            checkpoint_path = workspace / "state.last-good.json"
+            checkpoint_path.write_bytes(before)
+            checkpoint_before = checkpoint_path.read_bytes()
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
 
             result = subprocess.run(
@@ -391,6 +494,8 @@ class TestTransactionalReset(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(state_path.read_bytes(), before, "validate 失敗時舊 state 必須原封不動")
+            self.assertEqual(checkpoint_path.read_bytes(), checkpoint_before,
+                             "validate 失敗時 recovery checkpoint 也必須原封不動")
             self.assertEqual(snapshot_path.read_bytes(), snapshot_before,
                              "Validate 失敗時舊 protected snapshot 也必須保留")
             self.assertIn("啟動前檢查通過後才會正式清除", result.stdout)
@@ -422,6 +527,8 @@ class TestTransactionalReset(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             current = json.loads((workspace / "state.json").read_text())
+            self.assertEqual((workspace / "state.json").read_bytes(),
+                             (workspace / "state.last-good.json").read_bytes())
             self.assertEqual(current["plan"], [])
             self.assertEqual(current["plan_version"], 0)
             self.assertEqual(current["round"], 1)
@@ -530,6 +637,9 @@ class TestTransactionalDashboardPlanImport(unittest.TestCase):
             state_path = workspace / "state.json"
             state_path.write_text(json.dumps(previous))
             before = state_path.read_bytes()
+            checkpoint_path = workspace / "state.last-good.json"
+            checkpoint_path.write_bytes(before)
+            checkpoint_before = checkpoint_path.read_bytes()
             (workspace / "snapshots").mkdir()
             snapshot_path = workspace / "snapshots" / "goal.md"
             snapshot_path.write_text("old snapshot\n")
@@ -558,6 +668,8 @@ class TestTransactionalDashboardPlanImport(unittest.TestCase):
                 job.reader.join(timeout=1)
                 self.assertEqual(D.job_startup_status("import-safe", job.popen.pid)["status"], "failed")
                 self.assertEqual(state_path.read_bytes(), before, "失敗 import 不得覆寫舊 state")
+                self.assertEqual(checkpoint_path.read_bytes(), checkpoint_before,
+                                 "失敗 import 不得覆寫 recovery checkpoint")
                 self.assertEqual(snapshot_path.read_bytes(), snapshot_before,
                                  "失敗 import 不得覆寫舊 protected snapshot")
             finally:
@@ -582,10 +694,18 @@ class TestWorkspaceFleetValidity(unittest.TestCase):
             valid = root / "valid"
             valid.mkdir()
             (valid / "state.json").write_text(json.dumps(L.Workspace.__new__(L.Workspace).fresh_state()))
+            checkpoint_only = root / "checkpoint-only"
+            checkpoint_only.mkdir()
+            checkpoint_state = L.Workspace.__new__(L.Workspace).fresh_state()
+            checkpoint_state["round"] = 8
+            (checkpoint_only / "state.last-good.json").write_text(json.dumps(checkpoint_state))
             old_root = D.ROOT
             try:
                 D.ROOT = root
-                self.assertEqual([item["name"] for item in D.list_workspaces()], ["valid"])
+                fleet = D.list_workspaces()
+                self.assertEqual([item["name"] for item in fleet], ["checkpoint-only", "valid"])
+                self.assertEqual(fleet[0]["round"], 8)
+                self.assertFalse((checkpoint_only / "state.json").exists(), "fleet 掃描必須保持唯讀")
             finally:
                 D.ROOT = old_root
 

@@ -53,7 +53,7 @@
 
 ## 禁區
 
-- goal、參考文件、workspace 的 state.json 是受保護真相:直接改檔會被偵測、還原、該輪作廢。
+- goal、參考文件、workspace 的 state.json / state.last-good.json 是受保護真相:直接改檔會被偵測、還原、該輪作廢。
 - goal 本身矛盾/缺關鍵資訊時,執行 `<<ISSUE_CMD>> "一句話描述問題"` 回報,不要自行腦補。
 - 規劃期不要動 repo 的任何檔案(不寫 code、不 commit)。若工作區有前人殘留的異動,
   判斷是垃圾就用 `git checkout .` 與 `git clean -fd` 清掉。

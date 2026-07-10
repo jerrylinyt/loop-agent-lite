@@ -228,6 +228,82 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
+class StateLoadError(RuntimeError):
+    """主 state 與 recovery checkpoint 都存在但無法安全解碼。"""
+
+
+def state_checkpoint_path(state_path: Path) -> Path:
+    return state_path.with_name("state.last-good.json")
+
+
+def decode_state_bytes(data: bytes, label: str):
+    try:
+        state = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise StateLoadError(f"{label} JSON 損壞:{e}") from e
+    if not isinstance(state, dict):
+        raise StateLoadError(f"{label} 頂層必須是 JSON object,實得 {type(state).__name__}")
+    return state
+
+
+def write_checkpointed_state(state_path: Path, data: bytes) -> None:
+    """state.json 是主真相；主檔提交成功後才更新 last-good recovery copy。"""
+    atomic_write_bytes(state_path, data)
+    atomic_write_bytes(state_checkpoint_path(state_path), data)
+
+
+def load_checkpointed_state(state_path: Path, *, repair: bool = True):
+    """回傳 (state, canonical bytes, recovered)。
+
+    primary 合法時永遠以它為準並刷新 checkpoint；只有 primary 不可讀時才採 checkpoint。
+    repair=False 供唯讀 Dashboard 使用：可顯示 checkpoint，但不修改任何檔案。
+    """
+    checkpoint = state_checkpoint_path(state_path)
+    primary_error = None
+    try:
+        primary_data = state_path.read_bytes()
+        state = decode_state_bytes(primary_data, "state.json")
+    except FileNotFoundError as e:
+        primary_error = e
+    except (OSError, StateLoadError) as e:
+        primary_error = e
+    else:
+        if repair:
+            try:
+                checkpoint_matches = checkpoint.read_bytes() == primary_data
+            except OSError:
+                checkpoint_matches = False
+            if not checkpoint_matches:
+                atomic_write_bytes(checkpoint, primary_data)
+        return state, primary_data, False
+
+    try:
+        checkpoint_data = checkpoint.read_bytes()
+        state = decode_state_bytes(checkpoint_data, "state.last-good.json")
+    except FileNotFoundError:
+        if isinstance(primary_error, FileNotFoundError):
+            raise FileNotFoundError(state_path)
+        raise StateLoadError(f"state.json 無法讀取，且沒有 recovery checkpoint:{primary_error}") from primary_error
+    except (OSError, StateLoadError) as checkpoint_error:
+        raise StateLoadError(f"state.json 與 recovery checkpoint 都無法讀取:"
+                             f"primary={primary_error}; checkpoint={checkpoint_error}") from checkpoint_error
+
+    if repair:
+        write_checkpointed_state(state_path, checkpoint_data)
+    return state, checkpoint_data, True
+
+
+def mark_state_recovered(state):
+    """把 recovery 事件寫回 state，供 console/UI 稽核。"""
+    try:
+        count = max(0, int(state.get("state_recovery_count", 0))) + 1
+    except (TypeError, ValueError):
+        count = 1
+    state["state_recovery_count"] = count
+    state["last_state_recovery"] = datetime.now().isoformat(timespec="seconds")
+    return state
+
+
 class Workspace:
     """workspace/<name>/ 底下所有 python-owned 檔案的單一寫入點。"""
 
@@ -237,8 +313,11 @@ class Workspace:
         (self.dir / "prompts").mkdir(parents=True, exist_ok=True)
         (self.dir / "snapshots").mkdir(parents=True, exist_ok=True)
         self.state_path = self.dir / "state.json"
+        self.checkpoint_path = state_checkpoint_path(self.state_path)
         self.history = self.dir / "history.log"
         self._state_hash = None  # 本 session 內偵測 agent 直接改 state.json 用
+        self._checkpoint_hash = None
+        self.state_recovered = False
 
     # ---- state.json ----
     def fresh_state(self):
@@ -251,28 +330,41 @@ class Workspace:
             "red_streak": 0, "stall_rounds": 0,
             "agent_failure_streak": 0, "agent_backoff_seconds": 0,
             "agent_backoff_until": None,
+            "state_recovery_count": 0, "last_state_recovery": None,
             "task_reset_counts": {},    # {order(str): 次數}
             "notes": [],
             "issues": [],               # agent 用 work.py issue 回報,給人類看,不影響計數
         }
 
     def load_state(self):
-        if self.state_path.exists():
-            data = self.state_path.read_bytes()
-            self._state_hash = sha256_bytes(data)  # 停機期間人工改檔視為合法,resume 直接信任
-            return json.loads(data)
-        return self.fresh_state()
+        try:
+            state, data, recovered = load_checkpointed_state(self.state_path)
+        except FileNotFoundError:
+            return self.fresh_state()
+        if recovered:
+            self.state_recovered = True
+            mark_state_recovered(state)
+            data = json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")
+            write_checkpointed_state(self.state_path, data)
+        # 停機期間人工改合法 primary 視為真相；load helper 已同步成 checkpoint。
+        self._state_hash = sha256_bytes(data)
+        self._checkpoint_hash = self._state_hash
+        return state
 
     def save_state(self, state):
         data = json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")
-        atomic_write_bytes(self.state_path, data)
+        write_checkpointed_state(self.state_path, data)
         self._state_hash = sha256_bytes(data)
+        self._checkpoint_hash = self._state_hash
 
     def state_tampered(self) -> bool:
-        """回傳 True 表示 agent 在本輪繞過 work.py 直接改了 state.json。"""
-        if self._state_hash is None or not self.state_path.exists():
-            return not self.state_path.exists() and self._state_hash is not None
-        return sha256_bytes(self.state_path.read_bytes()) != self._state_hash
+        """回傳 True 表示 agent 在本輪繞過 work.py 直接改了主 state 或 recovery copy。"""
+        if self._state_hash is None:
+            return False
+        if not self.state_path.exists() or not self.checkpoint_path.exists():
+            return True
+        return (sha256_bytes(self.state_path.read_bytes()) != self._state_hash or
+                sha256_bytes(self.checkpoint_path.read_bytes()) != self._checkpoint_hash)
 
     # ---- 輪間訊號(work.py 寫、loop 讀) ----
     def clear_signals(self):
@@ -557,7 +649,15 @@ def main():
         state = ws.fresh_state()
         log("🧹 準備重置既有 state｜啟動前檢查通過後才會正式清除舊進度")
     else:
-        state = ws.load_state()
+        try:
+            state = ws.load_state()
+        except StateLoadError as e:
+            fail(f"workspace state 無法復原：{e}。請由人工檢查 {ws.state_path} 與 {ws.checkpoint_path}")
+        if ws.state_recovered:
+            log(f"🛟 state.json 已從 last-good checkpoint 復原｜第 {state['state_recovery_count']} 次")
+            state.setdefault("notes", []).append(
+                "🛟 協調 state 曾損壞或遺失，本次已從 last-good checkpoint 復原；"
+                "先核對目前 task 與 repo 現場再繼續。")
 
     # repo identity fail-closed:workspace 只按 name 載入,若既有 state 綁的是別的 repo,
     # 續跑會拿別人的 plan/completed/last_green_sha 去 reset --hard——寧可停也不帶病前進。

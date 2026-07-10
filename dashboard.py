@@ -295,23 +295,33 @@ def job_startup_status(name, pid):
     return {"status": "starting"}
 
 
-def read_state(name):
-    """讀 workspace state.json;回 (state, err)。"""
+def read_state(name, *, repair=True):
+    """讀 workspace state；主檔壞時可由 last-good checkpoint 復原。"""
     if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
         return None, f"workspace 名稱 {name or '(空)'} 不合法"
-    p = ROOT / name / "state.json"
-    if not p.exists():
-        return None, f"workspace {name} 不存在(沒有 state.json)"
+    state_path = ROOT / name / "state.json"
     try:
-        return json.loads(p.read_text(encoding="utf-8")), None
-    except json.JSONDecodeError:
-        return None, "state.json 讀取失敗(可能撞上寫入瞬間),再試一次"
+        state, _data, recovered = loop_mod.load_checkpointed_state(state_path, repair=repair)
+    except FileNotFoundError:
+        return None, f"workspace {name} 不存在(沒有 state.json/checkpoint)"
+    except loop_mod.StateLoadError as e:
+        return None, f"state.json 與 recovery checkpoint 都無法讀取:{e}"
+    if recovered:
+        state = dict(state)
+        if repair:
+            loop_mod.mark_state_recovered(state)
+            write_state(name, state)
+            workspace_console_log(name, f"🛟 state.json 已從 last-good checkpoint 復原｜"
+                                  f"第 {state['state_recovery_count']} 次")
+        else:
+            state["state_recovery_pending"] = True
+    return state, None
 
 
 def write_state(name, st):
-    """原子寫 workspace state.json(共用 loop 的 tmp→fsync→os.replace,#6)。"""
+    """原子寫 workspace 主 state 與 last-good checkpoint。"""
     data = json.dumps(st, ensure_ascii=False, indent=2).encode("utf-8")
-    loop_mod.atomic_write_bytes(ROOT / name / "state.json", data)
+    loop_mod.write_checkpointed_state(ROOT / name / "state.json", data)
 
 
 def workspace_console_log(name, message):
@@ -457,25 +467,23 @@ MIME_OVERRIDES = {
 
 
 def list_workspaces():
-    """fleet 總覽:只列有 state.json 的有效 workspace；失敗啟動留下的 log 目錄不冒充 workspace。"""
+    """fleet 總覽:主 state 或 checkpoint 至少一份存在才算 workspace；掃描本身不修檔。"""
     if not ROOT.is_dir():
         return []
     out = []
     for d in sorted(ROOT.iterdir()):
         if not d.is_dir():
             continue
-        if not (d / "state.json").is_file():
+        if not ((d / "state.json").is_file() or (d / "state.last-good.json").is_file()):
             continue
         info = {"name": d.name, "phase": None, "running": False}
-        try:
-            st = json.loads((d / "state.json").read_text(encoding="utf-8"))
+        st, err = read_state(d.name, repair=False)
+        if not err:
             c = st.get("config") or {}
             info.update(phase=st.get("phase"), round=st.get("round", 0), flag=st.get("flag", 0),
                         completed=len(st.get("completed") or []), plan_len=len(st.get("plan") or []),
                         done_count=st.get("done_count", 0), repo=c.get("repo"),
                         running=ws_running(d.name, st))
-        except json.JSONDecodeError:
-            pass
         out.append(info)
     return out
 
@@ -609,7 +617,9 @@ class Handler(BaseHTTPRequestHandler):
                     fleet_at = now + 0.6
 
                 if workspace:
-                    state, err = read_state(workspace)
+                    # GET/SSE 永遠只讀；真正修復由 loop resume 或後續明確 mutation 完成，
+                    # 避免 Dashboard 在活躍 loop 的 agent round 中途改 python-owned state。
+                    state, err = read_state(workspace, repair=False)
                     projected = {"error": err} if err else state
                     sig = json.dumps(projected, ensure_ascii=False, sort_keys=True)
                     if sig != state_sig:
@@ -704,16 +714,8 @@ class Handler(BaseHTTPRequestHandler):
                 d = self._ws_dir(q)
                 if d is None:
                     return
-                p = d / "state.json"
-                if not p.exists():
-                    self._out(200, json.dumps({"error": "state.json 不存在,loop 尚未啟動"}, ensure_ascii=False))
-                    return
-                try:
-                    st = json.loads(p.read_text(encoding="utf-8"))
-                except json.JSONDecodeError:
-                    self._out(200, json.dumps({"error": "busy"}))
-                    return
-                self._out(200, json.dumps(st, ensure_ascii=False))
+                st, err = read_state(d.name, repair=False)
+                self._out(200, json.dumps({"error": err} if err else st, ensure_ascii=False))
             elif u.path == "/api/tail":
                 d = self._ws_dir(q)
                 if d is None:

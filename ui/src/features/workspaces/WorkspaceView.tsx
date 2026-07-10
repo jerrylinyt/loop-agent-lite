@@ -137,6 +137,8 @@ export default function WorkspaceView({
           <div className="health-status">
             <span key={`${state.red_streak}-${state.stall_rounds}`} className={`chip subdued${state.phase === "plan" && state.plan_version >= 10 ? " warning" : ""}${pulse.has("health") ? " status-pulse" : ""}`}>紅連跳 {state.red_streak} · 停滯 {state.stall_rounds} · plan v{state.plan_version}{state.phase === "plan" && state.plan_version >= 10 ? " ⚠ 可能震盪" : ""}</span>
             {!!state.agent_failure_streak && <span key={`${state.agent_failure_streak}-${state.agent_backoff_seconds}`} className={`chip warning${pulse.has("health") ? " status-pulse" : ""}`}>Agent 異常 {state.agent_failure_streak}{state.agent_backoff_seconds ? ` · ${state.agent_backoff_seconds} 秒後重試` : ""}</span>}
+            {!!state.state_recovery_count && <span className="chip warning" title={state.last_state_recovery ?? undefined}>🛟 state 復原 {state.state_recovery_count}</span>}
+            {state.state_recovery_pending && <span className="chip warning">🛟 正從 checkpoint 唯讀顯示</span>}
             {!!state.issues?.length && <button type="button" className="chip issue-chip" onClick={() => setIssuesOpen(true)}>⚠ issues {state.issues.length}</button>}
             {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setHistoryOpen(true)}>🕒 輪次紀錄</button>}
           </div>

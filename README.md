@@ -97,6 +97,7 @@ Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace 
 ```text
 workspace/<name>/
 ├── state.json       目前進度與執行設定
+├── state.last-good.json  最近一次合法 state 的復原副本（主檔不可讀時才使用）
 ├── console.log      完整流程紀錄
 ├── logs/             每輪 Agent 原始輸出
 ├── prompts/          最近幾輪送出的 prompt
@@ -115,7 +116,7 @@ workspace/<name>/
 
 **workspace 顯示沒有 state.json**
 
-請從 Dashboard 的啟動表單重新啟動，或使用 `--reset-state`；不要在 loop 執行中手動刪除 workspace 檔案。
+若 `state.last-good.json` 存在，Dashboard／loop 會自動復原主檔並留下 🛟 紀錄；兩份都不存在時，請從 Dashboard 的啟動表單重新啟動或使用 `--reset-state`。不要在 loop 執行中手動刪除 workspace 檔案。
 
 ## 開發與測試
 

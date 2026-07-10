@@ -72,6 +72,9 @@ export interface WorkspaceState {
   agent_failure_streak?: number;
   agent_backoff_seconds?: number;
   agent_backoff_until?: string | null;
+  state_recovery_count?: number;
+  last_state_recovery?: string | null;
+  state_recovery_pending?: boolean;
   plan_version: number;
   current_order?: number;
   goal_changed?: boolean;
