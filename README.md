@@ -154,3 +154,17 @@ python3 -m unittest tests.test_guards        # 或  python3 tests/test_guards.py
 覆蓋:綠點錨定 fail-closed(green 須存在/是 HEAD 祖先/protected blob 與快照相符)、
 竄改輪整輪作廢(同輪偷改 goal + create-plan,竄改的 plan 不得存活,正常規劃不誤殺)、
 原子寫並發(多執行緒不共用 tmp)。
+
+Dashboard Playwright E2E 使用 production build、隔離的暫存 git repo/workspace、真 Python API/SSE
+與 fake agent，不會讀寫你的實際 workspace:
+
+```bash
+cd ui
+npx playwright install chromium   # 每台測試機首次執行一次
+npm run test:e2e                  # build + 完整 E2E
+npm run test:e2e:headed           # 需要看瀏覽器操作時
+```
+
+覆蓋:空狀態與主題、Launcher/plan 校驗/goal 匯入/new branch、loop 啟動與 SSE console/issues、
+停止與重啟、jobs 管理、Workspace 設定取消/關閉/儲存、計畫編輯、事件收合、issues 清除、
+規劃/執行 phase 切換、人工進度跳轉、splitter 鍵盤操作，以及 read-only UI/API 防線。

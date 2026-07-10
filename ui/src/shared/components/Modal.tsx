@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, type MouseEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 
 export interface ModalProps {
   title: string;
@@ -64,7 +65,7 @@ export default function Modal({ title, description, onClose, children, footer, w
   }, []);
 
   const stop = (event: MouseEvent) => event.stopPropagation();
-  return (
+  return createPortal(
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div
         ref={panelRef}
@@ -84,6 +85,7 @@ export default function Modal({ title, description, onClose, children, footer, w
         <div className="modal-body">{children}</div>
         {footer && <footer className="modal-footer">{footer}</footer>}
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

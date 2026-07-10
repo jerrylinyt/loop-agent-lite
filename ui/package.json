@@ -7,13 +7,17 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
     "check:offline": "node scripts/check-offline-assets.mjs",
-    "check": "npm run build && npm run check:offline"
+    "check": "npm run build && npm run check:offline",
+    "test:e2e": "npm run build && playwright test",
+    "test:e2e:headed": "npm run build && playwright test --headed",
+    "check:all": "npm run check && playwright test"
   },
   "dependencies": {
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@vitejs/plugin-react": "^6.0.3",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",

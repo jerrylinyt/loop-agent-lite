@@ -36,6 +36,7 @@ from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+WORKSPACE_ROOT = Path(os.environ.get("LOOP_AGENT_WORKSPACE_ROOT", HERE / "workspace")).expanduser().resolve()
 
 # ===== 預設值(全部可用命令列覆蓋) =====
 AGENT_CMD = ["claude", "-p"]          # prompt 走 stdin;公司 CLI 用 --agent-cmd 覆蓋
@@ -129,7 +130,7 @@ class Workspace:
     """workspace/<name>/ 底下所有 python-owned 檔案的單一寫入點。"""
 
     def __init__(self, name: str):
-        self.dir = HERE / "workspace" / name
+        self.dir = WORKSPACE_ROOT / name
         (self.dir / "logs").mkdir(parents=True, exist_ok=True)
         (self.dir / "prompts").mkdir(parents=True, exist_ok=True)
         (self.dir / "snapshots").mkdir(parents=True, exist_ok=True)

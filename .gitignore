@@ -23,3 +23,5 @@ venv/
 
 # React dashboard 開發依賴；ui/dist 是 production 產物，刻意進版控供 Python 離線提供
 ui/node_modules/
+ui/test-results/
+ui/playwright-report/
