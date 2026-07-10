@@ -425,6 +425,42 @@ class TestRoundTelemetry(unittest.TestCase):
             self.assertEqual(latest["retained_size"], 8)
             self.assertTrue((anomaly_dir / latest["log_file"]).read_text().endswith("101-tail"))
 
+    def test_anomaly_retention_ignores_unrelated_json_and_log_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            workspace = Path(d) / "workspace"
+            logs = workspace / "logs"
+            logs.mkdir(parents=True)
+            anomaly_dir = logs / "anomalies"
+            anomaly_dir.mkdir()
+            unrelated_json = anomaly_dir / "zzzz.json"
+            unrelated_log = anomaly_dir / "notes.log"
+            unrelated_json.write_text("{}", encoding="utf-8")
+            unrelated_log.write_text("do not manage", encoding="utf-8")
+            old_max = L.ANOMALY_LOG_MAX_COUNT
+            try:
+                L.ANOMALY_LOG_MAX_COUNT = 2
+                for index in range(3):
+                    round_log = logs / f"round-{index:04d}.log"
+                    round_log.write_text(f"round {index}", encoding="utf-8")
+                    L.preserve_anomaly_log(
+                        workspace, round_log, round_number=index, phase="exec",
+                        task="task-1", timestamp=f"2026-07-10T10:00:0{index}",
+                    )
+            finally:
+                L.ANOMALY_LOG_MAX_COUNT = old_max
+            managed_json = [
+                path for path in anomaly_dir.glob("*.json")
+                if L.ANOMALY_ID_RE.fullmatch(path.stem)
+            ]
+            managed_logs = [
+                path for path in anomaly_dir.glob("*.log")
+                if L.ANOMALY_ID_RE.fullmatch(path.stem)
+            ]
+            self.assertEqual(len(managed_json), 2)
+            self.assertEqual(len(managed_logs), 2)
+            self.assertEqual(unrelated_json.read_text(encoding="utf-8"), "{}")
+            self.assertEqual(unrelated_log.read_text(encoding="utf-8"), "do not manage")
+
 
 class TestLiveRoundTiming(unittest.TestCase):
     """進行中 round 可觀測；正常輪末清除，立即停止則保留凍結的中斷上下文。"""

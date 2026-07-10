@@ -656,7 +656,7 @@ FLEET_METRICS_TAIL = 512 * 1024  # 足以 bounded 掃描單 workspace 近期 500
 FLEET_METRICS_LIMIT = 100
 FLEET_AGGREGATE_LIMIT = 500      # 全 workspace 合併後只取時間最新 500 筆
 FLEET_HISTORY_SSE_INTERVAL = 2.0  # 事件流只在歷史有變時推送，避免每圈重送整段尾端
-ANOMALY_ID_RE = re.compile(r"\d{8}T\d{12}-r\d{6}-[0-9a-f]{8}")
+ANOMALY_ID_RE = loop_mod.ANOMALY_ID_RE
 
 
 def aggregate_fleet_round_metrics(samples, *, history_truncated=False):
