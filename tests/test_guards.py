@@ -1068,6 +1068,23 @@ class TestWorkspaceFleetValidity(unittest.TestCase):
                 D.ROOT = old_root
 
 
+class TestHistoryRetention(unittest.TestCase):
+    """當前 run 的 history 不得無限成長，且裁切保留最新紀錄。"""
+
+    def test_append_history_keeps_latest_tail_without_touching_previous_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "history.log"
+            previous = Path(d) / "history.log.1"
+            previous.write_text("previous-run\n", encoding="utf-8")
+            for index in range(6):
+                L.append_history(path, f"round={index} event=latest-{index}\n", max_bytes=64)
+            current = path.read_text(encoding="utf-8")
+            self.assertLessEqual(path.stat().st_size, 64)
+            self.assertIn("round=5", current)
+            self.assertNotIn("round=0", current)
+            self.assertEqual(previous.read_text(encoding="utf-8"), "previous-run\n")
+
+
 class TestStopIdempotency(unittest.TestCase):
     """fleet 狀態稍舊時重複 stop 不應報「沒有在執行中」。"""
 

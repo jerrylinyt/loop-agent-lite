@@ -63,6 +63,7 @@ VALIDATE_TAIL = 50                     # 驗證失敗餵給下一輪的輸出尾
 TASK_LIST_TRUNC = 80                   # prompt 任務總覽單行截斷長度
 CONSOLE_MAX_BYTES = 5 * 1024 * 1024   # console.log 單檔 5 MiB
 CONSOLE_BACKUPS = 3                    # 保留 console.log.1～.3
+HISTORY_MAX_BYTES = 10 * 1024 * 1024  # history.log 當前 run 上限；只保留最新完整尾段
 STOP_AFTER_ROUND_FILE = "stop-after-round.json"
 STOP_AFTER_ROUND_CLAIMED_FILE = "stop-after-round.claimed.json"
 WORKSPACE_OPS_DIR = ".ops"
@@ -185,6 +186,31 @@ def append_regular_text(path: Path, text: str) -> None:
     except BaseException:
         # fdopen 接手後例外會由 context manager 關閉；這裡只讓原例外上拋。
         raise
+
+
+def append_history(path: Path, text: str, *, max_bytes: int = HISTORY_MAX_BYTES) -> None:
+    """追加 history 並限制當前 run 大小；裁切時盡量從完整行邊界開始。
+
+    history.log.1 是 reset/import 保留的上一個 run，這裡只裁切當前 history.log，
+    不會覆蓋上一輪稽核資料。
+    """
+    append_regular_text(path, text)
+    if max_bytes <= 0:
+        return
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size <= max_bytes:
+        return
+    data = read_regular_bytes(path, "history.log")
+    if len(data) <= max_bytes:
+        return
+    tail = data[-max_bytes:]
+    first_newline = tail.find(b"\n")
+    if first_newline >= 0 and first_newline + 1 < len(tail):
+        tail = tail[first_newline + 1:]
+    atomic_write_bytes(path, tail)
 
 
 def read_regular_bytes(path: Path, label: str = "workspace 檔案") -> bytes:
@@ -1579,7 +1605,7 @@ def main():
                 f"agent_failures={state['agent_failure_streak']} backoff={retry_delay:g}s validate={validate_note} "
                 f"flag={state['flag']} done={state['done_count']}"
                 + (f"  << {event}" if event else ""))
-        append_regular_text(ws.history, line + "\n")
+        append_history(ws.history, line + "\n")
         log(f"📊 第 {rnd} 輪結束｜變更={'有' if changed else '無'}｜驗證={validate_note}｜"
             f"flag={state['flag']}｜done={state['done_count']}" + (f"｜{event}" if event else ""))
         if retry_delay:

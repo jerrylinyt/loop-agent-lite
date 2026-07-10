@@ -136,7 +136,8 @@ workspace/<name>/
 ├── state.json       目前進度與執行設定
 ├── state.last-good.json  最近一次合法 state 的復原副本（主檔不可讀時才使用）
 ├── stop-after-round.json  暫時的 session-scoped 平順停止請求（loop 消耗後刪除）
-├── console.log      完整流程紀錄
+├── console.log      完整流程紀錄（單檔上限 5 MiB，輪替保留 3 代）
+├── history.log      逐輪判定（當前 run 上限 10 MiB，超出保留最新尾段）
 ├── logs/             每輪 Agent 原始輸出
 ├── prompts/          最近幾輪送出的 prompt
 └── REPORT.md        全部任務完成後的摘要
