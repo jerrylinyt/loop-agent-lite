@@ -733,7 +733,7 @@ class TestStatusCli(unittest.TestCase):
                 L.WORKSPACE_ROOT = root / "workspace"
                 ws = L.Workspace("check-status")
                 state = ws.fresh_state()
-                state["stall_rounds"] = 1
+                state.update(agent_failure_streak=1, state_recovery_count=2, goal_changed=True)
                 ws.save_state(state)
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 result = subprocess.run(
@@ -743,6 +743,13 @@ class TestStatusCli(unittest.TestCase):
                 payload = json.loads(result.stdout)
                 self.assertEqual(payload["summary"]["attention"], 1)
                 self.assertEqual(payload["summary"]["error_count"], 0)
+                self.assertEqual(payload["summary"]["agent_failures"], 1)
+                self.assertEqual(payload["summary"]["state_recoveries"], 2)
+                self.assertEqual(payload["summary"]["goal_changes"], 1)
+                projection = payload["workspaces"][0]
+                self.assertEqual(projection["agent_failure_streak"], 1)
+                self.assertEqual(projection["state_recovery_count"], 2)
+                self.assertTrue(projection["goal_changed"])
             finally:
                 L.WORKSPACE_ROOT = old_root
 
@@ -788,6 +795,9 @@ class TestStatusCli(unittest.TestCase):
                     "done": 0,
                     "attention": 0,
                     "issues": 0,
+                    "agent_failures": 0,
+                    "state_recoveries": 0,
+                    "goal_changes": 0,
                     "tasks_completed": 0,
                     "tasks_total": 0,
                     "task_completion_pct": 0,

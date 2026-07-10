@@ -64,6 +64,10 @@ def project_status(name: str):
         "red_streak": state.get("red_streak", 0),
         "stall_rounds": state.get("stall_rounds", 0),
         "agent_failure_streak": state.get("agent_failure_streak", 0),
+        "agent_backoff_seconds": state.get("agent_backoff_seconds", 0),
+        "state_recovery_count": state.get("state_recovery_count", 0),
+        "last_state_recovery": state.get("last_state_recovery"),
+        "goal_changed": bool(state.get("goal_changed")),
         "issues": len(issues),
         "last_green_sha": state.get("last_green_sha"),
         "loop_pid": pid,
@@ -121,8 +125,15 @@ def summarize_status(results):
         "attention": sum(1 for result in valid if (
             result.get("red_streak", 0) > 0 or
             result.get("stall_rounds", 0) > 0 or
-            result.get("issues", 0) > 0)),
+            result.get("issues", 0) > 0 or
+            result.get("agent_failure_streak", 0) > 0 or
+            result.get("state_recovery_count", 0) > 0 or
+            result.get("state_recovery_pending") or
+            result.get("goal_changed"))),
         "issues": sum(result.get("issues", 0) for result in valid),
+        "agent_failures": sum(result.get("agent_failure_streak", 0) for result in valid),
+        "state_recoveries": sum(result.get("state_recovery_count", 0) for result in valid),
+        "goal_changes": sum(1 for result in valid if result.get("goal_changed")),
         "tasks_completed": tasks_completed,
         "tasks_total": tasks_total,
         "task_completion_pct": round(tasks_completed / tasks_total * 100) if tasks_total else 0,
