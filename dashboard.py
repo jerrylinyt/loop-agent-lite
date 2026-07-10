@@ -193,6 +193,20 @@ def write_state(name, st):
     loop_mod.atomic_write_bytes(ROOT / name / "state.json", data)
 
 
+def workspace_console_log(name, message):
+    """將 Dashboard 操作與 loop/Agent 寫進同一條 workspace console 時序。"""
+    line = f"[{time.strftime('%H:%M:%S')}] 🖥️ Dashboard｜{message}"
+    print(line, flush=True)
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
+        return
+    try:
+        workspace_dir = ROOT / name
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        loop_mod.append_console(workspace_dir / "console.log", line)
+    except OSError as e:
+        print(f"⚠ console.log 寫入失敗:{e}", flush=True)
+
+
 def ws_running(name, st=None):
     """workspace 是否執行中:本 dashboard 的 job 或 state.json 記錄的外部 pid。"""
     with JOBS_LOCK:
@@ -363,7 +377,7 @@ class Handler(BaseHTTPRequestHandler):
         return ROOT / name
 
     def _serve_events(self, q):
-        """SSE:主畫面單向推送 fleet/state/history/console 增量；寫入操作仍走 REST。"""
+        """SSE:主畫面單向推送 fleet/state/完整 console 增量；寫入操作仍走 REST。"""
         workspace = q.get("ws", [""])[0]
         if workspace and not re.fullmatch(r"[A-Za-z0-9._-]+", workspace):
             self._err("workspace 名稱不合法")
@@ -383,9 +397,16 @@ class Handler(BaseHTTPRequestHandler):
 
         fleet_sig = state_sig = None
         fleet_at = keepalive_at = 0.0
-        history_offset = -1
-        tail_offset = -1
-        current_round = 0
+        console_offset = -1
+        console_identity = None
+
+        def file_identity(path):
+            try:
+                stat = path.stat()
+                return stat.st_dev, stat.st_ino
+            except FileNotFoundError:
+                return None
+
         try:
             while True:
                 now = time.monotonic()
@@ -404,22 +425,20 @@ class Handler(BaseHTTPRequestHandler):
                     if sig != state_sig:
                         emit("state", projected)
                         state_sig = sig
-                    if state:
-                        rnd = int(state.get("round") or 0)
-                        if rnd > 0 and rnd != current_round:
-                            current_round = rnd
-                            tail_offset = -1
-                            emit("round", {"round": rnd})
-                        history = read_incremental(ROOT / workspace / "history.log", history_offset)
-                        history_offset = history["size"]
-                        if history["data"]:
-                            emit("history", {"data": history["data"]})
-                        if current_round > 0:
-                            tail = read_incremental(ROOT / workspace / "logs" / f"round-{current_round:04d}.log",
-                                                    tail_offset)
-                            tail_offset = tail["size"]
-                            if tail["data"]:
-                                emit("tail", {"data": tail["data"]})
+                    console_path = ROOT / workspace / "console.log"
+                    identity_before = file_identity(console_path)
+                    if console_identity is not None and identity_before != console_identity:
+                        console_offset = 0  # rotation 後從新 console.log 開頭接續
+                    console = read_incremental(console_path, console_offset)
+                    identity_after = file_identity(console_path)
+                    if identity_before != identity_after:
+                        # 剛好撞上 rename/create；下一圈重新讀穩定的新檔，不冒險漏掉開頭。
+                        console_offset = 0
+                    else:
+                        console_offset = console["size"]
+                        if console["data"]:
+                            emit("console", {"data": console["data"]})
+                    console_identity = identity_after
 
                 if now >= keepalive_at:
                     self.wfile.write(b": keepalive\n\n")
@@ -631,7 +650,7 @@ class Handler(BaseHTTPRequestHandler):
                 if r.returncode != 0:
                     self._err(f"切換 branch {br} 失敗:" + (r.stdout + r.stderr).strip()[-300:])
                     return
-                print(f"⎇ {repo} → {br}", flush=True)
+                workspace_console_log(name, f"已切換 Git branch｜{br}")
             # goal.md 隨啟動自動 commit(gate#1:人選了檔=人審過)。檔名固定、指定 pathspec,
             # 內容與 HEAD 相同就不產生新 commit。
             if goal_content.strip():
@@ -650,7 +669,7 @@ class Handler(BaseHTTPRequestHandler):
                     if r.returncode != 0:
                         self._err("git commit goal.md 失敗:" + (r.stdout + r.stderr).strip()[-300:])
                         return
-                    print(f"⤴ goal.md 已隨啟動 commit:{repo}", flush=True)
+                    workspace_console_log(name, "已匯入並 commit goal.md")
             if normalized is not None:
                 lws = loop_mod.Workspace(name)
                 st_new = lws.fresh_state()
@@ -660,14 +679,17 @@ class Handler(BaseHTTPRequestHandler):
                 if start_phase == "exec":
                     st_new["current_order"] = normalized[0]["order"]
                 lws.save_state(st_new)
-                print(f"⤴ 匯入 plan.json:{name} 共 {len(normalized)} 條,從 {start_phase} 開跑", flush=True)
+                workspace_console_log(
+                    name,
+                    f"已匯入 plan.json｜共 {len(normalized)} 條｜從 {'規劃期' if start_phase == 'plan' else '執行期'} 開始",
+                )
             p = spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt,
                            reset=bool(body.get("reset_state")) and normalized is None,
                            notify_cmd=str(cfg.get("notify_cmd") or ""),
                            red_limit=rl, stall_limit=sl,
                            stuck_stop=bool(d.get("stuck_stop")),
                            stuck_count=int(d.get("stuck_stop_count", 100)))
-        print(f"▶ 啟動 loop:{name}(pid {p.pid})repo={repo}", flush=True)
+        workspace_console_log(name, f"啟動 loop｜pid={p.pid}｜repo={repo}")
         self._out(200, json.dumps({"ok": True, "name": name, "pid": p.pid}, ensure_ascii=False))
 
     @with_state_lock
@@ -718,7 +740,7 @@ class Handler(BaseHTTPRequestHandler):
                            stall_limit=c.get("stall_limit", d.get("stall_limit", 300)),
                            stuck_stop=bool(d.get("stuck_stop")),
                            stuck_count=int(d.get("stuck_stop_count", 100)))
-        print(f"▶ run workspace:{name}(pid {p.pid})", flush=True)
+        workspace_console_log(name, f"繼續運行 loop｜pid={p.pid}")
         self._out(200, json.dumps({"ok": True, "name": name, "pid": p.pid}, ensure_ascii=False))
 
     @with_state_lock
@@ -768,7 +790,7 @@ class Handler(BaseHTTPRequestHandler):
                 st["done_count"] = dc
                 changed.append(f"done_count={dc}")
         write_state(name, st)
-        print(f"✎ 人工編輯 {name}:{', '.join(changed) or '無變更'}", flush=True)
+        workspace_console_log(name, f"人工編輯計畫｜{', '.join(changed) or '無變更'}")
         self._out(200, json.dumps({"ok": True, "changed": changed}, ensure_ascii=False))
 
     @with_state_lock
@@ -825,7 +847,7 @@ class Handler(BaseHTTPRequestHandler):
                 changed.append("validate_cmd")
         st["config"] = c
         write_state(name, st)
-        print(f"⚙ 編輯設定 {name}:{', '.join(changed) or '無變更'}", flush=True)
+        workspace_console_log(name, f"更新 Workspace 設定｜{', '.join(changed) or '無變更'}")
         self._out(200, json.dumps({"ok": True, "changed": changed}, ensure_ascii=False))
 
     @with_state_lock
@@ -859,7 +881,7 @@ class Handler(BaseHTTPRequestHandler):
             self._err("phase 只能是 plan 或 exec")
             return
         write_state(name, st)
-        print(f"⇄ 切換 phase:{name} → {target}", flush=True)
+        workspace_console_log(name, f"切換階段｜{'規劃期' if target == 'plan' else '執行期'}")
         self._out(200, json.dumps({"ok": True, "phase": target}, ensure_ascii=False))
 
     @with_state_lock
@@ -908,8 +930,11 @@ class Handler(BaseHTTPRequestHandler):
         st["completed"] = completed
         st.update(phase="exec", current_order=order, done_count=0, red_streak=0, stall_rounds=0)
         write_state(name, st)
-        print(f"⏵ 進度調整:{name} → task-{order}"
-              + (f"(人工標記完成:{skipped})" if skipped else ""), flush=True)
+        workspace_console_log(
+            name,
+            f"調整任務進度｜前往 task-{order}"
+            + (f"｜人工標記完成：{', '.join(f'task-{value}' for value in skipped)}" if skipped else ""),
+        )
         self._out(200, json.dumps({"ok": True, "current_order": order,
                                    "human_marked": skipped}, ensure_ascii=False))
 
@@ -918,14 +943,15 @@ class Handler(BaseHTTPRequestHandler):
         with JOBS_LOCK:
             j = JOBS.get(name)
         if j is not None and j.alive():
+            workspace_console_log(name, f"停止 loop｜pid={j.popen.pid}")
             j.stop()
-            print(f"⏹ 停止 loop:{name}(pid {j.popen.pid})", flush=True)
             self._out(200, json.dumps({"ok": True, "name": name}, ensure_ascii=False))
             return
         # 不是本 dashboard 啟動的:用 state.json 記錄的 pid 停(SIGINT 優雅收尾,8 秒後 SIGKILL)
         st, _ = read_state(name)
         pid = (st.get("loop") or {}).get("pid") if st else None
         if loop_pid_alive(pid):
+            workspace_console_log(name, f"停止外部 loop｜pid={pid}")
             os.kill(int(pid), signal.SIGINT)
 
             def _force():
@@ -937,7 +963,6 @@ class Handler(BaseHTTPRequestHandler):
             t = threading.Timer(8, _force)
             t.daemon = True
             t.start()
-            print(f"⏹ 停止外部 loop:{name}(pid {pid})", flush=True)
             self._out(200, json.dumps({"ok": True, "name": name, "external": True}, ensure_ascii=False))
             return
         self._err(f"{name} 沒有在執行中")

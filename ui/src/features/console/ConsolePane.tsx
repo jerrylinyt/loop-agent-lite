@@ -25,18 +25,18 @@ export default function ConsolePane({
   };
 
   return (
-    <section className="console-pane" aria-label="Agent console">
+    <section className="console-pane" aria-label="完整執行紀錄">
       <header className="pane-header console-header">
         <div>
-          <strong>Agent console</strong>
-          <span>{hasWorkspace ? `round ${round}` : "等待 workspace"}</span>
+          <strong>完整執行紀錄</strong>
+          <span>{hasWorkspace ? `console.log · round ${round}` : "等待 workspace"}</span>
         </div>
         <span className={`live-status ${running ? "running" : "idle"}`}>
           <span aria-hidden="true" />{running ? "live" : "idle"}
         </span>
       </header>
       <pre ref={consoleRef} className="console-output" onScroll={onScroll} tabIndex={0}>
-        {text || (hasWorkspace ? "尚無 console 輸出。" : "建立或選擇 workspace 後，agent 輸出會顯示在這裡。")}
+        {text || (hasWorkspace ? "尚無執行紀錄。" : "建立或選擇 workspace 後，完整流程紀錄會顯示在這裡。")}
       </pre>
       {!follow && (
         <button type="button" className="floating-button" onClick={() => setFollow(true)}>

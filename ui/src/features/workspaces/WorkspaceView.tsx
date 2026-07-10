@@ -4,7 +4,7 @@ import type { PlanTask, WorkspaceState, WorkspaceSummary } from "../../shared/ap
 import ConfigModal from "./ConfigModal";
 import IssuesModal from "./IssuesModal";
 import PlanTable from "./PlanTable";
-import RecentEvents from "./RecentEvents";
+import useStatusPulse from "./useStatusPulse";
 
 const PHASE_NAMES = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
 
@@ -12,14 +12,12 @@ export default function WorkspaceView({
   workspace,
   state,
   readonly,
-  events,
   onRefresh,
   onRefreshWorkspaces
 }: {
   workspace?: WorkspaceSummary;
   state: WorkspaceState | null;
   readonly: boolean;
-  events: string[];
   onRefresh: () => void;
   onRefreshWorkspaces: () => void;
 }) {
@@ -27,6 +25,7 @@ export default function WorkspaceView({
   const [issuesOpen, setIssuesOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const canChange = !!workspace && !readonly && !workspace.running;
+  const pulse = useStatusPulse(state);
 
   if (!state) return <section className="workspace-pane"><div className="loading-state">載入 workspace…</div></section>;
   if (state.error) return <section className="workspace-pane"><div className="loading-state error">{state.error === "busy" ? "state 更新中…" : state.error}</div></section>;
@@ -66,7 +65,7 @@ export default function WorkspaceView({
     <section className="workspace-pane">
       <header className="workspace-header">
         <div className="workspace-title-row">
-          <div className="workspace-title"><h1>{workspace?.name ?? "workspace"}</h1><span className={`phase-badge phase-${state.phase}`}>{PHASE_NAMES[state.phase]}</span></div>
+          <div className="workspace-title"><h1>{workspace?.name ?? "workspace"}</h1><span key={state.phase} className={`phase-badge phase-${state.phase}${pulse.has("phase") ? " status-pulse" : ""}`}>{PHASE_NAMES[state.phase]}</span></div>
           {!readonly && workspace && <div className="workspace-actions">
             <button type="button" className={workspace.running ? "danger-button" : "success-button"} disabled={busy} onClick={() => void mutate(workspace.running ? "/api/stop" : "/api/run", { name: workspace.name })}>{workspace.running ? "⏹ 停止" : "▶ 運行"}</button>
             {canChange && state.phase === "plan" && total > 0 && <button type="button" className="secondary-button" onClick={() => changePhase("exec")}>⏩ 進執行期</button>}
@@ -77,19 +76,18 @@ export default function WorkspaceView({
         <div className="workspace-status-row">
           <div className="primary-status">
             <span className="chip">round {state.round}</span>
-            {state.phase !== "plan" && total > 0 && <span className="chip">任務 {completed}/{total}</span>}
-            {state.phase === "plan" && <span className="chip">flag {state.flag} / &gt;{state.config?.flag_threshold ?? 10}</span>}
-            {state.phase === "exec" && <span className="chip">done {state.done_count} / ≥{state.config?.done_threshold ?? 3}</span>}
+            {state.phase !== "plan" && total > 0 && <span key={`${completed}-${state.current_order}`} className={`chip${pulse.has("task") ? " status-pulse" : ""}`}>任務 {completed}/{total}</span>}
+            {state.phase === "plan" && <span key={state.flag} className={`chip${pulse.has("flag") ? " status-pulse" : ""}`}>flag {state.flag} / &gt;{state.config?.flag_threshold ?? 10}</span>}
+            {state.phase === "exec" && <span key={state.done_count} className={`chip${pulse.has("done") ? " status-pulse" : ""}`}>done {state.done_count} / ≥{state.config?.done_threshold ?? 3}</span>}
           </div>
           <div className="health-status">
-            <span className={`chip subdued${state.phase === "plan" && state.plan_version >= 10 ? " warning" : ""}`}>紅連跳 {state.red_streak} · 停滯 {state.stall_rounds} · plan v{state.plan_version}{state.phase === "plan" && state.plan_version >= 10 ? " ⚠ 可能震盪" : ""}</span>
+            <span key={`${state.red_streak}-${state.stall_rounds}`} className={`chip subdued${state.phase === "plan" && state.plan_version >= 10 ? " warning" : ""}${pulse.has("health") ? " status-pulse" : ""}`}>紅連跳 {state.red_streak} · 停滯 {state.stall_rounds} · plan v{state.plan_version}{state.phase === "plan" && state.plan_version >= 10 ? " ⚠ 可能震盪" : ""}</span>
             {!!state.issues?.length && <button type="button" className="chip issue-chip" onClick={() => setIssuesOpen(true)}>⚠ issues {state.issues.length}</button>}
           </div>
         </div>
         {state.goal_changed && <div className="goal-warning">⚠ goal 已變更，建議回規劃期重新收斂</div>}
       </header>
       <PlanTable state={state} canEdit={canChange} onSave={savePlan} onGoto={gotoTask} />
-      <RecentEvents lines={events} />
       {issuesOpen && workspace && <IssuesModal workspace={workspace.name} issues={state.issues ?? []} readonly={readonly || workspace.running} onClose={() => setIssuesOpen(false)} onChanged={onRefresh} />}
       {configOpen && workspace && <ConfigModal workspace={workspace.name} config={state.config ?? {}} onClose={() => setConfigOpen(false)} onChanged={onRefresh} />}
     </section>

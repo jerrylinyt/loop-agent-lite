@@ -77,11 +77,11 @@ npm run build
 `python3 dashboard.py --port 8765`，再於另一個 terminal 執行 `cd ui && npm run dev`；
 Vite 會把 `/api` proxy 到本機 dashboard。
 
-介面提供深色／淺色／跟隨系統三種主題，偏好、左右欄寬、完成任務與事件區塊的展開狀態
+介面提供深色／淺色／跟隨系統三種主題，偏好、左右欄寬與完成任務的展開狀態
 都只存在瀏覽器 `localStorage`，不會修改 workspace truth。
 
 頂部 tabs = fleet 總覽(每個 workspace 的 phase 色點+進度),點擊即切換(支援 #hash 深連結)。
-主畫面的 fleet/state/history/console 由單向 SSE (`/api/events`) 增量推送；瀏覽器斷線會自動重連，
+主畫面的 fleet/state/完整 console 由單向 SSE (`/api/events`) 增量推送；瀏覽器斷線會自動重連，
 寫入操作仍使用既有 REST POST。只有「執行中的 jobs」面板在打開時每 2 秒查詢一次。
 **版面鎖 100vh**:頁面永不捲動,左(計畫表格)右(console)兩欄各自內部 scroll。
 多個 loop 同時跑各自 workspace,開一個 dashboard 就夠;`--read-only` 起唯讀實例分享給別人看。
@@ -92,10 +92,12 @@ Vite 會把 `/api` proxy 到本機 dashboard。
   捲離進行中任務時出現「→ 回到執行中」浮鈕一鍵跳回;
 - header 有 任務 n/N 進度、⚠ issues 紅章——點擊開**彈窗表格**(round/位置/內容/時間,最新在上、
   可捲動、開著會隨 SSE 即時更新,內含清空鈕);issues 來自 agent 的 `work.py issue` 結構化回報;
-- 規劃期 plan 更新時**變動的列亮一閃+plan chip 閃**(v4 動態樹的極簡版),
+- 規劃期 plan 更新時**變動列亮一閃、表頭脈衝並顯示「計畫已更新 vN」**；
+  Agent 指令造成 flag、done、phase、任務進度或健康狀態變動時，對應狀態 chip 也會短暫脈衝；
   plan 版本異常增長(≥10)標黃提示可能震盪。
 
-右欄(console 直播):
+右欄(完整執行紀錄):
+- 依時間顯示 Dashboard 操作、loop 中文流程、Agent stdout、協調指令、驗證與 reset，不再只顯示 Agent；
 - 超長 log 首抓只載尾段(64KB)秒開;在底部就跟著 tail,永遠看得到最新 print;
 - 往上翻閱時出現「⤓ 跟到最新」浮鈕一鍵回底;顯示緩衝上限 300KB,最舊自動丟棄。
 
@@ -129,12 +131,13 @@ Vite 會把 `/api` proxy 到本機 dashboard。
 - ⏪ 回規劃期 / ⏩ 進執行期:phase 切換;回規劃期會把執行進度全部歸零(計畫保留);
 - **進度管理(任務列 ⏵)**:退回 task-N=清掉 N 起的完成紀錄重做(code 不動,交輪次驗收);
   往前跳=中間任務標「✔ 人工」,且**先跑 validate、綠燈才放行**(同 preflight 原則)。
-  loop 每輪只保留當前輪的 agent log(round-*.log),舊輪自動清除。
+  loop 每輪只保留當前輪的 agent 原始輸出(round-*.log),舊輪自動清除；完整流程則持續追加到 console.log。
 
 ## Workspace 佈局(`workspace/<name>/`)
 
 - `state.json` — 唯一真相:phase / flag / plan / 進度 / 完成 sha / reset 統計
-- `history.log` — 一輪一行;`prompts/`、`logs/` — 每輪 prompt 原文與 agent stdout
+- `console.log` — Dashboard 操作、loop 中文階段訊息、Agent stdout 與驗證結果的完整時間序；單檔 5 MiB，自動輪替並保留 `.1`～`.3`
+- `history.log` — 一輪一行的機械摘要;`prompts/`、`logs/` — 每輪 prompt 原文與 Agent 原始 stdout
 - `REPORT.md` — 收斂後的總結
 
 ## agent 可用命令(prompt 內已附完整指令)

@@ -20,7 +20,9 @@ export default function PlanTable({
   const [message, setMessage] = useState("");
   const [currentOffscreen, setCurrentOffscreen] = useState(false);
   const [flashOrders, setFlashOrders] = useState<Set<number>>(new Set());
+  const [updatedVersion, setUpdatedVersion] = useState<number | null>(null);
   const previous = useRef<WorkspaceState | null>(null);
+  const flashTimer = useRef<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -33,10 +35,19 @@ export default function PlanTable({
       .filter((task) => old.get(task.order) !== `${task.task}|${task.ref ?? ""}`)
       .map((task) => task.order));
     setFlashOrders(changed);
+    setUpdatedVersion(state.plan_version);
     previous.current = state;
-    const timeout = window.setTimeout(() => setFlashOrders(new Set()), 1600);
-    return () => window.clearTimeout(timeout);
+    if (flashTimer.current !== null) window.clearTimeout(flashTimer.current);
+    flashTimer.current = window.setTimeout(() => {
+      setFlashOrders(new Set());
+      setUpdatedVersion(null);
+      flashTimer.current = null;
+    }, 2400);
   }, [state]);
+
+  useEffect(() => () => {
+    if (flashTimer.current !== null) window.clearTimeout(flashTimer.current);
+  }, []);
 
   useEffect(() => {
     const current = scrollRef.current?.querySelector<HTMLElement>("tr.current");
@@ -105,8 +116,12 @@ export default function PlanTable({
   const visibleTasks = plan.filter((task) => showDone || !completed.has(task.order));
   return (
     <section className="plan-pane">
-      <header className="pane-header plan-header">
-        <div><strong>任務計畫</strong><span>{completed.size}/{plan.length} 已完成</span></div>
+      <header className={`pane-header plan-header${updatedVersion !== null ? " updated" : ""}`}>
+        <div>
+          <strong>任務計畫</strong>
+          <span>{completed.size}/{plan.length} 已完成</span>
+          {updatedVersion !== null && <span className="plan-update-badge" role="status" aria-label={`計畫已更新 v${updatedVersion}`}>計畫已更新 v{updatedVersion}</span>}
+        </div>
         {canEdit && plan.length > 0 && <button type="button" className="secondary-button" onClick={startEditing}>✎ 編輯計畫</button>}
       </header>
       <div className="table-scroll" ref={scrollRef} onScroll={checkCurrentVisibility}>

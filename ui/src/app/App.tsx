@@ -44,12 +44,12 @@ export default function App() {
           <main className="empty-state">
             <div className="empty-icon" aria-hidden="true">⌁</div>
             <h1>尚未建立 workspace</h1>
-            <p>啟動第一個 loop 後，任務計畫、執行狀態與 agent console 會顯示在這裡。</p>
+            <p>啟動第一個 loop 後，任務計畫、執行狀態與完整流程紀錄會顯示在這裡。</p>
             {!dashboard.bootstrap.readonly && <button type="button" className="primary-button" onClick={() => setLauncherOpen(true)}>＋ 啟動第一個 loop</button>}
           </main>
         ) : (
           <main className="dashboard-grid" style={{ gridTemplateColumns: `${leftWidth}px 6px minmax(0, 1fr)` }}>
-            <WorkspaceView workspace={workspace} state={dashboard.state} readonly={dashboard.bootstrap.readonly} events={dashboard.events} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} />
+            <WorkspaceView key={dashboard.selected} workspace={workspace} state={dashboard.state} readonly={dashboard.bootstrap.readonly} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} />
             <Splitter onResize={resize} />
             <ConsolePane text={dashboard.consoleText} round={dashboard.state?.round ?? 0} running={workspace?.running ?? false} hasWorkspace={!!dashboard.selected} />
           </main>

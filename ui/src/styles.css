@@ -192,15 +192,14 @@ tr.current td { color: var(--warning); background: color-mix(in srgb, var(--warn
 .goto-button { min-width: 26px; min-height: 24px; margin-left: 6px; padding: 0 5px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-subtle); color: var(--accent); }
 .table-empty { height: 80px; color: var(--muted); text-align: center; vertical-align: middle; }
 @keyframes flash { from { background: var(--accent-soft); } to { background: transparent; } }
-tr.flash td { animation: flash 1.6s ease-out; }
+@keyframes plan-pulse { 0%, 100% { box-shadow: inset 0 0 0 0 transparent; } 18% { box-shadow: inset 0 -3px 0 var(--accent); } }
+@keyframes status-pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 65%, transparent); transform: translateY(0); } 30% { box-shadow: 0 0 0 5px transparent; transform: translateY(-1px); } 100% { box-shadow: none; transform: translateY(0); } }
+tr.flash td { animation: flash 2.4s ease-out; }
+.plan-header.updated { animation: plan-pulse 2.4s ease-out; }
+.plan-update-badge { padding: 2px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-strong) !important; font-weight: 700; }
+.status-pulse { animation: status-pulse 1.8s ease-out; }
 .floating-button { position: absolute; z-index: 4; right: 18px; bottom: 14px; min-height: 30px; padding: 4px 14px; border: 0; border-radius: 999px; background: var(--accent-strong); color: #fff; box-shadow: var(--shadow); }
 .current-jump { bottom: 16px; }
-
-.recent-events { max-height: 180px; border-top: 1px solid var(--border); background: var(--surface); }
-.event-toggle { display: flex; width: 100%; min-height: 32px; align-items: center; justify-content: space-between; padding: 4px 10px; border: 0; background: var(--surface); color: var(--muted); text-align: left; }
-.event-toggle:hover { color: var(--text); }
-.event-count { min-width: 22px; padding: 0 6px; border-radius: 999px; background: var(--surface-subtle); text-align: center; }
-.event-output { max-height: 145px; margin: 0; overflow: auto; padding: 5px 10px 9px; color: var(--muted); font: 11.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
 
 .console-pane { background: var(--bg); }
 .console-header { min-height: 48px; }

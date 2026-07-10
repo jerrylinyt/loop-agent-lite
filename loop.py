@@ -22,6 +22,7 @@
 
 import argparse
 import atexit
+import fcntl
 import hashlib
 import json
 import os
@@ -49,14 +50,73 @@ STUCK_STOP_COUNT = 100                 # --stuck-stop 開啟時,同一任務 res
 ROUND_TIMEOUT_MIN = 30                 # 單輪 agent 上限(分鐘);0=不限
 VALIDATE_TAIL = 50                     # 驗證失敗餵給下一輪的輸出尾行數
 TASK_LIST_TRUNC = 80                   # prompt 任務總覽單行截斷長度
+CONSOLE_MAX_BYTES = 5 * 1024 * 1024   # console.log 單檔 5 MiB
+CONSOLE_BACKUPS = 3                    # 保留 console.log.1～.3
+
+_CONSOLE_PATH = None
+_CONSOLE_LOCK = threading.Lock()
 
 
 def now_ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
+def configure_console(path: Path) -> None:
+    """將 loop 與 agent 的所有輸出追加到 workspace 共用 console。"""
+    global _CONSOLE_PATH
+    _CONSOLE_PATH = path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    append_console(path, f"\n[{now_ts()}] ━━━ 新的 loop session ━━━")
+
+
+def append_console(path: Path, line: str, *, max_bytes: int = CONSOLE_MAX_BYTES,
+                   backups: int = CONSOLE_BACKUPS) -> None:
+    """跨 process 鎖定後追加 console；超過大小時輪替 .1～.N。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (line + "\n").encode("utf-8")
+    lock_path = path.with_name(f".{path.name}.lock")
+    with _CONSOLE_LOCK, open(lock_path, "a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            current_size = path.stat().st_size if path.exists() else 0
+            if max_bytes > 0 and current_size > 0 and current_size + len(encoded) > max_bytes:
+                if backups > 0:
+                    oldest = path.with_name(f"{path.name}.{backups}")
+                    oldest.unlink(missing_ok=True)
+                    for index in range(backups - 1, 0, -1):
+                        source = path.with_name(f"{path.name}.{index}")
+                        if source.exists():
+                            os.replace(source, path.with_name(f"{path.name}.{index + 1}"))
+                    os.replace(path, path.with_name(f"{path.name}.1"))
+                else:
+                    path.unlink(missing_ok=True)
+            with open(path, "ab") as console:
+                console.write(encoded)
+                console.flush()
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _console_line(line: str) -> None:
+    print(line, flush=True)
+    if _CONSOLE_PATH is None:
+        return
+    append_console(_CONSOLE_PATH, line)
+
+
 def log(msg: str) -> None:
-    print(f"[{now_ts()}] {msg}", flush=True)
+    lines = str(msg).splitlines() or [""]
+    for line in lines:
+        _console_line(f"[{now_ts()}] {line}")
+
+
+def agent_log(msg: str) -> None:
+    _console_line(f"[{now_ts()}] 🤖 Agent｜{msg}")
+
+
+def fail(msg: str):
+    log(f"⛔ 流程停止｜{msg}")
+    raise SystemExit(msg)
 
 
 def sh(args, cwd, check=True):
@@ -240,7 +300,7 @@ def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs):
         try:
             for raw in p.stdout:
                 line = raw.decode("utf-8", errors="replace")
-                print("  │ " + line.rstrip("\n"), flush=True)
+                agent_log(line.rstrip("\n"))
                 lf.write(line)
                 lf.flush()  # 逐行落盤,dashboard 才 tail 得到即時輸出
         except KeyboardInterrupt:
@@ -342,16 +402,19 @@ def main():
             sys.exit(f"❌ preflight:{rel} 不在 HEAD 裡。流程是:模板產初版 → 你審 → commit → 才 run loop")
 
     ws = Workspace(args.name or repo.name)
+    configure_console(ws.dir / "console.log")
+    log(f"🚀 Loop 啟動｜workspace={ws.dir.name}｜repo={repo}")
     if args.reset_state and ws.state_path.exists():
         ws.state_path.unlink()
+        log("🧹 已依設定重置既有 state")
     state = ws.load_state()
 
     # repo identity fail-closed:workspace 只按 name 載入,若既有 state 綁的是別的 repo,
     # 續跑會拿別人的 plan/completed/last_green_sha 去 reset --hard——寧可停也不帶病前進。
     bound_repo = (state.get("config") or {}).get("repo")
     if bound_repo and Path(bound_repo).resolve() != repo and not (args.reset_state or args.import_plan):
-        sys.exit(f"❌ workspace '{ws.dir.name}' 綁定的是 {bound_repo},但這次 --repo 是 {repo}。"
-                 f"同名 workspace 指到不同 repo 會用錯 plan/SHA——換個 --name,或加 --reset-state 重來。")
+        fail(f"workspace '{ws.dir.name}' 綁定的是 {bound_repo},但這次 --repo 是 {repo}。"
+             f"同名 workspace 指到不同 repo 會用錯 plan/SHA——換個 --name,或加 --reset-state 重來。")
 
     # 選配:CLI 匯入 plan.json(重置 state,選起跑階段)——dashboard 匯入的 CLI 等價
     if args.import_plan:
@@ -359,47 +422,51 @@ def main():
         try:
             plan_obj = json.loads(Path(args.import_plan).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
-            sys.exit(f"❌ --import-plan 讀取/解析失敗:{e}")
+            fail(f"--import-plan 讀取/解析失敗:{e}")
         normalized, errs = validate_plan(plan_obj)
         if errs:
-            sys.exit("❌ plan.json 校驗未過:\n- " + "\n- ".join(errs))
+            fail("plan.json 校驗未過:\n- " + "\n- ".join(errs))
         state = ws.fresh_state()
         state["plan"] = normalized
         state["plan_version"] = 1
         state["phase"] = args.start_phase
         if args.start_phase == "exec":
             state["current_order"] = normalized[0]["order"]
-        log(f"⤴ 匯入 plan {len(normalized)} 條(state 已重置),從 {args.start_phase} 開跑")
+        log(f"📝 匯入計畫｜{len(normalized)} 條｜從 {'規劃期' if args.start_phase == 'plan' else '執行期'} 開始")
 
     # 每次啟動重拍受保護檔快照:停機期間的人工修改視為合法(綠點一致性驗證要用,故先拍)
     ws.snapshot_protected(repo, protected)
 
     # preflight:validate。綠點錨定 fail-closed(#1)——resume 不能只看 last_green_sha 非空,
     # 否則舊 green 若已不存在/非 HEAD 祖先/protected 已分歧,reset 回去會製造髒工作樹或錯版 goal。
+    log(f"🔎 啟動前檢查｜執行驗證：{shlex.join(validate_cmd)}")
     ok, vtail = run_validate(validate_cmd, repo)
     # validate 本身若修改 tracked/untracked(non-ignored)檔案,不論 rc 綠紅都不能放行。否則 rc=0
     # 會落出下列分支直接續跑;rc!=0 + 舊 green 合法也會帶髒工作樹進 loop,把 validator 的副作用
     # 誤判成 agent 異動。preflight 起點必須在 validate 前後都乾淨。
     if is_dirty(repo):
-        sys.exit(f"❌ preflight:validate 命令 `{' '.join(validate_cmd)}` 執行後弄髒工作樹——"
-                 "validate 必須只產生 ignored build artifacts,不能修改 tracked/untracked 原始碼。"
-                 f"輸出尾段:\n{vtail}")
+        fail(f"啟動前驗證 `{shlex.join(validate_cmd)}` 執行後弄髒工作樹——"
+             "validate 必須只產生 ignored build artifacts,不能修改 tracked/untracked 原始碼。"
+             f"輸出尾段:\n{vtail}")
     if ok:
         # 當前 HEAD 綠且乾淨:它就是最新、protected 必然與啟動快照一致的錨點,直接錨在這。
         # 同時修掉「停機期間人改 goal、舊 green 已分歧」——丟棄舊 green,不沿用過時錨點。
         state["last_green_sha"] = head_sha(repo)
+        log(f"✅ 啟動前檢查完成｜驗證通過｜綠點 {state['last_green_sha'][:8]}")
     elif not ok:
         # 當前 HEAD 紅:必須有「通過驗證」的舊綠點才放行,否則沒有可信起點,fail-closed 停機。
         green = state["last_green_sha"]
         if green_anchor_valid(repo, green, ws.dir / "snapshots", protected):
-            log(f"⚠ preflight:validate 紅,但綠點 {green[:8]} 通過可達性/一致性驗證——放行續跑")
+            log(f"⚠️ 啟動驗證失敗｜沿用已確認綠點 {green[:8]} 繼續修復")
+            if vtail:
+                log(f"驗證錯誤尾段：\n{vtail}")
             state["notes"].append(f"❌ 啟動時 `{' '.join(validate_cmd)}` 就是紅的,"
                                   f"先把它修綠再繼續往下做。輸出尾段:\n```\n{vtail}\n```")
         else:
             why = ("沒有綠點可錨定" if not green else
                    f"綠點 {green[:8]} 未通過驗證(不存在/非 HEAD 祖先/protected 與現況分歧)")
-            sys.exit(f"❌ preflight:validate 命令 `{' '.join(validate_cmd)}` 是紅的,{why}——"
-                     f"起點必須是可信綠點。先把工作樹修到 validate 綠再 resume。輸出尾段:\n{vtail}")
+            fail(f"啟動驗證 `{shlex.join(validate_cmd)}` 失敗，{why}——"
+                 f"起點必須是可信綠點。先把工作樹修到 validate 綠再 resume。輸出尾段:\n{vtail}")
 
     # goal 變更偵測:停機期間人改 goal 是合法的,但既有計畫是舊 goal 收斂的——大聲提醒
     goal_hash = sha256_bytes((repo / args.goal).read_bytes())
@@ -430,9 +497,10 @@ def main():
     issue_cmd = f"{py} {shlex.quote(str(work_py))} issue"
     env = {**os.environ, "LOOP_WS": str(ws.dir)}
 
-    log(f"repo={repo}  workspace={ws.dir.name}  phase={state['phase']}  round={state['round']}")
-    log(f"agent={' '.join(agent_cmd)}  validate={' '.join(validate_cmd)}")
-    log(f"flag>{args.flag_threshold}  done≥{args.done_threshold}  red-limit={args.red_limit}  "
+    phase_name = "規劃期" if state["phase"] == "plan" else "執行期"
+    log(f"📍 恢復進度｜階段：{phase_name}｜已完成 round {state['round']}")
+    log(f"⚙️ 執行設定｜Agent：{shlex.join(agent_cmd)}｜驗證：{shlex.join(validate_cmd)}")
+    log(f"⚙️ 收斂門檻｜flag>{args.flag_threshold}｜done≥{args.done_threshold}｜red-limit={args.red_limit}｜"
         f"stall-limit={args.stall_limit}  stuck-stop={'on(' + str(args.stuck_stop_count) + ')' if args.stuck_stop else 'off'}  "
         f"round-timeout={args.round_timeout:g}min")
 
@@ -457,14 +525,14 @@ def main():
         if not (repo / args.goal).exists():
             ws.save_state(state)
             notify(args.notify_cmd, "goal_missing", ws.dir.name)
-            sys.exit(f"❌ {args.goal} 不存在(每輪 spawn 前檢查)——請補回並 commit 後再啟動")
+            fail(f"{args.goal} 不存在（每輪啟動前檢查）——請補回並 commit 後再啟動")
 
         # 派工資訊落地(work.py 靠這兩個檔做當場驗:phase 凍結 + task id 核對)
         cur_task = next((t for t in state["plan"] if t["order"] == state["current_order"]), None)
         if phase == "exec" and cur_task is None:
             ws.save_state(state)
-            sys.exit(f"❌ 執行期但找不到 current_order={state['current_order']} 的任務"
-                     f"(plan {len(state['plan'])} 條)——state 不合法,fail-closed 停機交人")
+            fail(f"執行期找不到 current_order={state['current_order']} 的任務"
+                 f"（plan {len(state['plan'])} 條）——state 不合法，停機交由人員確認")
         task_id = f"task-{state['current_order']}" if (phase == "exec" and cur_task) else ""
         ws.write_dispatch(phase, task_id)
         ws.clear_signals()
@@ -501,12 +569,14 @@ def main():
             old.unlink(missing_ok=True)  # prompt 留最近 5 輪當稽核,其餘清掉
 
         head_before = head_sha(repo)
-        log(f"── round {rnd} [{phase}{' ' + task_id if task_id else ''}] "
-            f"flag={state['flag']} done={state['done_count']} ──")
+        phase_name = "規劃期" if phase == "plan" else "執行期"
+        task_summary = f"｜{task_id}：{cur_task['task']}" if cur_task else ""
+        log(f"🔄 第 {rnd} 輪開始｜{phase_name}{task_summary}｜flag={state['flag']}｜done={state['done_count']}")
+        log(f"🤖 啟動 Agent｜命令：{shlex.join(agent_cmd)}")
         rc, secs, timed_out = run_agent(agent_cmd, prompt_path, repo, env,
                                         ws.dir / "logs" / f"round-{rnd:04d}.log",
                                         args.round_timeout * 60)
-        log(f"agent 結束 rc={rc} 耗時={secs:.0f}s" + "(逾時強殺)" * timed_out)
+        log(f"🤖 Agent 結束｜exit code={rc}｜耗時 {secs:.0f} 秒" + "｜超時，已強制終止" * timed_out)
         if timed_out:
             state["notes"].append(f"⚠️ 上一輪 agent 超過 {args.round_timeout:g} 分鐘被強制終止,"
                                   "工作可能做到一半——工作區殘留照「收拾現場」步驟判斷。")
@@ -538,12 +608,13 @@ def main():
             ws.save_state(state)  # 用 loop 記憶中的真相覆寫回去
             state["notes"].append("⚠️ 上一輪繞過 work.py 直接改了 state.json,已還原、該輪作廢。"
                                   "計畫與進度只能透過 work.py 的命令寫入。")
+            log("⚠️ 偵測到 Agent 直接修改 state.json｜已用 loop 保存的狀態還原")
         if tampered:
             # 竄改輪整輪作廢:本輪任何偷渡的 signal / pending plan 一律不採信(#2)。
             # reset --hard 只清 repo,pending_plan.json 在 workspace 目錄清不到,必須顯式丟棄——
             # 否則規劃期會把「同一輪偷改 goal + create-plan」提交的髒 plan 當成真相收進去。
             ws.clear_signals()
-            log(f"⚠️ 竄改還原:{tampered}")
+            log(f"⚠️ 本輪作廢｜偵測到不允許的變更：{', '.join(tampered)}｜相關 signal 已丟棄")
 
         head_after = head_sha(repo)
         dirty = is_dirty(repo)
@@ -554,21 +625,29 @@ def main():
         if phase == "plan":
             # create-plan 只要被 call(不論成敗)就歸零 —— fail-closed
             if ws.signal("called_create_plan"):
+                log("📨 Agent 指令｜create-plan（提交新計畫）")
                 state["flag"] = 0
                 pending = ws.take_pending_plan()
                 if pending is not None:
                     state["plan"] = pending
                     state["plan_version"] += 1
-                    event = f"plan 更新 v{state['plan_version']}({len(pending)} 條)"
+                    event = f"📝 計畫已更新｜v{state['plan_version']}｜共 {len(pending)} 條任務"
+                    log(event)
                 else:
-                    event = "create-plan 被 call 但校驗未過,plan 未更新"
+                    event = "❌ create-plan 校驗未通過｜保留原計畫"
+                    log(event)
             elif tampered or changed:  # 規劃期 repo 異動已在上面整輪 reset,這裡只確保 flag 歸零
                 state["flag"] = 0
             elif ws.signal("signal_plan_ok"):
+                log("📨 Agent 指令｜plan-ok（確認目前計畫）")
                 if state["plan"]:
                     state["flag"] += 1
+                    log(f"✅ 規劃共識累計｜flag={state['flag']}｜門檻 > {args.flag_threshold}")
                 else:
                     state["notes"].append("plan 仍為空,plan-ok 不計數。請先 create-plan。")
+                    log("⚠️ plan-ok 未計數｜目前計畫為空，請先 create-plan")
+            elif not tampered:
+                log("ℹ️ Agent 本輪未送出 create-plan 或 plan-ok｜規劃共識不增加")
             validate_note = "-"
             if state["flag"] > args.flag_threshold:
                 state["phase"] = "exec"
@@ -582,13 +661,24 @@ def main():
                 event = f"✅ 規劃收斂(plan v{state['plan_version']},{len(state['plan'])} 條)→ 執行期"
                 log(event)
         else:
+            if ws.signal("signal_done"):
+                log(f"📨 Agent 指令｜done {task_id}（回報任務完成）")
+            else:
+                log(f"ℹ️ Agent 本輪未送出 done {task_id}")
+            if ws.signal("called_create_plan"):
+                log("📨 Agent 指令｜create-plan｜執行期計畫已凍結，將忽略此指令")
+            log(f"🧪 執行驗證｜命令：{shlex.join(validate_cmd)}")
             ok, vtail = run_validate(validate_cmd, repo)
             validate_note = "PASS" if ok else "FAIL"
             if ok:
+                log("✅ 驗證通過")
                 state["red_streak"] = 0
                 if not dirty:
                     state["last_green_sha"] = head_after
             else:
+                log(f"❌ 驗證失敗｜紅燈連續 {state['red_streak'] + 1} 輪")
+                if vtail:
+                    log(f"驗證錯誤尾段：\n{vtail}")
                 state["red_streak"] += 1
                 state["done_count"] = 0
                 state["notes"].append(
@@ -598,8 +688,11 @@ def main():
                 state["notes"].append("執行期計畫已凍結,create-plan 被忽略。任務本身有問題請在 log/commit 說明,交人處理。")
             if tampered or changed:
                 state["done_count"] = 0
+                reason = "本輪被判定作廢" if tampered else "偵測到程式碼或 commit 變更，等待下一輪確認"
+                log(f"↩️ done 共識歸零｜{reason}")
             elif ws.signal("signal_done") and ok:
                 state["done_count"] += 1
+                log(f"✅ done 共識累計｜{state['done_count']} / {args.done_threshold}")
 
             # ---- 任務完成判定 ----
             if state["done_count"] >= args.done_threshold:
@@ -631,9 +724,9 @@ def main():
                 if head_sha(repo) != green or is_dirty(repo):
                     ws.save_state(state)
                     notify(args.notify_cmd, "reset_broken", ws.dir.name)
-                    sys.exit(f"⛔ reset 回綠點 {green[:8]} 後工作樹不符預期"
-                             f"(HEAD={head_sha(repo)[:8]}、dirty={is_dirty(repo)})——"
-                             f"綠點錨定不可信,停機交人。詳見 {ws.history}")
+                    fail(f"reset 回綠點 {green[:8]} 後工作樹不符預期"
+                         f"（HEAD={head_sha(repo)[:8]}、dirty={is_dirty(repo)}）——"
+                         f"綠點錨定不可信，停機交由人員確認。詳見 {ws.history}")
                 # 依完成 sha 回退任務指標,不用一個一個退
                 state["completed"] = [e for e in state["completed"] if is_ancestor(repo, e["sha"], green)]
                 state["current_order"] = (state["completed"][-1]["order"] + 1) if state["completed"] else \
@@ -651,19 +744,24 @@ def main():
                 if args.stuck_stop and state["task_reset_counts"][key] >= args.stuck_stop_count:
                     ws.save_state(state)
                     notify(args.notify_cmd, "stuck_stop", ws.dir.name)
-                    sys.exit(f"⛔ stuck-stop:task-{state['current_order']} 已 reset {state['task_reset_counts'][key]} 次,"
-                             f"停機交人。詳見 {ws.history}")
+                    fail(f"stuck-stop：task-{state['current_order']} 已 reset {state['task_reset_counts'][key]} 次，"
+                         f"停機交由人員確認。詳見 {ws.history}")
 
         # agent 回報的 issue(work.py issue):落 state 給人類看,不影響任何計數
         pend = ws.dir / "pending_issues"
         if pend.exists():
+            issue_lines = []
             for iline in pend.read_text(encoding="utf-8").splitlines():
                 if iline.strip():
+                    issue_lines.append(iline.strip())
                     state.setdefault("issues", []).append(
                         {"round": rnd, "where": task_id or phase, "text": iline.strip(),
                          "ts": datetime.now().isoformat(timespec="seconds")})
             pend.unlink()
-            log(f"⚠ agent 回報 issue,累計 {len(state.get('issues', []))} 條未清(dashboard 可看/清)")
+            for issue_text in issue_lines:
+                log(f"⚠️ Agent 回報 issue｜{issue_text}")
+            if issue_lines:
+                log(f"📌 Issue 累計｜目前有 {len(state.get('issues', []))} 條未清")
 
         line = (f"{datetime.now().isoformat(timespec='seconds')} round={rnd} phase={phase} "
                 f"task={task_id or '-'} rc={rc} changed={changed} "
@@ -673,7 +771,8 @@ def main():
                 + (f"  << {event}" if event else ""))
         with open(ws.history, "a", encoding="utf-8") as hf:
             hf.write(line + "\n")
-        log(line)
+        log(f"📊 第 {rnd} 輪結束｜變更={'有' if changed else '無'}｜驗證={validate_note}｜"
+            f"flag={state['flag']}｜done={state['done_count']}" + (f"｜{event}" if event else ""))
         ws.save_state(state)
 
     if state["phase"] == "done":
@@ -694,5 +793,5 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n⏸ 手動中斷。state 已落地,重跑同一條命令即可續跑。")
+        log("⏸ 手動中斷｜state 已落地，重跑同一條命令即可續跑")
         sys.exit(130)

@@ -135,6 +135,22 @@ class TestAtomicWriteConcurrency(unittest.TestCase):
             json.loads(target.read_bytes())  # 最終檔完整、未被 truncate
 
 
+class TestConsoleRotation(unittest.TestCase):
+    """完整 console 必須在上限前輪替，且按新舊順序保留固定份數。"""
+
+    def test_rotates_and_keeps_bounded_backups(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "console.log"
+            L.append_console(target, "a" * 30, max_bytes=40, backups=2)
+            L.append_console(target, "b" * 20, max_bytes=40, backups=2)
+            L.append_console(target, "c" * 30, max_bytes=40, backups=2)
+
+            self.assertEqual(target.read_text().strip(), "c" * 30)
+            self.assertEqual((Path(d) / "console.log.1").read_text().strip(), "b" * 20)
+            self.assertEqual((Path(d) / "console.log.2").read_text().strip(), "a" * 30)
+            self.assertFalse((Path(d) / "console.log.3").exists())
+
+
 class TestDashboardStateLockCoverage(unittest.TestCase):
     """#3 run/launch 必須和 edit/phase 共用 workspace lock,不能在 stopped check 後競態。"""
 
