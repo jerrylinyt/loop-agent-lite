@@ -3354,6 +3354,29 @@ class TestAnomalyLogProjection(unittest.TestCase):
             finally:
                 D.ROOT = old_root
 
+    def test_workspace_list_returns_json_error_for_unsafe_anomaly_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            workspace = root / "alpha"
+            (workspace / "logs").mkdir(parents=True)
+            (workspace / "history.log").write_text(
+                "2026-07-10T10:00:00 round=1 phase=exec task=task-1 rc=0 secs=1 "
+                "timeout=False changed=False signal=- done_missing=True validate=PASS\n",
+                encoding="utf-8",
+            )
+            (workspace / "logs" / "anomalies").symlink_to(root)
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                handler = self.ResponseCapture()
+                handler.path = "/api/anomalies?ws=alpha"
+                D.Handler.do_GET(handler)
+                self.assertEqual(handler.response[0], 400)
+                self.assertIn("異常清單讀取失敗", handler.response[1]["error"])
+                self.assertIn("symbolic link", handler.response[1]["error"])
+            finally:
+                D.ROOT = old_root
+
 
 class TestFreshStartClearsRoundArtifacts(unittest.TestCase):
     """reset/import 是交易式「從頭跑」:preflight 通過後舊 run 的 history/REPORT/prompt/log

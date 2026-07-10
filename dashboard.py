@@ -1584,7 +1584,11 @@ class Handler(BaseHTTPRequestHandler):
                     directory = self._ws_dir(q)
                     if directory is None:
                         return
-                    projection = read_anomaly_records(directory, run=run)
+                    try:
+                        projection = read_anomaly_records(directory, run=run)
+                    except (OSError, ValueError) as e:
+                        self._err(f"異常清單讀取失敗:{e}")
+                        return
                 else:
                     if run != "current":
                         self._err("全域異常清單只支援 current run")
