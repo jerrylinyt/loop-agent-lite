@@ -4,6 +4,7 @@ import Modal from "../../shared/components/Modal";
 import { getJson, postJson, waitForJobStartup } from "../../shared/api/client";
 import type { ConfigResponse, JobInfo, StartupResponse, WorkspaceState, WorkspaceSummary } from "../../shared/api/types";
 import PlanImportField from "./PlanImportField";
+import NotifyModal from "./NotifyModal";
 import RepoRootsModal from "./RepoRootsModal";
 import { validatePlan } from "./planValidation";
 
@@ -48,6 +49,7 @@ export default function LauncherModal({
   const [preflightResult, setPreflightResult] = useState<{ ok: boolean; text: string; tail: string } | null>(null);
   const [cliManagerOpen, setCliManagerOpen] = useState(false);
   const [repoRootsOpen, setRepoRootsOpen] = useState(false);
+  const [notifyOpen, setNotifyOpen] = useState(false);
   const hydratedRepo = useRef("");
 
   const repo = repoChoice === "__custom__" ? customRepo.trim() : repoChoice;
@@ -272,6 +274,7 @@ export default function LauncherModal({
             </div>
             <label className="checkbox-row"><input type="checkbox" checked={resetState} onChange={(event) => setResetState(event.target.checked)} />重置 workspace state（清除舊進度）</label>
             <label className="checkbox-row"><input type="checkbox" checked={newBranch} onChange={(event) => setNewBranch(event.target.checked)} />在新 branch 跑（loop/&lt;workspace 名&gt;）</label>
+            <div className="notify-entry-row"><button type="button" className="secondary-button" disabled={!config} onClick={() => setNotifyOpen(true)}>🔔 管理終態通知</button><span className="label-help">{config?.notify_cmd ? `目前：${config.notify_cmd}` : "目前未設定通知"}</span></div>
           </details>
         </div>
       ) : (
@@ -290,6 +293,7 @@ export default function LauncherModal({
         setConfig(next);
         setAgentIndex(String(nextIndex >= 0 ? nextIndex : 0));
       }} />}
+      {notifyOpen && config && <NotifyModal config={config} onClose={() => setNotifyOpen(false)} onSaved={setConfig} />}
       {repoRootsOpen && config && <RepoRootsModal config={config} onClose={() => setRepoRootsOpen(false)} onSaved={(next) => {
         setConfig(next);
         if (repo !== "" && next.repos.includes(repo)) return;

@@ -103,6 +103,7 @@ export interface ConfigResponse {
   personal_config_path?: string;
   project_config_path?: string;
   config_override?: boolean;
+  notify_cmd?: string;
   repo_roots?: string[];
 }
 

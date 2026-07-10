@@ -63,6 +63,18 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await launcher.getByLabel("單輪上限（分）").fill("1");
   await launcher.getByLabel("Agent 異常退避上限（秒）").fill("5");
   await launcher.getByLabel("在新 branch 跑（loop/<workspace 名>）").check();
+
+  await launcher.getByRole("button", { name: "🔔 管理終態通知" }).click();
+  const notifyManager = page.getByRole("dialog", { name: "終態通知管理" });
+  await expect(notifyManager).toBeVisible();
+  await notifyManager.getByLabel("通知命令").fill("echo ping-{status}-{name}");
+  await notifyManager.getByRole("button", { name: "以 status=test 執行測試" }).click();
+  await expect(notifyManager.getByRole("status")).toContainText("通知命令執行成功");
+  await expect(notifyManager.locator("pre")).toContainText("ping-test-dashboard-test");
+  await notifyManager.getByRole("button", { name: "儲存通知設定" }).click();
+  await expect(notifyManager).toBeHidden();
+  await expect(launcher.getByText("目前：echo ping-{status}-{name}")).toBeVisible();
+
   await launcher.getByRole("button", { name: "▶ 啟動" }).click();
 
   await expect(launcher).toBeHidden();

@@ -464,6 +464,7 @@ def config_projection(cfg):
             "personal_config_path": str(PERSONAL_CONFIG_PATH),
             "project_config_path": str(PROJECT_CONFIG_PATH),
             "config_override": bool(CONFIG_OVERRIDE),
+            "notify_cmd": str(cfg.get("notify_cmd") or ""),
             "repo_roots": cfg.get("repo_roots", DEFAULT_CONFIG["repo_roots"]),
             "repos": scan_repos(cfg)}
 
@@ -839,6 +840,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.api_edit_cli_config(body)
             elif u.path == "/api/edit-repo-roots":
                 self.api_edit_repo_roots(body)
+            elif u.path == "/api/edit-notify":
+                self.api_edit_notify(body)
+            elif u.path == "/api/test-notify":
+                self.api_test_notify(body)
             elif u.path == "/api/phase":
                 self.api_phase(body)
             elif u.path == "/api/set-task":
@@ -1455,6 +1460,49 @@ class Handler(BaseHTTPRequestHandler):
             save_personal_config({"repo_roots": roots})
             cfg = load_config()
         self._out(200, json.dumps(config_projection(cfg), ensure_ascii=False))
+
+    def api_edit_notify(self, body):
+        """儲存個人設定的終態通知命令(佔位符 {status}/{name});空字串=停用。"""
+        raw = body.get("notify_cmd")
+        if not isinstance(raw, str) or len(raw) > 2000:
+            self._err("notify_cmd 必須是 ≤2000 字元的字串(空=停用通知)")
+            return
+        raw = raw.strip()
+        if raw:
+            try:
+                shlex.split(raw.replace("{status}", "test").replace("{name}", "test"))
+            except ValueError as e:
+                self._err(f"通知命令格式錯誤:{e}")
+                return
+        with CONFIG_LOCK:
+            cfg = load_config()
+            if "error" in cfg:
+                self._err(cfg["error"])
+                return
+            save_personal_config({"notify_cmd": raw})
+            cfg = load_config()
+        self._out(200, json.dumps(config_projection(cfg), ensure_ascii=False))
+
+    def api_test_notify(self, body):
+        """以 {status}=test/{name}=dashboard-test 實跑通知命令(替換規則同 loop 終態通知),15 秒上限。"""
+        raw = str(body.get("notify_cmd") or "").strip()
+        if not raw:
+            self._err("通知命令為空,沒有可測試的內容")
+            return
+        cfg = load_config()
+        if "error" in cfg:
+            self._err(cfg["error"])
+            return
+        rendered = raw.replace("{status}", "test").replace("{name}", "dashboard-test")
+        command_problem = command_error(rendered, "通知命令", cfg)
+        if command_problem:
+            self._err(command_problem)
+            return
+        rc, output, timed_out = run_command_check(shlex.split(rendered), HERE,
+                                                  timeout=15, env=command_env(cfg))
+        tail = "\n".join(output.strip().splitlines()[-20:])[-4000:]
+        self._out(200, json.dumps({"ok": rc == 0 and not timed_out, "rc": rc,
+                                   "timeout": timed_out, "output": tail}, ensure_ascii=False))
 
     @with_state_lock
     def api_phase(self, body):

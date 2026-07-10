@@ -1220,5 +1220,51 @@ class TestDashboardPreflight(unittest.TestCase):
                     os.environ["LOOP_AGENT_WORKSPACE_ROOT"] = old_env
 
 
+
+class TestNotifyEndpoints(unittest.TestCase):
+    """通知管理:test-notify 以 {status}=test 實跑;edit-notify 只寫個人設定檔。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_test_notify_substitutes_placeholders(self):
+        old_load = D.load_config
+        D.load_config = lambda: json.loads(json.dumps(D.DEFAULT_CONFIG))
+        try:
+            handler = self.ResponseCapture()
+            D.Handler.api_test_notify(handler, {"notify_cmd": "echo ping-{status}-{name}"})
+        finally:
+            D.load_config = old_load
+        self.assertEqual(handler.response[0], 200)
+        self.assertTrue(handler.response[1]["ok"])
+        self.assertIn("ping-test-dashboard-test", handler.response[1]["output"])
+
+    def test_edit_notify_persists_to_personal_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            personal = Path(td) / "personal.json"
+            old = (D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE)
+            D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE = personal, None
+            try:
+                handler = self.ResponseCapture()
+                D.Handler.api_edit_notify(handler, {"notify_cmd": "echo done-{status}"})
+                self.assertEqual(handler.response[0], 200)
+                saved = json.loads(personal.read_text(encoding="utf-8"))
+                self.assertEqual(saved["notify_cmd"], "echo done-{status}")
+                self.assertEqual(handler.response[1]["notify_cmd"], "echo done-{status}")
+                # 空字串=停用,合法
+                handler = self.ResponseCapture()
+                D.Handler.api_edit_notify(handler, {"notify_cmd": ""})
+                self.assertEqual(handler.response[0], 200)
+                self.assertEqual(json.loads(personal.read_text(encoding="utf-8"))["notify_cmd"], "")
+            finally:
+                D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE = old
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
