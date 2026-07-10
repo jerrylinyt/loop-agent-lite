@@ -589,6 +589,37 @@ def read_report(name):
         return {"error": f"REPORT.md 讀取失敗:{e}"}
 
 
+FLEET_HISTORY_TAIL = 16 * 1024  # 每個 workspace 事件流尾段上限
+
+
+def read_fleet_history():
+    """全 fleet history.log 尾段的唯讀投影;總覽事件流由前端解析推導,不動任何 truth。"""
+    out = []
+    if not ROOT.is_dir():
+        return out
+    for d in sorted(ROOT.iterdir()):
+        if not loop_mod.valid_workspace_name(d.name) or d.is_symlink() or not d.is_dir():
+            continue
+        try:
+            history = loop_mod.workspace_file(d / "history.log", "history.log")
+            fd = loop_mod._open_regular(history, os.O_RDONLY)
+            with os.fdopen(fd, "rb", closefd=True) as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(max(0, size - FLEET_HISTORY_TAIL))
+                data = stream.read(FLEET_HISTORY_TAIL)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            continue
+        tail = data.decode("utf-8", errors="replace")
+        if size > FLEET_HISTORY_TAIL:
+            newline = tail.find("\n")
+            tail = tail[newline + 1:] if newline != -1 else tail
+        out.append({"name": d.name, "data": tail})
+    return out
+
+
 def read_goal(name):
     """goal 唯讀投影:從 state.config 記錄的 repo+goal 相對路徑讀人類真相,不寫回。"""
     st, err = read_state(name, repair=False)
@@ -810,11 +841,17 @@ def list_workspaces():
             running = ws_running(d.name, st)
             drain_claimed = running and loop_mod.stop_after_round_claimed(
                 d, loop_state.get("pid"), loop_state.get("session_id"))
+            current_order = st.get("current_order")
+            current_task = next((t.get("task") or "" for t in (st.get("plan") or [])
+                                 if isinstance(t, dict) and t.get("order") == current_order), "")
+            if len(current_task) > 120:
+                current_task = current_task[:120] + "…"
             info.update(phase=st.get("phase"), round=st.get("round", 0), flag=st.get("flag", 0),
                         completed=len(st.get("completed") or []), plan_len=len(st.get("plan") or []),
                         done_count=st.get("done_count", 0), repo=c.get("repo"),
                         red_streak=st.get("red_streak", 0), stall_rounds=st.get("stall_rounds", 0),
                         issues=len(st.get("issues") or []),
+                        current_order=current_order, current_task=current_task,
                         running=running,
                         draining=drain_claimed or (running and loop_mod.stop_after_round_requested(
                             d, loop_state.get("pid"), loop_state.get("session_id"))),
@@ -1101,6 +1138,8 @@ class Handler(BaseHTTPRequestHandler):
                 if d is None:
                     return
                 self._out(200, json.dumps(read_prompt(d.name), ensure_ascii=False))
+            elif u.path == "/api/fleet-history":
+                self._out(200, json.dumps(read_fleet_history(), ensure_ascii=False))
             else:
                 self._err("not found", 404)
         except (ValueError, BrokenPipeError, ConnectionResetError):

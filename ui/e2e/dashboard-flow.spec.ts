@@ -93,6 +93,10 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   const fleetCard = overview.locator(".fleet-card", { hasText: "e2e-workspace" });
   await expect(fleetCard).toBeVisible();
   await expect(fleetCard.locator(".breathing-dot")).toBeVisible();
+  await expect(fleetCard.locator(".fleet-card-task")).toContainText("task-1");
+  const eventFeed = overview.getByRole("complementary", { name: "事件推播" });
+  await expect(eventFeed.locator(".fleet-event", { hasText: "▶ 開始 task-1" }).first()).toBeVisible();
+  await expect(eventFeed.locator(".fleet-event-ws", { hasText: "e2e-workspace" }).first()).toBeVisible();
   await fleetCard.click();
   await expect(overview).toBeHidden();
   await expect(page.getByRole("heading", { name: "e2e-workspace" })).toBeVisible();

@@ -1992,5 +1992,36 @@ class TestNotifyEndpoints(unittest.TestCase):
                 D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE = old
 
 
+class TestFleetHistoryProjection(unittest.TestCase):
+    """fleet 事件流投影:回各 workspace history.log 尾段;無 history 的 workspace 跳過,不動 truth。"""
+
+    def test_tail_and_current_task_projection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            (root / "alpha").mkdir(parents=True)
+            (root / "beta").mkdir(parents=True)
+            line = ("2026-07-10T10:00:00 round=1 phase=exec task=task-1 rc=0 changed=False "
+                    "signal=done tamper=False agent_ok=True validate=PASS flag=0 done=1")
+            (root / "alpha" / "history.log").write_text(line + "\n", encoding="utf-8")
+            (root / "alpha" / "state.json").write_text(json.dumps({
+                "phase": "exec", "current_order": 2,
+                "plan": [{"order": 1, "task": "第一項", "ref": None},
+                         {"order": 2, "task": "第二項很長" + "x" * 200, "ref": None}],
+            }), encoding="utf-8")
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                entries = D.read_fleet_history()
+                self.assertEqual([e["name"] for e in entries], ["alpha"], "沒 history 的 beta 應跳過")
+                self.assertIn("task=task-1", entries[0]["data"])
+                fleet = D.list_workspaces()
+                alpha = next(w for w in fleet if w["name"] == "alpha")
+                self.assertEqual(alpha["current_order"], 2)
+                self.assertTrue(alpha["current_task"].startswith("第二項很長"))
+                self.assertLessEqual(len(alpha["current_task"]), 121, "任務文字應截斷")
+            finally:
+                D.ROOT = old_root
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

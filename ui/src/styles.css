@@ -374,7 +374,18 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .fleet-stat.running strong { color: var(--success); }
 .fleet-stat.warning strong { color: var(--warning); }
 .fleet-stat.tasks { min-width: 200px; }
-.fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; align-content: start; }
+.fleet-body { display: flex; min-height: 0; flex: 1; gap: 14px; align-items: stretch; }
+.fleet-grid { display: grid; flex: 1; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; align-content: start; overflow: auto; }
+.fleet-card-task { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; color: var(--text); font-size: 12px; line-height: 1.45; }
+.fleet-events { display: flex; width: 320px; flex: none; flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-raised); }
+.fleet-events-head { display: flex; flex: none; align-items: baseline; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.fleet-events-list { min-height: 0; flex: 1; overflow: auto; padding: 6px; }
+.fleet-event { display: flex; width: 100%; flex-wrap: wrap; align-items: baseline; gap: 6px; padding: 6px 8px; border: 0; border-radius: 6px; background: transparent; color: inherit; text-align: left; font-size: 12px; cursor: pointer; }
+.fleet-event:hover { background: var(--surface-subtle); }
+.fleet-event-time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.fleet-event-ws { padding: 0 6px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 11px; }
+.fleet-event-text { flex: 1 1 100%; color: var(--text); line-height: 1.4; overflow-wrap: anywhere; }
+@media (max-width: 1100px) { .fleet-body { flex-direction: column; } .fleet-events { width: auto; max-height: 40vh; } }
 .fleet-card { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border: 1px solid var(--border); border-left: 4px solid var(--muted); border-radius: 10px; background: var(--surface-raised); color: inherit; text-align: left; cursor: pointer; transition: border-color .15s, transform .1s; }
 .fleet-card:hover { border-color: var(--accent); transform: translateY(-1px); }
 .fleet-card.phase-plan { border-left-color: var(--accent); }

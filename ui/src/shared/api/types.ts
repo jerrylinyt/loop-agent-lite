@@ -15,6 +15,8 @@ export interface WorkspaceSummary {
   red_streak?: number;
   stall_rounds?: number;
   issues?: number;
+  current_order?: number | null;
+  current_task?: string;
 }
 
 export interface PlanTask {

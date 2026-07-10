@@ -1,5 +1,6 @@
 export interface HistoryRow {
   round: number;
+  ts: string;
   time: string;
   phase: string;
   phaseRaw: string;
@@ -40,6 +41,7 @@ export function parseHistory(data: string): { rows: HistoryRow[]; unparsed: numb
     const ts = tokens[0];
     const signal = fields.signal ?? "-";
     rows.push({
+      ts,
       time: ts.includes("T") ? ts.slice(ts.indexOf("T") + 1) : ts,
       round: +fields.round,
       phase: PHASE_NAMES[fields.phase] ?? fields.phase,
