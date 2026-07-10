@@ -337,6 +337,18 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await restoreDialog.getByRole("button", { name: "還原" }).click();
   await expect(page.getByRole("heading", { name: "e2e-workspace" })).toBeVisible();
   await expect(page.getByRole("button", { name: "▶ 運行" })).toBeVisible();
+
+  await page.getByRole("button", { name: "🗄 封存" }).click();
+  const secondArchiveDialog = page.getByRole("dialog", { name: "請確認" });
+  await secondArchiveDialog.getByRole("button", { name: "封存" }).click();
+  await expect(page.getByRole("heading", { name: "尚未建立 workspace" })).toBeVisible();
+  await page.getByRole("button", { name: "🗃 已封存" }).click();
+  const deleteArchivesModal = page.getByRole("dialog", { name: "已封存 workspace" });
+  await deleteArchivesModal.getByRole("button", { name: "永久刪除" }).click();
+  const deleteDialog = page.getByRole("dialog", { name: "確認永久刪除" });
+  await expect(deleteDialog).toContainText("無法還原");
+  await deleteDialog.getByRole("button", { name: "永久刪除" }).click();
+  await expect(deleteArchivesModal).toContainText("目前沒有已封存的 workspace");
 });
 
 test("read-only instance 隱藏寫入控制並拒絕 POST", async ({ page, request }) => {
@@ -346,6 +358,7 @@ test("read-only instance 隱藏寫入控制並拒絕 POST", async ({ page, reque
   await page.getByRole("button", { name: "🗃 已封存" }).click();
   await expect(page.getByRole("dialog", { name: "已封存 workspace" })).toBeVisible();
   await expect(page.getByRole("button", { name: /還原 / })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "永久刪除" })).toHaveCount(0);
   const response = await request.post("http://127.0.0.1:8877/api/run", { data: { name: "anything" } });
   expect(response.status()).toBe(403);
   expect(await response.json()).toMatchObject({ error: expect.stringContaining("唯讀模式") });

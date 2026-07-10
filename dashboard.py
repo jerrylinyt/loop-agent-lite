@@ -303,6 +303,31 @@ def _require_absent_entry(parent_fd, name: str, label: str):
         raise ArchiveOperationError(f"{label}已存在，已拒絕覆寫", 409)
 
 
+def _remove_tree_at(parent_fd, name: str, label: str):
+    """以 descriptor-relative、不跟隨 symlink 的方式移除目錄樹。"""
+    with directory_fd(name, label, dir_fd=parent_fd) as child_fd:
+        try:
+            entries = list(os.scandir(child_fd))
+        except OSError as e:
+            raise ArchiveOperationError(f"無法讀取{label}:{e}", 409) from e
+        for entry in entries:
+            try:
+                mode = entry.stat(follow_symlinks=False).st_mode
+            except OSError as e:
+                raise ArchiveOperationError(f"無法檢查{label}內容:{e}", 409) from e
+            if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
+                _remove_tree_at(child_fd, entry.name, f"{label}/{entry.name}")
+            else:
+                try:
+                    os.unlink(entry.name, dir_fd=child_fd)
+                except OSError as e:
+                    raise ArchiveOperationError(f"無法移除{label}/{entry.name}:{e}", 409) from e
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError as e:
+        raise ArchiveOperationError(f"無法移除{label}:{e}", 409) from e
+
+
 def archived_state_projection(directory: Path):
     """archive 列表只讀可安全解析的 state；壞檔或 symlink 只省略 metadata。"""
     state_path = directory / "state.json"
@@ -1329,6 +1354,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.api_archive_workspace(body)
             elif u.path == "/api/restore-workspace":
                 self.api_restore_workspace(body)
+            elif u.path == "/api/delete-archive":
+                self.api_delete_archive(body)
             else:
                 self._err("not found", 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -2197,6 +2224,46 @@ class Handler(BaseHTTPRequestHandler):
             JOBS.pop(name, None)
         print(f"[{time.strftime('%H:%M:%S')}] 🖥️ Dashboard｜還原 workspace {name} ← {archive_id}", flush=True)
         self._out(200, json.dumps({"ok": True, "name": name, "archive_id": archive_id}, ensure_ascii=False))
+
+    def api_delete_archive(self, body):
+        """永久刪除停止中的封存；先原子搬到隱藏名稱，再以安全 fd 遞迴移除。"""
+        archive_id = body.get("archive_id")
+        metadata = archive_metadata(archive_id)
+        if metadata is None:
+            self._err("archive_id 不合法")
+            return
+        name = metadata["name"]
+        with _state_lock(name):
+            try:
+                with JOBS_LOCK:
+                    job = JOBS.get(name)
+                    if job is not None and job.alive():
+                        raise ArchiveOperationError(f"workspace {name} 正在執行，不能刪除封存", 409)
+                with loop_mod.workspace_operation_lock(ROOT, name, blocking=False):
+                    with archive_operation_lock(create=False) as (_root, _root_fd, archive_fd):
+                        with directory_fd(archive_id, f"封存項目 {archive_id}", dir_fd=archive_fd) as source_fd:
+                            with exclusive_file_lock(".run.lock", f"{name} 的單 writer 鎖", dir_fd=source_fd):
+                                _require_same_directory_entry(archive_fd, archive_id, source_fd,
+                                                              f"封存項目 {archive_id}")
+                                tombstone = f".delete-{uuid.uuid4().hex}"
+                                _require_absent_entry(archive_fd, tombstone, "封存刪除暫存項目")
+                                try:
+                                    os.rename(archive_id, tombstone, src_dir_fd=archive_fd, dst_dir_fd=archive_fd)
+                                except OSError as e:
+                                    raise ArchiveOperationError(f"準備刪除封存失敗:{e}", 409) from e
+                        _remove_tree_at(archive_fd, tombstone, f"封存刪除暫存項目 {tombstone}")
+            except ArchiveOperationError as e:
+                self._err(str(e), e.status)
+                return
+            except loop_mod.WorkspaceOperationLockError as e:
+                self._err(str(e), 409)
+                return
+            except ValueError as e:
+                self._err(str(e))
+                return
+        print(f"[{time.strftime('%H:%M:%S')}] 🖥️ Dashboard｜永久刪除封存 {archive_id}", flush=True)
+        self._out(200, json.dumps({"ok": True, "name": name, "archive_id": archive_id,
+                                   "deleted": True}, ensure_ascii=False))
 
     @with_state_lock
     def api_drain(self, body):

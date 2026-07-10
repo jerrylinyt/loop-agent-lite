@@ -116,7 +116,7 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 - 分隔線可拖曳調整欄寬；箭頭可收合，設定會保存在瀏覽器。
 - 狀態列的「🎯 goal」「🕒 輪次紀錄」「📨 prompt」chips 分別顯示目前 goal 內容、history.log 逐輪判定，以及最近一輪送給 Agent 的完整 prompt（全部唯讀）。
 - 全部任務收斂後，狀態列出現「📄 完成報告」直接檢視 REPORT.md。
-- 停止狀態可「🗄 封存」workspace：整個目錄以 UUID 封存 ID 移到 `workspace/.archive/`，target repo 不受影響；工具列的「🗃 已封存」可列出並安全還原，還原不會自動啟動 loop。執行中、鎖定中、symlink 或目標名稱已存在時一律拒絕。
+- 停止狀態可「🗄 封存」workspace：整個目錄以 UUID 封存 ID 移到 `workspace/.archive/`，target repo 不受影響；工具列的「🗃 已封存」可列出、安全還原或在雙重確認後永久刪除，還原不會自動啟動 loop。執行中、鎖定中、symlink 或目標名稱已存在時一律拒絕；永久刪除只作用於封存目錄，不會碰 target repo。
 - 啟動表單進階設定內的「🔔 管理終態通知」可編輯、儲存並以 `status=test` 實測 `notify_cmd`（佔位符 `{status}`、`{name}`）。
 - 啟動表單的「完整健檢」會檢查目前已 commit repo 的 git／鎖／乾淨工作樹／goal 與 Validate，不建 state、不啟動 Agent；待匯入 goal、plan、reset 或新 branch 時會停用，實際啟動仍會再驗一次。
 - 正常要停時用「本輪後停止」：目前 Agent、Validate 與 state/history 落盤完成後才停，不會啟動下一輪。

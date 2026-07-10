@@ -183,3 +183,11 @@ export interface RestoreArchiveResponse {
   archive_id?: string;
   error?: string;
 }
+
+export interface DeleteArchiveResponse {
+  ok?: boolean;
+  deleted?: boolean;
+  name?: string;
+  archive_id?: string;
+  error?: string;
+}

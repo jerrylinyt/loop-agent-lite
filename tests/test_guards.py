@@ -1981,6 +1981,93 @@ class TestWorkspaceArchiveRestore(unittest.TestCase):
                 D.ROOT = old_root
 
 
+class TestWorkspaceArchiveDelete(unittest.TestCase):
+    """永久刪除只移除 archive entry，不跟隨 symlink，也尊重 archive 單 writer 鎖。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_deletes_nested_archive_without_following_symlink(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            workspace = root / "demo"
+            workspace.mkdir(parents=True)
+            (workspace / "state.json").write_text(json.dumps({"phase": "done", "loop": {"pid": None}}))
+            (workspace / "nested").mkdir()
+            (workspace / "nested" / "kept.txt").write_text("keep")
+            outside = Path(td) / "outside"
+            outside.mkdir()
+            (outside / "must-survive.txt").write_text("outside")
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                archive = self.ResponseCapture()
+                D.Handler.api_archive_workspace(archive, {"name": "demo"})
+                self.assertEqual(archive.response[0], 200, archive.response)
+                archive_id = archive.response[1]["archive_id"]
+                archived = root / ".archive" / archive_id
+                (archived / "escape").symlink_to(outside, target_is_directory=True)
+
+                delete = self.ResponseCapture()
+                D.Handler.api_delete_archive(delete, {"archive_id": archive_id})
+                self.assertEqual(delete.response[0], 200, delete.response)
+                self.assertEqual(delete.response[1], {"ok": True, "name": "demo",
+                                                       "archive_id": archive_id, "deleted": True})
+                self.assertFalse(archived.exists())
+                self.assertEqual(D.list_archives()["archives"], [])
+                self.assertTrue((outside / "must-survive.txt").exists())
+                self.assertFalse(workspace.exists())
+            finally:
+                D.ROOT = old_root
+
+    def test_rejects_invalid_symlink_and_held_archive_lock(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            workspace = root / "demo"
+            workspace.mkdir(parents=True)
+            (workspace / "state.json").write_text(json.dumps({"phase": "done", "loop": {"pid": None}}))
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                bad = self.ResponseCapture()
+                D.Handler.api_delete_archive(bad, {"archive_id": "../escape"})
+                self.assertEqual(bad.response[0], 400)
+
+                archive = self.ResponseCapture()
+                D.Handler.api_archive_workspace(archive, {"name": "demo"})
+                archive_id = archive.response[1]["archive_id"]
+                archived = root / ".archive" / archive_id
+                holder = open(archived / ".run.lock", "a+b")
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    locked = self.ResponseCapture()
+                    D.Handler.api_delete_archive(locked, {"archive_id": archive_id})
+                finally:
+                    fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+                    holder.close()
+                self.assertEqual(locked.response[0], 409, locked.response)
+                self.assertTrue(archived.exists())
+
+                outside = Path(td) / "outside-entry"
+                outside.mkdir()
+                symlink_id = "symlinked--20250102T030405Z--" + "c" * 32
+                (root / ".archive" / symlink_id).symlink_to(outside, target_is_directory=True)
+                symlink = self.ResponseCapture()
+                D.Handler.api_delete_archive(symlink, {"archive_id": symlink_id})
+                self.assertEqual(symlink.response[0], 409, symlink.response)
+                self.assertTrue((root / ".archive" / symlink_id).is_symlink())
+                self.assertTrue(outside.exists())
+            finally:
+                D.ROOT = old_root
+
+
 class TestPreflightOnly(unittest.TestCase):
     """--preflight-only:只健檢不啟動——不建 state.json、不動 snapshots,依結果回 exit code。"""
 

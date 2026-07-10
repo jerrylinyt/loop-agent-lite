@@ -277,6 +277,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .segmented-tabs button.active { background: var(--surface-raised); color: var(--accent); box-shadow: 0 1px 3px rgba(0, 0, 0, .15); }
 .history-run-tabs { margin-bottom: 10px; }
 .modal-table-scroll { max-height: 58vh; overflow: auto; border: 1px solid var(--border-soft); border-radius: 8px; }
+.archive-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
 .form-grid { display: grid; gap: 10px; }
 .form-grid label, .form-field { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }

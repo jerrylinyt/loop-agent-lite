@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { getJson, postJson } from "../../shared/api/client";
-import type { ArchiveSummary, ArchivesResponse, RestoreArchiveResponse } from "../../shared/api/types";
+import type { ArchiveSummary, ArchivesResponse, DeleteArchiveResponse, RestoreArchiveResponse } from "../../shared/api/types";
 import ActionDialog from "../../shared/components/ActionDialog";
 import Modal from "../../shared/components/Modal";
 
@@ -17,7 +17,9 @@ export default function ArchivesModal({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [pending, setPending] = useState<ArchiveSummary | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<ArchiveSummary | null>(null);
   const [restoring, setRestoring] = useState("");
+  const [deleting, setDeleting] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -30,7 +32,7 @@ export default function ArchivesModal({
   useEffect(() => { void load(); }, [load]);
 
   const restore = async (archive: ArchiveSummary) => {
-    if (restoring) return;
+    if (restoring || deleting) return;
     setRestoring(archive.id);
     try {
       const response = await postJson<RestoreArchiveResponse>("/api/restore-workspace", { archive_id: archive.id });
@@ -45,14 +47,30 @@ export default function ArchivesModal({
     }
   };
 
+  const deleteArchive = async (archive: ArchiveSummary) => {
+    if (restoring || deleting) return;
+    setDeleting(archive.id);
+    try {
+      const response = await postJson<DeleteArchiveResponse>("/api/delete-archive", { archive_id: archive.id });
+      if (response.error) {
+        setError(response.error);
+        return;
+      }
+      await load();
+    } finally {
+      setPendingDelete(null);
+      setDeleting("");
+    }
+  };
+
   return (
     <>
       <Modal
         title="已封存 workspace"
-        description={readonly ? "可查看封存內容；唯讀模式不可還原。" : "還原只搬回 coordinator state，不會自動啟動 loop。"}
+        description={readonly ? "可查看封存內容；唯讀模式不可還原或刪除。" : "還原只搬回 coordinator state；永久刪除不可復原。"}
         onClose={onClose}
         wide
-        footer={<><button type="button" className="secondary-button" onClick={() => void load()} disabled={loading || !!restoring}>{loading ? "載入中…" : "重新整理"}</button><span role="status" className="muted">{error}</span></>}
+        footer={<><button type="button" className="secondary-button" onClick={() => void load()} disabled={loading || !!restoring || !!deleting}>{loading ? "載入中…" : "重新整理"}</button><span role="status" className="muted">{error}</span></>}
       >
         {loading ? <div className="loading-state">讀取封存清單…</div>
           : !archives.length ? <div className="loading-state">目前沒有已封存的 workspace</div>
@@ -64,7 +82,7 @@ export default function ArchivesModal({
                       <td><strong>{archive.name}</strong>{archive.legacy && <div className="muted">舊版封存格式</div>}</td>
                       <td>{archive.archived_at}</td>
                       <td>{archive.phase ?? "—"}{typeof archive.round === "number" ? ` · round ${archive.round}` : ""}</td>
-                      {!readonly && <td><button type="button" className="secondary-button" disabled={!!restoring} onClick={() => setPending(archive)}>{restoring === archive.id ? "還原中…" : `還原 ${archive.name}`}</button></td>}
+                      {!readonly && <td className="archive-actions"><button type="button" className="secondary-button" disabled={!!restoring || !!deleting} onClick={() => setPending(archive)}>{restoring === archive.id ? "還原中…" : `還原 ${archive.name}`}</button><button type="button" className="danger-button" disabled={!!restoring || !!deleting} onClick={() => setPendingDelete(archive)}>{deleting === archive.id ? "刪除中…" : "永久刪除"}</button></td>}
                     </tr>)}
                   </tbody>
                 </table>
@@ -76,6 +94,14 @@ export default function ArchivesModal({
         confirmLabel="還原"
         onClose={() => !restoring && setPending(null)}
         onConfirm={() => void restore(pending)}
+      />}
+      {pendingDelete && <ActionDialog
+        title="確認永久刪除"
+        message={`永久刪除 ${pendingDelete.name} 的封存？完整 workspace 會被移除，無法還原；target repo 與程式碼不受影響。`}
+        confirmLabel="永久刪除"
+        danger
+        onClose={() => !deleting && setPendingDelete(null)}
+        onConfirm={() => void deleteArchive(pendingDelete)}
       />}
     </>
   );
