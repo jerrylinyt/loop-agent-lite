@@ -631,6 +631,11 @@ def validate_state_shape(state, label: str):
             raise StateLoadError(f"{label} {field} 必須是字串或 null")
     if "goal_changed" in state and not isinstance(state["goal_changed"], bool):
         raise StateLoadError(f"{label} goal_changed 必須是 boolean")
+    for field in ("goal_hash", "goal_previous_hash"):
+        value = state.get(field)
+        if field in state and value is not None and (
+                not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None):
+            raise StateLoadError(f"{label} {field} 必須是 64 字元小寫 SHA-256 或 null")
     return state
 
 
@@ -1235,11 +1240,17 @@ def main():
     # goal 變更偵測:停機期間人改 goal 是合法的,但既有計畫是舊 goal 收斂的——大聲提醒
     goal_path = repo_relative_path(repo, args.goal)
     goal_hash = sha256_bytes(goal_path.read_bytes())
-    if state.get("goal_hash") and state["goal_hash"] != goal_hash and state.get("plan"):
+    previous_goal_hash = state.get("goal_hash")
+    if previous_goal_hash and previous_goal_hash != goal_hash and state.get("plan"):
+        # 保留「現有計畫所依據的 goal」hash；goal_changed 期間再次修改仍以最初基準為準。
+        if not state.get("goal_previous_hash"):
+            state["goal_previous_hash"] = previous_goal_hash
         state["goal_changed"] = True
         log("⚠ goal 已變更,但計畫是舊 goal 收斂的——建議回規劃期重新收斂(dashboard ⏪);刻意如此可忽略")
         state["notes"].append("⚠ goal 內容已被人類更新,現有計畫可能過期。以新 goal 為準檢視你的任務;"
                               "若計畫明顯對不上,用 issue 回報。")
+    elif not state.get("goal_changed"):
+        state.pop("goal_previous_hash", None)
     state["goal_hash"] = goal_hash
     try:
         state["agent_failure_streak"] = max(0, int(state.get("agent_failure_streak", 0)))
@@ -1511,6 +1522,7 @@ def main():
                 state["stall_rounds"] = 0
                 state["red_streak"] = 0
                 state["goal_changed"] = False  # 計畫已在(可能更新過的)goal 下重新收斂
+                state.pop("goal_previous_hash", None)
                 event = f"✅ 規劃收斂(plan v{state['plan_version']},{len(state['plan'])} 條)→ 執行期"
                 log(event)
         else:

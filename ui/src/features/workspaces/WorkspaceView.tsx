@@ -190,7 +190,7 @@ export default function WorkspaceView({
             {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setPromptOpen(true)}>📨 prompt</button>}
           </div>
         </div>
-        {state.goal_changed && <div className="goal-warning">⚠ goal 已變更，建議回規劃期重新收斂</div>}
+        {state.goal_changed && <div className="goal-warning">⚠ goal 已變更；點「🎯 goal」查看差異，建議回規劃期重新收斂</div>}
       </header>
       <div className="workspace-main">
         <PlanTable state={state} canEdit={canChange} onSave={savePlan} onGoto={gotoTask} />

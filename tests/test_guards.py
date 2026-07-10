@@ -505,6 +505,20 @@ class TestStateSchemaGuard(unittest.TestCase):
             finally:
                 L.WORKSPACE_ROOT = old_root
 
+    def test_invalid_goal_history_hash_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d)
+                ws = L.Workspace("schema-goal-hash")
+                invalid = {"phase": "plan", "goal_previous_hash": "not-a-sha256"}
+                ws.state_path.write_text(json.dumps(invalid), encoding="utf-8")
+                ws.checkpoint_path.write_text(json.dumps(invalid), encoding="utf-8")
+                with self.assertRaises(L.StateLoadError):
+                    ws.load_state()
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
 
 class TestConsoleRotation(unittest.TestCase):
     """完整 console 必須在上限前輪替，且按新舊順序保留固定份數。"""
@@ -2508,11 +2522,76 @@ class TestGoalProjection(unittest.TestCase):
                 result = D.read_goal("demo")
                 self.assertEqual(result["content"], "GOAL v1\n")
                 self.assertTrue(result["goal_changed"])
+                self.assertIn("舊版", result["diff_error"])
                 # goal 檔被移走 → 明確 error,不 crash
                 (repo / "goal.md").unlink()
                 self.assertIn("goal 檔不存在", D.read_goal("demo")["error"])
             finally:
                 D.ROOT = old_root
+
+    def test_loop_preserves_previous_hash_and_goal_projection_builds_git_diff(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            previous_content = (repo / "goal.md").read_bytes()
+            previous_hash = L.sha256_bytes(previous_content)
+            workspace_root = root / "workspace"
+            old_loop_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = workspace_root
+                ws = L.Workspace("goal-diff")
+                state = ws.fresh_state()
+                state.update(plan=[{"order": 1, "task": "existing plan"}], plan_version=1,
+                             goal_hash=previous_hash)
+                ws.save_state(state)
+            finally:
+                L.WORKSPACE_ROOT = old_loop_root
+
+            (repo / "goal.md").write_text("GOAL v2\n新增驗收條件\n", encoding="utf-8")
+            git(repo, "add", "goal.md")
+            git(repo, "commit", "-qm", "update goal")
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            result = subprocess.run(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "goal-diff",
+                 "--agent-cmd", "true", "--validate-cmd", "true", "--max-rounds", "1"],
+                capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            saved = json.loads((workspace_root / "goal-diff" / "state.json").read_text(encoding="utf-8"))
+            self.assertTrue(saved["goal_changed"])
+            self.assertEqual(saved["goal_previous_hash"], previous_hash)
+            self.assertEqual(saved["goal_hash"], L.sha256_bytes((repo / "goal.md").read_bytes()))
+
+            old_dashboard_root = D.ROOT
+            D.ROOT = workspace_root
+            try:
+                projection = D.read_goal("goal-diff")
+            finally:
+                D.ROOT = old_dashboard_root
+            self.assertNotIn("error", projection)
+            self.assertEqual(projection["previous_hash"], previous_hash)
+            self.assertEqual(projection["previous_content"], "GOAL v1\n")
+            self.assertIn("--- goal.md（計畫基準）", projection["diff"])
+            self.assertIn("-GOAL v1", projection["diff"])
+            self.assertIn("+GOAL v2", projection["diff"])
+
+            # 尚未重新收斂前再次修改 goal，差異基準仍必須是原計畫使用的 v1。
+            (repo / "goal.md").write_text("GOAL v3\n再調整範圍\n", encoding="utf-8")
+            git(repo, "add", "goal.md")
+            git(repo, "commit", "-qm", "update goal again")
+            result = subprocess.run(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "goal-diff",
+                 "--agent-cmd", "true", "--validate-cmd", "true", "--max-rounds", "1"],
+                capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            saved = json.loads((workspace_root / "goal-diff" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["goal_previous_hash"], previous_hash)
+            D.ROOT = workspace_root
+            try:
+                projection = D.read_goal("goal-diff")
+            finally:
+                D.ROOT = old_dashboard_root
+            self.assertIn("-GOAL v1", projection["diff"])
+            self.assertIn("+GOAL v3", projection["diff"])
 
 
 class TestPromptProjection(unittest.TestCase):

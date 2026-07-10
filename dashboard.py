@@ -12,6 +12,7 @@
 stdlib only,綁 127.0.0.1。
 """
 import argparse
+import difflib
 import fcntl
 import functools
 import json
@@ -678,12 +679,53 @@ def read_goal(name):
     except ValueError as e:
         return {"error": f"goal 路徑不合法:{e}"}
     try:
-        return {"content": goal_path.read_text(encoding="utf-8"), "path": str(goal_path),
-                "goal_changed": bool(st.get("goal_changed"))}
+        content = goal_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {"error": f"goal 檔不存在:{goal_path}(repo 被移走或 goal 被刪?)"}
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         return {"error": f"goal 讀取失敗:{e}"}
+    projection = {"content": content, "path": str(goal_path),
+                  "goal_changed": bool(st.get("goal_changed"))}
+    if not projection["goal_changed"]:
+        return projection
+    previous_hash = st.get("goal_previous_hash")
+    projection["previous_hash"] = previous_hash
+    if not isinstance(previous_hash, str):
+        projection["diff_error"] = "此 workspace 由舊版建立，沒有保留舊 goal hash"
+        return projection
+    try:
+        history = subprocess.run(
+            ["git", "-C", str(Path(repo).expanduser()), "log", "--format=%H", "--max-count=200",
+             "--", goal_rel], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        projection["diff_error"] = f"無法查詢 goal Git 歷史:{e}"
+        return projection
+    if history.returncode != 0:
+        projection["diff_error"] = "無法查詢 goal Git 歷史"
+        return projection
+    previous_content = None
+    for commit in history.stdout.splitlines():
+        try:
+            shown = subprocess.run(
+                ["git", "-C", str(Path(repo).expanduser()), "show", f"{commit}:{goal_rel}"],
+                capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if shown.returncode == 0 and loop_mod.sha256_bytes(shown.stdout) == previous_hash:
+            try:
+                previous_content = shown.stdout.decode("utf-8")
+            except UnicodeDecodeError:
+                projection["diff_error"] = "舊 goal 不是 UTF-8，無法顯示差異"
+                return projection
+            break
+    if previous_content is None:
+        projection["diff_error"] = "最近 200 筆 goal Git 歷史中找不到計畫基準版本"
+        return projection
+    projection["previous_content"] = previous_content
+    projection["diff"] = "".join(difflib.unified_diff(
+        previous_content.splitlines(keepends=True), content.splitlines(keepends=True),
+        fromfile=f"{goal_rel}（計畫基準）", tofile=f"{goal_rel}（目前）"))
+    return projection
 
 
 def read_prompt(name):
@@ -2079,6 +2121,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             st.update(phase="plan", flag=0, current_order=0, done_count=0, completed=[],
                       red_streak=0, stall_rounds=0, task_reset_counts={}, goal_changed=False)
+            st.pop("goal_previous_hash", None)
         elif target == "exec":
             if st.get("phase") != "plan":
                 self._err(f"目前是 {st.get('phase')},只有 plan 能直接切執行期(exec/done 請用進度管理)")

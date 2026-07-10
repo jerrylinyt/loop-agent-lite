@@ -70,6 +70,7 @@ def project_status(name: str):
         "state_recovery_count": state.get("state_recovery_count", 0),
         "last_state_recovery": state.get("last_state_recovery"),
         "goal_changed": bool(state.get("goal_changed")),
+        "goal_previous_hash": state.get("goal_previous_hash"),
         "issues": len(issues),
         "unread_issues": loop.unread_issue_count(state),
         "last_green_sha": state.get("last_green_sha"),

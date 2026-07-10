@@ -114,7 +114,7 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 - workspace header 有輪次 sparkline（綠紅灰橙＝驗證綠／紅／規劃／reset，點擊開逐輪判定）與頂部健康色帶（越紅越接近 reset 防線）；若 loop 被強制終止後留下 stale PID，詳細頁也會保留警示。
 - 工具列「📺 總覽」切換電視牆模式：聚合統計（執行中／完成／任務完成率）＋全 fleet 即時卡片，點卡片切入；卡片與事件推播共用 SSE，不另開輪詢；可用名稱搜尋與「全部／需關注／執行中／已完成」篩選卡片，選擇會保存在瀏覽器；紅連跳、停滯、issues、Agent 異常、checkpoint 復原、goal 變更與 state 錯誤都會在卡片上標示；搭配 `--read-only` 適合掛牆監控。
 - 分隔線可拖曳調整欄寬；箭頭可收合，設定會保存在瀏覽器。
-- 狀態列的「🎯 goal」「🕒 輪次紀錄」「📨 prompt」chips 分別顯示目前 goal 內容、history.log 逐輪判定，以及最近一輪送給 Agent 的完整 prompt（全部唯讀）。
+- 狀態列的「🎯 goal」「🕒 輪次紀錄」「📨 prompt」chips 分別顯示目前 goal 內容、history.log 逐輪判定，以及最近一輪送給 Agent 的完整 prompt（全部唯讀）；goal 在停機期間變更時，Goal 視窗會用保存的計畫基準 hash 從 Git 歷史重建並顯示 unified diff。
 - Issues 視窗可「標記已讀」而不刪除稽核紀錄；只有未讀 issues 會讓 fleet 顯示需關注，仍可用「清空全部」永久移除紀錄。
 - 全部任務收斂後，狀態列出現「📄 完成報告」直接檢視 REPORT.md。
 - 停止狀態可「🗄 封存」workspace：整個目錄以 UUID 封存 ID 移到 `workspace/.archive/`，target repo 不受影響；工具列的「🗃 已封存」可列出、安全還原或在雙重確認後永久刪除，還原不會自動啟動 loop。執行中、鎖定中、symlink 或目標名稱已存在時一律拒絕；永久刪除只作用於封存目錄，不會碰 target repo。
