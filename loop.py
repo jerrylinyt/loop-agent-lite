@@ -187,6 +187,18 @@ def append_regular_text(path: Path, text: str) -> None:
         raise
 
 
+def read_regular_bytes(path: Path, label: str = "workspace 檔案") -> bytes:
+    """以 O_NOFOLLOW 讀取 regular artifact；遺失/不安全時由呼叫端決定處理。"""
+    path = workspace_file(path, label)
+    fd = _open_regular(path, os.O_RDONLY)
+    with os.fdopen(fd, "rb", closefd=True) as stream:
+        return stream.read()
+
+
+def read_regular_text(path: Path, label: str = "workspace 檔案") -> str:
+    return read_regular_bytes(path, label).decode("utf-8")
+
+
 def repo_relative_path(repo: Path, rel: str) -> Path:
     """解析受保護檔案；只接受 repo 內的相對 regular file，拒絕 traversal 與 symlink。"""
     if not isinstance(rel, str) or not rel:
@@ -714,15 +726,17 @@ class Workspace:
             path.unlink(missing_ok=True)
 
     def signal(self, name, round_token) -> bool:
-        return (self.dir / f"{name}.{round_token}").exists()
+        try:
+            read_regular_bytes(self.dir / f"{name}.{round_token}", f"signal {name}")
+            return True
+        except (FileNotFoundError, OSError, ValueError):
+            return False
 
     def take_pending_plan(self, round_token):
         p = self.dir / f"pending_plan.{round_token}.json"
-        if not p.exists():
-            return None
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            return json.loads(read_regular_text(p, "pending plan"))
+        except (FileNotFoundError, OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
             # work.py 理論上只會原子寫入校驗過的 JSON；磁碟/外力仍可能破壞檔案。
             # 壞 proposal 只應讓本輪不採用，不能讓跑整夜的 loop 整支 crash。
             return None
@@ -1480,9 +1494,18 @@ def main():
 
         # agent 回報的 issue(work.py issue):落 state 給人類看,不影響任何計數
         pend = ws.pending_issues(round_token)
-        if pend.exists():
+        try:
+            issue_text = read_regular_text(pend, "pending issue")
+        except FileNotFoundError:
+            issue_text = None
+        except (OSError, ValueError, UnicodeDecodeError) as e:
+            # 外力若把 signal 換成 symlink/FIFO，只忽略該 round 的 issue；不可讀檔不應
+            # 阻斷整個 loop，也不可跟隨到 workspace 外。
+            log(f"⚠️ 忽略不安全的 pending issue：{e}")
+            issue_text = None
+        if issue_text is not None:
             issue_lines = []
-            for iline in pend.read_text(encoding="utf-8").splitlines():
+            for iline in issue_text.splitlines():
                 if iline.strip():
                     issue_lines.append(iline.strip())
                     state.setdefault("issues", []).append(

@@ -578,6 +578,29 @@ class TestWorkCliArtifactGuards(unittest.TestCase):
             self.assertEqual(outside.read_text(encoding="utf-8"), "outside secret\n")
 
 
+class TestLoopSignalIngestionGuards(unittest.TestCase):
+    """loop 讀 agent signal/proposal 時不跟隨 workspace 內 symlink。"""
+
+    def test_symlinked_signal_and_pending_plan_are_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = root / "workspace"
+                ws = L.Workspace("signals")
+                outside = root / "outside.json"
+                outside.write_text(json.dumps([{"order": 1, "task": "outside"}]), encoding="utf-8")
+                token = "a" * 32
+                (ws.dir / f"pending_plan.{token}.json").symlink_to(outside)
+                (ws.dir / f"signal_plan_ok.{token}").symlink_to(outside)
+                self.assertIsNone(ws.take_pending_plan(token))
+                self.assertFalse(ws.signal("signal_plan_ok", token))
+                self.assertEqual(outside.read_text(encoding="utf-8"),
+                                 json.dumps([{"order": 1, "task": "outside"}]))
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+
 class TestPreflightConsole(unittest.TestCase):
     """preflight 立刻失敗時，原因仍必須落進 dashboard 正在看的 console.log。"""
 
