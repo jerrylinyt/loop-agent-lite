@@ -105,6 +105,30 @@ def project_all_status():
     return results
 
 
+def summarize_status(results):
+    """將 fleet projection 聚合成 shell/CI 可直接使用的摘要。"""
+    valid = [result for result in results if "error" not in result]
+    tasks_total = sum(result.get("plan_len", 0) for result in valid)
+    tasks_completed = sum(result.get("completed", 0) for result in valid)
+    return {
+        "workspace_count": len(results),
+        "valid_count": len(valid),
+        "error_count": len(results) - len(valid),
+        "running": sum(1 for result in valid if result.get("running")),
+        "planning": sum(1 for result in valid if result.get("phase") == "plan"),
+        "executing": sum(1 for result in valid if result.get("phase") == "exec"),
+        "done": sum(1 for result in valid if result.get("phase") == "done"),
+        "attention": sum(1 for result in valid if (
+            result.get("red_streak", 0) > 0 or
+            result.get("stall_rounds", 0) > 0 or
+            result.get("issues", 0) > 0)),
+        "issues": sum(result.get("issues", 0) for result in valid),
+        "tasks_completed": tasks_completed,
+        "tasks_total": tasks_total,
+        "task_completion_pct": round(tasks_completed / tasks_total * 100) if tasks_total else 0,
+    }
+
+
 def render_human(result, *, timestamp=False) -> None:
     phase = {"plan": "規劃期", "exec": "執行期", "done": "完成"}.get(result["phase"], result["phase"] or "未知")
     running = "執行中" if result["running"] else "已停止"
@@ -115,6 +139,15 @@ def render_human(result, *, timestamp=False) -> None:
           f"紅連跳 {result['red_streak']}｜停滯 {result['stall_rounds']}｜issues {result['issues']}", flush=True)
     if result["state_recovery_pending"]:
         print("🛟 primary state 不可讀，目前只投影 last-good checkpoint（未修改檔案）", flush=True)
+
+
+def render_fleet_summary(summary) -> None:
+    """輸出 --all 的一行摘要，方便人類快速掌握 fleet 健康度。"""
+    print(f"fleet｜workspaces {summary['workspace_count']}｜執行中 {summary['running']}｜"
+          f"規劃/執行/完成 {summary['planning']}/{summary['executing']}/{summary['done']}｜"
+          f"需關注 {summary['attention']}｜issues {summary['issues']}｜"
+          f"任務 {summary['tasks_completed']}/{summary['tasks_total']} "
+          f"({summary['task_completion_pct']}%)｜錯誤 {summary['error_count']}", flush=True)
 
 
 def main(argv=None) -> int:
@@ -137,9 +170,12 @@ def main(argv=None) -> int:
         while True:
             if args.all:
                 results = project_all_status()
+                summary = summarize_status(results)
                 if args.as_json:
-                    print(json.dumps({"workspaces": results}, ensure_ascii=False, separators=(",", ":")), flush=True)
+                    print(json.dumps({"summary": summary, "workspaces": results},
+                                     ensure_ascii=False, separators=(",", ":")), flush=True)
                 else:
+                    render_fleet_summary(summary)
                     if not results:
                         print("（沒有合法 workspace）", flush=True)
                     for result in results:

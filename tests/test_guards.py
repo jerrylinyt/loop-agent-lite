@@ -695,14 +695,31 @@ class TestStatusCli(unittest.TestCase):
                     state["round"] = round_number
                     ws.save_state(state)
                 (L.WORKSPACE_ROOT / "reserved-empty").mkdir(parents=True)
+                broken = L.Workspace("broken")
+                broken.state_path.write_text("{broken", encoding="utf-8")
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 result = subprocess.run(
                     [sys.executable, STATUS_PY, "--all", "--json"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 payload = json.loads(result.stdout)
-                self.assertEqual([item["name"] for item in payload["workspaces"]], ["alpha", "beta"])
-                self.assertEqual([item["round"] for item in payload["workspaces"]], [2, 5])
+                self.assertEqual([item["name"] for item in payload["workspaces"]], ["alpha", "beta", "broken"])
+                self.assertEqual([item["round"] for item in payload["workspaces"] if "round" in item], [2, 5])
+                self.assertIn("error", payload["workspaces"][-1])
+                self.assertEqual(payload["summary"], {
+                    "workspace_count": 3,
+                    "valid_count": 2,
+                    "error_count": 1,
+                    "running": 0,
+                    "planning": 2,
+                    "executing": 0,
+                    "done": 0,
+                    "attention": 0,
+                    "issues": 0,
+                    "tasks_completed": 0,
+                    "tasks_total": 0,
+                    "task_completion_pct": 0,
+                })
             finally:
                 L.WORKSPACE_ROOT = old_root
 

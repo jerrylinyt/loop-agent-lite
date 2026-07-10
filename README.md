@@ -74,6 +74,7 @@ python3 status.py --all --json                # 一次列出整個 workspace fle
 ```
 
 `status.py` 不啟動 loop、不修復檔案；`--all` 與 `--name` 擇一，`--watch` 只重複唯讀輪詢，Ctrl-C 以 exit code 130 結束。primary state 不可讀時只投影 checkpoint，找不到 workspace 或兩份 state 都損壞會以 exit code 1 結束。
+`--all --json` 會同時輸出 `workspaces` 與 `summary`；摘要包含執行中、規劃／執行／完成數、需關注 workspace、issues、任務完成率，以及 state 錯誤數，方便 shell／CI 直接判斷 fleet 健康度。
 
 常用選項：
 
