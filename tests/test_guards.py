@@ -1139,5 +1139,27 @@ class TestGoalProjection(unittest.TestCase):
                 D.ROOT = old_root
 
 
+class TestPromptProjection(unittest.TestCase):
+    """prompt 唯讀投影:取 round 編號最大的一份;無紀錄回明確 error。"""
+
+    def test_latest_prompt_by_round_number(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            prompts = root / "demo" / "prompts"
+            prompts.mkdir(parents=True)
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                self.assertIn("尚無 prompt", D.read_prompt("demo")["error"])
+                (prompts / "round-0002.md").write_text("prompt r2", encoding="utf-8")
+                (prompts / "round-0010.md").write_text("prompt r10", encoding="utf-8")
+                result = D.read_prompt("demo")
+                self.assertEqual(result["content"], "prompt r10")
+                self.assertEqual(result["round"], 10)
+                self.assertEqual(result["file"], "round-0010.md")
+            finally:
+                D.ROOT = old_root
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

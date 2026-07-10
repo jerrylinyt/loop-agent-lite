@@ -9,6 +9,7 @@ import GoalModal from "./GoalModal";
 import HistoryModal from "./HistoryModal";
 import IssuesModal from "./IssuesModal";
 import PlanTable from "./PlanTable";
+import PromptModal from "./PromptModal";
 import ReportModal from "./ReportModal";
 import useStatusPulse from "./useStatusPulse";
 
@@ -34,6 +35,7 @@ export default function WorkspaceView({
   const [historyOpen, setHistoryOpen] = useState(false);
   const [issuesOpen, setIssuesOpen] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
+  const [promptOpen, setPromptOpen] = useState(false);
   const [statusHeight, setStatusHeight] = useState(() => +(localStorage.getItem("status-console-height") || 220));
   const [statusCollapsed, setStatusCollapsed] = useState(() => localStorage.getItem("status-console-collapsed") === "1");
   const [busyAction, setBusyAction] = useState<"run" | "drain" | "stop" | null>(null);
@@ -167,6 +169,7 @@ export default function WorkspaceView({
             {state.state_recovery_pending && <span className="chip warning">🛟 正從 checkpoint 唯讀顯示</span>}
             {!!state.issues?.length && <button type="button" className="chip issue-chip" onClick={() => setIssuesOpen(true)}>⚠ issues {state.issues.length}</button>}
             {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setHistoryOpen(true)}>🕒 輪次紀錄</button>}
+            {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setPromptOpen(true)}>📨 prompt</button>}
           </div>
         </div>
         {state.goal_changed && <div className="goal-warning">⚠ goal 已變更，建議回規劃期重新收斂</div>}
@@ -192,6 +195,7 @@ export default function WorkspaceView({
       {issuesOpen && workspace && <IssuesModal workspace={workspace.name} issues={state.issues ?? []} readonly={readonly || workspace.running} onClose={() => setIssuesOpen(false)} onChanged={onRefresh} />}
       {historyOpen && workspace && <HistoryModal workspace={workspace.name} onClose={() => setHistoryOpen(false)} />}
       {goalOpen && workspace && <GoalModal workspace={workspace.name} onClose={() => setGoalOpen(false)} />}
+      {promptOpen && workspace && <PromptModal workspace={workspace.name} onClose={() => setPromptOpen(false)} />}
       {reportOpen && workspace && <ReportModal workspace={workspace.name} onClose={() => setReportOpen(false)} />}
       {configOpen && workspace && <ConfigModal workspace={workspace.name} config={state.config ?? {}} onClose={() => setConfigOpen(false)} onChanged={onRefresh} />}
       {dialog && <ActionDialog title={dialog.title} message={dialog.message} confirmLabel={dialog.confirmLabel} onClose={() => setDialog(null)} onConfirm={dialog.onConfirm} />}

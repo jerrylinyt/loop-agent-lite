@@ -355,6 +355,22 @@ def read_goal(name):
         return {"error": f"goal 讀取失敗:{e}"}
 
 
+def read_prompt(name):
+    """最近一輪送出的 prompt 唯讀投影(loop 只保留最近幾份,取 round 編號最大者)。"""
+    def round_num(path):
+        m = re.search(r"round-(\d+)", path.name)
+        return int(m.group(1)) if m else -1
+
+    try:
+        latest = max((ROOT / name / "prompts").glob("round-*.md"), key=round_num, default=None)
+        if latest is None:
+            return {"error": "尚無 prompt 紀錄——loop 送出第一輪後才會出現"}
+        return {"content": latest.read_text(encoding="utf-8"),
+                "round": round_num(latest), "file": latest.name}
+    except OSError as e:
+        return {"error": f"prompt 讀取失敗:{e}"}
+
+
 def workspace_console_log(name, message):
     """將 Dashboard 操作與 loop/Agent 寫進同一條 workspace console 時序。"""
     line = f"[{time.strftime('%H:%M:%S')}] 🖥️ Dashboard｜{message}"
@@ -776,6 +792,11 @@ class Handler(BaseHTTPRequestHandler):
                 if d is None:
                     return
                 self._out(200, json.dumps(read_goal(d.name), ensure_ascii=False))
+            elif u.path == "/api/prompt":
+                d = self._ws_dir(q)
+                if d is None:
+                    return
+                self._out(200, json.dumps(read_prompt(d.name), ensure_ascii=False))
             else:
                 self._err("not found", 404)
         except (ValueError, BrokenPipeError, ConnectionResetError):
