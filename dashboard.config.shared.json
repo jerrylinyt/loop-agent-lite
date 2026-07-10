@@ -35,6 +35,7 @@
     "flag_threshold": 10,
     "done_threshold": 3,
     "round_timeout": 30,
+    "agent_backoff_max": 60,
     "validate_timeout": 120,
     "red_limit": 20,
     "stall_limit": 300,

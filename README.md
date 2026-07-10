@@ -71,6 +71,7 @@ Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace 
 --import-plan <file>      匯入 plan JSON 並建立新 state
 --start-phase exec        搭配匯入 plan，直接進入執行期
 --round-timeout <分鐘>    單輪上限，0 表示不限
+--agent-backoff-max <秒>   CLI 連續異常時 1,2,4…秒退避上限，0 表示關閉
 --validate-timeout <秒>   驗證命令上限
 --stuck-stop              同一任務反覆 reset 達上限時停機
 ```

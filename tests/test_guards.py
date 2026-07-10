@@ -10,6 +10,7 @@
 """
 import json
 import os
+import signal
 import shlex
 import shutil
 import subprocess
@@ -240,6 +241,88 @@ class TestAbnormalRoundVoided(unittest.TestCase):
             state = json.loads((workspace_root / "abnormal-vote" / "state.json").read_text())
             self.assertEqual(state["flag"], 0)
             self.assertIn("coordinator 訊號已全部作廢", result.stdout)
+
+
+class TestAgentFailureBackoff(unittest.TestCase):
+    """Agent CLI 秒退時要節流；成功後 failure streak 立即復原。"""
+
+    def test_exponential_backoff_is_capped_and_disableable(self):
+        self.assertEqual([L.agent_failure_backoff(n, 10) for n in range(1, 6)], [1, 2, 4, 8, 10])
+        self.assertEqual(L.agent_failure_backoff(99, 0), 0)
+        self.assertEqual(L.agent_failure_backoff(0, 60), 0)
+
+    def test_failure_then_success_resets_streak(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            agent = root / "flaky_agent.py"
+            agent.write_text(
+                "from pathlib import Path\n"
+                "marker = Path(__file__).with_suffix('.once')\n"
+                "if not marker.exists():\n"
+                "    marker.write_text('failed')\n"
+                "    raise SystemExit(7)\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            started = time.monotonic()
+
+            result = subprocess.run(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "flaky-backoff",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--agent-backoff-max", "0.05", "--max-rounds", "2"],
+                capture_output=True, text=True, env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertGreaterEqual(time.monotonic() - started, 0.04)
+            state = json.loads((workspace_root / "flaky-backoff" / "state.json").read_text())
+            self.assertEqual(state["agent_failure_streak"], 0)
+            self.assertEqual(state["agent_backoff_seconds"], 0)
+            self.assertIsNone(state["agent_backoff_until"])
+            self.assertIn("0.05 秒後重試", result.stdout)
+            self.assertIn("Agent CLI 已恢復", result.stdout)
+
+    def test_backoff_is_visible_in_state_and_interruptible(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            state_path = workspace_root / "visible-backoff" / "state.json"
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            process = subprocess.Popen(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "visible-backoff",
+                 "--agent-cmd", "false", "--validate-cmd", "true",
+                 "--agent-backoff-max", "2", "--max-rounds", "2"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+            )
+            try:
+                deadline = time.monotonic() + 3
+                observed = None
+                while time.monotonic() < deadline:
+                    try:
+                        candidate = json.loads(state_path.read_text())
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        time.sleep(0.02)
+                        continue
+                    if candidate.get("agent_backoff_seconds") == 1:
+                        observed = candidate
+                        break
+                    time.sleep(0.02)
+
+                self.assertIsNotNone(observed, "退避開始前必須先把等待狀態落進 state.json")
+                self.assertEqual(observed["agent_failure_streak"], 1)
+                self.assertIsNotNone(observed["agent_backoff_until"])
+                process.send_signal(signal.SIGINT)
+                output, _ = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 130, output)
+                stopped = json.loads(state_path.read_text())
+                self.assertEqual(stopped["agent_backoff_seconds"], 0)
+                self.assertIsNone(stopped["agent_backoff_until"])
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
 
 
 class TestConsoleRotation(unittest.TestCase):

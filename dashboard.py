@@ -58,8 +58,8 @@ DEFAULT_CONFIG = {
     # 支援 ~ 與 $HOME。不同電腦可在個人設定或 UI 的 CLI 管理器自行增刪。
     "extra_path_dirs": ["~/.local/bin", "~/bin"],
     "notify_cmd": "",  # 終態通知(completed/stuck_stop/goal_missing),佔位符 {status} {name};空=不通知
-    "defaults": {      # launch/run 的預設值,表單可覆蓋前三顆;防線參數只在這裡改
-        "flag_threshold": 10, "done_threshold": 3, "round_timeout": 30,
+    "defaults": {      # launch/run 的預設值；表單可覆蓋常用參數，其他防線參數在團隊設定改
+        "flag_threshold": 10, "done_threshold": 3, "round_timeout": 30, "agent_backoff_max": 60,
         "validate_timeout": 120,
         "red_limit": 20, "stall_limit": 300, "stuck_stop": False, "stuck_stop_count": 100,
     },
@@ -225,11 +225,13 @@ def norm_cmd(s):
 
 def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout=120,
                reset=False, import_plan=None, start_phase="plan", notify_cmd="",
-               red_limit=20, stall_limit=300, stuck_stop=False, stuck_count=100, env=None):
+               red_limit=20, stall_limit=300, stuck_stop=False, stuck_count=100,
+               agent_backoff_max=60, env=None):
     """spawn loop.py 並登記進 JOBS(呼叫方需持 JOBS_LOCK)。"""
     cmd = [sys.executable, str(HERE / "loop.py"), "--repo", str(repo), "--name", name,
            "--agent-cmd", agent_cmd, "--validate-cmd", validate_cmd,
            "--flag-threshold", str(ft), "--done-threshold", str(dt), "--round-timeout", str(rt),
+           "--agent-backoff-max", str(agent_backoff_max),
            "--validate-timeout", str(validate_timeout),
            "--red-limit", str(red_limit), "--stall-limit", str(stall_limit)]
     if stuck_stop:
@@ -816,14 +818,17 @@ class Handler(BaseHTTPRequestHandler):
             dt = int(body.get("done_threshold") or d.get("done_threshold", 3))
             rt = float(body.get("round_timeout") if body.get("round_timeout") is not None
                        else d.get("round_timeout", 30))
+            ab = float(body.get("agent_backoff_max") if body.get("agent_backoff_max") is not None
+                       else d.get("agent_backoff_max", 60))
             vt = float(body.get("validate_timeout") if body.get("validate_timeout") is not None
                        else d.get("validate_timeout", 120))
             rl = int(body.get("red_limit") or d.get("red_limit", 20))
             sl = int(body.get("stall_limit") or d.get("stall_limit", 300))
-            if ft < 1 or dt < 1 or rt < 0 or vt <= 0 or rl < 1 or sl < 1:
+            if ft < 1 or dt < 1 or rt < 0 or ab < 0 or vt <= 0 or rl < 1 or sl < 1:
                 raise ValueError
         except (TypeError, ValueError):
-            self._err("flag/done/red/stall 必須 ≥1，round_timeout 必須 ≥0 分，validate_timeout 必須 >0 秒")
+            self._err("flag/done/red/stall 必須 ≥1，round_timeout/agent_backoff_max 必須 ≥0，"
+                      "validate_timeout 必須 >0 秒")
             return
         # 貼了 plan.json → 建全新 state(等同重置),由使用者決定從 plan 或 exec 開跑
         plan_raw = (body.get("plan_json") or "").strip()
@@ -907,6 +912,7 @@ class Handler(BaseHTTPRequestHandler):
                            import_plan=import_plan_path, start_phase=start_phase,
                            notify_cmd=str(cfg.get("notify_cmd") or ""),
                            red_limit=rl, stall_limit=sl,
+                           agent_backoff_max=ab,
                            stuck_stop=bool(d.get("stuck_stop")),
                            stuck_count=int(d.get("stuck_stop_count", 100)),
                            env=command_env(cfg))
@@ -967,6 +973,7 @@ class Handler(BaseHTTPRequestHandler):
                            notify_cmd=str(cfg.get("notify_cmd") or ""),
                            red_limit=c.get("red_limit", d.get("red_limit", 20)),
                            stall_limit=c.get("stall_limit", d.get("stall_limit", 300)),
+                           agent_backoff_max=c.get("agent_backoff_max", d.get("agent_backoff_max", 60)),
                            stuck_stop=bool(d.get("stuck_stop")),
                            stuck_count=int(d.get("stuck_stop_count", 100)),
                            env=command_env(cfg))
@@ -1042,18 +1049,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         c = dict(st.get("config") or {})
         changed = []
-        # 五顆數字旋鈕(round_timeout≥0,其餘≥1)
+        # 數字旋鈕(round_timeout/agent_backoff_max≥0,其餘≥1)
         for k, lo in (("flag_threshold", 1), ("done_threshold", 1), ("round_timeout", 0),
+                      ("agent_backoff_max", 0),
                       ("validate_timeout", 1),
                       ("red_limit", 1), ("stall_limit", 1)):
             if body.get(k) is None:
                 continue
             try:
-                v = float(body[k]) if k in ("round_timeout", "validate_timeout") else int(body[k])
+                v = float(body[k]) if k in ("round_timeout", "agent_backoff_max", "validate_timeout") else int(body[k])
                 if v < lo:
                     raise ValueError
             except (TypeError, ValueError):
-                self._err(f"{k} 不合法(round_timeout 需 ≥0；validate_timeout 需 ≥1 秒；其餘需 ≥1)")
+                self._err(f"{k} 不合法(round_timeout/agent_backoff_max 需 ≥0；"
+                          "validate_timeout 需 ≥1 秒；其餘需 ≥1)")
                 return
             if c.get(k) != v:
                 c[k] = v

@@ -38,6 +38,7 @@ export interface DashboardConfig {
   flag_threshold?: number;
   done_threshold?: number;
   round_timeout?: number;
+  agent_backoff_max?: number;
   validate_timeout?: number;
   red_limit?: number;
   stall_limit?: number;
@@ -68,6 +69,9 @@ export interface WorkspaceState {
   done_count: number;
   red_streak: number;
   stall_rounds: number;
+  agent_failure_streak?: number;
+  agent_backoff_seconds?: number;
+  agent_backoff_until?: string | null;
   plan_version: number;
   current_order?: number;
   goal_changed?: boolean;

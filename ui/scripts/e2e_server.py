@@ -74,6 +74,7 @@ def prepare_fixture():
             "flag_threshold": 10,
             "done_threshold": 999,
             "round_timeout": 1,
+            "agent_backoff_max": 60,
             "validate_timeout": 10,
             "red_limit": 20,
             "stall_limit": 300,

@@ -18,7 +18,9 @@ export default function useStatusPulse(state: WorkspaceState | null) {
     if (before.current_order !== state.current_order || before.completed?.length !== state.completed?.length) changed.add("task");
     if (before.flag !== state.flag) changed.add("flag");
     if (before.done_count !== state.done_count) changed.add("done");
-    if (before.red_streak !== state.red_streak || before.stall_rounds !== state.stall_rounds) changed.add("health");
+    if (before.red_streak !== state.red_streak || before.stall_rounds !== state.stall_rounds ||
+        before.agent_failure_streak !== state.agent_failure_streak ||
+        before.agent_backoff_seconds !== state.agent_backoff_seconds) changed.add("health");
     if (!changed.size) return;
 
     setTargets(changed);

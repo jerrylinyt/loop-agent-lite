@@ -34,6 +34,7 @@ export default function LauncherModal({
   const [flagThreshold, setFlagThreshold] = useState(10);
   const [doneThreshold, setDoneThreshold] = useState(3);
   const [roundTimeout, setRoundTimeout] = useState(30);
+  const [agentBackoffMax, setAgentBackoffMax] = useState(60);
   const [validateTimeout, setValidateTimeout] = useState(120);
   const [resetState, setResetState] = useState(false);
   const [newBranch, setNewBranch] = useState(false);
@@ -58,6 +59,7 @@ export default function LauncherModal({
       setFlagThreshold(response.defaults.flag_threshold ?? 10);
       setDoneThreshold(response.defaults.done_threshold ?? 3);
       setRoundTimeout(response.defaults.round_timeout ?? 30);
+      setAgentBackoffMax(response.defaults.agent_backoff_max ?? 60);
       setValidateTimeout(response.defaults.validate_timeout ?? 120);
     });
   }, []);
@@ -102,6 +104,7 @@ export default function LauncherModal({
           setFlagThreshold(saved.flag_threshold ?? config.defaults.flag_threshold ?? 10);
           setDoneThreshold(saved.done_threshold ?? config.defaults.done_threshold ?? 3);
           setRoundTimeout(saved.round_timeout ?? config.defaults.round_timeout ?? 30);
+          setAgentBackoffMax(saved.agent_backoff_max ?? config.defaults.agent_backoff_max ?? 60);
           setValidateTimeout(saved.validate_timeout ?? config.defaults.validate_timeout ?? 120);
           return;
         }
@@ -131,6 +134,7 @@ export default function LauncherModal({
       flag_threshold: flagThreshold,
       done_threshold: doneThreshold,
       round_timeout: roundTimeout,
+      agent_backoff_max: agentBackoffMax,
       validate_timeout: validateTimeout,
       reset_state: resetState,
       new_branch: newBranch,
@@ -225,6 +229,7 @@ export default function LauncherModal({
               <label>flag 收斂（&gt;）<input type="number" min={1} value={flagThreshold} onChange={(event) => setFlagThreshold(+event.target.value)} /></label>
               <label>done 收斂（≥）<input type="number" min={1} value={doneThreshold} onChange={(event) => setDoneThreshold(+event.target.value)} /></label>
               <label>單輪上限（分）<input type="number" min={0} value={roundTimeout} onChange={(event) => setRoundTimeout(+event.target.value)} /></label>
+              <label>Agent 異常退避上限（秒）<input type="number" min={0} value={agentBackoffMax} onChange={(event) => setAgentBackoffMax(+event.target.value)} /></label>
               <label>Validate 上限（秒）<input type="number" min={1} value={validateTimeout} onChange={(event) => setValidateTimeout(+event.target.value)} /></label>
             </div>
             <label className="checkbox-row"><input type="checkbox" checked={resetState} onChange={(event) => setResetState(event.target.checked)} />重置 workspace state（清除舊進度）</label>

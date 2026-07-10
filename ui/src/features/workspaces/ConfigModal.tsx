@@ -24,6 +24,7 @@ export default function ConfigModal({
     flag_threshold: config.flag_threshold ?? 10,
     done_threshold: config.done_threshold ?? 3,
     round_timeout: config.round_timeout ?? 30,
+    agent_backoff_max: config.agent_backoff_max ?? 60,
     validate_timeout: config.validate_timeout ?? 120,
     red_limit: config.red_limit ?? 20,
     stall_limit: config.stall_limit ?? 300
@@ -93,6 +94,7 @@ export default function ConfigModal({
           {numberField("flag_threshold", "flag 收斂（>）", 1)}
           {numberField("done_threshold", "done 收斂（≥）", 1)}
           {numberField("round_timeout", "單輪上限（分）", 0)}
+          {numberField("agent_backoff_max", "Agent 異常退避上限（秒）", 0)}
           {numberField("validate_timeout", "Validate 上限（秒）", 1)}
         </div>
         <div className="number-grid two">

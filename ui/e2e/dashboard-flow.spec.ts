@@ -58,6 +58,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await launcher.getByText("進階設定").click();
   await launcher.getByLabel("done 收斂（≥）").fill("999");
   await launcher.getByLabel("單輪上限（分）").fill("1");
+  await launcher.getByLabel("Agent 異常退避上限（秒）").fill("5");
   await launcher.getByLabel("在新 branch 跑（loop/<workspace 名>）").check();
   await launcher.getByRole("button", { name: "▶ 啟動" }).click();
 
@@ -109,6 +110,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await settings.getByLabel("flag 收斂（>）").fill("7");
   await settings.getByLabel("done 收斂（≥）").fill("888");
   await settings.getByLabel("單輪上限（分）").fill("2");
+  await settings.getByLabel("Agent 異常退避上限（秒）").fill("9");
   await settings.getByLabel("Validate 上限（秒）").fill("15");
   await settings.getByLabel("紅燈連跳 reset").fill("21");
   await settings.getByLabel("HEAD 停滯 reset").fill("301");
@@ -121,6 +123,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(settings.getByLabel("flag 收斂（>）")).toHaveValue("7");
   await expect(settings.getByLabel("done 收斂（≥）")).toHaveValue("888");
   await expect(settings.getByLabel("單輪上限（分）")).toHaveValue("2");
+  await expect(settings.getByLabel("Agent 異常退避上限（秒）")).toHaveValue("9");
   await expect(settings.getByLabel("Validate 上限（秒）")).toHaveValue("15");
   await expect(settings.getByLabel("紅燈連跳 reset")).toHaveValue("21");
   await expect(settings.getByLabel("HEAD 停滯 reset")).toHaveValue("301");

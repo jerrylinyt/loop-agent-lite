@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -50,6 +50,7 @@ RED_LIMIT = 20                         # 連續驗證紅 N 輪 → reset
 STALL_LIMIT = 300                      # HEAD 連續 N 輪沒前進 → reset
 STUCK_STOP_COUNT = 100                 # --stuck-stop 開啟時,同一任務 reset 達此次數停機
 ROUND_TIMEOUT_MIN = 30                 # 單輪 agent 上限(分鐘);0=不限
+AGENT_BACKOFF_MAX_SEC = 60             # CLI 連續異常退出:1,2,4...秒退避上限;0=關閉
 VALIDATE_TIMEOUT_SEC = 120             # 啟動前/每輪驗證上限(秒);避免 validator 永久卡住
 VALIDATE_TAIL = 50                     # 驗證失敗餵給下一輪的輸出尾行數
 TASK_LIST_TRUNC = 80                   # prompt 任務總覽單行截斷長度
@@ -248,6 +249,8 @@ class Workspace:
             "completed": [],            # [{order, sha, round}]
             "last_green_sha": None,
             "red_streak": 0, "stall_rounds": 0,
+            "agent_failure_streak": 0, "agent_backoff_seconds": 0,
+            "agent_backoff_until": None,
             "task_reset_counts": {},    # {order(str): 次數}
             "notes": [],
             "issues": [],               # agent 用 work.py issue 回報,給人類看,不影響計數
@@ -476,6 +479,14 @@ def build_prompt(tpl_path, mapping):
     return text
 
 
+def agent_failure_backoff(streak, maximum_seconds) -> float:
+    """CLI 連續異常的機械退避：1,2,4...秒並封頂；0 表示關閉。"""
+    if streak <= 0 or maximum_seconds <= 0:
+        return 0.0
+    # 防止被手改的巨大 streak 觸發超大整數運算；超過 2^30 對實際秒數上限已無意義。
+    return min(float(maximum_seconds), float(2 ** min(streak - 1, 30)))
+
+
 def main():
     ap = argparse.ArgumentParser(description="loop-agent-lite:規劃/執行雙段共識迴圈")
     ap.add_argument("--repo", required=True, help="target code repo(git、乾淨、validate 綠)")
@@ -492,6 +503,8 @@ def main():
     ap.add_argument("--stuck-stop-count", type=int, default=STUCK_STOP_COUNT)
     ap.add_argument("--round-timeout", type=float, default=ROUND_TIMEOUT_MIN,
                     help="單輪 agent 上限(分鐘;0=不限,預設 30)")
+    ap.add_argument("--agent-backoff-max", type=float, default=AGENT_BACKOFF_MAX_SEC,
+                    help="Agent CLI 連續異常退出的指數退避上限(秒;0=關閉,預設 60)")
     ap.add_argument("--validate-timeout", type=float, default=VALIDATE_TIMEOUT_SEC,
                     help="啟動前與每輪 Validate 上限(秒;必須 >0,預設 120)")
     ap.add_argument("--notify-cmd", default="", help="終態通知命令,佔位符 {status} {name}(空=不通知)")
@@ -504,6 +517,8 @@ def main():
     args = ap.parse_args()
     if args.validate_timeout <= 0:
         ap.error("--validate-timeout 必須 > 0")
+    if args.agent_backoff_max < 0:
+        ap.error("--agent-backoff-max 必須 ≥ 0")
 
     repo = Path(args.repo).resolve()
     agent_cmd = shlex.split(args.agent_cmd) if args.agent_cmd else AGENT_CMD
@@ -618,10 +633,18 @@ def main():
         state["notes"].append("⚠ goal 內容已被人類更新,現有計畫可能過期。以新 goal 為準檢視你的任務;"
                               "若計畫明顯對不上,用 issue 回報。")
     state["goal_hash"] = goal_hash
+    try:
+        state["agent_failure_streak"] = max(0, int(state.get("agent_failure_streak", 0)))
+    except (TypeError, ValueError):
+        state["agent_failure_streak"] = 0
+    # resume 是人類主動重啟，第一輪立即嘗試；只有再次異常才依保留的 streak 退避。
+    state["agent_backoff_seconds"] = 0
+    state["agent_backoff_until"] = None
     # dashboard 靠 config 做 workspace 掃描與一鍵 run(agent_cmd 會再對 config 白名單驗過才准跑)
     state["config"] = {"flag_threshold": args.flag_threshold, "done_threshold": args.done_threshold,
                        "red_limit": args.red_limit, "stall_limit": args.stall_limit,
                        "round_timeout": args.round_timeout,
+                       "agent_backoff_max": args.agent_backoff_max,
                        "validate_timeout": args.validate_timeout,
                        "repo": str(repo), "agent_cmd": shlex.join(agent_cmd),
                        "validate_cmd": shlex.join(validate_cmd),
@@ -664,7 +687,8 @@ def main():
     log(f"⚙️ 執行設定｜Agent：{shlex.join(agent_cmd)}｜驗證：{shlex.join(validate_cmd)}")
     log(f"⚙️ 收斂門檻｜flag>{args.flag_threshold}｜done≥{args.done_threshold}｜red-limit={args.red_limit}｜"
         f"stall-limit={args.stall_limit}  stuck-stop={'on(' + str(args.stuck_stop_count) + ')' if args.stuck_stop else 'off'}  "
-        f"round-timeout={args.round_timeout:g}min  validate-timeout={args.validate_timeout:g}s")
+        f"round-timeout={args.round_timeout:g}min  agent-backoff≤{args.agent_backoff_max:g}s  "
+        f"validate-timeout={args.validate_timeout:g}s")
 
     goal_text = (repo / args.goal).read_text(encoding="utf-8")
 
@@ -791,12 +815,17 @@ def main():
         # 也不能把不完整的一輪算成共識票。執行期 repo 產出不回滾，仍留給下一輪收拾驗證。
         agent_failed = rc != 0 or timed_out
         if agent_failed:
+            state["agent_failure_streak"] = state.get("agent_failure_streak", 0) + 1
             ws.clear_signals()
             state["notes"].append(
                 f"⚠️ 上一輪 Agent 未正常結束(exit code={rc}"
                 + (f",逾時 {args.round_timeout:g} 分鐘" if timed_out else "")
                 + ")，該輪 coordinator 訊號已作廢；repo 殘留交下一輪檢查。")
             log("⚠️ Agent round 異常｜本輪 coordinator 訊號已全部作廢")
+        else:
+            if state.get("agent_failure_streak", 0):
+                log(f"✅ Agent CLI 已恢復｜連續異常 {state['agent_failure_streak']} 輪後正常退出")
+            state["agent_failure_streak"] = 0
 
         head_after = head_sha(repo)
         dirty = is_dirty(repo)
@@ -949,17 +978,37 @@ def main():
             if issue_lines:
                 log(f"📌 Issue 累計｜目前有 {len(state.get('issues', []))} 條未清")
 
+        will_retry = (agent_failed and state["phase"] != "done" and
+                      not (args.max_rounds and state["round"] >= args.max_rounds))
+        retry_delay = agent_failure_backoff(state["agent_failure_streak"], args.agent_backoff_max) \
+            if will_retry else 0.0
+        state["agent_backoff_seconds"] = retry_delay
+        state["agent_backoff_until"] = ((datetime.now() + timedelta(seconds=retry_delay))
+                                          .isoformat(timespec="seconds")) if retry_delay else None
+
         line = (f"{datetime.now().isoformat(timespec='seconds')} round={rnd} phase={phase} "
                 f"task={task_id or '-'} rc={rc} changed={changed} "
                 f"signal={'create' if ws.signal('called_create_plan', round_token) else 'ok' if ws.signal('signal_plan_ok', round_token) else 'done' if ws.signal('signal_done', round_token) else '-'} "
-                f"tamper={bool(tampered)} agent_ok={not agent_failed} validate={validate_note} "
+                f"tamper={bool(tampered)} agent_ok={not agent_failed} "
+                f"agent_failures={state['agent_failure_streak']} backoff={retry_delay:g}s validate={validate_note} "
                 f"flag={state['flag']} done={state['done_count']}"
                 + (f"  << {event}" if event else ""))
         with open(ws.history, "a", encoding="utf-8") as hf:
             hf.write(line + "\n")
         log(f"📊 第 {rnd} 輪結束｜變更={'有' if changed else '無'}｜驗證={validate_note}｜"
             f"flag={state['flag']}｜done={state['done_count']}" + (f"｜{event}" if event else ""))
+        if retry_delay:
+            log(f"⏳ Agent CLI 連續異常 {state['agent_failure_streak']} 輪｜{retry_delay:g} 秒後重試"
+                f"（上限 {args.agent_backoff_max:g} 秒）")
         ws.save_state(state)
+        if retry_delay:
+            try:
+                time.sleep(retry_delay)
+            finally:
+                # Ctrl-C/正常醒來都清掉 UI 的等待狀態；failure streak 留到下一輪成功才歸零。
+                state["agent_backoff_seconds"] = 0
+                state["agent_backoff_until"] = None
+                ws.save_state(state)
 
     if state["phase"] == "done":
         report = (f"# loop-agent-lite RUN REPORT\n\n"
