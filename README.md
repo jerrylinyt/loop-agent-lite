@@ -74,6 +74,7 @@ Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace 
 --agent-backoff-max <秒>   CLI 連續異常時 1,2,4…秒退避上限，0 表示關閉
 --validate-timeout <秒>   驗證命令上限
 --stuck-stop              同一任務反覆 reset 達上限時停機
+--preflight-only          只跑啟動前健檢（git／鎖／乾淨樹／validate）就退出，不動任何進度
 ```
 
 ## Dashboard 操作

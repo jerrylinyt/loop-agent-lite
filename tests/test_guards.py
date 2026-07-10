@@ -1071,5 +1071,45 @@ class TestWorkspaceArchive(unittest.TestCase):
                 D.ROOT = old_root
 
 
+class TestPreflightOnly(unittest.TestCase):
+    """--preflight-only:只健檢不啟動——不建 state.json、不動 snapshots,依結果回 exit code。"""
+
+    def _run(self, repo, workspace_root, validate_cmd, name):
+        env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+        return subprocess.run(
+            [sys.executable, LOOP_PY, "--repo", str(repo), "--name", name,
+             "--validate-cmd", validate_cmd, "--preflight-only"],
+            capture_output=True, text=True, env=env)
+
+    def test_green_passes_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = make_repo(d)
+            workspace_root = Path(d) / "ws"
+            r = self._run(repo, workspace_root, "true", "pfonly-green")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("preflight-only 全部通過", r.stdout)
+            wsd = workspace_root / "pfonly-green"
+            self.assertFalse((wsd / "state.json").exists(), "健檢不得建立 state")
+            self.assertFalse(list((wsd / "snapshots").iterdir()), "健檢不得寫 snapshots")
+
+    def test_red_validate_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = make_repo(d)
+            workspace_root = Path(d) / "ws"
+            r = self._run(repo, workspace_root, "false", "pfonly-red")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("驗證失敗", r.stdout)
+            self.assertFalse((workspace_root / "pfonly-red" / "state.json").exists())
+
+    def test_dirty_tree_fails_before_validate(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = make_repo(d)
+            (repo / "wip.txt").write_text("uncommitted\n")
+            workspace_root = Path(d) / "ws"
+            r = self._run(repo, workspace_root, "true", "pfonly-dirty")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("工作樹不乾淨", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

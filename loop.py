@@ -642,6 +642,9 @@ def main():
                     help="搭配 --import-plan:從規劃期(讓 agent 補完)或直接執行期開跑")
     ap.add_argument("--max-rounds", type=int, default=0, help="總輪數上限;0=不限(測試用)")
     ap.add_argument("--reset-state", action="store_true", help="清掉 workspace state 從頭跑")
+    ap.add_argument("--preflight-only", action="store_true",
+                    help="只跑啟動前健檢(git/鎖/乾淨樹/goal 已 commit/validate)就退出;"
+                         "不建 state、不動 snapshots、不啟動 agent")
     args = ap.parse_args()
     if args.validate_timeout <= 0:
         ap.error("--validate-timeout 必須 > 0")
@@ -660,7 +663,8 @@ def main():
     configure_console(ws.dir / "console.log")
     acquire_run_lock(ws.dir / ".run.lock", f"workspace '{ws.dir.name}'")
     startup_ready = ws.dir / "startup_ready.json"
-    startup_ready.unlink(missing_ok=True)
+    if not args.preflight_only:  # 健檢模式不得動到既有啟動 handshake 檔
+        startup_ready.unlink(missing_ok=True)
 
     # ===== preflight:第一行就擋,不合格不進迴圈 =====
     if git(repo, "rev-parse", "--is-inside-work-tree", check=False).returncode != 0:
@@ -676,6 +680,21 @@ def main():
     for rel in protected:
         if not tracked_in_head(repo, rel):
             fail(f"preflight：{rel} 不在 HEAD 裡。流程是：模板產初版 → 你審 → commit → 才 run loop")
+
+    if args.preflight_only:
+        # 健檢=全新啟動的可行性:validate 必須綠且不弄髒工作樹。resume 沿用舊綠點的
+        # 放行路徑不在此模擬(那需要既有 snapshots),紅燈時訊息會說明差異。
+        log(f"🔎 Preflight 健檢（--preflight-only,不啟動 loop）｜驗證:{shlex.join(validate_cmd)}")
+        ok, vtail, validate_timed_out = run_validate(validate_cmd, repo, args.validate_timeout)
+        if is_dirty(repo):
+            fail(f"preflight-only:validate `{shlex.join(validate_cmd)}` 執行後弄髒工作樹——"
+                 "validate 必須只產生 ignored build artifacts。輸出尾段:\n" + vtail)
+        if not ok:
+            timeout_note = f"（逾時 {args.validate_timeout:g} 秒）" if validate_timed_out else ""
+            fail(f"preflight-only:驗證失敗{timeout_note}——全新啟動會被擋"
+                 f"(既有 workspace 若有合法綠點,resume 仍可能放行)。輸出尾段:\n{vtail}")
+        log("✅ preflight-only 全部通過｜repo 乾淨、goal/plan-doc 已 commit、validate 綠、無其他 loop 佔用")
+        return
 
     log(f"🚀 Loop 啟動｜workspace={ws.dir.name}｜repo={repo}")
     if args.reset_state:
