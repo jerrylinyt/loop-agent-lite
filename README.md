@@ -4,7 +4,7 @@
 
 ![Dashboard 執行中展示](docs/dashboard-running.jpg)
 
-Dashboard 執行中時，左側顯示 Loop 狀態與驗證紀錄，右側顯示 Agent 輸出；兩側可拖曳調整寬度或收合。
+展示圖以 mock fleet 呈現執行中、規劃中、驗收中與已完成等 workspace 狀態；實際資料會由 `workspace/*/state.json` 提供。左側顯示 Loop 狀態與驗證紀錄，右側顯示 Agent 輸出；兩側可拖曳調整寬度或收合。
 
 ## 流程
 
