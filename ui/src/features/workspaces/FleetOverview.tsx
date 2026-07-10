@@ -40,6 +40,7 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
 }) {
   const events = useMemo(() => deriveFleetEvents(fleetHistory), [fleetHistory]);
   const [filter, setFilter] = useState<FleetFilter>("all");
+  const [search, setSearch] = useState("");
 
   const running = workspaces.filter((workspace) => workspace.running).length;
   const done = workspaces.filter((workspace) => workspace.phase === "done").length;
@@ -49,11 +50,14 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
   const doneTasks = workspaces.reduce((sum, workspace) => sum + (workspace.completed ?? 0), 0);
   const alerts = workspaces.filter(needsAttention).length;
   const visibleWorkspaces = useMemo(() => {
-    if (filter === "attention") return workspaces.filter(needsAttention);
-    if (filter === "running") return workspaces.filter((workspace) => workspace.running);
-    if (filter === "done") return workspaces.filter((workspace) => workspace.phase === "done");
-    return workspaces;
-  }, [filter, workspaces]);
+    let visible = filter === "attention" ? workspaces.filter(needsAttention)
+      : filter === "running" ? workspaces.filter((workspace) => workspace.running)
+        : filter === "done" ? workspaces.filter((workspace) => workspace.phase === "done")
+          : workspaces;
+    const query = search.trim().toLowerCase();
+    if (query) visible = visible.filter((workspace) => workspace.name.toLowerCase().includes(query));
+    return visible;
+  }, [filter, search, workspaces]);
   const filters: Array<{ id: FleetFilter; label: string; count: number }> = [
     { id: "all", label: "全部", count: workspaces.length },
     { id: "attention", label: "需關注", count: alerts },
@@ -84,6 +88,8 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
             </button>
           ))}
         </div>
+        <input className="fleet-search" type="search" aria-label="搜尋 workspace" placeholder="搜尋 workspace…"
+          value={search} onChange={(event) => setSearch(event.target.value)} />
         <span className="muted">顯示 {visibleWorkspaces.length} / {workspaces.length}</span>
       </div>
       <div className="fleet-body">
@@ -127,7 +133,7 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
               </button>
             );
           })}
-          {!visibleWorkspaces.length && <div className="empty-inline">{filter === "all" ? "尚未建立 workspace" : "沒有符合目前篩選的 workspace"}</div>}
+          {!visibleWorkspaces.length && <div className="empty-inline">{search.trim() ? "沒有符合搜尋的 workspace" : filter === "all" ? "尚未建立 workspace" : "沒有符合目前篩選的 workspace"}</div>}
         </div>
         <aside className="fleet-events" aria-label="事件推播">
           <div className="fleet-events-head"><strong>事件推播</strong><span className="muted">最近 {events.length} 則</span></div>

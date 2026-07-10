@@ -96,6 +96,12 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(runningFilter).toHaveAttribute("aria-pressed", "true");
   await expect(overview.locator(".fleet-card", { hasText: "e2e-workspace" })).toBeVisible();
   await overview.getByRole("button", { name: /^全部 \d+$/ }).click();
+  const fleetSearch = overview.getByRole("searchbox", { name: "搜尋 workspace" });
+  await fleetSearch.fill("e2e-work");
+  await expect(overview.locator(".fleet-card", { hasText: "e2e-workspace" })).toBeVisible();
+  await fleetSearch.fill("does-not-exist");
+  await expect(overview.getByText("沒有符合搜尋的 workspace")).toBeVisible();
+  await fleetSearch.fill("");
   const fleetCard = overview.locator(".fleet-card", { hasText: "e2e-workspace" });
   await expect(fleetCard).toBeVisible();
   await expect(fleetCard.locator(".breathing-dot")).toBeVisible();
