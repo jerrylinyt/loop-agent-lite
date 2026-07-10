@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import Modal from "../../shared/components/Modal";
 import type { IncrementalResponse, RoundMetrics } from "../../shared/api/types";
@@ -15,8 +15,12 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
   const [metrics, setMetrics] = useState<RoundMetrics | null>(null);
   const [note, setNote] = useState("");
   const [loading, setLoading] = useState(true);
+  const requestSeq = useRef(0);
 
   const load = useCallback(async () => {
+    // 切換 run 分頁/按重新整理會連發請求;舊請求晚回不得覆蓋新分頁的結果
+    const seq = requestSeq.current + 1;
+    requestSeq.current = seq;
     setLoading(true);
     setMetrics(null);
     const encodedWorkspace = encodeURIComponent(workspace);
@@ -24,6 +28,7 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
       getJson<IncrementalResponse>(`/api/history?ws=${encodedWorkspace}&offset=-1&run=${run}`),
       getJson<RoundMetrics>(`/api/round-metrics?ws=${encodedWorkspace}&run=${run}&limit=100`)
     ]);
+    if (seq !== requestSeq.current) return;
     setLoading(false);
     if (!response || response.error) {
       setNote("❌ 讀取 history.log 失敗");
