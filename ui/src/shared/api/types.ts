@@ -126,3 +126,24 @@ export interface BootstrapResponse {
   readonly: boolean;
   preselect: string;
 }
+
+export interface ArchiveSummary {
+  id: string;
+  name: string;
+  archived_at: string;
+  legacy?: boolean;
+  phase?: Phase | null;
+  round?: number | null;
+}
+
+export interface ArchivesResponse {
+  archives: ArchiveSummary[];
+  error?: string;
+}
+
+export interface RestoreArchiveResponse {
+  ok?: boolean;
+  name?: string;
+  archive_id?: string;
+  error?: string;
+}

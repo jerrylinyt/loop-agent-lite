@@ -1186,7 +1186,7 @@ class TestWorkspaceArchive(unittest.TestCase):
                 finally:
                     fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
                     holder.close()
-                self.assertEqual(handler.response[0], 400)
+                self.assertEqual(handler.response[0], 409)
                 self.assertIn("單 writer 鎖", handler.response[1]["error"])
                 self.assertTrue((root / "demo").exists())
 
@@ -1200,6 +1200,187 @@ class TestWorkspaceArchive(unittest.TestCase):
                 self.assertTrue((archived[0] / "state.json").exists())
                 # .archive 不得冒充 workspace 出現在 fleet
                 self.assertEqual(D.list_workspaces(), [])
+            finally:
+                D.ROOT = old_root
+
+
+class TestWorkspaceArchiveRestore(unittest.TestCase):
+    """封存還原必須只搬真實目錄、不覆寫既有目標，且不會暗中啟動 loop。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    @staticmethod
+    def _seed_workspace(root, name="demo", *, round_number=7):
+        workspace = root / name
+        workspace.mkdir(parents=True)
+        (workspace / "state.json").write_text(
+            json.dumps({"phase": "done", "round": round_number, "loop": {"pid": None}}), encoding="utf-8")
+        (workspace / "nested").mkdir()
+        (workspace / "nested" / "kept.txt").write_text("preserve me\n", encoding="utf-8")
+        return workspace
+
+    def test_archive_list_and_restore_preserve_content_without_starting_loop(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            workspace = self._seed_workspace(root)
+            old_root = D.ROOT
+            try:
+                D.ROOT = root
+                archive = self.ResponseCapture()
+                D.Handler.api_archive_workspace(archive, {"name": "demo"})
+                self.assertEqual(archive.response[0], 200, archive.response)
+                archive_id = archive.response[1]["archive_id"]
+                self.assertRegex(archive_id, r"^demo--\d{8}T\d{6}Z--[0-9a-f]{32}$")
+                self.assertFalse(workspace.exists())
+
+                listed = D.list_archives()
+                self.assertNotIn("error", listed)
+                self.assertEqual(len(listed["archives"]), 1)
+                self.assertEqual(listed["archives"][0]["id"], archive_id)
+                self.assertEqual(listed["archives"][0]["name"], "demo")
+                self.assertEqual(listed["archives"][0]["phase"], "done")
+                self.assertEqual(listed["archives"][0]["round"], 7)
+
+                restore = self.ResponseCapture()
+                D.Handler.api_restore_workspace(restore, {"archive_id": archive_id})
+                self.assertEqual(restore.response[0], 200, restore.response)
+                self.assertEqual(restore.response[1], {"ok": True, "name": "demo", "archive_id": archive_id})
+                self.assertEqual((root / "demo" / "nested" / "kept.txt").read_text(), "preserve me\n")
+                self.assertEqual(D.list_archives()["archives"], [])
+                self.assertEqual([item["name"] for item in D.list_workspaces()], ["demo"])
+                self.assertFalse(D.ws_running("demo"), "還原只恢復 state，不得自動啟動 loop")
+                with D.JOBS_LOCK:
+                    self.assertNotIn("demo", D.JOBS)
+            finally:
+                D.ROOT = old_root
+
+    def test_restores_legacy_archive_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            archive_id = "legacy-orders-20250102-030405"
+            self._seed_workspace(root / ".archive", archive_id, round_number=3)
+            old_root = D.ROOT
+            try:
+                D.ROOT = root
+                listed = D.list_archives()["archives"]
+                self.assertEqual([(item["id"], item["name"]) for item in listed], [(archive_id, "legacy-orders")])
+                handler = self.ResponseCapture()
+                D.Handler.api_restore_workspace(handler, {"archive_id": archive_id})
+                self.assertEqual(handler.response[0], 200, handler.response)
+                self.assertTrue((root / "legacy-orders" / "state.json").is_file())
+            finally:
+                D.ROOT = old_root
+
+    def test_restore_rejects_invalid_or_colliding_destination_without_moving_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            archive_id = "collision--20250102T030405Z--" + "a" * 32
+            archived = self._seed_workspace(root / ".archive", archive_id)
+            old_root = D.ROOT
+            try:
+                D.ROOT = root
+                for bad_id in ("", "..", "../" + archive_id, "/tmp/" + archive_id, "not-an-archive"):
+                    handler = self.ResponseCapture()
+                    D.Handler.api_restore_workspace(handler, {"archive_id": bad_id})
+                    with self.subTest(bad_id=bad_id):
+                        self.assertEqual(handler.response[0], 400)
+                        self.assertTrue(archived.exists())
+
+                with L.workspace_operation_lock(root, "collision"):
+                    handler = self.ResponseCapture()
+                    D.Handler.api_restore_workspace(handler, {"archive_id": archive_id})
+                    self.assertEqual(handler.response[0], 409, handler.response)
+                    self.assertTrue(archived.exists(), "CLI 建立 workspace 的 root lock 存在時不得搬移")
+
+                destination = root / "collision"
+                cases = {
+                    "directory": lambda: destination.mkdir(),
+                    "file": lambda: destination.write_text("occupied", encoding="utf-8"),
+                    "dangling symlink": lambda: destination.symlink_to(root / "missing-target"),
+                }
+                for kind, create in cases.items():
+                    create()
+                    handler = self.ResponseCapture()
+                    D.Handler.api_restore_workspace(handler, {"archive_id": archive_id})
+                    with self.subTest(destination=kind):
+                        self.assertEqual(handler.response[0], 409, handler.response)
+                        self.assertTrue(archived.exists(), "衝突不得讓來源消失")
+                    if destination.is_dir() and not destination.is_symlink():
+                        destination.rmdir()
+                    else:
+                        destination.unlink(missing_ok=True)
+            finally:
+                D.ROOT = old_root
+
+    def test_archive_refuses_held_locks_and_symlink_archive_root(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            workspace = self._seed_workspace(root)
+            old_root = D.ROOT
+            try:
+                D.ROOT = root
+                holder = open(workspace / ".run.lock", "a+b")
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    handler = self.ResponseCapture()
+                    D.Handler.api_archive_workspace(handler, {"name": "demo"})
+                finally:
+                    fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+                    holder.close()
+                self.assertEqual(handler.response[0], 409, handler.response)
+                self.assertTrue(workspace.exists())
+
+                archive_root = root / ".archive"
+                archive_root.mkdir(exist_ok=True)
+                holder = open(archive_root / ".ops.lock", "a+b")
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    handler = self.ResponseCapture()
+                    D.Handler.api_archive_workspace(handler, {"name": "demo"})
+                finally:
+                    fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+                    holder.close()
+                self.assertEqual(handler.response[0], 409, handler.response)
+                self.assertTrue(workspace.exists())
+
+                shutil.rmtree(archive_root)
+                outside = Path(td) / "outside-archive"
+                outside.mkdir()
+                archive_root.symlink_to(outside, target_is_directory=True)
+                handler = self.ResponseCapture()
+                D.Handler.api_archive_workspace(handler, {"name": "demo"})
+                self.assertEqual(handler.response[0], 409, handler.response)
+                self.assertTrue(workspace.exists())
+                self.assertEqual(list(outside.iterdir()), [])
+
+                archive_root.unlink()
+                archive_root.mkdir()
+                outside_lock = Path(td) / "outside-run.lock"
+                (workspace / ".run.lock").unlink()
+                (workspace / ".run.lock").symlink_to(outside_lock)
+                handler = self.ResponseCapture()
+                D.Handler.api_archive_workspace(handler, {"name": "demo"})
+                self.assertEqual(handler.response[0], 409, handler.response)
+                self.assertTrue(workspace.exists())
+                self.assertFalse(outside_lock.exists(), "descriptor-relative lock 不得跟隨 workspace 內 symlink")
+
+                archive_id = "symlinked--20250102T030405Z--" + "b" * 32
+                outside_entry = Path(td) / "outside-entry"
+                outside_entry.mkdir()
+                (archive_root / archive_id).symlink_to(outside_entry, target_is_directory=True)
+                self.assertEqual(D.list_archives()["archives"], [], "封存列表不得投影 symlink entry")
+                handler = self.ResponseCapture()
+                D.Handler.api_restore_workspace(handler, {"archive_id": archive_id})
+                self.assertEqual(handler.response[0], 409, handler.response)
+                self.assertFalse((root / "symlinked").exists())
             finally:
                 D.ROOT = old_root
 

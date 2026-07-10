@@ -38,6 +38,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -63,6 +64,7 @@ CONSOLE_MAX_BYTES = 5 * 1024 * 1024   # console.log 單檔 5 MiB
 CONSOLE_BACKUPS = 3                    # 保留 console.log.1～.3
 STOP_AFTER_ROUND_FILE = "stop-after-round.json"
 STOP_AFTER_ROUND_CLAIMED_FILE = "stop-after-round.claimed.json"
+WORKSPACE_OPS_DIR = ".ops"
 
 _CONSOLE_PATH = None
 _CONSOLE_LOCK = threading.Lock()
@@ -94,6 +96,64 @@ def workspace_path(root: Path, name: str) -> Path:
     if stat.S_ISLNK(mode):
         raise ValueError("workspace 目錄不可為 symbolic link（避免逸出 workspace root）")
     return path
+
+
+class WorkspaceOperationLockError(RuntimeError):
+    """另一個 archive/restore 或 CLI 正在改同名 workspace 的 root entry。"""
+
+
+@contextmanager
+def workspace_operation_lock(root: Path, name: str, *, blocking=True):
+    """跨 Dashboard/CLI 的 per-name root lock，保護「不存在→建立/還原」這類競態。"""
+    name = require_workspace_name(name)
+    root = Path(root)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise WorkspaceOperationLockError(f"無法建立 workspace 根目錄:{e}") from e
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise WorkspaceOperationLockError("此系統不支援安全的 workspace operation lock")
+    directory_flags = os.O_RDONLY | nofollow | getattr(os, "O_DIRECTORY", 0)
+    root_fd = ops_fd = None
+    lock_file = None
+    try:
+        try:
+            root_fd = os.open(root, directory_flags)
+            try:
+                os.mkdir(WORKSPACE_OPS_DIR, dir_fd=root_fd)
+            except FileExistsError:
+                pass
+            ops_fd = os.open(WORKSPACE_OPS_DIR, directory_flags, dir_fd=root_fd)
+        except OSError as e:
+            raise WorkspaceOperationLockError(f"無法開啟 workspace operation lock 目錄:{e}") from e
+        if not stat.S_ISDIR(os.fstat(ops_fd).st_mode):
+            raise WorkspaceOperationLockError("workspace operation lock 目錄不是實體目錄")
+        try:
+            lock_fd = os.open(f"{name}.lock", os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | nofollow,
+                              0o600, dir_fd=ops_fd)
+        except OSError as e:
+            raise WorkspaceOperationLockError(f"無法取得 workspace operation lock:{e}") from e
+        lock_file = os.fdopen(lock_fd, "a+b")
+        info = os.fstat(lock_file.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise WorkspaceOperationLockError("workspace operation lock 不是安全的 regular file")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError as e:
+            raise WorkspaceOperationLockError(f"workspace {name} 正在進行 archive/restore 操作") from e
+        yield
+    finally:
+        if lock_file is not None:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_file.close()
+        if ops_fd is not None:
+            os.close(ops_fd)
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 def now_ts() -> str:
@@ -412,10 +472,11 @@ class Workspace:
 
     def __init__(self, name: str):
         self.name = require_workspace_name(name)
-        self.dir = workspace_path(WORKSPACE_ROOT, self.name)
-        (self.dir / "logs").mkdir(parents=True, exist_ok=True)
-        (self.dir / "prompts").mkdir(parents=True, exist_ok=True)
-        (self.dir / "snapshots").mkdir(parents=True, exist_ok=True)
+        with workspace_operation_lock(WORKSPACE_ROOT, self.name):
+            self.dir = workspace_path(WORKSPACE_ROOT, self.name)
+            (self.dir / "logs").mkdir(parents=True, exist_ok=True)
+            (self.dir / "prompts").mkdir(parents=True, exist_ok=True)
+            (self.dir / "snapshots").mkdir(parents=True, exist_ok=True)
         self.state_path = self.dir / "state.json"
         self.checkpoint_path = state_checkpoint_path(self.state_path)
         self.history = self.dir / "history.log"

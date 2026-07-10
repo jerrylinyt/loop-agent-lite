@@ -17,16 +17,20 @@ import functools
 import json
 import mimetypes
 import os
+import errno
 import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -44,6 +48,12 @@ PERSONAL_CONFIG_PATH = Path(CONFIG_OVERRIDE or HERE / "dashboard.config.local.js
 LEGACY_CONFIG_PATH = (HERE / "dashboard.config.json").resolve()
 CONFIG_PATH = PERSONAL_CONFIG_PATH  # 舊程式/錯誤訊息相容名稱；UI 會分別顯示團隊版與個人版
 MAX_CHUNK = 512 * 1024  # 單次 tail 最多回傳量
+ARCHIVE_DIR_NAME = ".archive"
+ARCHIVE_OPS_LOCK_NAME = ".ops.lock"
+ARCHIVE_ID_RE = re.compile(
+    r"(?P<name>[A-Za-z0-9._-]+)--(?P<stamp>\d{8}T\d{6}Z)--(?P<nonce>[0-9a-f]{32})"
+)
+LEGACY_ARCHIVE_ID_RE = re.compile(r"(?P<name>[A-Za-z0-9._-]+)-(?P<stamp>\d{8}-\d{6})")
 
 DEFAULT_CONFIG = {
     "agent_cmds": [
@@ -115,6 +125,224 @@ def command_error(raw, label, cfg):
 def safe_workspace_dir(name):
     """Dashboard 的 ROOT 也必須套用 loop 共用的名稱與 symlink 邊界。"""
     return loop_mod.workspace_path(ROOT, name)
+
+
+class ArchiveOperationError(RuntimeError):
+    """封存操作的可預期 fail-closed 錯誤；status 直接對應 REST 回應。"""
+
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+def _lstat(path: Path, label: str):
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise ArchiveOperationError(f"無法檢查{label}:{e}") from e
+
+
+def _require_real_directory(path: Path, label: str, *, missing_status=404) -> Path:
+    """只接受真的 directory；exists/is_dir 會跟隨 symlink，不足以當邊界檢查。"""
+    info = _lstat(path, label)
+    if info is None:
+        raise ArchiveOperationError(f"{label}不存在", missing_status)
+    if stat.S_ISLNK(info.st_mode):
+        raise ArchiveOperationError(f"{label}不可為 symbolic link", 409)
+    if not stat.S_ISDIR(info.st_mode):
+        raise ArchiveOperationError(f"{label}必須是目錄", 409)
+    return path
+
+
+def archive_root(*, create=False):
+    """取得真正的 .archive 目錄；不跟隨 symlink，建立時也會重新 lstat 確認。"""
+    path = ROOT / ARCHIVE_DIR_NAME
+    info = _lstat(path, "封存根目錄")
+    if info is None:
+        if not create:
+            return None
+        try:
+            path.mkdir()
+        except FileExistsError:
+            pass
+        except OSError as e:
+            raise ArchiveOperationError(f"無法建立封存根目錄:{e}") from e
+    return _require_real_directory(path, "封存根目錄")
+
+
+def archive_metadata(archive_id):
+    """驗證 archive id 並從新、舊檔名格式取回原 workspace 名稱與時間。"""
+    if not isinstance(archive_id, str) or Path(archive_id).name != archive_id:
+        return None
+    matched = ARCHIVE_ID_RE.fullmatch(archive_id)
+    legacy = False
+    if matched is None:
+        matched = LEGACY_ARCHIVE_ID_RE.fullmatch(archive_id)
+        legacy = True
+    if matched is None:
+        return None
+    name, stamp = matched.group("name"), matched.group("stamp")
+    if not loop_mod.valid_workspace_name(name):
+        return None
+    try:
+        parsed = datetime.strptime(stamp, "%Y%m%d-%H%M%S" if legacy else "%Y%m%dT%H%M%SZ")
+    except ValueError:
+        return None
+    if legacy:
+        archived_at = parsed.strftime("%Y-%m-%d %H:%M:%S（舊格式，時區未知）")
+    else:
+        archived_at = parsed.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    return {"id": archive_id, "name": name, "archived_at": archived_at, "legacy": legacy}
+
+
+def new_archive_id(name: str) -> str:
+    loop_mod.require_workspace_name(name)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{name}--{stamp}--{uuid.uuid4().hex}"
+
+
+def _lstat_at(directory_fd, name: str, label: str):
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise ArchiveOperationError(f"無法檢查{label}:{e}", 409) from e
+
+
+@contextmanager
+def directory_fd(path, label: str, *, dir_fd=None):
+    """以 O_DIRECTORY|O_NOFOLLOW 開實體目錄；後續 lock/rename 都相對此 descriptor 執行。"""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ArchiveOperationError("此系統不支援安全的 O_NOFOLLOW 目錄操作，已拒絕封存操作")
+    flags = os.O_RDONLY | nofollow | getattr(os, "O_DIRECTORY", 0)
+    fd = None
+    try:
+        try:
+            fd = os.open(path, flags, dir_fd=dir_fd)
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                raise ArchiveOperationError(f"{label}不可為 symbolic link", 409) from e
+            if e.errno == errno.ENOENT:
+                raise ArchiveOperationError(f"{label}不存在", 404) from e
+            raise ArchiveOperationError(f"無法開啟{label}:{e}", 409) from e
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise ArchiveOperationError(f"{label}必須是目錄", 409)
+        yield fd
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+@contextmanager
+def exclusive_file_lock(path, label: str, *, dir_fd=None):
+    """以 descriptor-relative O_NOFOLLOW regular file + flock 取得跨 dashboard 鎖。"""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ArchiveOperationError("此系統不支援安全的 O_NOFOLLOW 鎖定，已拒絕封存操作")
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | nofollow | os.O_NONBLOCK, 0o600, dir_fd=dir_fd)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise ArchiveOperationError(f"{label}不可為 symbolic link", 409) from e
+        raise ArchiveOperationError(f"無法取得{label}:{e}", 409) from e
+    lock_file = os.fdopen(fd, "a+b")
+    try:
+        info = os.fstat(lock_file.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ArchiveOperationError(f"{label}必須是單一 regular file", 409)
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise ArchiveOperationError(f"{label}仍被持有，請稍後再試", 409) from e
+        yield lock_file
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_file.close()
+
+
+_ARCHIVE_THREAD_LOCK = threading.Lock()
+
+
+@contextmanager
+def archive_operation_lock(*, create=True):
+    """序列化 archive/restore 的檢查→rename，並回傳 ROOT/.archive 的安全 dir fd。"""
+    if not _ARCHIVE_THREAD_LOCK.acquire(blocking=False):
+        raise ArchiveOperationError("另一個封存操作正在進行，請稍後再試", 409)
+    try:
+        root = archive_root(create=create)
+        if root is None:
+            raise ArchiveOperationError("封存根目錄不存在", 404)
+        with directory_fd(ROOT, "workspace 根目錄") as root_fd:
+            with directory_fd(ARCHIVE_DIR_NAME, "封存根目錄", dir_fd=root_fd) as archive_fd:
+                with exclusive_file_lock(ARCHIVE_OPS_LOCK_NAME, "封存操作鎖", dir_fd=archive_fd):
+                    yield root, root_fd, archive_fd
+    finally:
+        _ARCHIVE_THREAD_LOCK.release()
+
+
+def _require_same_directory_entry(parent_fd, name: str, opened_fd, label: str):
+    """確認 parent/name 仍指向剛開啟且持鎖的同一個 directory inode。"""
+    entry = _lstat_at(parent_fd, name, label)
+    opened = os.fstat(opened_fd)
+    if (entry is None or stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode)
+            or (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino)):
+        raise ArchiveOperationError(f"{label}在操作期間變更，已拒絕搬移", 409)
+
+
+def _require_absent_entry(parent_fd, name: str, label: str):
+    if _lstat_at(parent_fd, name, label) is not None:
+        raise ArchiveOperationError(f"{label}已存在，已拒絕覆寫", 409)
+
+
+def archived_state_projection(directory: Path):
+    """archive 列表只讀可安全解析的 state；壞檔或 symlink 只省略 metadata。"""
+    state_path = directory / "state.json"
+    checkpoint_path = loop_mod.state_checkpoint_path(state_path)
+    for path in (state_path, checkpoint_path):
+        info = _lstat(path, "封存 state")
+        if info is not None and (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)):
+            return {}
+    try:
+        state, _data, _recovered = loop_mod.load_checkpointed_state(state_path, repair=False)
+    except (FileNotFoundError, OSError, loop_mod.StateLoadError):
+        return {}
+    return {"phase": state.get("phase"), "round": state.get("round")}
+
+
+def list_archives():
+    """列出可嚴格辨識、非 symlink 的封存項目；不修 state、不暴露任意路徑。"""
+    try:
+        root = archive_root(create=False)
+    except ArchiveOperationError as e:
+        return {"archives": [], "error": str(e)}
+    if root is None:
+        return {"archives": []}
+    archives = []
+    try:
+        entries = list(root.iterdir())
+    except OSError as e:
+        return {"archives": [], "error": f"無法讀取封存根目錄:{e}"}
+    for entry in entries:
+        metadata = archive_metadata(entry.name)
+        if metadata is None:
+            continue
+        try:
+            info = _lstat(entry, f"封存項目 {entry.name}")
+        except ArchiveOperationError:
+            continue
+        if info is None or stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            continue
+        metadata.update(archived_state_projection(entry))
+        archives.append(metadata)
+    archives.sort(key=lambda item: item["id"], reverse=True)
+    return {"archives": archives}
 
 JOBS = {}          # name -> Job(由本 dashboard 啟動的 loop)
 JOBS_LOCK = threading.Lock()
@@ -754,6 +982,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve_events(q)
             elif u.path == "/api/workspaces":
                 self._out(200, json.dumps(list_workspaces(), ensure_ascii=False))
+            elif u.path == "/api/archives":
+                self._out(200, json.dumps(list_archives(), ensure_ascii=False))
             elif u.path == "/api/config":
                 cfg = load_config()
                 if "error" in cfg:
@@ -890,6 +1120,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.api_set_task(body)
             elif u.path == "/api/archive-workspace":
                 self.api_archive_workspace(body)
+            elif u.path == "/api/restore-workspace":
+                self.api_restore_workspace(body)
             else:
                 self._err("not found", 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -1644,10 +1876,9 @@ class Handler(BaseHTTPRequestHandler):
 
     @with_state_lock
     def api_archive_workspace(self, body):
-        """停止狀態下封存 workspace:整個目錄搬進 .archive/(軟刪除,可手動搬回還原)。
-        不動 target repo;執行中或單 writer 鎖仍被持有時 fail-closed 拒絕。"""
+        """停止狀態下以原子 rename 軟刪除 workspace；不動 target repo 或覆寫既有 archive。"""
         name = str(body.get("name") or "")
-        st, err = read_state(name)
+        st, err = read_state(name, repair=False)
         if err:
             self._err(err)
             return
@@ -1655,37 +1886,85 @@ class Handler(BaseHTTPRequestHandler):
             self._err(f"{name} 執行中,不能封存——先停止")
             return
         try:
-            wsd = safe_workspace_dir(name)
+            safe_workspace_dir(name)
         except ValueError as e:
             self._err(str(e))
             return
-        # pid 偵測可能失準(SIGKILL 殘值/ps 誤判);flock 是 loop 單 writer 的機械真相,
-        # 拿不到鎖就代表還有 loop 活著,寧可擋下也不搬走執行中的 state。
         try:
-            lock_file = open(wsd / ".run.lock", "a+b")
-        except OSError as e:
-            self._err(f"無法檢查單 writer 鎖:{e}")
+            with loop_mod.workspace_operation_lock(ROOT, name, blocking=False):
+                with archive_operation_lock(create=True) as (root, root_fd, archive_fd):
+                    # 從 ROOT descriptor 開 source，避免檢查後 workspace path 被換成 symlink。
+                    with directory_fd(name, f"workspace {name}", dir_fd=root_fd) as workspace_fd:
+                        current, current_error = read_state(name, repair=False)
+                        if current_error or ws_running(name, current):
+                            raise ArchiveOperationError(f"{name} 在封存時已開始執行，不能封存", 409)
+                        # pid 偵測可能失準；.run.lock 是 loop 單 writer 的機械真相。鎖檔本身也必須非 symlink。
+                        with exclusive_file_lock(".run.lock", f"{name} 的單 writer 鎖", dir_fd=workspace_fd):
+                            _require_same_directory_entry(root_fd, name, workspace_fd, f"workspace {name}")
+                            archive_id = new_archive_id(name)
+                            _require_absent_entry(archive_fd, archive_id, "封存目標")
+                            target = root / archive_id
+                            try:
+                                os.rename(name, archive_id, src_dir_fd=root_fd, dst_dir_fd=archive_fd)
+                            except OSError as e:
+                                raise ArchiveOperationError(f"封存失敗:{e}", 409) from e
+        except ArchiveOperationError as e:
+            self._err(str(e), e.status)
             return
-        try:
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                self._err(f"{name} 的單 writer 鎖仍被持有(loop 還活著),不能封存")
-                return
-            archive_root = ROOT / ".archive"
-            archive_root.mkdir(exist_ok=True)
-            target = archive_root / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}"
-            try:
-                os.rename(wsd, target)
-            except OSError as e:
-                self._err(f"封存失敗:{e}")
-                return
-        finally:
-            lock_file.close()
+        except loop_mod.WorkspaceOperationLockError as e:
+            self._err(str(e), 409)
+            return
+        except ValueError as e:
+            self._err(str(e))
+            return
         with JOBS_LOCK:
             JOBS.pop(name, None)  # 已結束 job 的殘影一併移除,避免 stale tail/名稱衝突
         print(f"[{time.strftime('%H:%M:%S')}] 🖥️ Dashboard｜封存 workspace {name} → {target}", flush=True)
-        self._out(200, json.dumps({"ok": True, "archived_to": str(target)}, ensure_ascii=False))
+        self._out(200, json.dumps({"ok": True, "name": name, "archive_id": archive_id,
+                                   "archived_to": str(target)}, ensure_ascii=False))
+
+    def api_restore_workspace(self, body):
+        """從嚴格 archive id 還原原目錄；只 rename，絕不覆寫或自動啟動 loop。"""
+        archive_id = body.get("archive_id")
+        metadata = archive_metadata(archive_id)
+        if metadata is None:
+            self._err("archive_id 不合法")
+            return
+        name = metadata["name"]
+        # restore 的 body 是 archive id，不會自然與 launch/run 共享 decorator key；手動拿原名稱鎖。
+        with _state_lock(name):
+            try:
+                with JOBS_LOCK:
+                    job = JOBS.get(name)
+                    if job is not None and job.alive():
+                        raise ArchiveOperationError(f"workspace {name} 正在執行，不能還原", 409)
+                with loop_mod.workspace_operation_lock(ROOT, name, blocking=False):
+                    # 無 archive 時 restore 只回 404，不建立空 .archive 目錄。
+                    with archive_operation_lock(create=False) as (_root, root_fd, archive_fd):
+                        _require_absent_entry(root_fd, name, f"workspace {name}")
+                        # 從 archive descriptor 開 source，避免 archive entry / parent 被替換後跟隨 symlink。
+                        with directory_fd(archive_id, f"封存項目 {archive_id}", dir_fd=archive_fd) as source_fd:
+                            with exclusive_file_lock(".run.lock", f"{name} 的單 writer 鎖", dir_fd=source_fd):
+                                _require_same_directory_entry(archive_fd, archive_id, source_fd,
+                                                              f"封存項目 {archive_id}")
+                                _require_absent_entry(root_fd, name, f"workspace {name}")
+                                try:
+                                    os.rename(archive_id, name, src_dir_fd=archive_fd, dst_dir_fd=root_fd)
+                                except OSError as e:
+                                    raise ArchiveOperationError(f"還原失敗:{e}", 409) from e
+            except ArchiveOperationError as e:
+                self._err(str(e), e.status)
+                return
+            except loop_mod.WorkspaceOperationLockError as e:
+                self._err(str(e), 409)
+                return
+            except ValueError as e:
+                self._err(str(e))
+                return
+        with JOBS_LOCK:
+            JOBS.pop(name, None)
+        print(f"[{time.strftime('%H:%M:%S')}] 🖥️ Dashboard｜還原 workspace {name} ← {archive_id}", flush=True)
+        self._out(200, json.dumps({"ok": True, "name": name, "archive_id": archive_id}, ensure_ascii=False))
 
     @with_state_lock
     def api_drain(self, body):

@@ -276,15 +276,28 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
 
   await page.getByRole("button", { name: "🗄 封存" }).click();
   const archiveDialog = page.getByRole("dialog", { name: "請確認" });
-  await expect(archiveDialog).toContainText("可手動搬回還原");
+  await expect(archiveDialog).toContainText("已封存");
   await archiveDialog.getByRole("button", { name: "封存" }).click();
   await expect(page.getByRole("heading", { name: "尚未建立 workspace" })).toBeVisible();
+
+  await page.getByRole("button", { name: "🗃 已封存" }).click();
+  const archivesModal = page.getByRole("dialog", { name: "已封存 workspace" });
+  await expect(archivesModal).toContainText("e2e-workspace");
+  await archivesModal.getByRole("button", { name: "還原 e2e-workspace" }).click();
+  const restoreDialog = page.getByRole("dialog", { name: "確認還原" });
+  await expect(restoreDialog).toContainText("不會自動啟動 loop");
+  await restoreDialog.getByRole("button", { name: "還原" }).click();
+  await expect(page.getByRole("heading", { name: "e2e-workspace" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "▶ 運行" })).toBeVisible();
 });
 
 test("read-only instance 隱藏寫入控制並拒絕 POST", async ({ page, request }) => {
   await page.goto("http://127.0.0.1:8877/");
   await expect(page.getByRole("heading", { name: "尚未建立 workspace" })).toBeVisible();
   await expect(page.getByRole("button", { name: /啟動/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "🗃 已封存" }).click();
+  await expect(page.getByRole("dialog", { name: "已封存 workspace" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /還原 / })).toHaveCount(0);
   const response = await request.post("http://127.0.0.1:8877/api/run", { data: { name: "anything" } });
   expect(response.status()).toBe(403);
   expect(await response.json()).toMatchObject({ error: expect.stringContaining("唯讀模式") });

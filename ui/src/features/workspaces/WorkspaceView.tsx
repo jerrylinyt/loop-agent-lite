@@ -121,7 +121,7 @@ export default function WorkspaceView({
   const archiveWorkspace = () => {
     setDialog({
       title: "請確認",
-      message: `封存 ${workspace?.name}？整個 workspace 會移到 workspace/.archive/（可手動搬回還原），target repo 與程式碼不受影響。`,
+      message: `封存 ${workspace?.name}？整個 workspace 會移到 workspace/.archive/，可從「🗃 已封存」安全還原；target repo 與程式碼不受影響。`,
       confirmLabel: "封存",
       onConfirm: () => {
         setDialog(null);

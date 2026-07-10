@@ -3,6 +3,7 @@ import ConsolePane from "../features/console/ConsolePane";
 import Splitter from "../features/layout/Splitter";
 import LauncherModal from "../features/launcher/LauncherModal";
 import ThemePicker from "../features/theme/ThemePicker";
+import ArchivesModal from "../features/workspaces/ArchivesModal";
 import WorkspaceTabs from "../features/workspaces/WorkspaceTabs";
 import WorkspaceView from "../features/workspaces/WorkspaceView";
 import useDashboardData from "./useDashboardData";
@@ -10,6 +11,7 @@ import useDashboardData from "./useDashboardData";
 export default function App() {
   const dashboard = useDashboardData();
   const [launcherOpen, setLauncherOpen] = useState(false);
+  const [archivesOpen, setArchivesOpen] = useState(false);
   const [leftWidth, setLeftWidth] = useState(() => +(localStorage.getItem("left-pane-width") || Math.round(window.innerWidth * 0.44)));
   const [rightCollapsed, setRightCollapsed] = useState(() => localStorage.getItem("agent-console-collapsed") === "1");
   const workspace = useMemo(
@@ -31,6 +33,11 @@ export default function App() {
       return !value;
     });
   };
+  const restored = async (name: string) => {
+    dashboard.selectWorkspace(name);
+    await dashboard.refreshWorkspaces();
+    setArchivesOpen(false);
+  };
 
   return (
     <>
@@ -39,6 +46,7 @@ export default function App() {
           <WorkspaceTabs workspaces={dashboard.workspaces} selected={dashboard.selected} onSelect={dashboard.selectWorkspace} />
           <div className="toolbar-actions">
             <ThemePicker />
+            <button type="button" className="secondary-button" onClick={() => setArchivesOpen(true)}>🗃 已封存</button>
             {!dashboard.bootstrap.readonly && <button type="button" className="success-button" onClick={() => setLauncherOpen(true)}>＋ 啟動／管理</button>}
           </div>
         </header>
@@ -63,6 +71,7 @@ export default function App() {
         )}
       </div>
       {launcherOpen && <LauncherModal workspaces={dashboard.workspaces} onClose={() => setLauncherOpen(false)} onLaunched={launched} />}
+      {archivesOpen && <ArchivesModal readonly={dashboard.bootstrap.readonly} onClose={() => setArchivesOpen(false)} onRestored={restored} />}
     </>
   );
 }
