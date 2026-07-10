@@ -1,8 +1,22 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import type { FleetHistoryEntry, WorkspaceSummary } from "../../shared/api/types";
 import { deriveFleetEvents } from "./fleetEvents";
 
 const PHASE_NAMES: Record<string, string> = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
+type FleetFilter = "all" | "attention" | "running" | "done";
+
+function needsAttention(workspace: WorkspaceSummary): boolean {
+  return !!(
+    (workspace.red_streak ?? 0) > 0 ||
+    (workspace.stall_rounds ?? 0) > 0 ||
+    (workspace.issues ?? 0) > 0 ||
+    (workspace.agent_failure_streak ?? 0) > 0 ||
+    (workspace.state_recovery_count ?? 0) > 0 ||
+    workspace.state_recovery_pending ||
+    workspace.goal_changed
+  );
+}
+
 function progress(workspace: WorkspaceSummary): { done: number; total: number; pct: number } {
   const total = workspace.plan_len ?? 0;
   const done = workspace.completed ?? 0;
@@ -24,6 +38,7 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
   onSelect: (name: string) => void;
 }) {
   const events = useMemo(() => deriveFleetEvents(fleetHistory), [fleetHistory]);
+  const [filter, setFilter] = useState<FleetFilter>("all");
 
   const running = workspaces.filter((workspace) => workspace.running).length;
   const done = workspaces.filter((workspace) => workspace.phase === "done").length;
@@ -31,15 +46,19 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
   const executing = workspaces.filter((workspace) => workspace.phase === "exec").length;
   const totalTasks = workspaces.reduce((sum, workspace) => sum + (workspace.plan_len ?? 0), 0);
   const doneTasks = workspaces.reduce((sum, workspace) => sum + (workspace.completed ?? 0), 0);
-  const alerts = workspaces.filter((workspace) => (
-    (workspace.red_streak ?? 0) > 0 ||
-    (workspace.stall_rounds ?? 0) > 0 ||
-    (workspace.issues ?? 0) > 0 ||
-    (workspace.agent_failure_streak ?? 0) > 0 ||
-    (workspace.state_recovery_count ?? 0) > 0 ||
-    workspace.state_recovery_pending ||
-    workspace.goal_changed
-  )).length;
+  const alerts = workspaces.filter(needsAttention).length;
+  const visibleWorkspaces = useMemo(() => {
+    if (filter === "attention") return workspaces.filter(needsAttention);
+    if (filter === "running") return workspaces.filter((workspace) => workspace.running);
+    if (filter === "done") return workspaces.filter((workspace) => workspace.phase === "done");
+    return workspaces;
+  }, [filter, workspaces]);
+  const filters: Array<{ id: FleetFilter; label: string; count: number }> = [
+    { id: "all", label: "全部", count: workspaces.length },
+    { id: "attention", label: "需關注", count: alerts },
+    { id: "running", label: "執行中", count: running },
+    { id: "done", label: "已完成", count: done },
+  ];
   const taskPct = totalTasks > 0 ? Math.round((doneTasks / totalTasks) * 100) : 0;
 
   return (
@@ -55,19 +74,22 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
           <div className="fleet-progress"><div className="fleet-progress-fill" style={{ width: `${taskPct}%` }} /></div>
         </div>
       </div>
+      <div className="fleet-filter-row">
+        <div className="fleet-filters" role="group" aria-label="Workspace 篩選">
+          {filters.map((item) => (
+            <button key={item.id} type="button" className={filter === item.id ? "active" : ""}
+              aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}>
+              {item.label} <span>{item.count}</span>
+            </button>
+          ))}
+        </div>
+        <span className="muted">顯示 {visibleWorkspaces.length} / {workspaces.length}</span>
+      </div>
       <div className="fleet-body">
         <div className="fleet-grid">
-          {workspaces.map((workspace) => {
+          {visibleWorkspaces.map((workspace) => {
             const { done: cardDone, total, pct } = progress(workspace);
-            const alert = (
-              (workspace.red_streak ?? 0) > 0 ||
-              (workspace.stall_rounds ?? 0) > 0 ||
-              (workspace.issues ?? 0) > 0 ||
-              (workspace.agent_failure_streak ?? 0) > 0 ||
-              (workspace.state_recovery_count ?? 0) > 0 ||
-              workspace.state_recovery_pending ||
-              workspace.goal_changed
-            );
+            const alert = needsAttention(workspace);
             const activity = currentActivity(workspace);
             return (
               <button key={workspace.name} type="button" className={`fleet-card phase-${workspace.phase ?? "unknown"}${workspace.running ? " running" : ""}`} onClick={() => onSelect(workspace.name)}>
@@ -103,7 +125,7 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
               </button>
             );
           })}
-          {!workspaces.length && <div className="empty-inline">尚未建立 workspace</div>}
+          {!visibleWorkspaces.length && <div className="empty-inline">{filter === "all" ? "尚未建立 workspace" : "沒有符合目前篩選的 workspace"}</div>}
         </div>
         <aside className="fleet-events" aria-label="事件推播">
           <div className="fleet-events-head"><strong>事件推播</strong><span className="muted">最近 {events.length} 則</span></div>

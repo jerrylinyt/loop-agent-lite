@@ -91,6 +91,11 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   const overview = page.getByRole("main", { name: "Fleet 總覽" });
   await expect(overview).toBeVisible();
   await expect(overview.getByText("執行中", { exact: true })).toBeVisible();
+  const runningFilter = overview.getByRole("button", { name: /^執行中 \d+$/ });
+  await runningFilter.click();
+  await expect(runningFilter).toHaveAttribute("aria-pressed", "true");
+  await expect(overview.locator(".fleet-card", { hasText: "e2e-workspace" })).toBeVisible();
+  await overview.getByRole("button", { name: /^全部 \d+$/ }).click();
   const fleetCard = overview.locator(".fleet-card", { hasText: "e2e-workspace" });
   await expect(fleetCard).toBeVisible();
   await expect(fleetCard.locator(".breathing-dot")).toBeVisible();
