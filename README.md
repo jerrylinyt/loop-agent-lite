@@ -86,8 +86,9 @@ JSON 輸出包含 `schema_version: 1`；單 workspace 直接帶狀態欄位，`-
 `--metrics N` 可搭配單一或全部 workspace，唯讀掃描每份 `history.log` 尾端最多 2 MiB，聚合最近 N 輪（上限 500）的平均、P50、P95、最慢輪與逾時率；未指定時完全不掃 history。
 
 Dashboard 也提供唯讀 `GET /api/health`，回傳 `schema_version: 1`、`status`（`ok`／`degraded`／`error`）與 workspace、執行中、需關注、state 錯誤、issues、Agent 異常、最近一輪逾時、state 復原、goal 變更及 stale PID 摘要；適合本機探針或外部監控。加上 `?strict=1` 時，`degraded`／`error` 會以 HTTP 503 回應，方便 readiness probe 直接判斷；預設仍維持 HTTP 200 並讓呼叫端讀取 status。瀏覽器頁首與即時 SSE 的 `health` event 使用同一份 projection，不會修復或改寫任何 workspace。
-`GET /api/round-metrics?ws=<name>&run=current&limit=100` 使用同一套 bounded/safe history reader，供 Dashboard 與外部觀測工具取得近期效能摘要、逐輪樣本，以及 Agent 結束但未送出 phase 完成回報的異常次數／異常率；Plan 以 `create-plan`／`plan-ok`、Exec 以 `done` 作為完成回報，`run=previous` 可分析保留的上一個 run。
+`GET /api/round-metrics?ws=<name>&run=current&limit=100` 使用同一套 bounded/safe history reader，供 Dashboard 與外部觀測工具取得近期效能摘要、逐輪樣本，以及 Agent 結束但未送出 phase 完成回報的異常次數／異常率；Plan 以 `create-plan`／`plan-ok`、Exec 以 `done` 作為完成回報，即使本輪有 Git 變更，沒有回報仍算異常。人工立即中斷的未完成輪不寫入 history，因此不進入異常分子或總輪數；`run=previous` 可分析保留的上一個 run。
 `GET /api/fleet-round-metrics` 會將所有 workspace 的輪次依 timestamp 合併，只聚合全體最新 500 筆並回傳效能、未回 DONE 異常次數與全域異常率摘要；SSE 的 `fleet-round-metrics` event 使用同一 projection，瀏覽器不會收到原始樣本。
+`GET /api/anomalies[?ws=<name>&run=current]` 列出與 Overview 全域 500 輪或 workspace 100 輪統計一致的最近異常（最多 100 筆）；新發生的異常會把 Agent log 尾端最多 2 MiB 保存在 `logs/anomalies/`，每個 workspace 最多 100 份。`GET /api/anomaly-log?ws=<name>&id=<id>` 安全讀取其中一份；舊異常仍可列出輪次判定，但功能啟用前沒有可回補的 Agent log。
 
 常用選項：
 
@@ -118,7 +119,7 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 - 左側是 Loop 狀態；右側是 Agent 輸出，可切換 Agent／其他／全部，並可用「過濾…」輸入框對長 log 做文字過濾；Agent 的 ANSI 色碼會直接上色。
 - 瀏覽器 tab 標題與 favicon 會隨狀態變燈（執行＝綠、紅燈連跳＝紅、完成＝旗、停止＝灰），掛在背景 tab 也能監控。
 - workspace header 有輪次 sparkline（綠紅灰橙＝驗證綠／紅／規劃／reset，點擊開逐輪判定）與頂部健康色帶（越紅越接近 reset 防線）；進行中 round 會每秒顯示 elapsed 與 timeout 剩餘時間，最後 60 秒轉為警示。立即停止會凍結並保留中斷輪次時間；SIGKILL 無法留下停止時間時顯示「至少」已執行多久。若 loop 被強制終止後留下 stale PID，詳細頁也會保留警示。
-- 工具列「📺 總覽」切換電視牆模式：頂部在「任務完成」右側整合所有 workspace 依時間最新 500 筆輪次的平均、P50、P95、最慢、逾時率、未回 DONE 次數與全域異常率；下方各 workspace 卡片仍各自顯示近期最多 100 輪摘要及相同異常統計，點卡片切入。整合卡只透過 SSE 傳統計結果，不傳 500 筆原始樣本；卡片與事件推播共用同一連線，不另開輪詢，輪次計時由瀏覽器依 state 時間戳本地更新，不為時鐘製造高頻 SSE；可用名稱搜尋與「全部／需關注／執行中／已完成」篩選卡片，選擇會保存在瀏覽器；頁首只有在真的有問題時才顯示可點擊的「工作區需處理」，點下會直接篩出問題卡片，卡片列出原因並可切入指定 workspace。已完成 workspace 的歷史停滯／紅燈不再誤算為目前告警；未讀 issues、checkpoint、goal 變更、stale PID 與 state 錯誤仍會標示。搭配 `--read-only` 適合掛牆監控。
+- 工具列「📺 總覽」切換電視牆模式：頂部在「任務完成」右側整合所有 workspace 依時間最新 500 筆輪次的平均、P50、P95、最慢、逾時率、未回 DONE 次數與全域異常率；點「未回 DONE」可展開異常 workspace／round 清單，再點輪次查看保留的 Agent log。下方各 workspace 卡片仍各自顯示近期最多 100 輪摘要及相同異常統計，點卡片切入；輪次紀錄中的異常數也可開啟同一種清單與 log 檢視。整合卡只透過 SSE 傳統計結果，不傳 500 筆原始樣本；卡片與事件推播共用同一連線，不另開輪詢，輪次計時由瀏覽器依 state 時間戳本地更新，不為時鐘製造高頻 SSE；可用名稱搜尋與「全部／需關注／執行中／已完成」篩選卡片，選擇會保存在瀏覽器；頁首只有在真的有問題時才顯示可點擊的「工作區需處理」，點下會直接篩出問題卡片，卡片列出原因並可切入指定 workspace。已完成 workspace 的歷史停滯／紅燈不再誤算為目前告警；未讀 issues、checkpoint、goal 變更、stale PID 與 state 錯誤仍會標示。搭配 `--read-only` 適合掛牆監控。
 - 分隔線可拖曳調整欄寬；箭頭可收合，設定會保存在瀏覽器。
 - 狀態列的「🎯 goal」「🕒 輪次紀錄」「📨 prompt」chips 分別顯示目前 goal 內容、history.log 逐輪判定（含每輪 Agent 耗時／逾時／是否未回 phase DONE）、以及最近一輪送給 Agent 的完整 prompt（全部唯讀）；「輪次紀錄」保留最近 100 輪的樣本數、平均、P50、P95、最慢輪、逾時率、未回 DONE 次數與異常率完整分析，Overview 卡片同步提供快速摘要。goal 在停機期間變更時，Goal 視窗會用保存的計畫基準 hash 從 Git 歷史重建並顯示 unified diff。
 - Issues 視窗可「標記已讀」而不刪除稽核紀錄；只有未讀 issues 會讓 fleet 顯示需關注，仍可用「清空全部」永久移除紀錄。

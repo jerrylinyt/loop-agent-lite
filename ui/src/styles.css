@@ -294,6 +294,9 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .history-metric span, .history-metric small { color: var(--muted); font-size: 11px; }
 .history-metric strong { font-size: 14px; font-variant-numeric: tabular-nums; }
 .history-metric.warning strong, .history-metric.warning small { color: var(--warning); }
+.history-metric-action { padding: 0; }
+.history-metric-button { display: grid; width: 100%; height: 100%; align-content: center; padding: 7px 9px; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.history-metric-action:hover { border-color: var(--accent); background: var(--accent-soft); }
 .modal-table-scroll { max-height: 58vh; overflow: auto; border: 1px solid var(--border-soft); border-radius: 8px; }
 .archive-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
@@ -412,11 +415,14 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .fleet-stat.fleet-performance { min-width: 340px; }
 .fleet-performance-summary { margin-top: 3px; padding-top: 6px; border-top: 1px solid var(--border-soft); }
 .fleet-performance-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
-.fleet-performance-grid > span, .fleet-anomaly-grid > span { display: grid; min-width: 0; }
+.fleet-performance-grid > span, .fleet-anomaly-grid > span, .fleet-anomaly-grid > button { display: grid; min-width: 0; }
 .fleet-performance-grid small, .fleet-anomaly-grid small, .fleet-performance-empty { color: var(--muted); font-size: 10px; }
 .fleet-performance-grid b, .fleet-anomaly-grid b { overflow: hidden; color: var(--text); font-size: 12px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; }
 .fleet-performance-grid .warning b, .fleet-anomaly-grid .warning b { color: var(--warning); }
 .fleet-anomaly-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 5px; padding-top: 5px; border-top: 1px solid var(--border-soft); }
+.fleet-anomaly-button { position: relative; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.fleet-anomaly-button:hover b { text-decoration: underline; }
+.fleet-anomaly-button i { position: absolute; right: 0; bottom: 0; color: var(--accent); font-size: 9px; font-style: normal; }
 .fleet-performance-empty { margin-top: 5px; }
 .fleet-filter-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .fleet-filters { display: inline-flex; align-items: center; gap: 3px; padding: 3px; border-radius: 8px; background: var(--surface-subtle); }
@@ -464,6 +470,22 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .fleet-progress-text { position: absolute; inset: 0; display: grid; place-items: center; color: var(--text); font-size: 10px; font-variant-numeric: tabular-nums; }
 .fleet-card-alerts { display: flex; flex-wrap: wrap; gap: 6px; }
 .fleet-card-repo { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.anomaly-explorer { display: grid; min-height: 420px; grid-template-columns: minmax(280px, .9fr) minmax(0, 1.5fr); gap: 10px; }
+.anomaly-list, .anomaly-log-viewer { display: flex; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--surface); }
+.anomaly-list > header, .anomaly-log-viewer > header { display: flex; flex: none; align-items: baseline; justify-content: space-between; gap: 8px; padding: 9px 10px; border-bottom: 1px solid var(--border-soft); }
+.anomaly-list > header span, .anomaly-log-viewer > header span { color: var(--muted); font-size: 10px; }
+.anomaly-list { overflow-y: auto; }
+.anomaly-record { display: grid; gap: 3px; padding: 9px 10px; border: 0; border-bottom: 1px solid var(--border-soft); background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.anomaly-record:hover, .anomaly-record.active { background: var(--accent-soft); }
+.anomaly-record > span { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px; }
+.anomaly-record b, .anomaly-record em { font-size: 11px; font-style: normal; font-weight: normal; }
+.anomaly-record em { color: var(--accent); }
+.anomaly-record small { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.anomaly-record i { justify-self: start; padding: 1px 5px; border-radius: 999px; font-size: 9px; font-style: normal; }
+.anomaly-record .log-saved { background: var(--success-soft); color: var(--success); }
+.anomaly-record .log-missing { background: var(--surface-subtle); color: var(--muted); }
+.anomaly-log-viewer pre { flex: 1; min-height: 0; margin: 0; overflow: auto; padding: 10px; color: var(--text); font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+@media (max-width: 760px) { .anomaly-explorer { grid-template-columns: 1fr; } .anomaly-list { max-height: 34vh; } }
 .active-toggle { outline: 2px solid var(--accent); }
 
 /* Health strip:紅連跳/停滯逼近 reset 防線時由綠轉紅 */

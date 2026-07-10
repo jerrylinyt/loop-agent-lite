@@ -106,6 +106,32 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(fleetMetrics).toContainText("逾時");
   await expect(fleetMetrics).toContainText("未回 DONE");
   await expect(fleetMetrics).toContainText("異常率");
+  await page.route("**/api/anomalies", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({
+      limit: 100,
+      total_count: 1,
+      records: [{
+        workspace: "e2e-workspace", round: 7, seconds: 12.3, timed_out: false,
+        missing_done: true, phase: "exec", task: "task-1", signal: "", changed: true,
+        rc: 0, validate: "PASS", timestamp: "2026-07-10T10:00:00",
+        log_id: "20260710T100000000000-r000007-deadbeef", log_truncated: false
+      }]
+    }) });
+  });
+  await page.route("**/api/anomaly-log?**", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({
+      id: "20260710T100000000000-r000007-deadbeef", workspace: "e2e-workspace",
+      round: 7, timestamp: "2026-07-10T10:00:00", truncated: false,
+      data: "E2E retained anomaly log"
+    }) });
+  });
+  await fleetMetrics.getByRole("button", { name: /未回 DONE/ }).click();
+  const anomalyModal = page.getByRole("dialog", { name: "全部 workspace｜異常輪" });
+  await expect(anomalyModal).toBeVisible();
+  await anomalyModal.getByRole("button", { name: "e2e-workspace round 7 異常" }).click();
+  await expect(anomalyModal.getByRole("region", { name: "異常輪 Log" })).toContainText("E2E retained anomaly log");
+  await anomalyModal.getByRole("button", { name: "關閉對話框" }).click();
+  await expect(anomalyModal).toBeHidden();
   const runningFilter = overview.getByRole("button", { name: /^執行中 \d+$/ });
   await runningFilter.click();
   await expect(runningFilter).toHaveAttribute("aria-pressed", "true");
@@ -206,6 +232,12 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(roundMetrics).toContainText("逾時率");
   await expect(roundMetrics).toContainText("未回 DONE");
   await expect(roundMetrics).toContainText("異常率");
+  await expect(roundMetrics).toContainText("人工中斷不計");
+  await roundMetrics.getByRole("button", { name: /未回 DONE/ }).click();
+  const workspaceAnomalyModal = page.getByRole("dialog", { name: "e2e-workspace｜異常輪" });
+  await expect(workspaceAnomalyModal).toBeVisible();
+  await workspaceAnomalyModal.getByRole("button", { name: "關閉對話框" }).click();
+  await expect(workspaceAnomalyModal).toBeHidden();
   await expect(historyModal).not.toContainText("檔案較大，僅顯示最近的紀錄");
   await historyModal.getByRole("button", { name: "重新整理" }).click();
   await expect(firstHistoryRow).toContainText("task-1");

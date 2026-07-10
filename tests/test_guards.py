@@ -360,6 +360,71 @@ class TestRoundTelemetry(unittest.TestCase):
             self.assertIsNone(state["round_interrupted_at"])
             self.assertIn("timeout=True", history)
 
+    def test_exec_progress_without_done_is_anomaly(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            plan = root / "plan.json"
+            plan.write_text('[{"order": 1, "task": "implement feature"}]')
+            agent = root / "progress_agent.py"
+            agent.write_text(
+                "import sys\n"
+                "from pathlib import Path\n"
+                "sys.stdin.read()\n"
+                "print('anomaly-log-marker', flush=True)\n"
+                "Path('feature.txt').write_text('implemented')\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            result = subprocess.run(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "normal-progress",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--import-plan", str(plan),
+                 "--start-phase", "exec", "--max-rounds", "1"],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            history = (workspace_root / "normal-progress" / "history.log").read_text()
+            self.assertIn("changed=True signal=-", history)
+            self.assertIn("done_missing=True", history)
+            anomaly_dir = workspace_root / "normal-progress" / "logs" / "anomalies"
+            metadata_files = list(anomaly_dir.glob("*.json"))
+            log_files = list(anomaly_dir.glob("*.log"))
+            self.assertEqual(len(metadata_files), 1)
+            self.assertEqual(len(log_files), 1)
+            metadata = json.loads(metadata_files[0].read_text())
+            self.assertEqual(metadata["round"], 1)
+            self.assertEqual(metadata["phase"], "exec")
+            self.assertEqual(metadata["task"], "task-1")
+            self.assertIn("anomaly-log-marker", log_files[0].read_text())
+
+    def test_anomaly_log_retention_is_capped_and_tail_bounded(self):
+        with tempfile.TemporaryDirectory() as d:
+            workspace = Path(d) / "workspace"
+            logs = workspace / "logs"
+            logs.mkdir(parents=True)
+            old_max_bytes = L.ANOMALY_LOG_MAX_BYTES
+            try:
+                L.ANOMALY_LOG_MAX_BYTES = 8
+                for index in range(L.ANOMALY_LOG_MAX_COUNT + 2):
+                    current = logs / f"round-{index:04d}.log"
+                    current.write_text(f"prefix-{index:03d}-tail")
+                    L.preserve_anomaly_log(
+                        workspace, current, round_number=index, phase="exec",
+                        task="task-1", timestamp=(datetime(2026, 7, 10) + timedelta(seconds=index)).isoformat(),
+                    )
+            finally:
+                L.ANOMALY_LOG_MAX_BYTES = old_max_bytes
+            anomaly_dir = logs / "anomalies"
+            metadata_files = sorted(anomaly_dir.glob("*.json"))
+            log_files = sorted(anomaly_dir.glob("*.log"))
+            self.assertEqual(len(metadata_files), L.ANOMALY_LOG_MAX_COUNT)
+            self.assertEqual(len(log_files), L.ANOMALY_LOG_MAX_COUNT)
+            latest = json.loads(metadata_files[-1].read_text())
+            self.assertTrue(latest["truncated"])
+            self.assertEqual(latest["retained_size"], 8)
+            self.assertTrue((anomaly_dir / latest["log_file"]).read_text().endswith("101-tail"))
+
 
 class TestLiveRoundTiming(unittest.TestCase):
     """進行中 round 可觀測；正常輪末清除，立即停止則保留凍結的中斷上下文。"""
@@ -429,6 +494,12 @@ class TestLiveRoundTiming(unittest.TestCase):
                 self.assertEqual(stopped["round_deadline_at"], observed["round_deadline_at"])
                 self.assertIsNotNone(stopped["round_interrupted_at"])
                 self.assertIsNone(stopped["loop"]["pid"])
+                history_path = workspace_root / "live-round" / "history.log"
+                self.assertFalse(history_path.exists(), "人工中斷輪不得寫入已結束輪次或異常統計")
+                interrupted_metrics = L.read_round_metrics(history_path, 100)
+                self.assertEqual(interrupted_metrics["sample_count"], 0)
+                self.assertEqual(interrupted_metrics["missing_done_count"], 0)
+                self.assertFalse((workspace_root / "live-round" / "logs" / "anomalies").exists())
 
                 stopped_status = subprocess.run(
                     [sys.executable, STATUS_PY, "--name", "live-round"],
@@ -448,9 +519,9 @@ class TestRoundMetrics(unittest.TestCase):
         "2026-07-10T10:00:00 round=1 phase=plan task=- changed=False\n"
         "2026-07-10T10:01:00 round=1 phase=plan task=- secs=1.000 timeout=False changed=False signal=ok\n"
         "2026-07-10T10:02:00 round=9 phase=exec task=- secs=nan timeout=True changed=False signal=-\n"
-        "2026-07-10T10:03:00 round=2 phase=exec task=task-1 secs=4.000 timeout=True changed=False signal=-\n"
+        "2026-07-10T10:03:00 round=2 phase=exec task=task-1 secs=4.000 timeout=False changed=True signal=- done_missing=True agent_ok=True tamper=False validate=PASS\n"
         "2026-07-10T10:04:00 round=3 phase=exec task=task-1 secs=2.000 timeout=False changed=False signal=done\n"
-        "2026-07-10T10:05:00 round=4 phase=exec task=task-1 secs=8.000 timeout=False changed=False signal=- done_missing=True\n"
+        "2026-07-10T10:05:00 round=4 phase=exec task=task-1 secs=8.000 timeout=True changed=False signal=- done_missing=True\n"
     )
 
     class ResponseCapture:
@@ -3213,6 +3284,73 @@ class TestFleetHistoryProjection(unittest.TestCase):
                 self.assertEqual(alpha["round_started_at"], "2026-07-10T10:00:00")
                 self.assertEqual(alpha["round_deadline_at"], "2026-07-10T10:30:00")
                 self.assertIsNone(alpha["round_interrupted_at"])
+            finally:
+                D.ROOT = old_root
+
+
+class TestAnomalyLogProjection(unittest.TestCase):
+    class ResponseCapture:
+        response = None
+        _ws_dir = D.Handler._ws_dir
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_workspace_and_global_lists_link_to_safe_preserved_log(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            workspace = root / "alpha"
+            logs = workspace / "logs"
+            logs.mkdir(parents=True)
+            timestamp = "2026-07-10T10:00:00"
+            (workspace / "history.log").write_text(
+                f"{timestamp} round=7 phase=exec task=task-2 rc=0 secs=2.500 "
+                "timeout=False changed=True signal=- done_missing=True tamper=False "
+                "agent_ok=True validate=PASS flag=0 done=0\n",
+                encoding="utf-8",
+            )
+            round_log = logs / "round-0007.log"
+            round_log.write_text("preserved-agent-output\n", encoding="utf-8")
+            metadata = L.preserve_anomaly_log(
+                workspace, round_log, round_number=7, phase="exec",
+                task="task-2", timestamp=timestamp,
+            )
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                workspace_projection = D.read_anomaly_records(workspace)
+                self.assertEqual(workspace_projection["total_count"], 1)
+                record = workspace_projection["records"][0]
+                self.assertEqual(record["round"], 7)
+                self.assertTrue(record["changed"])
+                self.assertEqual(record["log_id"], metadata["id"])
+
+                global_projection = D.read_anomaly_records()
+                self.assertEqual(global_projection["total_count"], 1)
+                self.assertEqual(global_projection["records"][0]["workspace"], "alpha")
+
+                saved = D.read_preserved_anomaly_log(workspace, metadata["id"])
+                self.assertIn("preserved-agent-output", saved["data"])
+
+                handler = self.ResponseCapture()
+                handler.path = "/api/anomalies?ws=alpha"
+                D.Handler.do_GET(handler)
+                self.assertEqual(handler.response[0], 200)
+                self.assertEqual(handler.response[1]["records"][0]["log_id"], metadata["id"])
+
+                handler = self.ResponseCapture()
+                handler.path = f"/api/anomaly-log?ws=alpha&id={metadata['id']}"
+                D.Handler.do_GET(handler)
+                self.assertEqual(handler.response[0], 200)
+                self.assertIn("preserved-agent-output", handler.response[1]["data"])
+
+                unsafe = self.ResponseCapture()
+                unsafe.path = "/api/anomaly-log?ws=alpha&id=.."
+                D.Handler.do_GET(unsafe)
+                self.assertEqual(unsafe.response[0], 400)
             finally:
                 D.ROOT = old_root
 

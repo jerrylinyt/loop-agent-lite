@@ -79,7 +79,36 @@ export interface RoundTelemetrySample {
   seconds: number;
   timed_out: boolean;
   missing_done: boolean;
+  phase: string;
+  task: string;
+  signal: string;
+  changed: boolean;
+  rc: number | null;
+  validate: string;
   timestamp: string;
+}
+
+export interface AnomalyRecord extends RoundTelemetrySample {
+  workspace: string;
+  log_id: string | null;
+  log_truncated: boolean;
+}
+
+export interface AnomalyListResponse {
+  error?: string;
+  limit: number;
+  total_count: number;
+  records: AnomalyRecord[];
+}
+
+export interface AnomalyLogResponse {
+  error?: string;
+  id?: string;
+  workspace?: string;
+  round?: number;
+  timestamp?: string;
+  truncated?: boolean;
+  data?: string;
 }
 
 export interface RoundMetrics {

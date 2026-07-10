@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { FleetHistoryEntry, FleetRoundMetrics, WorkspaceSummary } from "../../shared/api/types";
+import AnomalyLogModal from "./AnomalyLogModal";
 import { deriveFleetEvents } from "./fleetEvents";
 import { deriveRoundTiming, useRoundNow } from "./roundTiming";
 
@@ -67,6 +68,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
     Boolean(workspace.round_started_at && !workspace.round_interrupted_at)));
   const [filter, setFilter] = useState<FleetFilter>(initialFleetFilter);
   const [search, setSearch] = useState(() => localStorage.getItem("fleet-search") ?? "");
+  const [anomaliesOpen, setAnomaliesOpen] = useState(false);
 
   useEffect(() => {
     if (attentionRequest > 0) {
@@ -126,7 +128,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
           <strong>{fleetMetrics?.sample_count ?? 0} 輪</strong>
           <span>全部 workspace 近 500 輪</span>
           {fleetMetrics && fleetMetrics.sample_count > 0 ? (
-            <div className="fleet-performance-summary" title={`${fleetMetrics.workspace_count} 個 workspace 合併後，取時間最新 ${fleetMetrics.limit} 個已結束輪次；Plan 以 create-plan / plan-ok、Exec 以 done 作為完成回報`}>
+            <div className="fleet-performance-summary" title={`${fleetMetrics.workspace_count} 個 workspace 合併後，取時間最新 ${fleetMetrics.limit} 個已結束輪次；Plan 以 create-plan / plan-ok、Exec 以 done 作為完成回報；有 Git 變更但未回報仍算異常，人工中斷輪不計`}>
               <div className="fleet-performance-grid">
                 <span><small>平均</small><b>{formatMetric(fleetMetrics.average_seconds)}</b></span>
                 <span><small>P50</small><b>{formatMetric(fleetMetrics.p50_seconds)}</b></span>
@@ -135,7 +137,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
                 <span className={fleetMetrics.timeout_count ? "warning" : ""}><small>逾時</small><b>{fleetMetrics.timeout_rate_pct}%</b></span>
               </div>
               <div className="fleet-anomaly-grid">
-                <span className={fleetMetrics.missing_done_count ? "warning" : ""}><small>未回 DONE</small><b>{fleetMetrics.missing_done_count} 次</b></span>
+                <button type="button" className={`fleet-anomaly-button${fleetMetrics.missing_done_count ? " warning" : ""}`} onClick={() => setAnomaliesOpen(true)}><small>未回 DONE</small><b>{fleetMetrics.missing_done_count} 次</b><i>查看</i></button>
                 <span className={fleetMetrics.missing_done_count ? "warning" : ""}><small>異常率</small><b>{fleetMetrics.missing_done_rate_pct}%</b></span>
               </div>
             </div>
@@ -195,7 +197,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
                       <span><small>最慢</small><strong>{formatMetric(metrics.max_seconds)}</strong></span>
                       <span className={metrics.timeout_count ? "warning" : ""}><small>逾時</small><strong>{metrics.timeout_rate_pct}%</strong></span>
                     </div>
-                    <div className="fleet-card-anomaly-grid">
+                    <div className="fleet-card-anomaly-grid" title="有 Git 變更但未回報仍算異常；人工中斷輪不計">
                       <span className={metrics.missing_done_count ? "warning" : ""}><small>未回 DONE</small><strong>{metrics.missing_done_count} 次</strong></span>
                       <span className={metrics.missing_done_count ? "warning" : ""}><small>異常率</small><strong>{metrics.missing_done_rate_pct}%</strong></span>
                     </div>
@@ -235,6 +237,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
           </div>
         </aside>
       </div>
+      {anomaliesOpen && <AnomalyLogModal onClose={() => setAnomaliesOpen(false)} />}
     </main>
   );
 }

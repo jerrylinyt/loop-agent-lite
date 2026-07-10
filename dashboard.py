@@ -638,6 +638,7 @@ FLEET_METRICS_TAIL = 512 * 1024  # 足以 bounded 掃描單 workspace 近期 500
 FLEET_METRICS_LIMIT = 100
 FLEET_AGGREGATE_LIMIT = 500      # 全 workspace 合併後只取時間最新 500 筆
 FLEET_HISTORY_SSE_INTERVAL = 2.0  # 事件流只在歷史有變時推送，避免每圈重送整段尾端
+ANOMALY_ID_RE = re.compile(r"\d{8}T\d{12}-r\d{6}-[0-9a-f]{8}")
 
 
 def aggregate_fleet_round_metrics(samples, *, history_truncated=False):
@@ -725,6 +726,119 @@ def read_fleet_observability():
 def read_fleet_history():
     """相容的 workspace history list API；全體摘要由 sibling projection 提供。"""
     return read_fleet_observability()["entries"]
+
+
+def read_preserved_anomaly_metadata(workspace_dir: Path):
+    """安全讀取單 workspace 最多 100 份異常 log 索引。"""
+    anomaly_dir = loop_mod.workspace_directory(
+        workspace_dir / "logs" / "anomalies", "異常 log 目錄")
+    if anomaly_dir is None:
+        return []
+    records = []
+    metadata_paths = [path for path in anomaly_dir.glob("*.json")
+                      if ANOMALY_ID_RE.fullmatch(path.stem)]
+    for path in sorted(metadata_paths, reverse=True)[:loop_mod.ANOMALY_LOG_MAX_COUNT]:
+        try:
+            fd = loop_mod._open_regular(path, os.O_RDONLY)
+            with os.fdopen(fd, "rb", closefd=True) as stream:
+                size = os.fstat(stream.fileno()).st_size
+                if size > 64 * 1024:
+                    continue
+                metadata = json.loads(stream.read().decode("utf-8"))
+        except (FileNotFoundError, OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if (not isinstance(metadata, dict) or metadata.get("id") != path.stem or
+                metadata.get("log_file") != f"{path.stem}.log" or
+                not isinstance(metadata.get("round"), int) or
+                not isinstance(metadata.get("timestamp"), str)):
+            continue
+        records.append(metadata)
+    return records
+
+
+def anomaly_records_for_workspace(workspace_dir: Path, *, run="current", round_limit=100):
+    history_name = "history.log" if run == "current" else "history.log.1"
+    metrics = loop_mod.read_round_metrics(workspace_dir / history_name, round_limit)
+    preserved = {
+        (item["timestamp"], item["round"]): item
+        for item in read_preserved_anomaly_metadata(workspace_dir)
+    }
+    records = []
+    for sample in metrics["samples"]:
+        if not sample["missing_done"]:
+            continue
+        saved = preserved.get((sample["timestamp"], sample["round"]))
+        records.append({
+            **sample,
+            "workspace": workspace_dir.name,
+            "log_id": saved.get("id") if saved else None,
+            "log_truncated": bool(saved.get("truncated")) if saved else False,
+        })
+    return records
+
+
+def read_anomaly_records(workspace_dir: Path = None, *, run="current"):
+    """列出與 workspace 100 輪／Overview 全域 500 輪統計一致的異常，最多回 100 筆。"""
+    if workspace_dir is not None:
+        records = anomaly_records_for_workspace(workspace_dir, run=run, round_limit=100)
+    else:
+        samples = []
+        if ROOT.is_dir():
+            for directory in sorted(ROOT.iterdir()):
+                if (not loop_mod.valid_workspace_name(directory.name) or directory.is_symlink() or
+                        not directory.is_dir()):
+                    continue
+                try:
+                    metrics = loop_mod.read_round_metrics(
+                        directory / "history.log", FLEET_AGGREGATE_LIMIT)
+                    preserved = {
+                        (item["timestamp"], item["round"]): item
+                        for item in read_preserved_anomaly_metadata(directory)
+                    }
+                except (OSError, ValueError):
+                    continue
+                for sample in metrics["samples"]:
+                    saved = preserved.get((sample["timestamp"], sample["round"]))
+                    samples.append({
+                        **sample,
+                        "workspace": directory.name,
+                        "log_id": saved.get("id") if saved else None,
+                        "log_truncated": bool(saved.get("truncated")) if saved else False,
+                    })
+        samples = sorted(samples, key=lambda item: (
+            item["timestamp"], item["workspace"], item["round"]))[-FLEET_AGGREGATE_LIMIT:]
+        records = [sample for sample in samples if sample["missing_done"]]
+    records.sort(key=lambda item: (
+        item["timestamp"], item["workspace"], item["round"]), reverse=True)
+    return {
+        "limit": loop_mod.ANOMALY_LOG_MAX_COUNT,
+        "total_count": len(records),
+        "records": records[:loop_mod.ANOMALY_LOG_MAX_COUNT],
+    }
+
+
+def read_preserved_anomaly_log(workspace_dir: Path, anomaly_id: str):
+    if not isinstance(anomaly_id, str) or not ANOMALY_ID_RE.fullmatch(anomaly_id):
+        raise ValueError("異常 log id 不合法")
+    metadata = next((item for item in read_preserved_anomaly_metadata(workspace_dir)
+                     if item["id"] == anomaly_id), None)
+    if metadata is None:
+        raise FileNotFoundError("異常 log 不存在或已超過保留上限")
+    log_path = workspace_dir / "logs" / "anomalies" / f"{anomaly_id}.log"
+    fd = loop_mod._open_regular(log_path, os.O_RDONLY)
+    with os.fdopen(fd, "rb", closefd=True) as stream:
+        data = stream.read(loop_mod.ANOMALY_LOG_MAX_BYTES + 1)
+    if len(data) > loop_mod.ANOMALY_LOG_MAX_BYTES:
+        data = data[-loop_mod.ANOMALY_LOG_MAX_BYTES:]
+        metadata = {**metadata, "truncated": True}
+    return {
+        "id": anomaly_id,
+        "workspace": workspace_dir.name,
+        "round": metadata["round"],
+        "timestamp": metadata["timestamp"],
+        "truncated": bool(metadata.get("truncated")),
+        "data": data.decode("utf-8", errors="replace"),
+    }
 
 
 def read_goal(name):
@@ -1457,6 +1571,36 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/api/fleet-round-metrics":
                 projection = read_fleet_observability()
                 self._out(200, json.dumps(projection["metrics"], ensure_ascii=False))
+            elif u.path == "/api/anomalies":
+                run = q.get("run", ["current"])[0]
+                if run not in ("current", "previous"):
+                    self._err("anomaly run 必須是 current 或 previous")
+                    return
+                if q.get("ws"):
+                    directory = self._ws_dir(q)
+                    if directory is None:
+                        return
+                    projection = read_anomaly_records(directory, run=run)
+                else:
+                    if run != "current":
+                        self._err("全域異常清單只支援 current run")
+                        return
+                    projection = read_anomaly_records()
+                self._out(200, json.dumps(projection, ensure_ascii=False))
+            elif u.path == "/api/anomaly-log":
+                directory = self._ws_dir(q)
+                if directory is None:
+                    return
+                anomaly_id = q.get("id", [""])[0]
+                try:
+                    projection = read_preserved_anomaly_log(directory, anomaly_id)
+                except FileNotFoundError as e:
+                    self._err(str(e), 404)
+                    return
+                except ValueError as e:
+                    self._err(str(e))
+                    return
+                self._out(200, json.dumps(projection, ensure_ascii=False))
             else:
                 self._err("not found", 404)
         except (ValueError, BrokenPipeError, ConnectionResetError):

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import Modal from "../../shared/components/Modal";
 import type { IncrementalResponse, RoundMetrics } from "../../shared/api/types";
+import AnomalyLogModal from "./AnomalyLogModal";
 import { parseHistory, type HistoryRow } from "./historyParser";
 
 function formatDuration(seconds: number | null): string {
@@ -16,6 +17,7 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
   const [note, setNote] = useState("");
   const [loading, setLoading] = useState(true);
   const requestSeq = useRef(0);
+  const [anomaliesOpen, setAnomaliesOpen] = useState(false);
 
   const load = useCallback(async () => {
     // 切換 run 分頁/按重新整理會連發請求;舊請求晚回不得覆蓋新分頁的結果
@@ -66,8 +68,8 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
             <div className="history-metric" role="listitem"><span>P95</span><strong>{formatDuration(metrics.p95_seconds)}</strong></div>
             <div className="history-metric" role="listitem"><span>最慢</span><strong>{formatDuration(metrics.max_seconds)}</strong><small>round {metrics.slowest_round}</small></div>
             <div className={`history-metric${metrics.timeout_count ? " warning" : ""}`} role="listitem"><span>逾時率</span><strong>{metrics.timeout_rate_pct}%</strong><small>{metrics.timeout_count} 輪</small></div>
-            <div className={`history-metric${metrics.missing_done_count ? " warning" : ""}`} role="listitem"><span>未回 DONE</span><strong>{metrics.missing_done_count} 次</strong></div>
-            <div className={`history-metric${metrics.missing_done_count ? " warning" : ""}`} role="listitem"><span>異常率</span><strong>{metrics.missing_done_rate_pct}%</strong><small>占全部已結束輪次</small></div>
+            <div className={`history-metric history-metric-action${metrics.missing_done_count ? " warning" : ""}`} role="listitem"><button type="button" className="history-metric-button" onClick={() => setAnomaliesOpen(true)}><span>未回 DONE</span><strong>{metrics.missing_done_count} 次</strong><small>點擊查看輪次與 log</small></button></div>
+            <div className={`history-metric${metrics.missing_done_count ? " warning" : ""}`} role="listitem"><span>異常率</span><strong>{metrics.missing_done_rate_pct}%</strong><small>人工中斷不計</small></div>
           </div>
         </section>
       )}
@@ -93,6 +95,7 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
           </tbody>
         </table>
       </div>
+      {anomaliesOpen && <AnomalyLogModal workspace={workspace} run={run} onClose={() => setAnomaliesOpen(false)} />}
     </Modal>
   );
 }

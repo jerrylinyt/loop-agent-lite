@@ -66,6 +66,8 @@ CONSOLE_BACKUPS = 3                    # 保留 console.log.1～.3
 HISTORY_MAX_BYTES = 10 * 1024 * 1024  # history.log 當前 run 上限；只保留最新完整尾段
 ROUND_METRICS_SCAN_BYTES = 2 * 1024 * 1024  # 效能投影只掃尾端，避免讀完整長 history
 ROUND_METRICS_MAX_SAMPLES = 500       # API/CLI 單次最多聚合的近期輪數
+ANOMALY_LOG_MAX_COUNT = 100           # 每個 workspace 最多保留的異常輪 Agent log
+ANOMALY_LOG_MAX_BYTES = 2 * 1024 * 1024  # 單份異常 log 保留尾端上限，最多約 200 MiB/workspace
 ISSUE_MAX_CHARS = 2000                # 單一 issue 文字上限
 ISSUES_MAX_PENDING = 100              # 單一 round 最多 ingest 的 issue 行數
 ISSUES_MAX_COUNT = 200                # state 保留最新 issue 數量
@@ -269,6 +271,12 @@ def round_metrics_from_history(data: str, limit: int = 50, *, history_truncated=
             "seconds": round(seconds, 3),
             "timed_out": fields.get("timeout") == "True",
             "missing_done": missing_done,
+            "phase": fields.get("phase") or "",
+            "task": "" if fields.get("task") in {None, "-"} else fields["task"],
+            "signal": "" if fields.get("signal") in {None, "-"} else fields["signal"],
+            "changed": fields.get("changed") == "True",
+            "rc": int(fields["rc"]) if fields.get("rc", "").lstrip("-").isdigit() else None,
+            "validate": fields.get("validate") or "-",
             "timestamp": tokens[0],
         })
         if len(samples) >= limit:
@@ -322,6 +330,69 @@ def read_round_metrics(path: Path, limit: int = 50):
         data = data[newline + 1:] if newline >= 0 else b""
     return round_metrics_from_history(
         data.decode("utf-8", errors="replace"), limit, history_truncated=start > 0)
+
+
+def preserve_anomaly_log(workspace_dir: Path, round_log: Path, *, round_number: int,
+                         phase: str, task: str, timestamp: str):
+    """保留異常輪 Agent log 尾段與索引；每 workspace 嚴格上限 100 份。"""
+    anomaly_dir = ensure_real_directory(
+        Path(workspace_dir) / "logs" / "anomalies", "異常 log 目錄")
+    fd = _open_regular(round_log, os.O_RDONLY)
+    with os.fdopen(fd, "rb", closefd=True) as stream:
+        original_size = os.fstat(stream.fileno()).st_size
+        start = max(0, original_size - ANOMALY_LOG_MAX_BYTES)
+        stream.seek(start)
+        data = stream.read(ANOMALY_LOG_MAX_BYTES)
+
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    anomaly_id = f"{stamp}-r{round_number:06d}-{uuid.uuid4().hex[:8]}"
+    log_name = f"{anomaly_id}.log"
+    atomic_write_bytes(anomaly_dir / log_name, data)
+    metadata = {
+        "schema_version": 1,
+        "id": anomaly_id,
+        "round": round_number,
+        "phase": phase,
+        "task": task,
+        "timestamp": timestamp,
+        "log_file": log_name,
+        "original_size": original_size,
+        "retained_size": len(data),
+        "truncated": start > 0,
+    }
+    atomic_write_bytes(
+        anomaly_dir / f"{anomaly_id}.json",
+        json.dumps(metadata, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+    )
+
+    metadata_files = []
+    for path in anomaly_dir.glob("*.json"):
+        try:
+            if stat.S_ISREG(path.lstat().st_mode):
+                metadata_files.append(path)
+        except OSError:
+            continue
+    ordered_metadata = sorted(metadata_files)
+    for old_metadata in ordered_metadata[:-ANOMALY_LOG_MAX_COUNT]:
+        old_log = anomaly_dir / f"{old_metadata.stem}.log"
+        old_metadata.unlink(missing_ok=True)
+        try:
+            if stat.S_ISREG(old_log.lstat().st_mode):
+                old_log.unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    kept_ids = {path.stem for path in ordered_metadata[-ANOMALY_LOG_MAX_COUNT:]}
+    for orphan_log in anomaly_dir.glob("*.log"):
+        if orphan_log.stem in kept_ids:
+            continue
+        try:
+            if stat.S_ISREG(orphan_log.lstat().st_mode):
+                orphan_log.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return metadata
 
 
 def repo_relative_path(repo: Path, rel: str) -> Path:
@@ -1789,7 +1860,20 @@ def main():
         state["agent_backoff_until"] = ((datetime.now() + timedelta(seconds=retry_delay))
                                           .isoformat(timespec="seconds")) if retry_delay else None
 
-        line = (f"{datetime.now().isoformat(timespec='seconds')} round={rnd} phase={phase} "
+        round_finished_at = datetime.now().isoformat(timespec="seconds")
+        if missing_done:
+            try:
+                preserve_anomaly_log(
+                    ws.dir, ws.dir / "logs" / f"round-{rnd:04d}.log",
+                    round_number=rnd, phase=phase, task=task_id,
+                    timestamp=round_finished_at,
+                )
+                log(f"🧾 已保留異常輪 log｜round {rnd}｜最多 {ANOMALY_LOG_MAX_COUNT} 份")
+            except (OSError, ValueError) as e:
+                # 稽核保留失敗不可反過來破壞 coordinator truth 或讓收斂迴圈停機。
+                log(f"⚠️ 異常輪 log 保留失敗｜round {rnd}｜{e}")
+
+        line = (f"{round_finished_at} round={rnd} phase={phase} "
                 f"task={task_id or '-'} rc={rc} secs={secs:.3f} timeout={timed_out} changed={changed} "
                 f"signal={'create' if ws.signal('called_create_plan', round_token) else 'ok' if ws.signal('signal_plan_ok', round_token) else 'done' if ws.signal('signal_done', round_token) else '-'} "
                 f"done_missing={missing_done} "
