@@ -57,6 +57,21 @@ export interface FleetHistoryEntry {
   metrics?: Omit<RoundMetrics, "samples">;
 }
 
+export interface FleetRoundMetrics {
+  limit: number;
+  workspace_count: number;
+  sample_count: number;
+  average_seconds: number | null;
+  p50_seconds: number | null;
+  p95_seconds: number | null;
+  max_seconds: number | null;
+  slowest_round: number | null;
+  slowest_workspace: string | null;
+  timeout_count: number;
+  timeout_rate_pct: number;
+  history_truncated: boolean;
+}
+
 export interface RoundTelemetrySample {
   round: number;
   seconds: number;

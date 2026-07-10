@@ -409,6 +409,13 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .fleet-stat.running strong { color: var(--success); }
 .fleet-stat.warning strong { color: var(--warning); }
 .fleet-stat.tasks { min-width: 200px; }
+.fleet-stat.fleet-performance { min-width: 340px; }
+.fleet-performance-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin-top: 3px; padding-top: 6px; border-top: 1px solid var(--border-soft); }
+.fleet-performance-grid > span { display: grid; min-width: 0; }
+.fleet-performance-grid small, .fleet-performance-empty { color: var(--muted); font-size: 10px; }
+.fleet-performance-grid b { overflow: hidden; color: var(--text); font-size: 12px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; }
+.fleet-performance-grid .warning b { color: var(--warning); }
+.fleet-performance-empty { margin-top: 5px; }
 .fleet-filter-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .fleet-filters { display: inline-flex; align-items: center; gap: 3px; padding: 3px; border-radius: 8px; background: var(--surface-subtle); }
 .fleet-filters button { min-height: 27px; padding: 3px 9px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; }

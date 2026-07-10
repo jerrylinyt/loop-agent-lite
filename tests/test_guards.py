@@ -3124,6 +3124,26 @@ class TestNotifyEndpoints(unittest.TestCase):
 class TestFleetHistoryProjection(unittest.TestCase):
     """fleet 事件流投影:回各 workspace history.log 尾段;無 history 的 workspace 跳過,不動 truth。"""
 
+    def test_aggregate_uses_latest_500_samples_across_all_workspaces(self):
+        samples = [{
+            "workspace": "alpha" if index % 2 == 0 else "beta",
+            "round": index,
+            "seconds": float(index),
+            "timed_out": index == 502,
+            "timestamp": f"2026-07-10T{index:04d}",
+        } for index in range(503)]
+        metrics = D.aggregate_fleet_round_metrics(samples)
+        self.assertEqual(metrics["limit"], 500)
+        self.assertEqual(metrics["sample_count"], 500)
+        self.assertEqual(metrics["workspace_count"], 2)
+        self.assertEqual(metrics["average_seconds"], 252.5)
+        self.assertEqual(metrics["p50_seconds"], 252)
+        self.assertEqual(metrics["p95_seconds"], 477)
+        self.assertEqual(metrics["max_seconds"], 502)
+        self.assertEqual(metrics["slowest_workspace"], "alpha")
+        self.assertEqual(metrics["timeout_count"], 1)
+        self.assertEqual(metrics["timeout_rate_pct"], 0.2)
+
     def test_tail_and_current_task_projection(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "workspace"
@@ -3144,13 +3164,18 @@ class TestFleetHistoryProjection(unittest.TestCase):
             old_root = D.ROOT
             D.ROOT = root
             try:
-                entries = D.read_fleet_history()
+                projection = D.read_fleet_observability()
+                entries = projection["entries"]
                 self.assertEqual([e["name"] for e in entries], ["alpha"], "沒 history 的 beta 應跳過")
                 self.assertIn("task=task-1", entries[0]["data"])
                 self.assertEqual(entries[0]["metrics"]["sample_count"], 1)
                 self.assertEqual(entries[0]["metrics"]["average_seconds"], 2.5)
                 self.assertEqual(entries[0]["metrics"]["p50_seconds"], 2.5)
                 self.assertEqual(entries[0]["metrics"]["p95_seconds"], 2.5)
+                self.assertEqual(projection["metrics"]["limit"], 500)
+                self.assertEqual(projection["metrics"]["sample_count"], 1)
+                self.assertEqual(projection["metrics"]["average_seconds"], 2.5)
+                self.assertEqual([e["name"] for e in D.read_fleet_history()], ["alpha"])
                 fleet = D.list_workspaces()
                 alpha = next(w for w in fleet if w["name"] == "alpha")
                 self.assertEqual(alpha["current_order"], 2)

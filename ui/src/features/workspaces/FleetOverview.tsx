@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { FleetHistoryEntry, WorkspaceSummary } from "../../shared/api/types";
+import type { FleetHistoryEntry, FleetRoundMetrics, WorkspaceSummary } from "../../shared/api/types";
 import { deriveFleetEvents } from "./fleetEvents";
 import { deriveRoundTiming, useRoundNow } from "./roundTiming";
 
@@ -51,9 +51,10 @@ function currentActivity(workspace: WorkspaceSummary): string {
 
 /** 監控電視牆:聚合統計 + 全 fleet 即時卡片 + 事件推播。
  * 卡片與歷史事件都走同一條 SSE；事件流仍由前端從 history 尾段推導。 */
-export default function FleetOverview({ workspaces, fleetHistory, attentionRequest, onSelect }: {
+export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, attentionRequest, onSelect }: {
   workspaces: WorkspaceSummary[];
   fleetHistory: FleetHistoryEntry[];
+  fleetMetrics: FleetRoundMetrics | null;
   attentionRequest: number;
   onSelect: (name: string) => void;
 }) {
@@ -120,6 +121,19 @@ export default function FleetOverview({ workspaces, fleetHistory, attentionReque
           <strong>{doneTasks} / {totalTasks}<em>（{taskPct}%）</em></strong>
           <span>任務完成</span>
           <div className="fleet-progress"><div className="fleet-progress-fill" style={{ width: `${taskPct}%` }} /></div>
+        </div>
+        <div className="fleet-stat fleet-performance" role="listitem" aria-label="全部 workspace 輪次效能">
+          <strong>{fleetMetrics?.sample_count ?? 0} 輪</strong>
+          <span>全部 workspace 近 500 輪</span>
+          {fleetMetrics && fleetMetrics.sample_count > 0 ? (
+            <div className="fleet-performance-grid" title={`${fleetMetrics.workspace_count} 個 workspace 合併後，取時間最新 ${fleetMetrics.limit} 輪`}>
+              <span><small>平均</small><b>{formatMetric(fleetMetrics.average_seconds)}</b></span>
+              <span><small>P50</small><b>{formatMetric(fleetMetrics.p50_seconds)}</b></span>
+              <span><small>P95</small><b>{formatMetric(fleetMetrics.p95_seconds)}</b></span>
+              <span><small>最慢</small><b>{formatMetric(fleetMetrics.max_seconds)}</b></span>
+              <span className={fleetMetrics.timeout_count ? "warning" : ""}><small>逾時</small><b>{fleetMetrics.timeout_rate_pct}%</b></span>
+            </div>
+          ) : <small className="fleet-performance-empty">尚無輪次資料</small>}
         </div>
       </div>
       <div className="fleet-filter-row">

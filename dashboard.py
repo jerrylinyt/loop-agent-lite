@@ -634,16 +634,50 @@ def read_report(name):
 
 
 FLEET_HISTORY_TAIL = 16 * 1024  # 每個 workspace 事件流尾段上限
-FLEET_METRICS_TAIL = 128 * 1024  # 同一次 bounded read 投影 Overview 近期效能
+FLEET_METRICS_TAIL = 512 * 1024  # 足以 bounded 掃描單 workspace 近期 500 輪
 FLEET_METRICS_LIMIT = 100
+FLEET_AGGREGATE_LIMIT = 500      # 全 workspace 合併後只取時間最新 500 筆
 FLEET_HISTORY_SSE_INTERVAL = 2.0  # 事件流只在歷史有變時推送，避免每圈重送整段尾端
 
 
-def read_fleet_history():
-    """投影各 workspace 的事件尾段與 Overview 效能摘要，不動任何 truth。"""
+def aggregate_fleet_round_metrics(samples, *, history_truncated=False):
+    """依時間合併各 workspace，精確聚合全體最新 500 筆。"""
+    samples = sorted(samples, key=lambda sample: (
+        sample["timestamp"], sample["workspace"], sample["round"]))[-FLEET_AGGREGATE_LIMIT:]
+    durations = sorted(sample["seconds"] for sample in samples)
+
+    def percentile(percent):
+        if not durations:
+            return None
+        index = max(0, (len(durations) * percent + 99) // 100 - 1)
+        return durations[index]
+
+    timeout_count = sum(1 for sample in samples if sample["timed_out"])
+    slowest = max(samples, key=lambda sample: (
+        sample["seconds"], sample["workspace"], sample["round"])) if samples else None
+    return {
+        "limit": FLEET_AGGREGATE_LIMIT,
+        "workspace_count": len({sample["workspace"] for sample in samples}),
+        "sample_count": len(samples),
+        "average_seconds": round(sum(durations) / len(durations), 3) if durations else None,
+        "p50_seconds": percentile(50),
+        "p95_seconds": percentile(95),
+        "max_seconds": slowest["seconds"] if slowest else None,
+        "slowest_round": slowest["round"] if slowest else None,
+        "slowest_workspace": slowest["workspace"] if slowest else None,
+        "timeout_count": timeout_count,
+        "timeout_rate_pct": round(timeout_count / len(samples) * 100, 1) if samples else 0,
+        "history_truncated": bool(history_truncated),
+    }
+
+
+def read_fleet_observability():
+    """一次 bounded read 投影事件尾段、各 workspace 與全體效能摘要。"""
     out = []
+    all_samples = []
+    any_truncated = False
     if not ROOT.is_dir():
-        return out
+        return {"entries": out, "metrics": aggregate_fleet_round_metrics([])}
     for d in sorted(ROOT.iterdir()):
         if not loop_mod.valid_workspace_name(d.name) or d.is_symlink() or not d.is_dir():
             continue
@@ -669,11 +703,25 @@ def read_fleet_history():
         if size > FLEET_HISTORY_TAIL:
             newline = tail.find("\n")
             tail = tail[newline + 1:] if newline != -1 else tail
+        aggregate_metrics = loop_mod.round_metrics_from_history(
+            metrics_text, FLEET_AGGREGATE_LIMIT, history_truncated=metrics_start > 0)
         metrics = loop_mod.round_metrics_from_history(
             metrics_text, FLEET_METRICS_LIMIT, history_truncated=metrics_start > 0)
-        metrics.pop("samples", None)  # Overview 只需摘要，避免 SSE 重送逐輪樣本
+        samples = aggregate_metrics["samples"]
+        metrics.pop("samples")
+        all_samples.extend({**sample, "workspace": d.name} for sample in samples)
+        any_truncated = any_truncated or metrics["history_truncated"]
         out.append({"name": d.name, "data": tail, "metrics": metrics})
-    return out
+    return {
+        "entries": out,
+        "metrics": aggregate_fleet_round_metrics(
+            all_samples, history_truncated=any_truncated),
+    }
+
+
+def read_fleet_history():
+    """相容的 workspace history list API；全體摘要由 sibling projection 提供。"""
+    return read_fleet_observability()["entries"]
 
 
 def read_goal(name):
@@ -1216,10 +1264,11 @@ class Handler(BaseHTTPRequestHandler):
                     fleet_at = now + 0.6
 
                 if include_fleet_history and now >= fleet_history_at:
-                    fleet_history = read_fleet_history()
-                    history_sig = json.dumps(fleet_history, ensure_ascii=False, sort_keys=True)
+                    fleet_observability = read_fleet_observability()
+                    history_sig = json.dumps(fleet_observability, ensure_ascii=False, sort_keys=True)
                     if history_sig != fleet_history_sig:
-                        emit("fleet-history", fleet_history)
+                        emit("fleet-history", fleet_observability["entries"])
+                        emit("fleet-round-metrics", fleet_observability["metrics"])
                         fleet_history_sig = history_sig
                     fleet_history_at = now + FLEET_HISTORY_SSE_INTERVAL
 
@@ -1396,6 +1445,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._out(200, json.dumps(read_prompt(d.name), ensure_ascii=False))
             elif u.path == "/api/fleet-history":
                 self._out(200, json.dumps(read_fleet_history(), ensure_ascii=False))
+            elif u.path == "/api/fleet-round-metrics":
+                projection = read_fleet_observability()
+                self._out(200, json.dumps(projection["metrics"], ensure_ascii=False))
             else:
                 self._err("not found", 404)
         except (ValueError, BrokenPipeError, ConnectionResetError):

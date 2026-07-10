@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getJson } from "../shared/api/client";
-import type { BootstrapResponse, FleetHealth, FleetHistoryEntry, WorkspaceState, WorkspaceSummary } from "../shared/api/types";
+import type { BootstrapResponse, FleetHealth, FleetHistoryEntry, FleetRoundMetrics, WorkspaceState, WorkspaceSummary } from "../shared/api/types";
 
 const CONSOLE_LIMIT = 300_000;
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting";
@@ -10,6 +10,7 @@ export default function useDashboardData() {
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [health, setHealth] = useState<FleetHealth | null>(null);
   const [fleetHistory, setFleetHistory] = useState<FleetHistoryEntry[]>([]);
+  const [fleetMetrics, setFleetMetrics] = useState<FleetRoundMetrics | null>(null);
   const [selected, setSelected] = useState("");
   const [state, setState] = useState<WorkspaceState | null>(null);
   const [consoleText, setConsoleText] = useState("");
@@ -92,6 +93,9 @@ export default function useDashboardData() {
     source.addEventListener("fleet-history", (event) => {
       setFleetHistory(JSON.parse(event.data) as FleetHistoryEntry[]);
     });
+    source.addEventListener("fleet-round-metrics", (event) => {
+      setFleetMetrics(JSON.parse(event.data) as FleetRoundMetrics);
+    });
     source.addEventListener("console", (event) => {
       const { data } = JSON.parse(event.data) as { data: string };
       setConsoleText((text) => (text + data).slice(-CONSOLE_LIMIT));
@@ -108,6 +112,7 @@ export default function useDashboardData() {
     selected,
     state,
     fleetHistory,
+    fleetMetrics,
     consoleText,
     selectWorkspace,
     refreshState,

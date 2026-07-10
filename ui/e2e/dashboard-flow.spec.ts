@@ -96,6 +96,14 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   const overview = page.getByRole("main", { name: "工作區總覽" });
   await expect(overview).toBeVisible();
   await expect(overview.getByText("執行中", { exact: true })).toBeVisible();
+  const fleetMetrics = overview.getByRole("listitem", { name: "全部 workspace 輪次效能" });
+  await expect(fleetMetrics).toBeVisible();
+  await expect(fleetMetrics).toContainText("全部 workspace 近 500 輪");
+  await expect(fleetMetrics).toContainText("平均");
+  await expect(fleetMetrics).toContainText("P50");
+  await expect(fleetMetrics).toContainText("P95");
+  await expect(fleetMetrics).toContainText("最慢");
+  await expect(fleetMetrics).toContainText("逾時");
   const runningFilter = overview.getByRole("button", { name: /^執行中 \d+$/ });
   await runningFilter.click();
   await expect(runningFilter).toHaveAttribute("aria-pressed", "true");
