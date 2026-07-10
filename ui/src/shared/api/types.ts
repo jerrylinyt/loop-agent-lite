@@ -125,6 +125,8 @@ export interface JobInfo {
 export interface IncrementalResponse {
   size: number;
   data: string;
+  run?: "current" | "previous";
+  error?: string;
 }
 
 export interface BootstrapResponse {

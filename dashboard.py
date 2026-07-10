@@ -1167,8 +1167,14 @@ class Handler(BaseHTTPRequestHandler):
                 if d is None:
                     return
                 off = int(q.get("offset", ["0"])[0])
-                self._out(200, json.dumps(
-                    read_incremental(d / "history.log", off), ensure_ascii=False))
+                run = q.get("run", ["current"])[0]
+                if run not in ("current", "previous"):
+                    self._err("history run 必須是 current 或 previous")
+                    return
+                history_name = "history.log" if run == "current" else "history.log.1"
+                projection = read_incremental(d / history_name, off)
+                projection["run"] = run
+                self._out(200, json.dumps(projection, ensure_ascii=False))
             elif u.path == "/api/report":
                 d = self._ws_dir(q)
                 if d is None:

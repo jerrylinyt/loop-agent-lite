@@ -150,6 +150,10 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(firstHistoryRow).toContainText("✅");
   await historyModal.getByRole("button", { name: "重新整理" }).click();
   await expect(firstHistoryRow).toContainText("task-1");
+  await historyModal.getByRole("tab", { name: "上一個 run" }).click();
+  await expect(historyModal).toContainText("沒有保留的上一個 run 紀錄");
+  await historyModal.getByRole("tab", { name: "目前 run" }).click();
+  await expect(firstHistoryRow).toContainText("task-1");
   await historyModal.getByRole("button", { name: "關閉對話框" }).click();
   await expect(historyModal).toBeHidden();
 

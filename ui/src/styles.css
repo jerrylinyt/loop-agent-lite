@@ -267,6 +267,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .segmented-tabs { display: inline-flex; gap: 2px; margin-bottom: 14px; padding: 3px; border-radius: 8px; background: var(--surface-subtle); }
 .segmented-tabs button { min-height: 30px; padding: 4px 12px; border: 0; border-radius: 6px; background: transparent; }
 .segmented-tabs button.active { background: var(--surface-raised); color: var(--accent); box-shadow: 0 1px 3px rgba(0, 0, 0, .15); }
+.history-run-tabs { margin-bottom: 10px; }
 .modal-table-scroll { max-height: 58vh; overflow: auto; border: 1px solid var(--border-soft); border-radius: 8px; }
 
 .form-grid { display: grid; gap: 10px; }

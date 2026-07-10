@@ -2203,5 +2203,45 @@ class TestDashboardRequestLimit(unittest.TestCase):
         self.assertIn("JSON", handler.response[1])
 
 
+class TestPreviousRunHistoryProjection(unittest.TestCase):
+    """history.log.1 只讀投影可供 UI 稽核，且 run 參數不允許任意檔名。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_previous_run_is_projected_and_invalid_run_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            workspace = root / "demo"
+            workspace.mkdir(parents=True)
+            (workspace / "history.log").write_text("current\n", encoding="utf-8")
+            (workspace / "history.log.1").write_text("previous\n", encoding="utf-8")
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                def invoke(query):
+                    handler = self.ResponseCapture()
+                    handler.path = f"/api/history?ws=demo&offset=-1{query}"
+                    handler._ws_dir = lambda _q: workspace
+                    D.Handler.do_GET(handler)
+                    return handler.response
+
+                code, body = invoke("&run=previous")
+                self.assertEqual(code, 200)
+                self.assertEqual(body["run"], "previous")
+                self.assertIn("previous", body["data"])
+                code, body = invoke("&run=other")
+                self.assertEqual(code, 400)
+                self.assertIn("current 或 previous", body["error"])
+            finally:
+                D.ROOT = old_root
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
