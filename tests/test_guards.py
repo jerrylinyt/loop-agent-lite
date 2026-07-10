@@ -517,6 +517,67 @@ class TestWorkspaceArtifactGuards(unittest.TestCase):
                 L.WORKSPACE_ROOT, D.ROOT = old_values
 
 
+class TestWorkCliArtifactGuards(unittest.TestCase):
+    """work.py 的 agent 寫入口也必須拒絕 workspace 內的 symlink artifact。"""
+
+    def run_work(self, workspace, token, command, *args):
+        env = {**os.environ, "LOOP_WS": str(workspace), "LOOP_ROUND_TOKEN": token}
+        return subprocess.run([sys.executable, WORK_PY, command, *args],
+                              capture_output=True, text=True, env=env)
+
+    def test_dispatch_symlink_is_rejected_without_reading_outside(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            outside = root / "outside"
+            outside.write_text(json.dumps({"phase": "plan", "round_token": "tok"}), encoding="utf-8")
+            (workspace / "dispatch.json").symlink_to(outside)
+            result = self.run_work(workspace, "tok", "plan-ok")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("派工資訊不存在或損壞", result.stderr)
+            self.assertFalse((workspace / "signal_plan_ok.tok").exists())
+
+    def test_signal_and_issue_symlinks_are_rejected_without_writing_outside(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            outside = root / "outside"
+            outside.write_text("outside secret\n", encoding="utf-8")
+            (workspace / "dispatch.json").write_text(
+                json.dumps({"phase": "plan", "round_token": "tok"}), encoding="utf-8")
+            (workspace / "signal_plan_ok.tok").symlink_to(outside)
+            result = self.run_work(workspace, "tok", "plan-ok")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("協調檔案不安全", result.stderr)
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside secret\n")
+
+            (workspace / "signal_plan_ok.tok").unlink()
+            (workspace / "pending_issues.tok").symlink_to(outside)
+            result = self.run_work(workspace, "tok", "issue", "must", "not", "escape")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("協調檔案不安全", result.stderr)
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside secret\n")
+
+    def test_single_writer_lock_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            outside = root / "outside.lock"
+            outside.write_text("outside secret\n", encoding="utf-8")
+            link = root / "loop.lock"
+            link.symlink_to(outside)
+            old_console = L._CONSOLE_PATH
+            try:
+                L._CONSOLE_PATH = None
+                with self.assertRaises(SystemExit):
+                    L.acquire_run_lock(link, "test lock")
+            finally:
+                L._CONSOLE_PATH = old_console
+                L.release_run_locks()
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside secret\n")
+
+
 class TestPreflightConsole(unittest.TestCase):
     """preflight 立刻失敗時，原因仍必須落進 dashboard 正在看的 console.log。"""
 

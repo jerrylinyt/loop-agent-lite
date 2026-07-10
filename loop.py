@@ -362,8 +362,12 @@ def release_run_locks() -> None:
 
 def acquire_run_lock(path: Path, label: str) -> None:
     """取得跨 Dashboard/terminal process 的單 writer 鎖；不等待、不猜 pid。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_file = open(path, "a+b")
+    try:
+        ensure_real_directory(path.parent, f"{label} 父目錄")
+        lock_fd = _open_regular(path, os.O_RDWR | os.O_CREAT)
+    except (OSError, ValueError) as e:
+        fail(f"preflight：{label} 鎖檔不安全或無法建立:{e}")
+    lock_file = os.fdopen(lock_fd, "a+b", closefd=True)
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
