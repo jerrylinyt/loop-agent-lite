@@ -373,7 +373,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(reportModal).toBeHidden();
 
   await page.getByRole("button", { name: "📺 總覽" }).click();
-  const finalOverview = page.getByRole("main", { name: "Fleet 總覽" });
+  const finalOverview = page.getByRole("main", { name: "工作區總覽" });
   const finalFeed = finalOverview.getByRole("complementary", { name: "事件推播" });
   await expect(finalFeed.locator(".fleet-event", { hasText: "▶ 開始 task-2" }).first()).toBeVisible();
   await expect(finalFeed.locator(".fleet-event", { hasText: "▶ 開始 task-1" })).toHaveCount(2);
