@@ -126,12 +126,18 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
           <strong>{fleetMetrics?.sample_count ?? 0} 輪</strong>
           <span>全部 workspace 近 500 輪</span>
           {fleetMetrics && fleetMetrics.sample_count > 0 ? (
-            <div className="fleet-performance-grid" title={`${fleetMetrics.workspace_count} 個 workspace 合併後，取時間最新 ${fleetMetrics.limit} 輪`}>
-              <span><small>平均</small><b>{formatMetric(fleetMetrics.average_seconds)}</b></span>
-              <span><small>P50</small><b>{formatMetric(fleetMetrics.p50_seconds)}</b></span>
-              <span><small>P95</small><b>{formatMetric(fleetMetrics.p95_seconds)}</b></span>
-              <span><small>最慢</small><b>{formatMetric(fleetMetrics.max_seconds)}</b></span>
-              <span className={fleetMetrics.timeout_count ? "warning" : ""}><small>逾時</small><b>{fleetMetrics.timeout_rate_pct}%</b></span>
+            <div className="fleet-performance-summary" title={`${fleetMetrics.workspace_count} 個 workspace 合併後，取時間最新 ${fleetMetrics.limit} 個已結束輪次；Plan 以 create-plan / plan-ok、Exec 以 done 作為完成回報`}>
+              <div className="fleet-performance-grid">
+                <span><small>平均</small><b>{formatMetric(fleetMetrics.average_seconds)}</b></span>
+                <span><small>P50</small><b>{formatMetric(fleetMetrics.p50_seconds)}</b></span>
+                <span><small>P95</small><b>{formatMetric(fleetMetrics.p95_seconds)}</b></span>
+                <span><small>最慢</small><b>{formatMetric(fleetMetrics.max_seconds)}</b></span>
+                <span className={fleetMetrics.timeout_count ? "warning" : ""}><small>逾時</small><b>{fleetMetrics.timeout_rate_pct}%</b></span>
+              </div>
+              <div className="fleet-anomaly-grid">
+                <span className={fleetMetrics.missing_done_count ? "warning" : ""}><small>未回 DONE</small><b>{fleetMetrics.missing_done_count} 次</b></span>
+                <span className={fleetMetrics.missing_done_count ? "warning" : ""}><small>異常率</small><b>{fleetMetrics.missing_done_rate_pct}%</b></span>
+              </div>
             </div>
           ) : <small className="fleet-performance-empty">尚無輪次資料</small>}
         </div>
@@ -188,6 +194,10 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
                       <span><small>P95</small><strong>{formatMetric(metrics.p95_seconds)}</strong></span>
                       <span><small>最慢</small><strong>{formatMetric(metrics.max_seconds)}</strong></span>
                       <span className={metrics.timeout_count ? "warning" : ""}><small>逾時</small><strong>{metrics.timeout_rate_pct}%</strong></span>
+                    </div>
+                    <div className="fleet-card-anomaly-grid">
+                      <span className={metrics.missing_done_count ? "warning" : ""}><small>未回 DONE</small><strong>{metrics.missing_done_count} 次</strong></span>
+                      <span className={metrics.missing_done_count ? "warning" : ""}><small>異常率</small><strong>{metrics.missing_done_rate_pct}%</strong></span>
                     </div>
                   </div>
                 ) : <div className="fleet-card-analysis-empty">尚無輪次效能資料</div>}

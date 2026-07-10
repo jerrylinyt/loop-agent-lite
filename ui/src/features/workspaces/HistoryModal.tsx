@@ -61,6 +61,8 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
             <div className="history-metric" role="listitem"><span>P95</span><strong>{formatDuration(metrics.p95_seconds)}</strong></div>
             <div className="history-metric" role="listitem"><span>最慢</span><strong>{formatDuration(metrics.max_seconds)}</strong><small>round {metrics.slowest_round}</small></div>
             <div className={`history-metric${metrics.timeout_count ? " warning" : ""}`} role="listitem"><span>逾時率</span><strong>{metrics.timeout_rate_pct}%</strong><small>{metrics.timeout_count} 輪</small></div>
+            <div className={`history-metric${metrics.missing_done_count ? " warning" : ""}`} role="listitem"><span>未回 DONE</span><strong>{metrics.missing_done_count} 次</strong></div>
+            <div className={`history-metric${metrics.missing_done_count ? " warning" : ""}`} role="listitem"><span>異常率</span><strong>{metrics.missing_done_rate_pct}%</strong><small>占全部已結束輪次</small></div>
           </div>
         </section>
       )}
@@ -79,7 +81,7 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
                 <td>{row.validate === "PASS" ? "✅" : row.validate === "FAIL" ? "❌" : "—"}</td>
                 <td>{row.flag}</td>
                 <td>{row.done}</td>
-                <td>{`${row.tamper ? "⚠️ 竄改 " : ""}${row.agentOk ? "" : "⚠️ Agent 異常 "}${row.event}`}</td>
+                <td>{`${row.missingDone ? "⚠️ 未回 DONE " : ""}${row.tamper ? "⚠️ 竄改 " : ""}${row.agentOk ? "" : "⚠️ Agent 異常 "}${row.event}`}</td>
               </tr>
             ))}
             {!rows.length && !loading && <tr><td colSpan={10} className="table-empty">尚無輪次紀錄</td></tr>}

@@ -69,6 +69,8 @@ export interface FleetRoundMetrics {
   slowest_workspace: string | null;
   timeout_count: number;
   timeout_rate_pct: number;
+  missing_done_count: number;
+  missing_done_rate_pct: number;
   history_truncated: boolean;
 }
 
@@ -76,6 +78,7 @@ export interface RoundTelemetrySample {
   round: number;
   seconds: number;
   timed_out: boolean;
+  missing_done: boolean;
   timestamp: string;
 }
 
@@ -91,6 +94,8 @@ export interface RoundMetrics {
   slowest_round: number | null;
   timeout_count: number;
   timeout_rate_pct: number;
+  missing_done_count: number;
+  missing_done_rate_pct: number;
   history_truncated: boolean;
   samples: RoundTelemetrySample[];
 }

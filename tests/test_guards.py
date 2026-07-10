@@ -346,6 +346,7 @@ class TestRoundTelemetry(unittest.TestCase):
             self.assertIsNone(state["round_deadline_at"])
             self.assertIsNone(state["round_interrupted_at"])
             self.assertRegex(history, r" secs=\d+\.\d{3} timeout=False ")
+            self.assertIn("done_missing=True", history, "Plan 結束但沒有 create-plan/plan-ok 應記為異常")
 
     def test_timed_out_round_records_timeout(self):
         with tempfile.TemporaryDirectory() as d:
@@ -445,11 +446,11 @@ class TestRoundMetrics(unittest.TestCase):
 
     HISTORY = (
         "2026-07-10T10:00:00 round=1 phase=plan task=- changed=False\n"
-        "2026-07-10T10:01:00 round=1 phase=plan task=- secs=1.000 timeout=False changed=False\n"
-        "2026-07-10T10:02:00 round=9 phase=exec task=- secs=nan timeout=True changed=False\n"
-        "2026-07-10T10:03:00 round=2 phase=exec task=task-1 secs=4.000 timeout=True changed=False\n"
-        "2026-07-10T10:04:00 round=3 phase=exec task=task-1 secs=2.000 timeout=False changed=False\n"
-        "2026-07-10T10:05:00 round=4 phase=exec task=task-1 secs=8.000 timeout=False changed=False\n"
+        "2026-07-10T10:01:00 round=1 phase=plan task=- secs=1.000 timeout=False changed=False signal=ok\n"
+        "2026-07-10T10:02:00 round=9 phase=exec task=- secs=nan timeout=True changed=False signal=-\n"
+        "2026-07-10T10:03:00 round=2 phase=exec task=task-1 secs=4.000 timeout=True changed=False signal=-\n"
+        "2026-07-10T10:04:00 round=3 phase=exec task=task-1 secs=2.000 timeout=False changed=False signal=done\n"
+        "2026-07-10T10:05:00 round=4 phase=exec task=task-1 secs=8.000 timeout=False changed=False signal=- done_missing=True\n"
     )
 
     class ResponseCapture:
@@ -472,6 +473,13 @@ class TestRoundMetrics(unittest.TestCase):
         self.assertEqual(metrics["slowest_round"], 4)
         self.assertEqual(metrics["timeout_count"], 1)
         self.assertEqual(metrics["timeout_rate_pct"], 33.3)
+        self.assertEqual([sample["missing_done"] for sample in metrics["samples"]], [True, False, True])
+        self.assertEqual(metrics["missing_done_count"], 2)
+        self.assertEqual(metrics["missing_done_rate_pct"], 66.7)
+        including_plan = L.round_metrics_from_history(self.HISTORY, 5)
+        self.assertEqual(including_plan["sample_count"], 4)
+        self.assertEqual(including_plan["missing_done_count"], 2, "plan-ok 不得算未回 DONE")
+        self.assertEqual(including_plan["missing_done_rate_pct"], 50)
 
     def test_reader_is_bounded_and_rejects_symlink(self):
         with tempfile.TemporaryDirectory() as d:
@@ -516,6 +524,8 @@ class TestRoundMetrics(unittest.TestCase):
                 self.assertEqual(previous.response[0], 200)
                 self.assertEqual(previous.response[1]["run"], "previous")
                 self.assertEqual(previous.response[1]["sample_count"], 1)
+                self.assertEqual(previous.response[1]["missing_done_count"], 0)
+                self.assertEqual(previous.response[1]["missing_done_rate_pct"], 0)
 
                 for path in (
                     "/api/round-metrics?ws=metrics&limit=0",
@@ -3130,6 +3140,7 @@ class TestFleetHistoryProjection(unittest.TestCase):
             "round": index,
             "seconds": float(index),
             "timed_out": index == 502,
+            "missing_done": index in {10, 502},
             "timestamp": f"2026-07-10T{index:04d}",
         } for index in range(503)]
         metrics = D.aggregate_fleet_round_metrics(samples)
@@ -3143,6 +3154,8 @@ class TestFleetHistoryProjection(unittest.TestCase):
         self.assertEqual(metrics["slowest_workspace"], "alpha")
         self.assertEqual(metrics["timeout_count"], 1)
         self.assertEqual(metrics["timeout_rate_pct"], 0.2)
+        self.assertEqual(metrics["missing_done_count"], 2)
+        self.assertEqual(metrics["missing_done_rate_pct"], 0.4)
 
     def test_tail_and_current_task_projection(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3150,8 +3163,8 @@ class TestFleetHistoryProjection(unittest.TestCase):
             (root / "alpha").mkdir(parents=True)
             (root / "beta").mkdir(parents=True)
             line = ("2026-07-10T10:00:00 round=1 phase=exec task=task-1 rc=0 secs=2.500 "
-                    "timeout=False changed=False signal=done tamper=False agent_ok=True "
-                    "validate=PASS flag=0 done=1")
+                    "timeout=False changed=False signal=- done_missing=True tamper=False agent_ok=True "
+                    "validate=PASS flag=0 done=0")
             (root / "alpha" / "history.log").write_text(line + "\n", encoding="utf-8")
             (root / "alpha" / "state.json").write_text(json.dumps({
                 "phase": "exec", "current_order": 2,
@@ -3172,9 +3185,13 @@ class TestFleetHistoryProjection(unittest.TestCase):
                 self.assertEqual(entries[0]["metrics"]["average_seconds"], 2.5)
                 self.assertEqual(entries[0]["metrics"]["p50_seconds"], 2.5)
                 self.assertEqual(entries[0]["metrics"]["p95_seconds"], 2.5)
+                self.assertEqual(entries[0]["metrics"]["missing_done_count"], 1)
+                self.assertEqual(entries[0]["metrics"]["missing_done_rate_pct"], 100)
                 self.assertEqual(projection["metrics"]["limit"], 500)
                 self.assertEqual(projection["metrics"]["sample_count"], 1)
                 self.assertEqual(projection["metrics"]["average_seconds"], 2.5)
+                self.assertEqual(projection["metrics"]["missing_done_count"], 1)
+                self.assertEqual(projection["metrics"]["missing_done_rate_pct"], 100)
                 self.assertEqual([e["name"] for e in D.read_fleet_history()], ["alpha"])
                 fleet = D.list_workspaces()
                 alpha = next(w for w in fleet if w["name"] == "alpha")

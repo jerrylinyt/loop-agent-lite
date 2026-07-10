@@ -13,6 +13,7 @@ export interface HistoryRow {
   agentOk: boolean;
   durationSeconds: number | null;
   timedOut: boolean;
+  missingDone: boolean;
   event: string;
 }
 
@@ -42,6 +43,12 @@ export function parseHistory(data: string): { rows: HistoryRow[]; unparsed: numb
     }
     const ts = tokens[0];
     const signal = fields.signal ?? "-";
+    const missingDone = fields.done_missing === "True" || (
+      fields.done_missing === undefined && fields.signal !== undefined && (
+        (fields.phase === "plan" && !["create", "ok"].includes(signal)) ||
+        (fields.phase === "exec" && signal !== "done")
+      )
+    );
     const duration = Number(fields.secs);
     rows.push({
       ts,
@@ -55,6 +62,7 @@ export function parseHistory(data: string): { rows: HistoryRow[]; unparsed: numb
       agentOk: fields.agent_ok !== "False",
       durationSeconds: Number.isFinite(duration) && duration >= 0 ? duration : null,
       timedOut: fields.timeout === "True",
+      missingDone,
       validate: fields.validate ?? "-",
       flag: +(fields.flag ?? 0),
       done: +(fields.done ?? 0),

@@ -410,11 +410,13 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .fleet-stat.warning strong { color: var(--warning); }
 .fleet-stat.tasks { min-width: 200px; }
 .fleet-stat.fleet-performance { min-width: 340px; }
-.fleet-performance-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin-top: 3px; padding-top: 6px; border-top: 1px solid var(--border-soft); }
-.fleet-performance-grid > span { display: grid; min-width: 0; }
-.fleet-performance-grid small, .fleet-performance-empty { color: var(--muted); font-size: 10px; }
-.fleet-performance-grid b { overflow: hidden; color: var(--text); font-size: 12px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; }
-.fleet-performance-grid .warning b { color: var(--warning); }
+.fleet-performance-summary { margin-top: 3px; padding-top: 6px; border-top: 1px solid var(--border-soft); }
+.fleet-performance-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+.fleet-performance-grid > span, .fleet-anomaly-grid > span { display: grid; min-width: 0; }
+.fleet-performance-grid small, .fleet-anomaly-grid small, .fleet-performance-empty { color: var(--muted); font-size: 10px; }
+.fleet-performance-grid b, .fleet-anomaly-grid b { overflow: hidden; color: var(--text); font-size: 12px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; }
+.fleet-performance-grid .warning b, .fleet-anomaly-grid .warning b { color: var(--warning); }
+.fleet-anomaly-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 5px; padding-top: 5px; border-top: 1px solid var(--border-soft); }
 .fleet-performance-empty { margin-top: 5px; }
 .fleet-filter-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .fleet-filters { display: inline-flex; align-items: center; gap: 3px; padding: 3px; border-radius: 8px; background: var(--surface-subtle); }
@@ -432,10 +434,11 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .fleet-card-analysis-head strong { font-size: 12px; }
 .fleet-card-analysis-head span, .fleet-card-analysis-empty { color: var(--muted); font-size: 11px; }
 .fleet-card-analysis-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; }
-.fleet-card-analysis-grid > span { display: grid; min-width: 0; }
-.fleet-card-analysis-grid small { color: var(--muted); font-size: 10px; }
-.fleet-card-analysis-grid strong { overflow: hidden; font-size: 11px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; }
-.fleet-card-analysis-grid .warning strong { color: var(--warning); }
+.fleet-card-analysis-grid > span, .fleet-card-anomaly-grid > span { display: grid; min-width: 0; }
+.fleet-card-analysis-grid small, .fleet-card-anomaly-grid small { color: var(--muted); font-size: 10px; }
+.fleet-card-analysis-grid strong, .fleet-card-anomaly-grid strong { overflow: hidden; font-size: 11px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; }
+.fleet-card-analysis-grid .warning strong, .fleet-card-anomaly-grid .warning strong { color: var(--warning); }
+.fleet-card-anomaly-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; margin-top: 5px; padding-top: 5px; border-top: 1px solid var(--border-soft); }
 .fleet-card-analysis-empty { padding: 7px 8px; border-radius: 7px; background: var(--surface-subtle); }
 .fleet-events { display: flex; width: 320px; flex: none; flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-raised); }
 .fleet-events-head { display: flex; flex: none; align-items: baseline; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }

@@ -104,6 +104,8 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(fleetMetrics).toContainText("P95");
   await expect(fleetMetrics).toContainText("最慢");
   await expect(fleetMetrics).toContainText("逾時");
+  await expect(fleetMetrics).toContainText("未回 DONE");
+  await expect(fleetMetrics).toContainText("異常率");
   const runningFilter = overview.getByRole("button", { name: /^執行中 \d+$/ });
   await runningFilter.click();
   await expect(runningFilter).toHaveAttribute("aria-pressed", "true");
@@ -127,6 +129,8 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(fleetAnalysis).toContainText("P95");
   await expect(fleetAnalysis).toContainText("最慢");
   await expect(fleetAnalysis).toContainText("逾時");
+  await expect(fleetAnalysis).toContainText("未回 DONE");
+  await expect(fleetAnalysis).toContainText("異常率");
   const eventFeed = overview.getByRole("complementary", { name: "事件推播" });
   await expect(eventFeed.locator(".fleet-event", { hasText: "▶ 開始 task-1" }).first()).toBeVisible();
   await expect(eventFeed.locator(".fleet-event-ws", { hasText: "e2e-workspace" }).first()).toBeVisible();
@@ -192,6 +196,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(firstHistoryRow).toContainText("done");
   await expect(firstHistoryRow).toContainText("✅");
   await expect(firstHistoryRow).toContainText("秒");
+  await expect(firstHistoryRow).not.toContainText("未回 DONE");
   const roundMetrics = historyModal.getByRole("list", { name: "輪次效能摘要" });
   await expect(roundMetrics).toBeVisible();
   await expect(roundMetrics).toContainText("平均");
@@ -199,6 +204,8 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(roundMetrics).toContainText("P95");
   await expect(roundMetrics).toContainText("最慢");
   await expect(roundMetrics).toContainText("逾時率");
+  await expect(roundMetrics).toContainText("未回 DONE");
+  await expect(roundMetrics).toContainText("異常率");
   await expect(historyModal).not.toContainText("檔案較大，僅顯示最近的紀錄");
   await historyModal.getByRole("button", { name: "重新整理" }).click();
   await expect(firstHistoryRow).toContainText("task-1");

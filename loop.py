@@ -231,7 +231,7 @@ def read_regular_text(path: Path, label: str = "workspace 檔案") -> str:
 
 
 def round_metrics_from_history(data: str, limit: int = 50, *, history_truncated=False):
-    """從 history 文字投影近期 Agent round 效能；未知／舊格式欄位安全忽略。"""
+    """從 history 投影近期 Agent round 效能與未回 phase DONE 統計。"""
     if (not isinstance(limit, int) or isinstance(limit, bool) or
             not 1 <= limit <= ROUND_METRICS_MAX_SAMPLES):
         raise ValueError(f"round metrics limit 必須介於 1～{ROUND_METRICS_MAX_SAMPLES}")
@@ -253,10 +253,22 @@ def round_metrics_from_history(data: str, limit: int = 50, *, history_truncated=
             continue
         if round_number < 0 or not math.isfinite(seconds) or seconds < 0:
             continue
+        explicit_missing_done = fields.get("done_missing")
+        if explicit_missing_done in {"True", "False"}:
+            missing_done = explicit_missing_done == "True"
+        else:
+            # 舊 history 沒有 done_missing 時，只有同時具備 phase/signal 才回溯判定。
+            # Plan 的 create-plan / plan-ok 是 DONE 等價回報；Exec 則必須是 done。
+            phase = fields.get("phase")
+            signal = fields.get("signal")
+            missing_done = ("signal" in fields and
+                            ((phase == "plan" and signal not in {"create", "ok"}) or
+                             (phase == "exec" and signal != "done")))
         samples.append({
             "round": round_number,
             "seconds": round(seconds, 3),
             "timed_out": fields.get("timeout") == "True",
+            "missing_done": missing_done,
             "timestamp": tokens[0],
         })
         if len(samples) >= limit:
@@ -271,6 +283,7 @@ def round_metrics_from_history(data: str, limit: int = 50, *, history_truncated=
         return durations[index]
 
     timeout_count = sum(1 for sample in samples if sample["timed_out"])
+    missing_done_count = sum(1 for sample in samples if sample["missing_done"])
     slowest = max(samples, key=lambda sample: (sample["seconds"], sample["round"])) if samples else None
     return {
         "limit": limit,
@@ -282,6 +295,8 @@ def round_metrics_from_history(data: str, limit: int = 50, *, history_truncated=
         "slowest_round": slowest["round"] if slowest else None,
         "timeout_count": timeout_count,
         "timeout_rate_pct": round(timeout_count / len(samples) * 100, 1) if samples else 0,
+        "missing_done_count": missing_done_count,
+        "missing_done_rate_pct": round(missing_done_count / len(samples) * 100, 1) if samples else 0,
         "history_truncated": bool(history_truncated),
         "samples": samples,
     }
@@ -1523,6 +1538,15 @@ def main():
         rc, secs, timed_out = run_agent(agent_cmd, prompt_path, repo, round_env,
                                         ws.dir / "logs" / f"round-{rnd:04d}.log",
                                         args.round_timeout * 60, on_started=mark_startup_ready)
+        # Agent process 已結束的當下先保存是否送出該 phase 的完成回報；Plan 的
+        # create-plan / plan-ok 是 DONE 等價訊號，Exec 則是 done。後續竄改／非零
+        # 退出可能清除 coordinator signals，但不能因此失去這個觀測事實。
+        agent_reported_done = (
+            (phase == "plan" and (ws.signal("called_create_plan", round_token) or
+                                  ws.signal("signal_plan_ok", round_token))) or
+            (phase == "exec" and ws.signal("signal_done", round_token))
+        )
+        missing_done = not agent_reported_done
         state["last_round_seconds"] = round(secs, 3)
         state["last_round_timed_out"] = bool(timed_out)
         state["round_started_at"] = None
@@ -1768,6 +1792,7 @@ def main():
         line = (f"{datetime.now().isoformat(timespec='seconds')} round={rnd} phase={phase} "
                 f"task={task_id or '-'} rc={rc} secs={secs:.3f} timeout={timed_out} changed={changed} "
                 f"signal={'create' if ws.signal('called_create_plan', round_token) else 'ok' if ws.signal('signal_plan_ok', round_token) else 'done' if ws.signal('signal_done', round_token) else '-'} "
+                f"done_missing={missing_done} "
                 f"tamper={bool(tampered)} agent_ok={not agent_failed} "
                 f"agent_failures={state['agent_failure_streak']} backoff={retry_delay:g}s validate={validate_note} "
                 f"flag={state['flag']} done={state['done_count']}"

@@ -653,6 +653,7 @@ def aggregate_fleet_round_metrics(samples, *, history_truncated=False):
         return durations[index]
 
     timeout_count = sum(1 for sample in samples if sample["timed_out"])
+    missing_done_count = sum(1 for sample in samples if sample.get("missing_done", False))
     slowest = max(samples, key=lambda sample: (
         sample["seconds"], sample["workspace"], sample["round"])) if samples else None
     return {
@@ -667,6 +668,8 @@ def aggregate_fleet_round_metrics(samples, *, history_truncated=False):
         "slowest_workspace": slowest["workspace"] if slowest else None,
         "timeout_count": timeout_count,
         "timeout_rate_pct": round(timeout_count / len(samples) * 100, 1) if samples else 0,
+        "missing_done_count": missing_done_count,
+        "missing_done_rate_pct": round(missing_done_count / len(samples) * 100, 1) if samples else 0,
         "history_truncated": bool(history_truncated),
     }
 
