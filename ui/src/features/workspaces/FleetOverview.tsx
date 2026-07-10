@@ -1,11 +1,8 @@
-import { useEffect, useState } from "react";
-import { getJson } from "../../shared/api/client";
-import type { WorkspaceSummary } from "../../shared/api/types";
-import { deriveFleetEvents, type FleetEvent, type FleetHistoryEntry } from "./fleetEvents";
+import { useMemo } from "react";
+import type { FleetHistoryEntry, WorkspaceSummary } from "../../shared/api/types";
+import { deriveFleetEvents } from "./fleetEvents";
 
 const PHASE_NAMES: Record<string, string> = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
-const EVENTS_POLL_MS = 2000;
-
 function progress(workspace: WorkspaceSummary): { done: number; total: number; pct: number } {
   const total = workspace.plan_len ?? 0;
   const done = workspace.completed ?? 0;
@@ -20,23 +17,13 @@ function currentActivity(workspace: WorkspaceSummary): string {
 }
 
 /** 監控電視牆:聚合統計 + 全 fleet 即時卡片 + 事件推播。
- * 卡片走既有 SSE workspaces 事件;事件流輪詢 /api/fleet-history 尾段在前端推導。 */
-export default function FleetOverview({ workspaces, onSelect }: {
+ * 卡片與歷史事件都走同一條 SSE；事件流仍由前端從 history 尾段推導。 */
+export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
   workspaces: WorkspaceSummary[];
+  fleetHistory: FleetHistoryEntry[];
   onSelect: (name: string) => void;
 }) {
-  const [events, setEvents] = useState<FleetEvent[]>([]);
-
-  useEffect(() => {
-    let active = true;
-    const poll = async () => {
-      const entries = await getJson<FleetHistoryEntry[]>("/api/fleet-history");
-      if (active && entries) setEvents(deriveFleetEvents(entries));
-    };
-    void poll();
-    const interval = window.setInterval(() => void poll(), EVENTS_POLL_MS);
-    return () => { active = false; window.clearInterval(interval); };
-  }, []);
+  const events = useMemo(() => deriveFleetEvents(fleetHistory), [fleetHistory]);
 
   const running = workspaces.filter((workspace) => workspace.running).length;
   const done = workspaces.filter((workspace) => workspace.phase === "done").length;

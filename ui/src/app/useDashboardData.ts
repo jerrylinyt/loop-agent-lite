@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getJson } from "../shared/api/client";
-import type { BootstrapResponse, WorkspaceState, WorkspaceSummary } from "../shared/api/types";
+import type { BootstrapResponse, FleetHistoryEntry, WorkspaceState, WorkspaceSummary } from "../shared/api/types";
 
 const CONSOLE_LIMIT = 300_000;
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting";
@@ -8,6 +8,7 @@ export type ConnectionStatus = "connecting" | "connected" | "reconnecting";
 export default function useDashboardData() {
   const [bootstrap, setBootstrap] = useState<BootstrapResponse>({ readonly: true, preselect: "" });
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
+  const [fleetHistory, setFleetHistory] = useState<FleetHistoryEntry[]>([]);
   const [selected, setSelected] = useState("");
   const [state, setState] = useState<WorkspaceState | null>(null);
   const [consoleText, setConsoleText] = useState("");
@@ -70,7 +71,9 @@ export default function useDashboardData() {
   useEffect(() => {
     if (!initialized) return;
     setConnection("connecting");
-    const source = new EventSource(`/api/events${selected ? `?ws=${encodeURIComponent(selected)}` : ""}`);
+    const params = new URLSearchParams({ fleet: "1" });
+    if (selected) params.set("ws", selected);
+    const source = new EventSource(`/api/events?${params.toString()}`);
     source.onopen = () => {
       setConnection("connected");
       setConsoleText("");
@@ -78,6 +81,9 @@ export default function useDashboardData() {
     source.onerror = () => setConnection("reconnecting");
     source.addEventListener("workspaces", (event) => applyWorkspaces(JSON.parse(event.data) as WorkspaceSummary[]));
     source.addEventListener("state", (event) => setState(JSON.parse(event.data) as WorkspaceState));
+    source.addEventListener("fleet-history", (event) => {
+      setFleetHistory(JSON.parse(event.data) as FleetHistoryEntry[]);
+    });
     source.addEventListener("console", (event) => {
       const { data } = JSON.parse(event.data) as { data: string };
       setConsoleText((text) => (text + data).slice(-CONSOLE_LIMIT));
@@ -92,6 +98,7 @@ export default function useDashboardData() {
     workspaces,
     selected,
     state,
+    fleetHistory,
     consoleText,
     selectWorkspace,
     refreshState,

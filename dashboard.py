@@ -607,6 +607,7 @@ def read_report(name):
 
 
 FLEET_HISTORY_TAIL = 16 * 1024  # 每個 workspace 事件流尾段上限
+FLEET_HISTORY_SSE_INTERVAL = 2.0  # 事件流只在歷史有變時推送，避免每圈重送整段尾端
 
 
 def read_fleet_history():
@@ -1003,8 +1004,9 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def _serve_events(self, q):
-        """SSE:主畫面單向推送 fleet/state/完整 console 增量；寫入操作仍走 REST。"""
+        """SSE:主畫面單向推送 fleet/state/歷史事件/console 增量；寫入操作仍走 REST。"""
         workspace = q.get("ws", [""])[0]
+        include_fleet_history = q.get("fleet", ["0"])[0] == "1"
         if workspace and not loop_mod.valid_workspace_name(workspace):
             self._err(f"workspace 名稱不合法：{loop_mod.WORKSPACE_NAME_RULE}")
             return
@@ -1026,8 +1028,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(f"event: {event}\ndata: {data}\n\n".encode("utf-8"))
             self.wfile.flush()
 
-        fleet_sig = state_sig = None
-        fleet_at = keepalive_at = 0.0
+        fleet_sig = state_sig = fleet_history_sig = None
+        fleet_at = fleet_history_at = keepalive_at = 0.0
         console_offset = -1
         console_identity = None
 
@@ -1050,6 +1052,14 @@ class Handler(BaseHTTPRequestHandler):
                     # dashboard 自己啟動的 job 可能在 preflight 立刻退出；快速同步避免
                     # UI 還顯示「停止」數秒，使用者再點後才發現程序早已結束。
                     fleet_at = now + 0.6
+
+                if include_fleet_history and now >= fleet_history_at:
+                    fleet_history = read_fleet_history()
+                    history_sig = json.dumps(fleet_history, ensure_ascii=False, sort_keys=True)
+                    if history_sig != fleet_history_sig:
+                        emit("fleet-history", fleet_history)
+                        fleet_history_sig = history_sig
+                    fleet_history_at = now + FLEET_HISTORY_SSE_INTERVAL
 
                 if workspace:
                     # GET/SSE 永遠只讀；真正修復由 loop resume 或後續明確 mutation 完成，

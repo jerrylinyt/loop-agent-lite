@@ -1,15 +1,11 @@
 import { parseHistory } from "./historyParser";
+import type { FleetHistoryEntry } from "../../shared/api/types";
 
 export interface FleetEvent {
   ws: string;
   ts: string;
   time: string;
   text: string;
-}
-
-export interface FleetHistoryEntry {
-  name: string;
-  data: string;
 }
 
 /** 從各 workspace 的 history.log 尾段推導事件流:

@@ -83,7 +83,7 @@ export default function App() {
             {!dashboard.bootstrap.readonly && <button type="button" className="primary-button" onClick={() => setLauncherOpen(true)}>＋ 啟動第一個 loop</button>}
           </main>
         ) : overviewOpen ? (
-          <FleetOverview workspaces={dashboard.workspaces} onSelect={selectFromOverview} />
+          <FleetOverview workspaces={dashboard.workspaces} fleetHistory={dashboard.fleetHistory} onSelect={selectFromOverview} />
         ) : (
           <main className="dashboard-grid" style={{ gridTemplateColumns: `${leftWidth}px 6px ${rightCollapsed ? "42px" : "minmax(0, 1fr)"}` }}>
             <WorkspaceView key={dashboard.selected} workspace={workspace} state={dashboard.state} consoleText={dashboard.consoleText} readonly={dashboard.bootstrap.readonly} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} />

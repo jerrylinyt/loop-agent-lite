@@ -19,6 +19,11 @@ export interface WorkspaceSummary {
   current_task?: string;
 }
 
+export interface FleetHistoryEntry {
+  name: string;
+  data: string;
+}
+
 export interface PlanTask {
   order: number;
   task: string;
