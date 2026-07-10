@@ -734,7 +734,8 @@ def read_goal(name):
         return {"error": err}
     c = st.get("config") or {}
     repo, goal_rel = c.get("repo"), c.get("goal") or "goal.md"
-    if not repo:
+    # repo 必須是非空字串:壞 state 塞非字串會讓 Path(repo) 拋 TypeError 變成未受控 500
+    if not isinstance(repo, str) or not repo:
         return {"error": "state 缺 repo 設定(舊版 state)——用啟動表單跑過一次後即可檢視 goal"}
     try:
         goal_path = loop_mod.repo_relative_path(Path(repo).expanduser(), goal_rel)

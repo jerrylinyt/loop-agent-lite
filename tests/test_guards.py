@@ -2925,6 +2925,10 @@ class TestGoalProjection(unittest.TestCase):
                 # 舊版 state 缺 config.repo → 明確 error
                 (root / "demo" / "state.json").write_text(json.dumps({"phase": "plan"}), encoding="utf-8")
                 self.assertIn("缺 repo 設定", D.read_goal("demo")["error"])
+                # 壞 state 塞非字串 repo → 受控 error,不得拋 TypeError
+                (root / "demo" / "state.json").write_text(json.dumps(
+                    {"phase": "plan", "config": {"repo": 123}}), encoding="utf-8")
+                self.assertIn("缺 repo 設定", D.read_goal("demo")["error"])
                 # 正常:回 goal 內容與路徑,goal_changed 透傳
                 (root / "demo" / "state.json").write_text(json.dumps(
                     {"phase": "plan", "goal_changed": True,
