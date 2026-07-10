@@ -639,6 +639,7 @@ class TestStatusCli(unittest.TestCase):
                 payload = json.loads(result.stdout)
                 self.assertEqual(payload["round"], 4)
                 self.assertEqual(payload["plan_len"], 1)
+                self.assertEqual(payload["current_task"], "one")
                 self.assertTrue(payload["state_recovery_pending"])
                 self.assertEqual(ws.state_path.read_bytes(), before, "status CLI 不得修復 primary state")
             finally:
@@ -653,6 +654,34 @@ class TestStatusCli(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             payload = json.loads(result.stdout)
             self.assertIn("不存在", payload["error"])
+
+    def test_watch_emits_repeated_json_and_stops_with_ctrl_c(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = root / "workspace"
+                ws = L.Workspace("watch-status")
+                ws.save_state(ws.fresh_state())
+                env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
+                process = subprocess.Popen(
+                    [sys.executable, STATUS_PY, "--name", "watch-status", "--json",
+                     "--watch", "--interval", "0.01"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+                try:
+                    time.sleep(0.08)
+                    process.send_signal(signal.SIGINT)
+                    output, error = process.communicate(timeout=2)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                self.assertEqual(process.returncode, 130, error)
+                lines = [line for line in output.splitlines() if line.strip()]
+                self.assertGreaterEqual(len(lines), 2)
+                self.assertTrue(all(json.loads(line)["name"] == "watch-status" for line in lines))
+            finally:
+                L.WORKSPACE_ROOT = old_root
 
 
 class TestLoopSignalIngestionGuards(unittest.TestCase):

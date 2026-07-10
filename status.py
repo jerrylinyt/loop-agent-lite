@@ -7,6 +7,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import loop
@@ -43,6 +44,11 @@ def project_status(name: str):
     plan = state.get("plan") if isinstance(state.get("plan"), list) else []
     completed = state.get("completed") if isinstance(state.get("completed"), list) else []
     issues = state.get("issues") if isinstance(state.get("issues"), list) else []
+    current_order = state.get("current_order")
+    current_task = next((task.get("task", "") for task in plan
+                         if isinstance(task, dict) and task.get("order") == current_order), "")
+    if len(current_task) > 160:
+        current_task = current_task[:160] + "…"
     return {
         "name": name,
         "workspace": str(directory),
@@ -53,7 +59,8 @@ def project_status(name: str):
         "plan_version": state.get("plan_version", 0),
         "plan_len": len(plan),
         "completed": len(completed),
-        "current_order": state.get("current_order"),
+        "current_order": current_order,
+        "current_task": current_task,
         "red_streak": state.get("red_streak", 0),
         "stall_rounds": state.get("stall_rounds", 0),
         "agent_failure_streak": state.get("agent_failure_streak", 0),
@@ -70,34 +77,49 @@ def stat_is_directory(mode: int) -> bool:
     return stat.S_ISDIR(mode) and not stat.S_ISLNK(mode)
 
 
+def render_human(result, *, timestamp=False) -> None:
+    phase = {"plan": "規劃期", "exec": "執行期", "done": "完成"}.get(result["phase"], result["phase"] or "未知")
+    running = "執行中" if result["running"] else "已停止"
+    prefix = f"[{time.strftime('%H:%M:%S')}] " if timestamp else ""
+    task = f"｜task-{result['current_order']}：{result['current_task']}" if result.get("current_task") else ""
+    print(f"{prefix}{result['name']}｜{phase}｜round {result['round']}｜"
+          f"任務 {result['completed']}/{result['plan_len']}{task}｜{running}｜"
+          f"紅連跳 {result['red_streak']}｜停滯 {result['stall_rounds']}｜issues {result['issues']}", flush=True)
+    if result["state_recovery_pending"]:
+        print("🛟 primary state 不可讀，目前只投影 last-good checkpoint（未修改檔案）", flush=True)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="唯讀查詢 loop-agent-lite workspace 狀態")
     parser.add_argument("--name", required=True, help="workspace 名稱")
     parser.add_argument("--workspace-root", default=None,
                         help="workspace 根目錄（預設使用 LOOP_AGENT_WORKSPACE_ROOT 或專案 workspace）")
     parser.add_argument("--json", action="store_true", dest="as_json", help="輸出單行 JSON，供 shell/CI 使用")
+    parser.add_argument("--watch", action="store_true", help="持續輪詢狀態，Ctrl-C 結束")
+    parser.add_argument("--interval", type=float, default=2.0, help="--watch 輪詢秒數（預設 2）")
     args = parser.parse_args(argv)
+    if not (args.interval > 0 and args.interval < float("inf")):
+        parser.error("--interval 必須是有限正數")
     if args.workspace_root:
         loop.WORKSPACE_ROOT = Path(args.workspace_root).expanduser().resolve()
     try:
-        result = project_status(args.name)
+        while True:
+            result = project_status(args.name)
+            if args.as_json:
+                print(json.dumps(result, ensure_ascii=False, separators=(",", ":")), flush=True)
+            else:
+                render_human(result, timestamp=args.watch)
+            if not args.watch:
+                return 0
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 130
     except (FileNotFoundError, OSError, ValueError, loop.StateLoadError) as e:
         if args.as_json:
-            print(json.dumps({"error": str(e)}, ensure_ascii=False))
+            print(json.dumps({"error": str(e)}, ensure_ascii=False), flush=True)
         else:
             print(f"❌ {e}", file=sys.stderr)
         return 1
-    if args.as_json:
-        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
-    else:
-        phase = {"plan": "規劃期", "exec": "執行期", "done": "完成"}.get(result["phase"], result["phase"] or "未知")
-        running = "執行中" if result["running"] else "已停止"
-        print(f"{result['name']}｜{phase}｜round {result['round']}｜"
-              f"任務 {result['completed']}/{result['plan_len']}｜{running}｜"
-              f"紅連跳 {result['red_streak']}｜停滯 {result['stall_rounds']}｜issues {result['issues']}")
-        if result["state_recovery_pending"]:
-            print("🛟 primary state 不可讀，目前只投影 last-good checkpoint（未修改檔案）")
-    return 0
 
 
 if __name__ == "__main__":
