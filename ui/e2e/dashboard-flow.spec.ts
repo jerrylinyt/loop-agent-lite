@@ -84,6 +84,19 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   const rootsManager = page.getByRole("dialog", { name: "Code Repo Roots 管理" });
   await expect(rootsManager.getByLabel("Repo root 1")).toBeVisible();
   await rootsManager.getByRole("button", { name: "取消" }).click();
+  const repoSelect = launcher.getByRole("combobox", { name: "Repo" });
+  const originalRepo = await repoSelect.inputValue();
+  await page.route("**/api/validate", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, rc: 0, timeout: false, tail: "stale validate" }) });
+  });
+  await launcher.locator(".validate-command-field").getByRole("button", { name: "執行確認" }).click();
+  await repoSelect.selectOption("__custom__");
+  await launcher.getByLabel("Repo 路徑").fill("/tmp/stale-validate-target");
+  await page.waitForTimeout(300);
+  await expect(launcher.locator(".validate-result")).toHaveCount(0);
+  await page.unroute("**/api/validate");
+  await repoSelect.selectOption(originalRepo);
   await launcher.locator(".validate-command-field").getByRole("button", { name: "執行確認" }).click();
   await expect(launcher.locator(".validate-result")).toContainText("Validate 通過");
   await launcher.locator(".validate-command-field").getByRole("button", { name: "完整健檢" }).click();

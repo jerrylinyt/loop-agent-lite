@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import CliManagerModal from "../cli/CliManagerModal";
 import Modal from "../../shared/components/Modal";
 import { getJson, postJson } from "../../shared/api/client";
@@ -33,8 +33,14 @@ export default function ConfigModal({
   const [validating, setValidating] = useState(false);
   const [validateResult, setValidateResult] = useState<{ ok: boolean; text: string; tail: string } | null>(null);
   const [cliManagerOpen, setCliManagerOpen] = useState(false);
+  const validateRequestSeq = useRef(0);
 
   useEffect(() => { void getJson<ConfigResponse>("/api/config").then(setAvailable); }, []);
+  useEffect(() => {
+    validateRequestSeq.current += 1;
+    setValidating(false);
+    setValidateResult(null);
+  }, [draft.validate_cmd, draft.validate_timeout]);
 
   const save = async () => {
     setMessage("儲存中…");
@@ -51,6 +57,8 @@ export default function ConfigModal({
   );
 
   const verifyValidate = async () => {
+    const seq = validateRequestSeq.current + 1;
+    validateRequestSeq.current = seq;
     setValidating(true);
     setValidateResult(null);
     const response = await postJson<ValidateResponse>("/api/validate", {
@@ -58,6 +66,7 @@ export default function ConfigModal({
       validate_cmd: draft.validate_cmd,
       validate_timeout: draft.validate_timeout
     });
+    if (seq !== validateRequestSeq.current) return;
     setValidating(false);
     if (response.error) {
       setValidateResult({ ok: false, text: `❌ ${response.error}`, tail: "" });
