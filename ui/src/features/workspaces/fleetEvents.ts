@@ -29,7 +29,8 @@ export function deriveFleetEvents(entries: FleetHistoryEntry[], limit = 60): Fle
       if (row.event) {
         events.push({ ws: entry.name, ts: row.ts, time: row.time, text: row.event });
       }
-      if (row.task) prevTask = row.task;
+      // 回規劃期代表任務指標已清空;之後重新進執行期,即使是同一個 task 也要重新發「開始」。
+      prevTask = row.phaseRaw === "plan" ? "" : (row.task || prevTask);
       prevValidate = row.validate;
     }
   }

@@ -372,6 +372,14 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await reportModal.getByRole("button", { name: "關閉對話框" }).click();
   await expect(reportModal).toBeHidden();
 
+  await page.getByRole("button", { name: "📺 總覽" }).click();
+  const finalOverview = page.getByRole("main", { name: "Fleet 總覽" });
+  const finalFeed = finalOverview.getByRole("complementary", { name: "事件推播" });
+  await expect(finalFeed.locator(".fleet-event", { hasText: "▶ 開始 task-2" }).first()).toBeVisible();
+  await expect(finalFeed.locator(".fleet-event", { hasText: "▶ 開始 task-1" })).toHaveCount(2);
+  await page.getByRole("button", { name: "📺 總覽" }).click();
+  await expect(finalOverview).toBeHidden();
+
   await page.getByRole("button", { name: "🗄 封存" }).click();
   const archiveDialog = page.getByRole("dialog", { name: "請確認" });
   await expect(archiveDialog).toContainText("已封存");
