@@ -12,6 +12,7 @@
 stdlib only,綁 127.0.0.1。
 """
 import argparse
+import fcntl
 import functools
 import json
 import mimetypes
@@ -788,6 +789,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.api_phase(body)
             elif u.path == "/api/set-task":
                 self.api_set_task(body)
+            elif u.path == "/api/archive-workspace":
+                self.api_archive_workspace(body)
             else:
                 self._err("not found", 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -1442,6 +1445,47 @@ class Handler(BaseHTTPRequestHandler):
         )
         self._out(200, json.dumps({"ok": True, "current_order": order,
                                    "human_marked": skipped}, ensure_ascii=False))
+
+    @with_state_lock
+    def api_archive_workspace(self, body):
+        """停止狀態下封存 workspace:整個目錄搬進 .archive/(軟刪除,可手動搬回還原)。
+        不動 target repo;執行中或單 writer 鎖仍被持有時 fail-closed 拒絕。"""
+        name = str(body.get("name") or "")
+        st, err = read_state(name)
+        if err:
+            self._err(err)
+            return
+        if ws_running(name, st):
+            self._err(f"{name} 執行中,不能封存——先停止")
+            return
+        wsd = ROOT / name
+        # pid 偵測可能失準(SIGKILL 殘值/ps 誤判);flock 是 loop 單 writer 的機械真相,
+        # 拿不到鎖就代表還有 loop 活著,寧可擋下也不搬走執行中的 state。
+        try:
+            lock_file = open(wsd / ".run.lock", "a+b")
+        except OSError as e:
+            self._err(f"無法檢查單 writer 鎖:{e}")
+            return
+        try:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self._err(f"{name} 的單 writer 鎖仍被持有(loop 還活著),不能封存")
+                return
+            archive_root = ROOT / ".archive"
+            archive_root.mkdir(exist_ok=True)
+            target = archive_root / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}"
+            try:
+                os.rename(wsd, target)
+            except OSError as e:
+                self._err(f"封存失敗:{e}")
+                return
+        finally:
+            lock_file.close()
+        with JOBS_LOCK:
+            JOBS.pop(name, None)  # 已結束 job 的殘影一併移除,避免 stale tail/名稱衝突
+        print(f"[{time.strftime('%H:%M:%S')}] 🖥️ Dashboard｜封存 workspace {name} → {target}", flush=True)
+        self._out(200, json.dumps({"ok": True, "archived_to": str(target)}, ensure_ascii=False))
 
     def api_stop(self, body):
         name = str(body.get("name") or "")

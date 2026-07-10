@@ -229,6 +229,12 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(reportModal).toContainText("task-2");
   await reportModal.getByRole("button", { name: "關閉對話框" }).click();
   await expect(reportModal).toBeHidden();
+
+  await page.getByRole("button", { name: "🗄 封存" }).click();
+  const archiveDialog = page.getByRole("dialog", { name: "請確認" });
+  await expect(archiveDialog).toContainText("可手動搬回還原");
+  await archiveDialog.getByRole("button", { name: "封存" }).click();
+  await expect(page.getByRole("heading", { name: "尚未建立 workspace" })).toBeVisible();
 });
 
 test("read-only instance 隱藏寫入控制並拒絕 POST", async ({ page, request }) => {

@@ -926,5 +926,65 @@ class TestReportProjection(unittest.TestCase):
                 D.ROOT = old_root
 
 
+class TestWorkspaceArchive(unittest.TestCase):
+    """封存=軟刪除:停止狀態整目錄搬進 .archive/;執行中或單 writer 鎖被持有時 fail-closed 拒絕。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_refuses_running_and_held_lock_then_archives(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            (root / "demo").mkdir(parents=True)
+            (root / "demo" / "state.json").write_text(
+                json.dumps({"phase": "done", "loop": {"pid": None}}), encoding="utf-8")
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                # 執行中 → 拒絕,目錄不動
+                old_running = D.ws_running
+                D.ws_running = lambda *a, **k: True
+                try:
+                    handler = self.ResponseCapture()
+                    D.Handler.api_archive_workspace(handler, {"name": "demo"})
+                finally:
+                    D.ws_running = old_running
+                self.assertEqual(handler.response[0], 400)
+                self.assertTrue((root / "demo").exists())
+
+                # 單 writer 鎖被持有 → fail-closed 拒絕(pid 偵測失準的兜底)
+                holder = open(root / "demo" / ".run.lock", "a+b")
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    handler = self.ResponseCapture()
+                    D.Handler.api_archive_workspace(handler, {"name": "demo"})
+                finally:
+                    fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+                    holder.close()
+                self.assertEqual(handler.response[0], 400)
+                self.assertIn("單 writer 鎖", handler.response[1]["error"])
+                self.assertTrue((root / "demo").exists())
+
+                # 停止且無鎖 → 搬進 .archive/,原目錄消失、內容完整
+                handler = self.ResponseCapture()
+                D.Handler.api_archive_workspace(handler, {"name": "demo"})
+                self.assertEqual(handler.response[0], 200)
+                self.assertFalse((root / "demo").exists())
+                archived = [d for d in (root / ".archive").iterdir() if d.is_dir()]
+                self.assertEqual(len(archived), 1)
+                self.assertTrue((archived[0] / "state.json").exists())
+                # .archive 不得冒充 workspace 出現在 fleet
+                self.assertEqual(D.list_workspaces(), [])
+            finally:
+                D.ROOT = old_root
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -114,6 +114,24 @@ export default function WorkspaceView({
     onRefresh();
     return `✅ 已儲存 ${response.changed?.join(", ") || "（無變更）"}`;
   };
+  const archiveWorkspace = () => {
+    setDialog({
+      title: "請確認",
+      message: `封存 ${workspace?.name}？整個 workspace 會移到 workspace/.archive/（可手動搬回還原），target repo 與程式碼不受影響。`,
+      confirmLabel: "封存",
+      onConfirm: () => {
+        setDialog(null);
+        void (async () => {
+          const response = await postJson<{ ok?: boolean }>("/api/archive-workspace", { name: workspace?.name });
+          if (response.error) {
+            setDialog({ title: "操作失敗", message: response.error });
+            return;
+          }
+          await Promise.resolve(onRefreshWorkspaces());
+        })();
+      }
+    });
+  };
 
   const completed = (state.completed ?? []).length;
   const total = (state.plan ?? []).length;
@@ -127,6 +145,7 @@ export default function WorkspaceView({
             {canChange && state.phase === "plan" && total > 0 && <button type="button" className="secondary-button" onClick={() => changePhase("exec")}>⏩ 進執行期</button>}
             {canChange && (state.phase === "exec" || state.phase === "done") && <button type="button" className="secondary-button" onClick={() => changePhase("plan")}>⏪ 回規劃期</button>}
             {canChange && <button type="button" className="secondary-button" onClick={() => setConfigOpen(true)}>⚙ 設定</button>}
+            {canChange && <button type="button" className="secondary-button" onClick={archiveWorkspace}>🗄 封存</button>}
           </div>}
         </div>
         <div className="workspace-status-row">
