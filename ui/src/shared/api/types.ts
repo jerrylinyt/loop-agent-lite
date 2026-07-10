@@ -2,6 +2,7 @@ export type Phase = "plan" | "exec" | "done";
 
 export interface WorkspaceSummary {
   name: string;
+  error?: string;
   phase: Phase | null;
   running: boolean;
   draining?: boolean;

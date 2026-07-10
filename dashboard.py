@@ -893,7 +893,9 @@ def list_workspaces():
             "stale_loop_pid": False,
         }
         st, err = read_state(d.name, repair=False)
-        if not err:
+        if err:
+            info["error"] = err
+        else:
             c = st.get("config") or {}
             loop_state = st.get("loop") or {}
             running = ws_running(d.name, st)

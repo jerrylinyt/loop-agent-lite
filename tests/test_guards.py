@@ -1177,13 +1177,17 @@ class TestWorkspaceFleetValidity(unittest.TestCase):
             checkpoint_state = L.Workspace.__new__(L.Workspace).fresh_state()
             checkpoint_state["round"] = 8
             (checkpoint_only / "state.last-good.json").write_text(json.dumps(checkpoint_state))
+            broken = root / "broken"
+            broken.mkdir()
+            (broken / "state.json").write_text("{broken", encoding="utf-8")
             old_root = D.ROOT
             try:
                 D.ROOT = root
                 fleet = D.list_workspaces()
-                self.assertEqual([item["name"] for item in fleet], ["checkpoint-only", "valid"])
-                self.assertEqual(fleet[0]["round"], 8)
-                valid_item = fleet[1]
+                self.assertEqual([item["name"] for item in fleet], ["broken", "checkpoint-only", "valid"])
+                self.assertIn("error", fleet[0])
+                self.assertEqual(fleet[1]["round"], 8)
+                valid_item = fleet[2]
                 self.assertEqual(valid_item["agent_failure_streak"], 2)
                 self.assertEqual(valid_item["agent_backoff_seconds"], 4)
                 self.assertEqual(valid_item["state_recovery_count"], 3)

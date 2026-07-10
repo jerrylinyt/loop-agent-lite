@@ -13,6 +13,7 @@ function initialFleetFilter(): FleetFilter {
 
 function needsAttention(workspace: WorkspaceSummary): boolean {
   return !!(
+    workspace.error ||
     (workspace.red_streak ?? 0) > 0 ||
     (workspace.stall_rounds ?? 0) > 0 ||
     (workspace.issues ?? 0) > 0 ||
@@ -31,6 +32,7 @@ function progress(workspace: WorkspaceSummary): { done: number; total: number; p
 }
 
 function currentActivity(workspace: WorkspaceSummary): string {
+  if (workspace.error) return "state 讀取失敗，請檢查 checkpoint 或重新啟動";
   if (workspace.phase === "done") return "全部任務收斂完成";
   if (workspace.phase === "plan") return workspace.running ? "規劃收斂中…" : "規劃期（已停止）";
   if (workspace.current_task) return `task-${workspace.current_order}：${workspace.current_task}`;
@@ -142,6 +144,7 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
                     {workspace.state_recovery_pending && <span className="chip warning">🛟 checkpoint</span>}
                     {workspace.goal_changed && <span className="chip warning">goal 已變更</span>}
                     {workspace.stale_loop_pid && <span className="chip warning">⚠ PID 殘留</span>}
+                    {workspace.error && <span className="chip warning">❌ state 錯誤</span>}
                   </div>
                 )}
                 {workspace.repo && <div className="fleet-card-repo" title={workspace.repo}>{workspace.repo}</div>}
