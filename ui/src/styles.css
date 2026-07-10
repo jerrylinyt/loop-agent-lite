@@ -110,6 +110,14 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .connection-status.connected > span { color: var(--success); }
 .connection-status.reconnecting { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
 .connection-status.reconnecting > span { color: var(--warning); animation: connection-pulse 1.2s ease-in-out infinite; }
+.fleet-health { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 7px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.fleet-health > span { color: var(--muted); font-size: 11px; }
+.fleet-health.ok { color: var(--success); border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
+.fleet-health.ok > span { color: var(--success); }
+.fleet-health.degraded { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.fleet-health.degraded > span { color: var(--warning); }
+.fleet-health.error { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+.fleet-health.error > span { color: var(--danger); }
 @keyframes connection-pulse { 50% { opacity: .3; } }
 .theme-picker {
   display: flex;

@@ -49,6 +49,7 @@ LEGACY_CONFIG_PATH = (HERE / "dashboard.config.json").resolve()
 CONFIG_PATH = PERSONAL_CONFIG_PATH  # 舊程式/錯誤訊息相容名稱；UI 會分別顯示團隊版與個人版
 MAX_CHUNK = 512 * 1024  # 單次 tail 最多回傳量
 MAX_REQUEST_BYTES = 8 * 1024 * 1024  # POST JSON 上限，避免 goal/plan 或惡意 body 吃光 dashboard 記憶體
+HEALTH_SCHEMA_VERSION = 1
 ARCHIVE_DIR_NAME = ".archive"
 ARCHIVE_OPS_LOCK_NAME = ".ops.lock"
 ARCHIVE_ID_RE = re.compile(
@@ -929,6 +930,44 @@ def list_workspaces():
     return out
 
 
+def _workspace_needs_attention(info):
+    """以 Dashboard fleet projection 的欄位判斷需關注項目；不讀寫 workspace。"""
+    if info.get("error"):
+        return True
+    return bool(
+        (info.get("red_streak") or 0) > 0 or
+        (info.get("stall_rounds") or 0) > 0 or
+        (info.get("issues") or 0) > 0 or
+        (info.get("agent_failure_streak") or 0) > 0 or
+        (info.get("state_recovery_count") or 0) > 0 or
+        info.get("state_recovery_pending") or
+        info.get("goal_changed") or
+        info.get("stale_loop_pid")
+    )
+
+
+def fleet_health_projection(workspaces=None):
+    """回傳唯讀 fleet health projection，供探針、SSE 與 UI 共用。"""
+    items = list_workspaces() if workspaces is None else list(workspaces)
+    error_count = sum(1 for item in items if item.get("error"))
+    attention = sum(1 for item in items if _workspace_needs_attention(item))
+    status = "error" if error_count else "degraded" if attention else "ok"
+    return {
+        "schema_version": HEALTH_SCHEMA_VERSION,
+        "status": status,
+        "workspace_count": len(items),
+        "running": sum(1 for item in items if item.get("running")),
+        "attention": attention,
+        "error_count": error_count,
+        "issues": sum(item.get("issues") or 0 for item in items),
+        "agent_failures": sum(item.get("agent_failure_streak") or 0 for item in items),
+        "state_recoveries": sum(item.get("state_recovery_count") or 0 for item in items),
+        "goal_changes": sum(1 for item in items if item.get("goal_changed")),
+        "stale_loop_pids": sum(1 for item in items if item.get("stale_loop_pid")),
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+
+
 TAIL_INIT = 64 * 1024  # offset<0(首抓)時只回檔案尾段,超長 log 秒開
 
 
@@ -1071,6 +1110,7 @@ class Handler(BaseHTTPRequestHandler):
                     sig = json.dumps(fleet, ensure_ascii=False, sort_keys=True)
                     if sig != fleet_sig:
                         emit("workspaces", fleet)
+                        emit("health", fleet_health_projection(fleet))
                         fleet_sig = sig
                     # dashboard 自己啟動的 job 可能在 preflight 立刻退出；快速同步避免
                     # UI 還顯示「停止」數秒，使用者再點後才發現程序早已結束。
@@ -1130,6 +1170,8 @@ class Handler(BaseHTTPRequestHandler):
                                            "readonly": self.readonly}, ensure_ascii=False))
             elif u.path == "/api/events":
                 self._serve_events(q)
+            elif u.path == "/api/health":
+                self._out(200, json.dumps(fleet_health_projection(), ensure_ascii=False))
             elif u.path == "/api/workspaces":
                 self._out(200, json.dumps(list_workspaces(), ensure_ascii=False))
             elif u.path == "/api/archives":

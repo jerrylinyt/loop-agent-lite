@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getJson } from "../shared/api/client";
-import type { BootstrapResponse, FleetHistoryEntry, WorkspaceState, WorkspaceSummary } from "../shared/api/types";
+import type { BootstrapResponse, FleetHealth, FleetHistoryEntry, WorkspaceState, WorkspaceSummary } from "../shared/api/types";
 
 const CONSOLE_LIMIT = 300_000;
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting";
@@ -8,6 +8,7 @@ export type ConnectionStatus = "connecting" | "connected" | "reconnecting";
 export default function useDashboardData() {
   const [bootstrap, setBootstrap] = useState<BootstrapResponse>({ readonly: true, preselect: "" });
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
+  const [health, setHealth] = useState<FleetHealth | null>(null);
   const [fleetHistory, setFleetHistory] = useState<FleetHistoryEntry[]>([]);
   const [selected, setSelected] = useState("");
   const [state, setState] = useState<WorkspaceState | null>(null);
@@ -49,6 +50,11 @@ export default function useDashboardData() {
     if (list) applyWorkspaces(list);
   }, [applyWorkspaces]);
 
+  const refreshHealth = useCallback(async () => {
+    const next = await getJson<FleetHealth>("/api/health");
+    if (next) setHealth(next);
+  }, []);
+
   const refreshState = useCallback(async () => {
     const workspace = selectedRef.current;
     if (!workspace) return;
@@ -64,9 +70,10 @@ export default function useDashboardData() {
         setBootstrap(value);
       }
       await refreshWorkspaces();
+      await refreshHealth();
       setInitialized(true);
     })();
-  }, [refreshWorkspaces]);
+  }, [refreshHealth, refreshWorkspaces]);
 
   useEffect(() => {
     if (!initialized) return;
@@ -80,6 +87,7 @@ export default function useDashboardData() {
     };
     source.onerror = () => setConnection("reconnecting");
     source.addEventListener("workspaces", (event) => applyWorkspaces(JSON.parse(event.data) as WorkspaceSummary[]));
+    source.addEventListener("health", (event) => setHealth(JSON.parse(event.data) as FleetHealth));
     source.addEventListener("state", (event) => setState(JSON.parse(event.data) as WorkspaceState));
     source.addEventListener("fleet-history", (event) => {
       setFleetHistory(JSON.parse(event.data) as FleetHistoryEntry[]);
@@ -96,12 +104,14 @@ export default function useDashboardData() {
     connection,
     bootstrap,
     workspaces,
+    health,
     selected,
     state,
     fleetHistory,
     consoleText,
     selectWorkspace,
     refreshState,
-    refreshWorkspaces
+    refreshWorkspaces,
+    refreshHealth
   };
 }

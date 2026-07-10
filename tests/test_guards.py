@@ -1202,6 +1202,66 @@ class TestWorkspaceFleetValidity(unittest.TestCase):
                 D.ROOT = old_root
 
 
+class TestFleetHealthProjection(unittest.TestCase):
+    """fleet health 是唯讀、可供 API/SSE/UI 共用的聚合 projection。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_health_aggregates_attention_and_state_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            healthy = root / "healthy"
+            healthy.mkdir()
+            (healthy / "state.json").write_text(json.dumps({"phase": "done"}), encoding="utf-8")
+            attention = root / "attention"
+            attention.mkdir()
+            (attention / "state.json").write_text(json.dumps({
+                "phase": "exec", "red_streak": 2, "issues": [{"text": "a"}, {"text": "b"}],
+                "agent_failure_streak": 3, "state_recovery_count": 4,
+                "state_recovery_pending": True, "goal_changed": True,
+                "loop": {"pid": 99999999, "session_id": "stale", "started_at": "2026-07-10T20:00:00"},
+            }), encoding="utf-8")
+            broken = root / "broken"
+            broken.mkdir()
+            (broken / "state.json").write_text("{broken", encoding="utf-8")
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                projection = D.fleet_health_projection()
+                self.assertEqual(projection["schema_version"], 1)
+                self.assertEqual(projection["status"], "error")
+                self.assertEqual(projection["workspace_count"], 3)
+                self.assertEqual(projection["error_count"], 1)
+                self.assertEqual(projection["attention"], 2)
+                self.assertEqual(projection["issues"], 2)
+                self.assertEqual(projection["agent_failures"], 3)
+                self.assertEqual(projection["state_recoveries"], 4)
+                self.assertEqual(projection["goal_changes"], 1)
+                self.assertEqual(projection["stale_loop_pids"], 1)
+
+                handler = self.ResponseCapture()
+                handler.path = "/api/health"
+                D.Handler.do_GET(handler)
+                self.assertEqual(handler.response[0], 200)
+                self.assertEqual(handler.response[1]["schema_version"], 1)
+                self.assertEqual(handler.response[1]["status"], "error")
+            finally:
+                D.ROOT = old_root
+
+    def test_empty_fleet_is_healthy(self):
+        projection = D.fleet_health_projection([])
+        self.assertEqual(projection["status"], "ok")
+        self.assertEqual(projection["workspace_count"], 0)
+        self.assertEqual(projection["attention"], 0)
+
+
 class TestHistoryRetention(unittest.TestCase):
     """當前 run 的 history 不得無限成長，且裁切保留最新紀錄。"""
 

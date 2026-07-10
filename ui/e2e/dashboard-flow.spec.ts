@@ -16,6 +16,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "尚未建立 workspace" })).toBeVisible();
   await expect(page.locator(".connection-status.connected")).toContainText("即時連線");
+  await expect(page.locator(".fleet-health.ok")).toContainText("Fleet 正常");
 
   const theme = page.getByRole("combobox", { name: "介面主題" });
   await theme.selectOption("light");

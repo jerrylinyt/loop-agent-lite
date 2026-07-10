@@ -22,6 +22,11 @@ export default function App() {
     [dashboard.workspaces, dashboard.selected]
   );
   useStatusFavicon(workspace, dashboard.state, dashboard.selected);
+  const health = dashboard.health;
+  const healthText = !health ? "Fleet 狀態載入中" : health.status === "error" ? "Fleet state 錯誤" : health.status === "degraded" ? "Fleet 需關注" : "Fleet 正常";
+  const healthLabel = health
+    ? `${healthText}：${health.workspace_count} 個 workspace，${health.attention} 項需關注`
+    : healthText;
   const resize = (pixels: number) => {
     setLeftWidth(pixels);
     localStorage.setItem("left-pane-width", String(pixels));
@@ -63,6 +68,9 @@ export default function App() {
             <span className={`connection-status ${dashboard.connection}`} role="status" aria-live="polite" aria-label={dashboard.connection === "connected" ? "即時連線" : dashboard.connection === "reconnecting" ? "重連中" : "連線中"} title={dashboard.connection === "connected" ? "Dashboard 即時事件串流已連線" : dashboard.connection === "reconnecting" ? "Dashboard 正在重新連線；狀態會自動恢復" : "Dashboard 正在建立即時事件串流"}>
               <span aria-hidden="true">●</span>
               {dashboard.connection === "connected" ? "即時連線" : dashboard.connection === "reconnecting" ? "重連中…" : "連線中…"}
+            </span>
+            <span className={`fleet-health${health ? ` ${health.status}` : " unknown"}`} role="status" aria-label={healthLabel} title={healthLabel}>
+              <span aria-hidden="true">●</span>{healthText}{health && health.attention > 0 ? ` · ${health.attention}` : ""}
             </span>
             <ThemePicker />
             <button type="button" className={`secondary-button${overviewOpen ? " active-toggle" : ""}`} aria-pressed={overviewOpen} onClick={toggleOverview}>📺 總覽</button>

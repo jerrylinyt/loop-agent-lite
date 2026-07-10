@@ -28,6 +28,21 @@ export interface WorkspaceSummary {
   current_task?: string;
 }
 
+export interface FleetHealth {
+  schema_version: number;
+  status: "ok" | "degraded" | "error";
+  workspace_count: number;
+  running: number;
+  attention: number;
+  error_count: number;
+  issues: number;
+  agent_failures: number;
+  state_recoveries: number;
+  goal_changes: number;
+  stale_loop_pids: number;
+  generated_at: string;
+}
+
 export interface FleetHistoryEntry {
   name: string;
   data: string;
