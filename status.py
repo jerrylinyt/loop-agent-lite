@@ -41,6 +41,7 @@ def project_status(name: str):
     state, _data, recovered = loop.load_checkpointed_state(directory / "state.json", repair=False)
     loop_state = state.get("loop") if isinstance(state.get("loop"), dict) else {}
     pid = loop_state.get("pid")
+    running = pid_is_loop_alive(pid)
     plan = state.get("plan") if isinstance(state.get("plan"), list) else []
     completed = state.get("completed") if isinstance(state.get("completed"), list) else []
     issues = state.get("issues") if isinstance(state.get("issues"), list) else []
@@ -72,7 +73,8 @@ def project_status(name: str):
         "last_green_sha": state.get("last_green_sha"),
         "loop_pid": pid,
         "loop_session_id": loop_state.get("session_id"),
-        "running": pid_is_loop_alive(pid),
+        "running": running,
+        "stale_loop_pid": pid is not None and not running,
         "state_recovery_pending": recovered,
     }
 
@@ -129,11 +131,13 @@ def summarize_status(results):
             result.get("agent_failure_streak", 0) > 0 or
             result.get("state_recovery_count", 0) > 0 or
             result.get("state_recovery_pending") or
-            result.get("goal_changed"))),
+            result.get("goal_changed") or
+            result.get("stale_loop_pid"))),
         "issues": sum(result.get("issues", 0) for result in valid),
         "agent_failures": sum(result.get("agent_failure_streak", 0) for result in valid),
         "state_recoveries": sum(result.get("state_recovery_count", 0) for result in valid),
         "goal_changes": sum(1 for result in valid if result.get("goal_changed")),
+        "stale_loops": sum(1 for result in valid if result.get("stale_loop_pid")),
         "tasks_completed": tasks_completed,
         "tasks_total": tasks_total,
         "task_completion_pct": round(tasks_completed / tasks_total * 100) if tasks_total else 0,
@@ -150,13 +154,14 @@ def projection_needs_attention(result) -> bool:
         result.get("agent_failure_streak", 0) > 0 or
         result.get("state_recovery_count", 0) > 0 or
         result.get("state_recovery_pending") or
-        result.get("goal_changed")
+        result.get("goal_changed") or
+        result.get("stale_loop_pid")
     )
 
 
 def render_human(result, *, timestamp=False) -> None:
     phase = {"plan": "規劃期", "exec": "執行期", "done": "完成"}.get(result["phase"], result["phase"] or "未知")
-    running = "執行中" if result["running"] else "已停止"
+    running = "執行中" if result["running"] else "⚠ PID 殘留" if result.get("stale_loop_pid") else "已停止"
     prefix = f"[{time.strftime('%H:%M:%S')}] " if timestamp else ""
     task = f"｜task-{result['current_order']}：{result['current_task']}" if result.get("current_task") else ""
     print(f"{prefix}{result['name']}｜{phase}｜round {result['round']}｜"

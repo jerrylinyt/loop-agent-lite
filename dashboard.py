@@ -888,12 +888,15 @@ def list_workspaces():
             "state_recovery_count": 0,
             "state_recovery_pending": False,
             "goal_changed": False,
+            "loop_pid": None,
+            "stale_loop_pid": False,
         }
         st, err = read_state(d.name, repair=False)
         if not err:
             c = st.get("config") or {}
             loop_state = st.get("loop") or {}
             running = ws_running(d.name, st)
+            loop_pid = loop_state.get("pid")
             drain_claimed = running and loop_mod.stop_after_round_claimed(
                 d, loop_state.get("pid"), loop_state.get("session_id"))
             current_order = st.get("current_order")
@@ -911,6 +914,8 @@ def list_workspaces():
                         state_recovery_count=st.get("state_recovery_count", 0),
                         state_recovery_pending=bool(st.get("state_recovery_pending")),
                         goal_changed=bool(st.get("goal_changed")),
+                        loop_pid=loop_pid,
+                        stale_loop_pid=loop_pid is not None and not running,
                         current_order=current_order, current_task=current_task,
                         running=running,
                         draining=drain_claimed or (running and loop_mod.stop_after_round_requested(

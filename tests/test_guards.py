@@ -733,7 +733,8 @@ class TestStatusCli(unittest.TestCase):
                 L.WORKSPACE_ROOT = root / "workspace"
                 ws = L.Workspace("check-status")
                 state = ws.fresh_state()
-                state.update(agent_failure_streak=1, state_recovery_count=2, goal_changed=True)
+                state.update(agent_failure_streak=1, state_recovery_count=2, goal_changed=True,
+                             loop={"pid": 99999999, "session_id": "stale"})
                 ws.save_state(state)
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 result = subprocess.run(
@@ -750,6 +751,7 @@ class TestStatusCli(unittest.TestCase):
                 self.assertEqual(projection["agent_failure_streak"], 1)
                 self.assertEqual(projection["state_recovery_count"], 2)
                 self.assertTrue(projection["goal_changed"])
+                self.assertTrue(projection["stale_loop_pid"])
             finally:
                 L.WORKSPACE_ROOT = old_root
 
@@ -798,6 +800,7 @@ class TestStatusCli(unittest.TestCase):
                     "agent_failures": 0,
                     "state_recoveries": 0,
                     "goal_changes": 0,
+                    "stale_loops": 0,
                     "tasks_completed": 0,
                     "tasks_total": 0,
                     "task_completion_pct": 0,
@@ -1084,7 +1087,7 @@ class TestWorkspaceFleetValidity(unittest.TestCase):
             valid_state = L.Workspace.__new__(L.Workspace).fresh_state()
             valid_state.update(agent_failure_streak=2, agent_backoff_seconds=4,
                                state_recovery_count=3, state_recovery_pending=True,
-                               goal_changed=True)
+                               goal_changed=True, loop={"pid": 99999999, "session_id": "stale"})
             (valid / "state.json").write_text(json.dumps(valid_state))
             checkpoint_only = root / "checkpoint-only"
             checkpoint_only.mkdir()
@@ -1103,6 +1106,7 @@ class TestWorkspaceFleetValidity(unittest.TestCase):
                 self.assertEqual(valid_item["state_recovery_count"], 3)
                 self.assertTrue(valid_item["state_recovery_pending"])
                 self.assertTrue(valid_item["goal_changed"])
+                self.assertTrue(valid_item["stale_loop_pid"])
                 self.assertFalse((checkpoint_only / "state.json").exists(), "fleet 掃描必須保持唯讀")
             finally:
                 D.ROOT = old_root

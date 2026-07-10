@@ -13,7 +13,8 @@ function needsAttention(workspace: WorkspaceSummary): boolean {
     (workspace.agent_failure_streak ?? 0) > 0 ||
     (workspace.state_recovery_count ?? 0) > 0 ||
     workspace.state_recovery_pending ||
-    workspace.goal_changed
+    workspace.goal_changed ||
+    workspace.stale_loop_pid
   );
 }
 
@@ -119,6 +120,7 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
                     {(workspace.state_recovery_count ?? 0) > 0 && <span className="chip warning">🛟 state 復原 {workspace.state_recovery_count}</span>}
                     {workspace.state_recovery_pending && <span className="chip warning">🛟 checkpoint</span>}
                     {workspace.goal_changed && <span className="chip warning">goal 已變更</span>}
+                    {workspace.stale_loop_pid && <span className="chip warning">⚠ PID 殘留</span>}
                   </div>
                 )}
                 {workspace.repo && <div className="fleet-card-repo" title={workspace.repo}>{workspace.repo}</div>}
