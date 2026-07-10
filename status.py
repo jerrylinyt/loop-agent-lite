@@ -12,6 +12,7 @@ from pathlib import Path
 
 import loop
 
+STATUS_SCHEMA_VERSION = 1
 
 def pid_is_loop_alive(pid) -> bool:
     """確認 state 記錄的 pid 仍是 loop.py，避免 pid reuse 誤報執行中。"""
@@ -246,7 +247,8 @@ def main(argv=None) -> int:
                 results = sort_status_results(project_all_status(), args.sort)
                 summary = summarize_status(results)
                 check_failed = summary["error_count"] > 0 or summary["attention"] > 0
-                projection = {"summary": summary, "workspaces": results}
+                projection = {"schema_version": STATUS_SCHEMA_VERSION,
+                              "summary": summary, "workspaces": results}
                 signature = json.dumps(projection, ensure_ascii=False, sort_keys=True,
                                        separators=(",", ":"))
                 changed = signature != previous_signature
@@ -267,13 +269,14 @@ def main(argv=None) -> int:
             else:
                 result = project_status(args.name)
                 check_failed = projection_needs_attention(result)
-                signature = json.dumps(result, ensure_ascii=False, sort_keys=True,
+                projection = {"schema_version": STATUS_SCHEMA_VERSION, **result}
+                signature = json.dumps(projection, ensure_ascii=False, sort_keys=True,
                                        separators=(",", ":"))
                 changed = signature != previous_signature
                 previous_signature = signature
                 if args.as_json:
                     if changed or not args.on_change:
-                        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")), flush=True)
+                        print(json.dumps(projection, ensure_ascii=False, separators=(",", ":")), flush=True)
                 else:
                     if changed or not args.on_change:
                         render_human(result, timestamp=args.watch)
@@ -284,7 +287,8 @@ def main(argv=None) -> int:
         return 130
     except (FileNotFoundError, OSError, ValueError, loop.StateLoadError) as e:
         if args.as_json:
-            print(json.dumps({"error": str(e)}, ensure_ascii=False), flush=True)
+            print(json.dumps({"schema_version": STATUS_SCHEMA_VERSION, "error": str(e)},
+                             ensure_ascii=False), flush=True)
         else:
             print(f"❌ {e}", file=sys.stderr)
         return 1

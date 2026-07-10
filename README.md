@@ -77,7 +77,7 @@ python3 status.py --all --json --sort attention  # 將需關注項目排前
 ```
 
 `status.py` 不啟動 loop、不修復檔案；`--all` 與 `--name` 擇一，`--watch` 只重複唯讀輪詢，`--on-change` 可抑制未變更 projection 的重複輸出，Ctrl-C 以 exit code 130 結束。primary state 不可讀時只投影 checkpoint，找不到 workspace 或兩份 state 都損壞會以 exit code 1 結束。
-`--all --json` 會同時輸出 `workspaces` 與 `summary`；摘要包含執行中、規劃／執行／完成數、需關注 workspace、issues、Agent 異常、state 復原、goal 變更、stale loop PID、任務完成率，以及 state 錯誤數，方便 shell／CI 直接判斷 fleet 健康度。
+JSON 輸出包含 `schema_version: 1`；單 workspace 直接帶狀態欄位，`--all --json` 另外輸出 `workspaces` 與 `summary`。摘要包含執行中、規劃／執行／完成數、需關注 workspace、issues、Agent 異常、state 復原、goal 變更、stale loop PID、任務完成率，以及 state 錯誤數，方便 shell／CI 直接判斷 fleet 健康度。
 `--check` 是一次性 gate：projection 仍照常輸出，但只要有 state 錯誤或需關注 workspace 就以 exit code 1 結束；不可與 `--watch` 同時使用。
 `--sort` 只作用於 `--all`，可選 `name`、`attention`、`running`、`phase`、`round`；預設 `name` 維持穩定的相容輸出。
 
