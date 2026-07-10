@@ -179,12 +179,12 @@ export default function FleetOverview({ workspaces, fleetHistory, attentionReque
                 ) : <div className="fleet-card-analysis-empty">尚無輪次效能資料</div>}
                 {alert && (
                   <div className="fleet-card-alerts">
-                    {(workspace.red_streak ?? 0) > 0 && <span className="chip warning">紅連跳 {workspace.red_streak}</span>}
-                    {(workspace.stall_rounds ?? 0) > 0 && <span className="chip subdued">停滯 {workspace.stall_rounds}</span>}
+                    {workspace.phase !== "done" && (workspace.red_streak ?? 0) > 0 && <span className="chip warning">紅連跳 {workspace.red_streak}</span>}
+                    {workspace.phase !== "done" && (workspace.stall_rounds ?? 0) > 0 && <span className="chip subdued">停滯 {workspace.stall_rounds}</span>}
                     {unreadIssues > 0 && <span className="chip issue-chip">issues 未讀 {unreadIssues}</span>}
-                    {(workspace.agent_failure_streak ?? 0) > 0 && <span className="chip warning">Agent 異常 {workspace.agent_failure_streak}</span>}
-                    {workspace.last_round_timed_out && <span className="chip warning">⏱ 上輪逾時</span>}
-                    {(workspace.state_recovery_count ?? 0) > 0 && <span className="chip warning">🛟 state 復原 {workspace.state_recovery_count}</span>}
+                    {workspace.phase !== "done" && (workspace.agent_failure_streak ?? 0) > 0 && <span className="chip warning">Agent 異常 {workspace.agent_failure_streak}</span>}
+                    {workspace.phase !== "done" && workspace.last_round_timed_out && <span className="chip warning">⏱ 上輪逾時</span>}
+                    {workspace.phase !== "done" && (workspace.state_recovery_count ?? 0) > 0 && <span className="chip warning">🛟 state 復原 {workspace.state_recovery_count}</span>}
                     {workspace.state_recovery_pending && <span className="chip warning">🛟 checkpoint</span>}
                     {workspace.goal_changed && <span className="chip warning">goal 已變更</span>}
                     {workspace.stale_loop_pid && <span className="chip warning">⚠ PID 殘留</span>}
