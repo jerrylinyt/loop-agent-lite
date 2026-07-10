@@ -32,7 +32,11 @@ function drawFavicon(status: Exclude<Status, "none"> | "plain"): string {
   if (!ctx) return "";
   ctx.fillStyle = "#161b22";
   ctx.beginPath();
-  ctx.roundRect(0, 0, 32, 32, 7);
+  if (typeof ctx.roundRect === "function") {
+    ctx.roundRect(0, 0, 32, 32, 7);
+  } else {
+    ctx.rect(0, 0, 32, 32); // 舊 Safari/Chromium 沒有 roundRect;方角退化,不能讓 effect 拋錯打掛整個 app
+  }
   ctx.fill();
   ctx.fillStyle = "#e6edf3";
   ctx.font = "700 18px system-ui, sans-serif";
