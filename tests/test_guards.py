@@ -1111,5 +1111,33 @@ class TestPreflightOnly(unittest.TestCase):
             self.assertIn("工作樹不乾淨", r.stdout)
 
 
+class TestGoalProjection(unittest.TestCase):
+    """goal 唯讀投影:從 state.config 的 repo+goal 讀人類真相;缺 config/缺檔回明確 error。"""
+
+    def test_goal_projection_states(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(td)
+            root = Path(td) / "workspace"
+            (root / "demo").mkdir(parents=True)
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                # 舊版 state 缺 config.repo → 明確 error
+                (root / "demo" / "state.json").write_text(json.dumps({"phase": "plan"}), encoding="utf-8")
+                self.assertIn("缺 repo 設定", D.read_goal("demo")["error"])
+                # 正常:回 goal 內容與路徑,goal_changed 透傳
+                (root / "demo" / "state.json").write_text(json.dumps(
+                    {"phase": "plan", "goal_changed": True,
+                     "config": {"repo": str(repo), "goal": "goal.md"}}), encoding="utf-8")
+                result = D.read_goal("demo")
+                self.assertEqual(result["content"], "GOAL v1\n")
+                self.assertTrue(result["goal_changed"])
+                # goal 檔被移走 → 明確 error,不 crash
+                (repo / "goal.md").unlink()
+                self.assertIn("goal 檔不存在", D.read_goal("demo")["error"])
+            finally:
+                D.ROOT = old_root
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

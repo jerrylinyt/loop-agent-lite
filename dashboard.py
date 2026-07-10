@@ -336,6 +336,25 @@ def read_report(name):
         return {"error": f"REPORT.md 讀取失敗:{e}"}
 
 
+def read_goal(name):
+    """goal 唯讀投影:從 state.config 記錄的 repo+goal 相對路徑讀人類真相,不寫回。"""
+    st, err = read_state(name, repair=False)
+    if err:
+        return {"error": err}
+    c = st.get("config") or {}
+    repo, goal_rel = c.get("repo"), c.get("goal") or "goal.md"
+    if not repo:
+        return {"error": "state 缺 repo 設定(舊版 state)——用啟動表單跑過一次後即可檢視 goal"}
+    goal_path = Path(repo).expanduser() / goal_rel
+    try:
+        return {"content": goal_path.read_text(encoding="utf-8"), "path": str(goal_path),
+                "goal_changed": bool(st.get("goal_changed"))}
+    except FileNotFoundError:
+        return {"error": f"goal 檔不存在:{goal_path}(repo 被移走或 goal 被刪?)"}
+    except OSError as e:
+        return {"error": f"goal 讀取失敗:{e}"}
+
+
 def workspace_console_log(name, message):
     """將 Dashboard 操作與 loop/Agent 寫進同一條 workspace console 時序。"""
     line = f"[{time.strftime('%H:%M:%S')}] 🖥️ Dashboard｜{message}"
@@ -752,6 +771,11 @@ class Handler(BaseHTTPRequestHandler):
                 if d is None:
                     return
                 self._out(200, json.dumps(read_report(d.name), ensure_ascii=False))
+            elif u.path == "/api/goal":
+                d = self._ws_dir(q)
+                if d is None:
+                    return
+                self._out(200, json.dumps(read_goal(d.name), ensure_ascii=False))
             else:
                 self._err("not found", 404)
         except (ValueError, BrokenPipeError, ConnectionResetError):

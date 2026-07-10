@@ -100,6 +100,13 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await historyModal.getByRole("button", { name: "關閉對話框" }).click();
   await expect(historyModal).toBeHidden();
 
+  await page.getByRole("button", { name: "🎯 goal" }).click();
+  const goalModal = page.getByRole("dialog", { name: "Goal" });
+  await expect(goalModal).toBeVisible();
+  await expect(goalModal).toContainText("E2E goal imported through UI");
+  await goalModal.getByRole("button", { name: "關閉對話框" }).click();
+  await expect(goalModal).toBeHidden();
+
   await page.getByRole("button", { name: "＋ 啟動／管理" }).click();
   await page.getByRole("dialog", { name: "啟動與管理" }).getByRole("tab", { name: "執行中的 jobs" }).click();
   await expect(page.getByRole("dialog", { name: "啟動與管理" }).getByText("e2e-workspace")).toBeVisible();

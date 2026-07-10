@@ -5,6 +5,7 @@ import type { PlanTask, StartupResponse, WorkspaceState, WorkspaceSummary } from
 import ConsolePane from "../console/ConsolePane";
 import HorizontalSplitter from "../layout/HorizontalSplitter";
 import ConfigModal from "./ConfigModal";
+import GoalModal from "./GoalModal";
 import HistoryModal from "./HistoryModal";
 import IssuesModal from "./IssuesModal";
 import PlanTable from "./PlanTable";
@@ -29,6 +30,7 @@ export default function WorkspaceView({
   onRefreshWorkspaces: () => void | Promise<void>;
 }) {
   const [configOpen, setConfigOpen] = useState(false);
+  const [goalOpen, setGoalOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [issuesOpen, setIssuesOpen] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
@@ -151,6 +153,7 @@ export default function WorkspaceView({
         </div>
         <div className="workspace-status-row">
           <div className="primary-status">
+            <button type="button" className="chip subdued" onClick={() => setGoalOpen(true)}>🎯 goal</button>
             <span className="chip">round {state.round}</span>
             {state.phase !== "plan" && total > 0 && <span key={`${completed}-${state.current_order}`} className={`chip${pulse.has("task") ? " status-pulse" : ""}`}>任務 {completed}/{total}</span>}
             {state.phase === "plan" && <span key={state.flag} className={`chip${pulse.has("flag") ? " status-pulse" : ""}`}>flag {state.flag} / &gt;{state.config?.flag_threshold ?? 10}</span>}
@@ -188,6 +191,7 @@ export default function WorkspaceView({
       </div>
       {issuesOpen && workspace && <IssuesModal workspace={workspace.name} issues={state.issues ?? []} readonly={readonly || workspace.running} onClose={() => setIssuesOpen(false)} onChanged={onRefresh} />}
       {historyOpen && workspace && <HistoryModal workspace={workspace.name} onClose={() => setHistoryOpen(false)} />}
+      {goalOpen && workspace && <GoalModal workspace={workspace.name} onClose={() => setGoalOpen(false)} />}
       {reportOpen && workspace && <ReportModal workspace={workspace.name} onClose={() => setReportOpen(false)} />}
       {configOpen && workspace && <ConfigModal workspace={workspace.name} config={state.config ?? {}} onClose={() => setConfigOpen(false)} onChanged={onRefresh} />}
       {dialog && <ActionDialog title={dialog.title} message={dialog.message} confirmLabel={dialog.confirmLabel} onClose={() => setDialog(null)} onConfirm={dialog.onConfirm} />}
