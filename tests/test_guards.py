@@ -314,6 +314,45 @@ class TestAgentProcessIsolation(unittest.TestCase):
                             "背景 child 繼承 stdout 也不得把 round 卡到 child 自行結束")
 
 
+class TestRoundTelemetry(unittest.TestCase):
+    """每輪 Agent 耗時／逾時必須落進 state 與可追溯 history。"""
+
+    def _run(self, root, name, agent_body, *extra):
+        repo = make_repo(root)
+        workspace_root = Path(root) / "workspace"
+        agent = Path(root) / "agent.py"
+        agent.write_text(agent_body)
+        env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+        result = subprocess.run(
+            [sys.executable, LOOP_PY, "--repo", str(repo), "--name", name,
+             "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+             "--validate-cmd", "true", "--agent-backoff-max", "0",
+             "--max-rounds", "1", *extra],
+            capture_output=True, text=True, env=env,
+        )
+        state = json.loads((workspace_root / name / "state.json").read_text())
+        history = (workspace_root / name / "history.log").read_text()
+        return result, state, history
+
+    def test_successful_round_records_duration(self):
+        with tempfile.TemporaryDirectory() as d:
+            result, state, history = self._run(
+                d, "round-duration", "import time\ntime.sleep(0.02)\n")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertGreater(state["last_round_seconds"], 0)
+            self.assertFalse(state["last_round_timed_out"])
+            self.assertRegex(history, r" secs=\d+\.\d{3} timeout=False ")
+
+    def test_timed_out_round_records_timeout(self):
+        with tempfile.TemporaryDirectory() as d:
+            result, state, history = self._run(
+                d, "round-timeout", "import time\ntime.sleep(1)\n", "--round-timeout", "0.001")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertGreater(state["last_round_seconds"], 0)
+            self.assertTrue(state["last_round_timed_out"])
+            self.assertIn("timeout=True", history)
+
+
 class TestAbnormalRoundVoided(unittest.TestCase):
     """Agent crash 前打出的共識訊號不得被採信。"""
 
@@ -489,6 +528,25 @@ class TestStateSchemaGuard(unittest.TestCase):
                 ws.checkpoint_path.write_text(json.dumps(invalid), encoding="utf-8")
                 with self.assertRaises(L.StateLoadError):
                     ws.load_state()
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_invalid_round_telemetry_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d)
+                for index, invalid_fields in enumerate((
+                    {"last_round_seconds": -0.1},
+                    {"last_round_seconds": True},
+                    {"last_round_timed_out": 1},
+                )):
+                    ws = L.Workspace(f"schema-telemetry-{index}")
+                    invalid = {"phase": "plan", **invalid_fields}
+                    ws.state_path.write_text(json.dumps(invalid), encoding="utf-8")
+                    ws.checkpoint_path.write_text(json.dumps(invalid), encoding="utf-8")
+                    with self.subTest(fields=invalid_fields), self.assertRaises(L.StateLoadError):
+                        ws.load_state()
             finally:
                 L.WORKSPACE_ROOT = old_root
 
@@ -686,7 +744,8 @@ class TestStatusCli(unittest.TestCase):
                 L.WORKSPACE_ROOT = root / "workspace"
                 ws = L.Workspace("cli-status")
                 state = ws.fresh_state()
-                state.update(round=4, plan=[{"order": 1, "task": "one"}], current_order=1)
+                state.update(round=4, plan=[{"order": 1, "task": "one"}], current_order=1,
+                             last_round_seconds=1.25, last_round_timed_out=False)
                 ws.save_state(state)
                 ws.state_path.write_text("{broken", encoding="utf-8")
                 before = ws.state_path.read_bytes()
@@ -700,6 +759,8 @@ class TestStatusCli(unittest.TestCase):
                 self.assertEqual(payload["round"], 4)
                 self.assertEqual(payload["plan_len"], 1)
                 self.assertEqual(payload["current_task"], "one")
+                self.assertEqual(payload["last_round_seconds"], 1.25)
+                self.assertFalse(payload["last_round_timed_out"])
                 self.assertTrue(payload["state_recovery_pending"])
                 self.assertEqual(ws.state_path.read_bytes(), before, "status CLI 不得修復 primary state")
             finally:
@@ -793,7 +854,8 @@ class TestStatusCli(unittest.TestCase):
                 L.WORKSPACE_ROOT = root / "workspace"
                 ws = L.Workspace("check-status")
                 state = ws.fresh_state()
-                state.update(agent_failure_streak=1, state_recovery_count=2, goal_changed=True,
+                state.update(agent_failure_streak=1, last_round_seconds=60.1,
+                             last_round_timed_out=True, state_recovery_count=2, goal_changed=True,
                              loop={"pid": 99999999, "session_id": "stale", "started_at": "2026-07-10T20:00:00"})
                 ws.save_state(state)
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
@@ -805,10 +867,13 @@ class TestStatusCli(unittest.TestCase):
                 self.assertEqual(payload["summary"]["attention"], 1)
                 self.assertEqual(payload["summary"]["error_count"], 0)
                 self.assertEqual(payload["summary"]["agent_failures"], 1)
+                self.assertEqual(payload["summary"]["round_timeouts"], 1)
                 self.assertEqual(payload["summary"]["state_recoveries"], 2)
                 self.assertEqual(payload["summary"]["goal_changes"], 1)
                 projection = payload["workspaces"][0]
                 self.assertEqual(projection["agent_failure_streak"], 1)
+                self.assertEqual(projection["last_round_seconds"], 60.1)
+                self.assertTrue(projection["last_round_timed_out"])
                 self.assertEqual(projection["state_recovery_count"], 2)
                 self.assertTrue(projection["goal_changed"])
                 self.assertTrue(projection["stale_loop_pid"])
@@ -890,6 +955,7 @@ class TestStatusCli(unittest.TestCase):
                 ws = L.Workspace("human-status")
                 state = ws.fresh_state()
                 state.update(agent_failure_streak=2, agent_backoff_seconds=4,
+                             last_round_seconds=60.1, last_round_timed_out=True,
                              state_recovery_count=1, goal_changed=True)
                 ws.save_state(state)
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
@@ -898,6 +964,7 @@ class TestStatusCli(unittest.TestCase):
                     capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("Agent 異常 2", result.stdout)
+                self.assertIn("最近一輪 60.1 秒（逾時）", result.stdout)
                 self.assertIn("state 復原 1", result.stdout)
                 self.assertIn("goal 已變更", result.stdout)
             finally:
@@ -1011,6 +1078,7 @@ class TestStatusCli(unittest.TestCase):
                     "issues": 0,
                     "unread_issues": 0,
                     "agent_failures": 0,
+                    "round_timeouts": 0,
                     "state_recoveries": 0,
                     "goal_changes": 0,
                     "stale_loops": 0,
@@ -1353,6 +1421,7 @@ class TestFleetHealthProjection(unittest.TestCase):
             (attention / "state.json").write_text(json.dumps({
                 "phase": "exec", "red_streak": 2, "issues": [{"text": "a"}, {"text": "b"}],
                 "agent_failure_streak": 3, "state_recovery_count": 4,
+                "last_round_seconds": 60.2, "last_round_timed_out": True,
                 "state_recovery_pending": True, "goal_changed": True,
                 "loop": {"pid": 99999999, "session_id": "stale", "started_at": "2026-07-10T20:00:00"},
             }), encoding="utf-8")
@@ -1371,6 +1440,7 @@ class TestFleetHealthProjection(unittest.TestCase):
                 self.assertEqual(projection["issues"], 2)
                 self.assertEqual(projection["unread_issues"], 2)
                 self.assertEqual(projection["agent_failures"], 3)
+                self.assertEqual(projection["round_timeouts"], 1)
                 self.assertEqual(projection["state_recoveries"], 4)
                 self.assertEqual(projection["goal_changes"], 1)
                 self.assertEqual(projection["stale_loop_pids"], 1)

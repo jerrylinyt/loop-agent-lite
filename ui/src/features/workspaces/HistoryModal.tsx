@@ -4,6 +4,11 @@ import Modal from "../../shared/components/Modal";
 import type { IncrementalResponse } from "../../shared/api/types";
 import { parseHistory, type HistoryRow } from "./historyParser";
 
+function formatDuration(seconds: number | null): string {
+  if (seconds === null) return "—";
+  return `${seconds < 1 ? seconds.toFixed(2) : seconds.toFixed(1)} 秒`;
+}
+
 export default function HistoryModal({ workspace, onClose }: { workspace: string; onClose: () => void }) {
   const [run, setRun] = useState<"current" | "previous">("current");
   const [rows, setRows] = useState<HistoryRow[]>([]);
@@ -39,12 +44,13 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
       </div>
       <div className="modal-table-scroll">
         <table>
-          <thead><tr><th>輪</th><th>時間</th><th>階段</th><th>任務</th><th>訊號</th><th>驗證</th><th>flag</th><th>done</th><th>事件</th></tr></thead>
+          <thead><tr><th>輪</th><th>時間</th><th>耗時</th><th>階段</th><th>任務</th><th>訊號</th><th>驗證</th><th>flag</th><th>done</th><th>事件</th></tr></thead>
           <tbody>
             {rows.map((row, index) => (
               <tr key={`${row.round}-${row.time}-${index}`}>
                 <td>{row.round}</td>
                 <td className="muted">{row.time}</td>
+                <td className={row.timedOut ? "warning" : "muted"}>{formatDuration(row.durationSeconds)}{row.timedOut ? "（逾時）" : ""}</td>
                 <td>{row.phase}</td>
                 <td>{row.task}</td>
                 <td>{row.signal}</td>
@@ -54,7 +60,7 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
                 <td>{`${row.tamper ? "⚠️ 竄改 " : ""}${row.agentOk ? "" : "⚠️ Agent 異常 "}${row.event}`}</td>
               </tr>
             ))}
-            {!rows.length && !loading && <tr><td colSpan={9} className="table-empty">尚無輪次紀錄</td></tr>}
+            {!rows.length && !loading && <tr><td colSpan={10} className="table-empty">尚無輪次紀錄</td></tr>}
           </tbody>
         </table>
       </div>

@@ -23,6 +23,9 @@ export function deriveFleetEvents(entries: FleetHistoryEntry[], limit = 60): Fle
       if (row.validate === "FAIL" && prevValidate !== "FAIL") {
         events.push({ ws: entry.name, ts: row.ts, time: row.time, text: `❌ 驗證轉紅（r${row.round}）` });
       }
+      if (row.timedOut) {
+        events.push({ ws: entry.name, ts: row.ts, time: row.time, text: `⏱ Agent 逾時（r${row.round}）` });
+      }
       if (row.event) {
         events.push({ ws: entry.name, ts: row.ts, time: row.time, text: row.event });
       }

@@ -19,6 +19,8 @@ export interface WorkspaceSummary {
   unread_issues?: number;
   agent_failure_streak?: number;
   agent_backoff_seconds?: number;
+  last_round_seconds?: number;
+  last_round_timed_out?: boolean;
   state_recovery_count?: number;
   state_recovery_pending?: boolean;
   goal_changed?: boolean;
@@ -39,6 +41,7 @@ export interface FleetHealth {
   issues: number;
   unread_issues: number;
   agent_failures: number;
+  round_timeouts: number;
   state_recoveries: number;
   goal_changes: number;
   stale_loop_pids: number;
@@ -110,6 +113,8 @@ export interface WorkspaceState {
   agent_failure_streak?: number;
   agent_backoff_seconds?: number;
   agent_backoff_until?: string | null;
+  last_round_seconds?: number;
+  last_round_timed_out?: boolean;
   state_recovery_count?: number;
   last_state_recovery?: string | null;
   state_recovery_pending?: boolean;

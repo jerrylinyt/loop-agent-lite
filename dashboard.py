@@ -953,6 +953,8 @@ def list_workspaces():
             "running": False,
             "agent_failure_streak": 0,
             "agent_backoff_seconds": 0,
+            "last_round_seconds": 0,
+            "last_round_timed_out": False,
             "state_recovery_count": 0,
             "state_recovery_pending": False,
             "unread_issues": 0,
@@ -984,6 +986,8 @@ def list_workspaces():
                         unread_issues=loop_mod.unread_issue_count(st),
                         agent_failure_streak=st.get("agent_failure_streak", 0),
                         agent_backoff_seconds=st.get("agent_backoff_seconds", 0),
+                        last_round_seconds=st.get("last_round_seconds", 0),
+                        last_round_timed_out=bool(st.get("last_round_timed_out")),
                         state_recovery_count=st.get("state_recovery_count", 0),
                         state_recovery_pending=bool(st.get("state_recovery_pending")),
                         goal_changed=bool(st.get("goal_changed")),
@@ -1009,6 +1013,7 @@ def _workspace_needs_attention(info):
         (info.get("stall_rounds") or 0) > 0 or
         unread_issues > 0 or
         (info.get("agent_failure_streak") or 0) > 0 or
+        info.get("last_round_timed_out") or
         (info.get("state_recovery_count") or 0) > 0 or
         info.get("state_recovery_pending") or
         info.get("goal_changed") or
@@ -1032,6 +1037,7 @@ def fleet_health_projection(workspaces=None):
         "issues": sum(item.get("issues") or 0 for item in items),
         "unread_issues": sum(item.get("unread_issues", item.get("issues", 0)) or 0 for item in items),
         "agent_failures": sum(item.get("agent_failure_streak") or 0 for item in items),
+        "round_timeouts": sum(1 for item in items if item.get("last_round_timed_out")),
         "state_recoveries": sum(item.get("state_recovery_count") or 0 for item in items),
         "goal_changes": sum(1 for item in items if item.get("goal_changed")),
         "stale_loop_pids": sum(1 for item in items if item.get("stale_loop_pid")),

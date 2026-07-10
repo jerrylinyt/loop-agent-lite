@@ -160,6 +160,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(firstHistoryRow).toContainText("task-1");
   await expect(firstHistoryRow).toContainText("done");
   await expect(firstHistoryRow).toContainText("✅");
+  await expect(firstHistoryRow).toContainText("秒");
   await historyModal.getByRole("button", { name: "重新整理" }).click();
   await expect(firstHistoryRow).toContainText("task-1");
   await historyModal.getByRole("tab", { name: "上一個 run" }).click();

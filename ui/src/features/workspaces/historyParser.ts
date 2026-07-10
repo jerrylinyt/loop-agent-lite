@@ -11,6 +11,8 @@ export interface HistoryRow {
   done: number;
   tamper: boolean;
   agentOk: boolean;
+  durationSeconds: number | null;
+  timedOut: boolean;
   event: string;
 }
 
@@ -40,6 +42,7 @@ export function parseHistory(data: string): { rows: HistoryRow[]; unparsed: numb
     }
     const ts = tokens[0];
     const signal = fields.signal ?? "-";
+    const duration = Number(fields.secs);
     rows.push({
       ts,
       time: ts.includes("T") ? ts.slice(ts.indexOf("T") + 1) : ts,
@@ -50,6 +53,8 @@ export function parseHistory(data: string): { rows: HistoryRow[]; unparsed: numb
       signal: SIGNAL_NAMES[signal] ?? (signal === "-" ? "" : signal),
       tamper: fields.tamper === "True",
       agentOk: fields.agent_ok !== "False",
+      durationSeconds: Number.isFinite(duration) && duration >= 0 ? duration : null,
+      timedOut: fields.timeout === "True",
       validate: fields.validate ?? "-",
       flag: +(fields.flag ?? 0),
       done: +(fields.done ?? 0),

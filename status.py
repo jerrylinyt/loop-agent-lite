@@ -67,6 +67,8 @@ def project_status(name: str):
         "stall_rounds": state.get("stall_rounds", 0),
         "agent_failure_streak": state.get("agent_failure_streak", 0),
         "agent_backoff_seconds": state.get("agent_backoff_seconds", 0),
+        "last_round_seconds": state.get("last_round_seconds", 0),
+        "last_round_timed_out": bool(state.get("last_round_timed_out")),
         "state_recovery_count": state.get("state_recovery_count", 0),
         "last_state_recovery": state.get("last_state_recovery"),
         "goal_changed": bool(state.get("goal_changed")),
@@ -133,6 +135,7 @@ def summarize_status(results):
             result.get("stall_rounds", 0) > 0 or
             result.get("unread_issues", result.get("issues", 0)) > 0 or
             result.get("agent_failure_streak", 0) > 0 or
+            result.get("last_round_timed_out") or
             result.get("state_recovery_count", 0) > 0 or
             result.get("state_recovery_pending") or
             result.get("goal_changed") or
@@ -140,6 +143,7 @@ def summarize_status(results):
         "issues": sum(result.get("issues", 0) for result in valid),
         "unread_issues": sum(result.get("unread_issues", result.get("issues", 0)) for result in valid),
         "agent_failures": sum(result.get("agent_failure_streak", 0) for result in valid),
+        "round_timeouts": sum(1 for result in valid if result.get("last_round_timed_out")),
         "state_recoveries": sum(result.get("state_recovery_count", 0) for result in valid),
         "goal_changes": sum(1 for result in valid if result.get("goal_changed")),
         "stale_loops": sum(1 for result in valid if result.get("stale_loop_pid")),
@@ -157,6 +161,7 @@ def projection_needs_attention(result) -> bool:
         result.get("stall_rounds", 0) > 0 or
         result.get("unread_issues", result.get("issues", 0)) > 0 or
         result.get("agent_failure_streak", 0) > 0 or
+        result.get("last_round_timed_out") or
         result.get("state_recovery_count", 0) > 0 or
         result.get("state_recovery_pending") or
         result.get("goal_changed") or
@@ -212,9 +217,12 @@ def render_human(result, *, timestamp=False) -> None:
     issue_note = (f"issues {result['issues']}（未讀 {result['unread_issues']}）"
                   if result.get("unread_issues", result["issues"]) != result["issues"]
                   else f"issues {result['issues']}")
+    duration = result.get("last_round_seconds", 0)
+    round_note = (f"｜最近一輪 {duration:g} 秒"
+                  + ("（逾時）" if result.get("last_round_timed_out") else "")) if duration else ""
     print(f"{prefix}{result['name']}｜{phase}｜round {result['round']}｜"
           f"任務 {result['completed']}/{result['plan_len']}{task}｜{running}｜"
-          f"紅連跳 {result['red_streak']}｜停滯 {result['stall_rounds']}｜{issue_note}", flush=True)
+          f"紅連跳 {result['red_streak']}｜停滯 {result['stall_rounds']}｜{issue_note}{round_note}", flush=True)
     if result["state_recovery_pending"]:
         print("🛟 primary state 不可讀，目前只投影 last-good checkpoint（未修改檔案）", flush=True)
     if result.get("agent_failure_streak", 0):
@@ -230,7 +238,8 @@ def render_fleet_summary(summary) -> None:
     print(f"fleet｜workspaces {summary['workspace_count']}｜執行中 {summary['running']}｜"
           f"規劃/執行/完成 {summary['planning']}/{summary['executing']}/{summary['done']}｜"
           f"需關注 {summary['attention']}｜issues {summary['issues']}（未讀 {summary['unread_issues']}）｜"
-          f"Agent 異常 {summary['agent_failures']}｜state 復原 {summary['state_recoveries']}｜"
+          f"Agent 異常 {summary['agent_failures']}｜round timeout {summary['round_timeouts']}｜"
+          f"state 復原 {summary['state_recoveries']}｜"
           f"goal 變更 {summary['goal_changes']}｜stale PID {summary['stale_loops']}｜"
           f"任務 {summary['tasks_completed']}/{summary['tasks_total']} "
           f"({summary['task_completion_pct']}%)｜錯誤 {summary['error_count']}", flush=True)

@@ -18,6 +18,7 @@ function needsAttention(workspace: WorkspaceSummary): boolean {
     (workspace.stall_rounds ?? 0) > 0 ||
     (workspace.unread_issues ?? workspace.issues ?? 0) > 0 ||
     (workspace.agent_failure_streak ?? 0) > 0 ||
+    workspace.last_round_timed_out ||
     (workspace.state_recovery_count ?? 0) > 0 ||
     workspace.state_recovery_pending ||
     workspace.goal_changed ||
@@ -127,6 +128,7 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
                   <span className="muted">round {workspace.round ?? 0}</span>
                   {workspace.phase === "plan" && <span className="muted">flag {workspace.flag ?? 0}</span>}
                   {workspace.phase === "exec" && <span className="muted">done {workspace.done_count ?? 0}</span>}
+                  {(workspace.last_round_seconds ?? 0) > 0 && <span className="muted">⏱ {workspace.last_round_seconds}s</span>}
                 </div>
                 {total > 0 && workspace.phase !== "plan" && (
                   <div className="fleet-progress" aria-label={`任務 ${cardDone}/${total}`}>
@@ -141,6 +143,7 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
                     {(workspace.stall_rounds ?? 0) > 0 && <span className="chip subdued">停滯 {workspace.stall_rounds}</span>}
                     {unreadIssues > 0 && <span className="chip issue-chip">issues 未讀 {unreadIssues}</span>}
                     {(workspace.agent_failure_streak ?? 0) > 0 && <span className="chip warning">Agent 異常 {workspace.agent_failure_streak}</span>}
+                    {workspace.last_round_timed_out && <span className="chip warning">⏱ 上輪逾時</span>}
                     {(workspace.state_recovery_count ?? 0) > 0 && <span className="chip warning">🛟 state 復原 {workspace.state_recovery_count}</span>}
                     {workspace.state_recovery_pending && <span className="chip warning">🛟 checkpoint</span>}
                     {workspace.goal_changed && <span className="chip warning">goal 已變更</span>}

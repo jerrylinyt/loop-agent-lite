@@ -626,6 +626,13 @@ def validate_state_shape(state, label: str):
         if (isinstance(delay, bool) or not isinstance(delay, (int, float)) or
                 not math.isfinite(delay) or delay < 0):
             raise StateLoadError(f"{label} agent_backoff_seconds 必須是有限非負數")
+    if "last_round_seconds" in state:
+        duration = state["last_round_seconds"]
+        if (isinstance(duration, bool) or not isinstance(duration, (int, float)) or
+                not math.isfinite(duration) or duration < 0):
+            raise StateLoadError(f"{label} last_round_seconds 必須是有限非負數")
+    if "last_round_timed_out" in state and not isinstance(state["last_round_timed_out"], bool):
+        raise StateLoadError(f"{label} last_round_timed_out 必須是 boolean")
     for field in ("agent_backoff_until", "last_state_recovery"):
         if field in state and state[field] is not None and not isinstance(state[field], str):
             raise StateLoadError(f"{label} {field} 必須是字串或 null")
@@ -772,6 +779,7 @@ class Workspace:
             "red_streak": 0, "stall_rounds": 0,
             "agent_failure_streak": 0, "agent_backoff_seconds": 0,
             "agent_backoff_until": None,
+            "last_round_seconds": 0, "last_round_timed_out": False,
             "state_recovery_count": 0, "last_state_recovery": None,
             "task_reset_counts": {},    # {order(str): 次數}
             "notes": [],
@@ -1424,6 +1432,8 @@ def main():
         rc, secs, timed_out = run_agent(agent_cmd, prompt_path, repo, round_env,
                                         ws.dir / "logs" / f"round-{rnd:04d}.log",
                                         args.round_timeout * 60, on_started=mark_startup_ready)
+        state["last_round_seconds"] = round(secs, 3)
+        state["last_round_timed_out"] = bool(timed_out)
         log(f"🤖 Agent 結束｜exit code={rc}｜耗時 {secs:.0f} 秒" + "｜超時，已強制終止" * timed_out)
         if timed_out:
             state["notes"].append(f"⚠️ 上一輪 agent 超過 {args.round_timeout:g} 分鐘被強制終止,"
@@ -1658,7 +1668,7 @@ def main():
                                           .isoformat(timespec="seconds")) if retry_delay else None
 
         line = (f"{datetime.now().isoformat(timespec='seconds')} round={rnd} phase={phase} "
-                f"task={task_id or '-'} rc={rc} changed={changed} "
+                f"task={task_id or '-'} rc={rc} secs={secs:.3f} timeout={timed_out} changed={changed} "
                 f"signal={'create' if ws.signal('called_create_plan', round_token) else 'ok' if ws.signal('signal_plan_ok', round_token) else 'done' if ws.signal('signal_done', round_token) else '-'} "
                 f"tamper={bool(tampered)} agent_ok={not agent_failed} "
                 f"agent_failures={state['agent_failure_streak']} backoff={retry_delay:g}s validate={validate_note} "
@@ -1666,7 +1676,8 @@ def main():
                 + (f"  << {event}" if event else ""))
         append_history(ws.history, line + "\n")
         log(f"📊 第 {rnd} 輪結束｜變更={'有' if changed else '無'}｜驗證={validate_note}｜"
-            f"flag={state['flag']}｜done={state['done_count']}" + (f"｜{event}" if event else ""))
+            f"耗時={secs:.1f}s｜flag={state['flag']}｜done={state['done_count']}"
+            + (f"｜{event}" if event else ""))
         if retry_delay:
             log(f"⏳ Agent CLI 連續異常 {state['agent_failure_streak']} 輪｜{retry_delay:g} 秒後重試"
                 f"（上限 {args.agent_backoff_max:g} 秒）")
