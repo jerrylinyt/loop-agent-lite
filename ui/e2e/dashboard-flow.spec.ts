@@ -96,6 +96,13 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(agentConsole).toContainText("📨 Agent 指令｜done task-1");
   await expect(agentConsole).toContainText("E2E fake agent started");
   await agentConsole.getByRole("button", { name: "Agent", exact: true }).click();
+
+  const consoleSearch = agentConsole.getByLabel("過濾Agent 執行輸出");
+  await consoleSearch.fill("no-such-string-xyz");
+  await expect(agentConsole).toContainText("沒有符合過濾條件的行");
+  await consoleSearch.fill("fake agent started");
+  await expect(agentConsole).toContainText("E2E fake agent started");
+  await consoleSearch.fill("");
   await expect(page.getByRole("button", { name: /issues/ })).toBeVisible();
 
   await page.getByRole("button", { name: "⏸ 本輪後停止" }).click();

@@ -8,6 +8,12 @@ export function filterConsoleText(text: string, filter: ConsoleFilter) {
   return text.split("\n").filter((line) => line.includes("🤖 Agent｜") === wantAgent).join("\n");
 }
 
+export function searchConsoleText(text: string, query: string) {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return text;
+  return text.split("\n").filter((line) => line.toLowerCase().includes(needle)).join("\n");
+}
+
 export default function ConsolePane({
   text,
   round,
@@ -34,7 +40,11 @@ export default function ConsolePane({
   const consoleRef = useRef<HTMLPreElement>(null);
   const [follow, setFollow] = useState(true);
   const [filter, setFilter] = useState<ConsoleFilter>(defaultFilter);
-  const visibleText = useMemo(() => filterConsoleText(text, showFilters ? filter : defaultFilter), [text, filter, showFilters, defaultFilter]);
+  const [search, setSearch] = useState("");
+  const visibleText = useMemo(
+    () => searchConsoleText(filterConsoleText(text, showFilters ? filter : defaultFilter), search),
+    [text, filter, showFilters, defaultFilter, search]
+  );
 
   useEffect(() => {
     if (follow && consoleRef.current) consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
@@ -64,6 +74,14 @@ export default function ConsolePane({
           <span>{hasWorkspace ? `console.log · round ${round}` : "等待 workspace"}</span>
         </div>
         <div className="console-tools">
+          <input
+            type="search"
+            className="console-search"
+            aria-label={`過濾${title}`}
+            placeholder="過濾…"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
           {showFilters && (
             <div className="console-filters" role="group" aria-label="紀錄篩選">
               {(["agent", "other", "all"] as const).map((value) => (
@@ -80,7 +98,8 @@ export default function ConsolePane({
         </div>
       </header>
       <pre ref={consoleRef} className="console-output" onScroll={onScroll} tabIndex={0}>
-        {visibleText || (hasWorkspace ? "此分類尚無執行紀錄。" : "建立或選擇 workspace 後，執行紀錄會顯示在這裡。")}
+        {visibleText || (search.trim() ? "沒有符合過濾條件的行。"
+          : hasWorkspace ? "此分類尚無執行紀錄。" : "建立或選擇 workspace 後，執行紀錄會顯示在這裡。")}
       </pre>
       {!follow && (
         <button type="button" className="floating-button" onClick={() => setFollow(true)}>
