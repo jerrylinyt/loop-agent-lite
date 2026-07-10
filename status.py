@@ -94,6 +94,11 @@ def project_all_status():
             entry_info = entry.lstat()
             if not stat_is_directory(entry_info.st_mode):
                 continue
+            # Dashboard 只把至少有 state/checkpoint 的目錄視為 workspace；空的
+            # mock/預留目錄不是錯誤，也不應污染 --all 的 fleet projection。
+            if not any(path.exists() or path.is_symlink()
+                       for path in (entry / "state.json", entry / "state.last-good.json")):
+                continue
             results.append(project_status(entry.name))
         except (FileNotFoundError, OSError, ValueError, loop.StateLoadError) as e:
             results.append({"name": entry.name, "error": str(e)})

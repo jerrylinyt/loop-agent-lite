@@ -694,6 +694,7 @@ class TestStatusCli(unittest.TestCase):
                     state = ws.fresh_state()
                     state["round"] = round_number
                     ws.save_state(state)
+                (L.WORKSPACE_ROOT / "reserved-empty").mkdir(parents=True)
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 result = subprocess.run(
                     [sys.executable, STATUS_PY, "--all", "--json"],
