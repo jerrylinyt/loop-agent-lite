@@ -21,6 +21,7 @@ export interface WorkspaceSummary {
   state_recovery_pending?: boolean;
   goal_changed?: boolean;
   loop_pid?: number | null;
+  loop_started_at?: string | null;
   stale_loop_pid?: boolean;
   current_order?: number | null;
   current_task?: string;

@@ -181,7 +181,7 @@ export default function WorkspaceView({
             {!!state.agent_failure_streak && <span key={`${state.agent_failure_streak}-${state.agent_backoff_seconds}`} className={`chip warning${pulse.has("health") ? " status-pulse" : ""}`}>Agent 異常 {state.agent_failure_streak}{state.agent_backoff_seconds ? ` · ${state.agent_backoff_seconds} 秒後重試` : ""}</span>}
             {!!state.state_recovery_count && <span className="chip warning" title={state.last_state_recovery ?? undefined}>🛟 state 復原 {state.state_recovery_count}</span>}
             {state.state_recovery_pending && <span className="chip warning">🛟 正從 checkpoint 唯讀顯示</span>}
-            {workspace?.stale_loop_pid && <span className="chip warning" title={`state 保留 PID ${workspace.loop_pid ?? "?"}，但目前程序不存在`}>⚠ PID 殘留</span>}
+            {workspace?.stale_loop_pid && <span className="chip warning" title={`state 保留 PID ${workspace.loop_pid ?? "?"}${workspace.loop_started_at ? `（啟動於 ${workspace.loop_started_at}）` : ""}，但目前程序不存在`}>⚠ PID 殘留</span>}
             {!!state.issues?.length && <button type="button" className="chip issue-chip" onClick={() => setIssuesOpen(true)}>⚠ issues {state.issues.length}</button>}
             {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setHistoryOpen(true)}>🕒 輪次紀錄</button>}
             {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setPromptOpen(true)}>📨 prompt</button>}

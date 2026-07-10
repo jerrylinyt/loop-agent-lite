@@ -73,6 +73,7 @@ def project_status(name: str):
         "last_green_sha": state.get("last_green_sha"),
         "loop_pid": pid,
         "loop_session_id": loop_state.get("session_id"),
+        "loop_started_at": loop_state.get("started_at"),
         "running": running,
         "stale_loop_pid": pid is not None and not running,
         "state_recovery_pending": recovered,

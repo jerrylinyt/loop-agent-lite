@@ -749,7 +749,7 @@ class TestStatusCli(unittest.TestCase):
                 ws = L.Workspace("check-status")
                 state = ws.fresh_state()
                 state.update(agent_failure_streak=1, state_recovery_count=2, goal_changed=True,
-                             loop={"pid": 99999999, "session_id": "stale"})
+                             loop={"pid": 99999999, "session_id": "stale", "started_at": "2026-07-10T20:00:00"})
                 ws.save_state(state)
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 result = subprocess.run(
@@ -767,6 +767,7 @@ class TestStatusCli(unittest.TestCase):
                 self.assertEqual(projection["state_recovery_count"], 2)
                 self.assertTrue(projection["goal_changed"])
                 self.assertTrue(projection["stale_loop_pid"])
+                self.assertEqual(projection["loop_started_at"], "2026-07-10T20:00:00")
             finally:
                 L.WORKSPACE_ROOT = old_root
 
@@ -1132,7 +1133,7 @@ class TestWorkspaceFleetValidity(unittest.TestCase):
             valid_state = L.Workspace.__new__(L.Workspace).fresh_state()
             valid_state.update(agent_failure_streak=2, agent_backoff_seconds=4,
                                state_recovery_count=3, state_recovery_pending=True,
-                               goal_changed=True, loop={"pid": 99999999, "session_id": "stale"})
+                               goal_changed=True, loop={"pid": 99999999, "session_id": "stale", "started_at": "2026-07-10T20:00:00"})
             (valid / "state.json").write_text(json.dumps(valid_state))
             checkpoint_only = root / "checkpoint-only"
             checkpoint_only.mkdir()
@@ -1152,6 +1153,7 @@ class TestWorkspaceFleetValidity(unittest.TestCase):
                 self.assertTrue(valid_item["state_recovery_pending"])
                 self.assertTrue(valid_item["goal_changed"])
                 self.assertTrue(valid_item["stale_loop_pid"])
+                self.assertEqual(valid_item["loop_started_at"], "2026-07-10T20:00:00")
                 self.assertFalse((checkpoint_only / "state.json").exists(), "fleet 掃描必須保持唯讀")
             finally:
                 D.ROOT = old_root

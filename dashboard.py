@@ -889,6 +889,7 @@ def list_workspaces():
             "state_recovery_pending": False,
             "goal_changed": False,
             "loop_pid": None,
+            "loop_started_at": None,
             "stale_loop_pid": False,
         }
         st, err = read_state(d.name, repair=False)
@@ -915,6 +916,7 @@ def list_workspaces():
                         state_recovery_pending=bool(st.get("state_recovery_pending")),
                         goal_changed=bool(st.get("goal_changed")),
                         loop_pid=loop_pid,
+                        loop_started_at=loop_state.get("started_at"),
                         stale_loop_pid=loop_pid is not None and not running,
                         current_order=current_order, current_task=current_task,
                         running=running,
