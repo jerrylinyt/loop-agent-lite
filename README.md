@@ -142,3 +142,15 @@ Vite 會把 `/api` proxy 到本機 dashboard。
 - `work.py create-plan [json檔]` — 整包重交計畫(stdin 或檔案);order 必須 1..N 連續不重複
 - `work.py plan-ok` — 宣告計畫完整
 - `work.py done task-N` — 宣告當前任務完成(task id 核對,錯了當場退)
+
+## 測試
+
+協調層防線的回歸測試(stdlib only,真 git + 真 loop/work,不做 mock):
+
+```
+python3 -m unittest tests.test_guards        # 或  python3 tests/test_guards.py
+```
+
+覆蓋:綠點錨定 fail-closed(green 須存在/是 HEAD 祖先/protected blob 與快照相符)、
+竄改輪整輪作廢(同輪偷改 goal + create-plan,竄改的 plan 不得存活,正常規劃不誤殺)、
+原子寫並發(多執行緒不共用 tmp)。

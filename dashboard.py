@@ -12,6 +12,7 @@
 stdlib only,綁 127.0.0.1。
 """
 import argparse
+import functools
 import json
 import mimetypes
 import os
@@ -54,6 +55,29 @@ DEFAULT_CONFIG = {
 
 JOBS = {}          # name -> Job(由本 dashboard 啟動的 loop)
 JOBS_LOCK = threading.Lock()
+
+# per-workspace state lock:ThreadingHTTPServer 下,兩個並發 POST(雙擊/多分頁/操作重疊)對同一
+# workspace 做 read-modify-write 會 lost update,且共用 state.json 的原子寫 tmp——用每個 name 一把鎖
+# 把「讀 state → 改 → 寫回」序列化(#3)。粒度到 name,不同 workspace 的操作互不阻塞。
+_STATE_LOCKS = {}
+_STATE_LOCKS_GUARD = threading.Lock()
+
+
+def _state_lock(name):
+    with _STATE_LOCKS_GUARD:
+        lk = _STATE_LOCKS.get(name)
+        if lk is None:
+            lk = _STATE_LOCKS[name] = threading.Lock()
+        return lk
+
+
+def with_state_lock(fn):
+    """裝飾 api_*(self, body):以 body['name'] 對應的 workspace 鎖序列化整段 read-modify-write。"""
+    @functools.wraps(fn)
+    def wrapper(self, body):
+        with _state_lock(str(body.get("name") or "")):
+            return fn(self, body)
+    return wrapper
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -686,6 +710,7 @@ class Handler(BaseHTTPRequestHandler):
         print(f"▶ run workspace:{name}(pid {p.pid})", flush=True)
         self._out(200, json.dumps({"ok": True, "name": name, "pid": p.pid}, ensure_ascii=False))
 
+    @with_state_lock
     def api_edit_state(self, body):
         """停止狀態下的人工編輯:plan 任務文字敘述 + done 計數。執行中全部鎖死。"""
         name = str(body.get("name") or "")
@@ -735,6 +760,7 @@ class Handler(BaseHTTPRequestHandler):
         print(f"✎ 人工編輯 {name}:{', '.join(changed) or '無變更'}", flush=True)
         self._out(200, json.dumps({"ok": True, "changed": changed}, ensure_ascii=False))
 
+    @with_state_lock
     def api_edit_config(self, body):
         """停止狀態下編輯 workspace 設定(agent/validate/五顆旋鈕),存回 state.config,▶ 運行時生效。執行中鎖死。"""
         name = str(body.get("name") or "")
@@ -791,6 +817,7 @@ class Handler(BaseHTTPRequestHandler):
         print(f"⚙ 編輯設定 {name}:{', '.join(changed) or '無變更'}", flush=True)
         self._out(200, json.dumps({"ok": True, "changed": changed}, ensure_ascii=False))
 
+    @with_state_lock
     def api_phase(self, body):
         """停止狀態下切換 phase:exec/done → plan(執行進度歸零,計畫保留);plan → exec(直接開做)。"""
         name = str(body.get("name") or "")
@@ -824,6 +851,7 @@ class Handler(BaseHTTPRequestHandler):
         print(f"⇄ 切換 phase:{name} → {target}", flush=True)
         self._out(200, json.dumps({"ok": True, "phase": target}, ensure_ascii=False))
 
+    @with_state_lock
     def api_set_task(self, body):
         """停止狀態下的進度管理:退回重做,或往前跳(validate 綠才放行,被跳過的標人工完成)。"""
         name = str(body.get("name") or "")

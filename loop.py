@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -81,6 +82,28 @@ def is_ancestor(repo, sha, of_sha) -> bool:
     return git(repo, "merge-base", "--is-ancestor", sha, of_sha, check=False).returncode == 0
 
 
+def green_anchor_valid(repo, green, snap_dir, rel_paths) -> bool:
+    """resume 時綠點錨定的 fail-closed 驗證(#1):綠點必須同時滿足
+    (1) 是 repo 裡真實存在的 commit;(2) 是目前 HEAD 的祖先;
+    (3) 該 commit 的每個受保護檔 blob 與本次啟動快照逐位元組相同。
+    任一不成立就不能沿用——reset 回這種綠點會製造髒工作樹或還原出錯版本的 goal/plan-doc。"""
+    if not green:
+        return False
+    if git(repo, "rev-parse", "--verify", "--quiet", f"{green}^{{commit}}", check=False).returncode != 0:
+        return False
+    if not is_ancestor(repo, green, head_sha(repo)):
+        return False
+    for rel in rel_paths:
+        snap = snap_dir / rel.replace("/", "__")
+        if not snap.exists():
+            return False
+        r = subprocess.run(["git", "cat-file", "blob", f"{green}:{rel}"],
+                           cwd=str(repo), capture_output=True)
+        if r.returncode != 0 or r.stdout != snap.read_bytes():
+            return False
+    return True
+
+
 def tracked_in_head(repo, rel_path) -> bool:
     return git(repo, "cat-file", "-e", f"HEAD:{rel_path}", check=False).returncode == 0
 
@@ -92,7 +115,9 @@ def sha256_bytes(data: bytes) -> str:
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     """原子寫:同目錄 tmp → fsync → os.replace。避免 SIGKILL/磁碟滿留下半截檔。
     唯一真相(state.json)不能寫到一半——這是跑整夜必備的 correctness 防線。"""
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    # tmp 名帶 uuid:同 process 多執行緒(dashboard ThreadingHTTPServer)並發寫同一 state.json
+    # 時不再共用 tmp,避免互相 truncate 或 replace 後對方拿到 FileNotFoundError(#3)。
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     with open(tmp, "wb") as f:
         f.write(data)
         f.flush()
@@ -178,11 +203,13 @@ class Workspace:
         return hit
 
     def restore_protected(self, repo, rel_paths):
-        """把受保護檔案寫回快照(供 reset 後補正,green sha 版本理應相同故多為 no-op)。"""
+        """把受保護檔案寫回快照(供 reset 後補正,green sha 版本理應相同故多為 no-op)。
+        寫回前先建父目錄:green 不含該子目錄時 write_bytes 會 FileNotFoundError(#1)。"""
         for rel in rel_paths:
             snap = (self.dir / "snapshots" / rel.replace("/", "__")).read_bytes()
             target = repo / rel
             if (not target.exists()) or target.read_bytes() != snap:
+                target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(snap)
 
 
@@ -343,19 +370,28 @@ def main():
             state["current_order"] = normalized[0]["order"]
         log(f"⤴ 匯入 plan {len(normalized)} 條(state 已重置),從 {args.start_phase} 開跑")
 
-    # preflight:validate——首跑必須綠;resume 已有綠點可錨定就放行(紅燈連跳防線會自行 reset 回綠)
+    # 每次啟動重拍受保護檔快照:停機期間的人工修改視為合法(綠點一致性驗證要用,故先拍)
+    ws.snapshot_protected(repo, protected)
+
+    # preflight:validate。綠點錨定 fail-closed(#1)——resume 不能只看 last_green_sha 非空,
+    # 否則舊 green 若已不存在/非 HEAD 祖先/protected 已分歧,reset 回去會製造髒工作樹或錯版 goal。
     ok, vtail = run_validate(validate_cmd, repo)
-    if not ok:
-        if state["last_green_sha"]:
-            log(f"⚠ preflight:validate 紅,但已有綠點 {state['last_green_sha'][:8]} 可錨定——放行續跑")
+    if ok and not is_dirty(repo):
+        # 當前 HEAD 綠且乾淨:它就是最新、protected 必然與啟動快照一致的錨點,直接錨在這。
+        # 同時修掉「停機期間人改 goal、舊 green 已分歧」——丟棄舊 green,不沿用過時錨點。
+        state["last_green_sha"] = head_sha(repo)
+    elif not ok:
+        # 當前 HEAD 紅:必須有「通過驗證」的舊綠點才放行,否則沒有可信起點,fail-closed 停機。
+        green = state["last_green_sha"]
+        if green_anchor_valid(repo, green, ws.dir / "snapshots", protected):
+            log(f"⚠ preflight:validate 紅,但綠點 {green[:8]} 通過可達性/一致性驗證——放行續跑")
             state["notes"].append(f"❌ 啟動時 `{' '.join(validate_cmd)}` 就是紅的,"
                                   f"先把它修綠再繼續往下做。輸出尾段:\n```\n{vtail}\n```")
         else:
-            sys.exit(f"❌ preflight:validate 命令 `{' '.join(validate_cmd)}` 是紅的,"
-                     f"首跑起點必須是綠點。輸出尾段:\n{vtail}")
-    if state["last_green_sha"] is None:
-        state["last_green_sha"] = head_sha(repo)  # 首跑起點就是綠點(上面保證)
-    ws.snapshot_protected(repo, protected)        # 每次啟動重拍:停機期間的人工修改視為合法
+            why = ("沒有綠點可錨定" if not green else
+                   f"綠點 {green[:8]} 未通過驗證(不存在/非 HEAD 祖先/protected 與現況分歧)")
+            sys.exit(f"❌ preflight:validate 命令 `{' '.join(validate_cmd)}` 是紅的,{why}——"
+                     f"起點必須是可信綠點。先把工作樹修到 validate 綠再 resume。輸出尾段:\n{vtail}")
 
     # goal 變更偵測:停機期間人改 goal 是合法的,但既有計畫是舊 goal 收斂的——大聲提醒
     goal_hash = sha256_bytes((repo / args.goal).read_bytes())
@@ -495,6 +531,10 @@ def main():
             state["notes"].append("⚠️ 上一輪繞過 work.py 直接改了 state.json,已還原、該輪作廢。"
                                   "計畫與進度只能透過 work.py 的命令寫入。")
         if tampered:
+            # 竄改輪整輪作廢:本輪任何偷渡的 signal / pending plan 一律不採信(#2)。
+            # reset --hard 只清 repo,pending_plan.json 在 workspace 目錄清不到,必須顯式丟棄——
+            # 否則規劃期會把「同一輪偷改 goal + create-plan」提交的髒 plan 當成真相收進去。
+            ws.clear_signals()
             log(f"⚠️ 竄改還原:{tampered}")
 
         head_after = head_sha(repo)
@@ -578,6 +618,14 @@ def main():
                 git(repo, "reset", "--hard", green)
                 git(repo, "clean", "-fd")
                 ws.restore_protected(repo, protected)
+                # reset 後 post-condition(#1):必須回到乾淨綠點,否則綠點錨定不可信,不靠寫回
+                # 快照硬撐,fail-closed 停機交人。
+                if head_sha(repo) != green or is_dirty(repo):
+                    ws.save_state(state)
+                    notify(args.notify_cmd, "reset_broken", ws.dir.name)
+                    sys.exit(f"⛔ reset 回綠點 {green[:8]} 後工作樹不符預期"
+                             f"(HEAD={head_sha(repo)[:8]}、dirty={is_dirty(repo)})——"
+                             f"綠點錨定不可信,停機交人。詳見 {ws.history}")
                 # 依完成 sha 回退任務指標,不用一個一個退
                 state["completed"] = [e for e in state["completed"] if is_ancestor(repo, e["sha"], green)]
                 state["current_order"] = (state["completed"][-1]["order"] + 1) if state["completed"] else \
