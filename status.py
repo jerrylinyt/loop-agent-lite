@@ -159,36 +159,53 @@ def main(argv=None) -> int:
     parser.add_argument("--json", action="store_true", dest="as_json", help="輸出單行 JSON，供 shell/CI 使用")
     parser.add_argument("--watch", action="store_true", help="持續輪詢狀態，Ctrl-C 結束")
     parser.add_argument("--interval", type=float, default=2.0, help="--watch 輪詢秒數（預設 2）")
+    parser.add_argument("--on-change", action="store_true",
+                        help="搭配 --watch：只有 projection 改變時才輸出")
     args = parser.parse_args(argv)
     if bool(args.name) == args.all:
         parser.error("--name 與 --all 必須且只能選一個")
     if not (args.interval > 0 and args.interval < float("inf")):
         parser.error("--interval 必須是有限正數")
+    if args.on_change and not args.watch:
+        parser.error("--on-change 必須搭配 --watch")
     if args.workspace_root:
         loop.WORKSPACE_ROOT = Path(args.workspace_root).expanduser().resolve()
+    previous_signature = None
     try:
         while True:
             if args.all:
                 results = project_all_status()
                 summary = summarize_status(results)
+                projection = {"summary": summary, "workspaces": results}
+                signature = json.dumps(projection, ensure_ascii=False, sort_keys=True,
+                                       separators=(",", ":"))
+                changed = signature != previous_signature
+                previous_signature = signature
                 if args.as_json:
-                    print(json.dumps({"summary": summary, "workspaces": results},
-                                     ensure_ascii=False, separators=(",", ":")), flush=True)
+                    if changed or not args.on_change:
+                        print(json.dumps(projection, ensure_ascii=False, separators=(",", ":")), flush=True)
                 else:
-                    render_fleet_summary(summary)
-                    if not results:
-                        print("（沒有合法 workspace）", flush=True)
-                    for result in results:
-                        if "error" in result:
-                            print(f"❌ {result['name']}｜{result['error']}", flush=True)
-                        else:
-                            render_human(result, timestamp=args.watch)
+                    if changed or not args.on_change:
+                        render_fleet_summary(summary)
+                        if not results:
+                            print("（沒有合法 workspace）", flush=True)
+                        for result in results:
+                            if "error" in result:
+                                print(f"❌ {result['name']}｜{result['error']}", flush=True)
+                            else:
+                                render_human(result, timestamp=args.watch)
             else:
                 result = project_status(args.name)
+                signature = json.dumps(result, ensure_ascii=False, sort_keys=True,
+                                       separators=(",", ":"))
+                changed = signature != previous_signature
+                previous_signature = signature
                 if args.as_json:
-                    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")), flush=True)
+                    if changed or not args.on_change:
+                        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")), flush=True)
                 else:
-                    render_human(result, timestamp=args.watch)
+                    if changed or not args.on_change:
+                        render_human(result, timestamp=args.watch)
             if not args.watch:
                 return 0
             time.sleep(args.interval)

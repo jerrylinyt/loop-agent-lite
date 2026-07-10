@@ -683,6 +683,48 @@ class TestStatusCli(unittest.TestCase):
             finally:
                 L.WORKSPACE_ROOT = old_root
 
+    def test_watch_on_change_suppresses_duplicate_json_until_state_changes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = root / "workspace"
+                ws = L.Workspace("watch-change")
+                state = ws.fresh_state()
+                ws.save_state(state)
+                env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
+                process = subprocess.Popen(
+                    [sys.executable, STATUS_PY, "--name", "watch-change", "--json",
+                     "--watch", "--on-change", "--interval", "0.01"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+                try:
+                    time.sleep(0.08)
+                    state["round"] = 1
+                    ws.save_state(state)
+                    time.sleep(0.08)
+                    process.send_signal(signal.SIGINT)
+                    output, error = process.communicate(timeout=2)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                self.assertEqual(process.returncode, 130, error)
+                lines = [line for line in output.splitlines() if line.strip()]
+                payloads = [json.loads(line) for line in lines]
+                self.assertEqual(len(payloads), 2)
+                self.assertEqual([payload["round"] for payload in payloads], [0, 1])
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_on_change_requires_watch(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
+            result = subprocess.run(
+                [sys.executable, STATUS_PY, "--name", "missing", "--on-change"],
+                capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("必須搭配 --watch", result.stderr)
+
     def test_all_json_lists_fleet_without_starting_or_repairing(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
