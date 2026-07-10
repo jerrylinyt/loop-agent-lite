@@ -70,9 +70,10 @@ Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace 
 python3 status.py --name <workspace>
 python3 status.py --name <workspace> --json   # 供 shell/CI 解析
 python3 status.py --name <workspace> --watch --interval 2
+python3 status.py --all --json                # 一次列出整個 workspace fleet
 ```
 
-`status.py` 不啟動 loop、不修復檔案；`--watch` 只重複唯讀輪詢，Ctrl-C 以 exit code 130 結束。primary state 不可讀時只投影 checkpoint，找不到 workspace 或兩份 state 都損壞會以 exit code 1 結束。
+`status.py` 不啟動 loop、不修復檔案；`--all` 與 `--name` 擇一，`--watch` 只重複唯讀輪詢，Ctrl-C 以 exit code 130 結束。primary state 不可讀時只投影 checkpoint，找不到 workspace 或兩份 state 都損壞會以 exit code 1 結束。
 
 常用選項：
 

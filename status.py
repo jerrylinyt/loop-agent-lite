@@ -77,6 +77,29 @@ def stat_is_directory(mode: int) -> bool:
     return stat.S_ISDIR(mode) and not stat.S_ISLNK(mode)
 
 
+def project_all_status():
+    """投影 workspace root 下所有合法 workspace；單一壞 workspace 不阻斷其他結果。"""
+    root = Path(loop.WORKSPACE_ROOT)
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        return []
+    if not stat_is_directory(info.st_mode):
+        raise ValueError("workspace root 必須是實體目錄")
+    results = []
+    for entry in sorted(root.iterdir(), key=lambda path: path.name):
+        if not loop.valid_workspace_name(entry.name):
+            continue
+        try:
+            entry_info = entry.lstat()
+            if not stat_is_directory(entry_info.st_mode):
+                continue
+            results.append(project_status(entry.name))
+        except (FileNotFoundError, OSError, ValueError, loop.StateLoadError) as e:
+            results.append({"name": entry.name, "error": str(e)})
+    return results
+
+
 def render_human(result, *, timestamp=False) -> None:
     phase = {"plan": "規劃期", "exec": "執行期", "done": "完成"}.get(result["phase"], result["phase"] or "未知")
     running = "執行中" if result["running"] else "已停止"
@@ -91,24 +114,40 @@ def render_human(result, *, timestamp=False) -> None:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="唯讀查詢 loop-agent-lite workspace 狀態")
-    parser.add_argument("--name", required=True, help="workspace 名稱")
+    parser.add_argument("--name", default=None, help="workspace 名稱（與 --all 擇一）")
+    parser.add_argument("--all", action="store_true", help="列出 workspace root 下全部合法 workspace")
     parser.add_argument("--workspace-root", default=None,
                         help="workspace 根目錄（預設使用 LOOP_AGENT_WORKSPACE_ROOT 或專案 workspace）")
     parser.add_argument("--json", action="store_true", dest="as_json", help="輸出單行 JSON，供 shell/CI 使用")
     parser.add_argument("--watch", action="store_true", help="持續輪詢狀態，Ctrl-C 結束")
     parser.add_argument("--interval", type=float, default=2.0, help="--watch 輪詢秒數（預設 2）")
     args = parser.parse_args(argv)
+    if bool(args.name) == args.all:
+        parser.error("--name 與 --all 必須且只能選一個")
     if not (args.interval > 0 and args.interval < float("inf")):
         parser.error("--interval 必須是有限正數")
     if args.workspace_root:
         loop.WORKSPACE_ROOT = Path(args.workspace_root).expanduser().resolve()
     try:
         while True:
-            result = project_status(args.name)
-            if args.as_json:
-                print(json.dumps(result, ensure_ascii=False, separators=(",", ":")), flush=True)
+            if args.all:
+                results = project_all_status()
+                if args.as_json:
+                    print(json.dumps({"workspaces": results}, ensure_ascii=False, separators=(",", ":")), flush=True)
+                else:
+                    if not results:
+                        print("（沒有合法 workspace）", flush=True)
+                    for result in results:
+                        if "error" in result:
+                            print(f"❌ {result['name']}｜{result['error']}", flush=True)
+                        else:
+                            render_human(result, timestamp=args.watch)
             else:
-                render_human(result, timestamp=args.watch)
+                result = project_status(args.name)
+                if args.as_json:
+                    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")), flush=True)
+                else:
+                    render_human(result, timestamp=args.watch)
             if not args.watch:
                 return 0
             time.sleep(args.interval)

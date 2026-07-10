@@ -683,6 +683,28 @@ class TestStatusCli(unittest.TestCase):
             finally:
                 L.WORKSPACE_ROOT = old_root
 
+    def test_all_json_lists_fleet_without_starting_or_repairing(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = root / "workspace"
+                for name, round_number in (("alpha", 2), ("beta", 5)):
+                    ws = L.Workspace(name)
+                    state = ws.fresh_state()
+                    state["round"] = round_number
+                    ws.save_state(state)
+                env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
+                result = subprocess.run(
+                    [sys.executable, STATUS_PY, "--all", "--json"],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual([item["name"] for item in payload["workspaces"]], ["alpha", "beta"])
+                self.assertEqual([item["round"] for item in payload["workspaces"]], [2, 5])
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
 
 class TestLoopSignalIngestionGuards(unittest.TestCase):
     """loop 讀 agent signal/proposal 時不跟隨 workspace 內 symlink。"""
