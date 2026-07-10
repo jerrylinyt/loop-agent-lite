@@ -34,7 +34,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await cliManager.getByRole("button", { name: "執行測試" }).click();
   const launchAgentCheck = page.getByRole("dialog", { name: "Agent CLI 執行確認" });
   await expect(launchAgentCheck.getByRole("status")).toContainText("E2E Agent CLI test result");
-  await launchAgentCheck.getByRole("button", { name: "關閉" }).click();
+  await launchAgentCheck.getByRole("button", { name: "關閉", exact: true }).click();
   await cliManager.getByRole("button", { name: "儲存 CLI 設定" }).click();
   await expect(cliManager).toBeHidden();
   await launcher.getByRole("button", { name: "管理 Code Repo Roots" }).click();
@@ -64,8 +64,8 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(launcher).toBeHidden();
   await expect(page.getByRole("heading", { name: "e2e-workspace" })).toBeVisible();
   await expect(page.getByRole("button", { name: "⏹ 停止" })).toBeVisible();
-  const agentConsole = page.getByLabel("Agent 執行輸出");
-  const loopConsole = page.getByLabel("Loop 狀態紀錄");
+  const agentConsole = page.getByRole("region", { name: "Agent 執行輸出", exact: true });
+  const loopConsole = page.getByRole("region", { name: "Loop 狀態紀錄", exact: true });
   await expect(agentConsole).toContainText("E2E fake agent started");
   await expect(loopConsole).toContainText("🤖 啟動 Agent｜命令：");
   await expect(loopConsole).toContainText("📨 Agent 指令｜done task-1");
@@ -105,7 +105,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await cliManager.getByRole("button", { name: "取消" }).click();
   await settings.getByLabel("Validate 命令").fill("true");
   await settings.locator(".validate-command-field").getByRole("button", { name: "執行確認" }).click();
-  await expect(settings.getByRole("status")).toContainText("Validate 通過");
+  await expect(settings.getByRole("status").filter({ hasText: "Validate 通過" })).toBeVisible();
   await settings.getByLabel("flag 收斂（>）").fill("7");
   await settings.getByLabel("done 收斂（≥）").fill("888");
   await settings.getByLabel("單輪上限（分）").fill("2");
@@ -190,7 +190,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
 
   await page.getByRole("button", { name: "▶ 運行" }).click();
   await expect(page.getByRole("button", { name: "⏹ 停止" })).toBeVisible();
-  await expect(page.getByLabel("Agent 執行輸出")).toContainText("E2E fake agent started");
+  await expect(page.getByRole("region", { name: "Agent 執行輸出", exact: true })).toContainText("E2E fake agent started");
   await expect(page.locator(".chip.status-pulse").filter({ hasText: /^done / })).toBeVisible();
   await page.getByRole("button", { name: "⏹ 停止" }).click();
   await expect(page.getByRole("button", { name: "▶ 運行" })).toBeVisible();

@@ -136,6 +136,112 @@ class TestAtomicWriteConcurrency(unittest.TestCase):
             json.loads(target.read_bytes())  # 最終檔完整、未被 truncate
 
 
+class TestRoundIsolation(unittest.TestCase):
+    """舊 round 的延遲 coordinator 命令/訊號不得污染目前 round。"""
+
+    def test_stale_work_command_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws_dir = Path(d)
+            ws = L.Workspace.__new__(L.Workspace)
+            ws.dir = ws_dir
+            current = "b" * 32
+            stale = "a" * 32
+            ws.write_dispatch("exec", "task-1", current)
+            env = {**os.environ, "LOOP_WS": str(ws_dir), "LOOP_ROUND_TOKEN": stale}
+
+            result = subprocess.run([sys.executable, WORK_PY, "done", "task-1"],
+                                    capture_output=True, text=True, env=env)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("已結束的 round", result.stderr)
+            self.assertFalse(ws.signal("signal_done", current))
+            self.assertEqual(list(ws_dir.glob("signal_done.*")), [])
+
+    def test_old_token_file_does_not_match_current_round(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = L.Workspace.__new__(L.Workspace)
+            ws.dir = Path(d)
+            (ws.dir / "signal_done.old-token").write_text("")
+            self.assertFalse(ws.signal("signal_done", "current-token"))
+
+
+class TestSingleWriterLock(unittest.TestCase):
+    """同一 state/worktree 的第二個 loop 必須立即失敗，不能競寫。"""
+
+    def test_lock_is_exclusive_and_released_explicitly(self):
+        with tempfile.TemporaryDirectory() as d:
+            lock_path = Path(d) / "run.lock"
+            try:
+                L.acquire_run_lock(lock_path, "test target")
+                with self.assertRaises(SystemExit):
+                    L.acquire_run_lock(lock_path, "test target")
+            finally:
+                L.release_run_locks()
+
+            try:
+                L.acquire_run_lock(lock_path, "test target")
+            finally:
+                L.release_run_locks()
+
+
+class TestAgentProcessIsolation(unittest.TestCase):
+    """CLI 主程序退出即封口；同 process-group 背景子行程不能拖住/污染下一輪。"""
+
+    def test_normal_exit_kills_background_child_holding_stdout(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            prompt = root / "prompt.md"
+            prompt.write_text("test\n")
+            child = "import time; time.sleep(10)"
+            parent = ("import subprocess, sys; "
+                      f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
+                      "print('parent done', flush=True)")
+            started = time.monotonic()
+
+            rc, _secs, timed_out = L.run_agent(
+                [sys.executable, "-c", parent], prompt, root, os.environ.copy(),
+                root / "agent.log", 0,
+            )
+
+            self.assertEqual(rc, 0)
+            self.assertFalse(timed_out)
+            self.assertLess(time.monotonic() - started, 2,
+                            "背景 child 繼承 stdout 也不得把 round 卡到 child 自行結束")
+
+
+class TestAbnormalRoundVoided(unittest.TestCase):
+    """Agent crash 前打出的共識訊號不得被採信。"""
+
+    def test_plan_ok_then_nonzero_exit_does_not_advance_consensus(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            plan = root / "plan.json"
+            plan.write_text('[{"order": 1, "task": "only task"}]')
+            agent = root / "agent.py"
+            agent.write_text(
+                "import os, subprocess, sys\n"
+                "sys.stdin.read()\n"
+                f"subprocess.run([sys.executable, {WORK_PY!r}, 'plan-ok'], env=dict(os.environ))\n"
+                "raise SystemExit(7)\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+
+            result = subprocess.run(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "abnormal-vote",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--import-plan", str(plan),
+                 "--start-phase", "plan", "--max-rounds", "1"],
+                capture_output=True, text=True, env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            state = json.loads((workspace_root / "abnormal-vote" / "state.json").read_text())
+            self.assertEqual(state["flag"], 0)
+            self.assertIn("coordinator 訊號已全部作廢", result.stdout)
+
+
 class TestConsoleRotation(unittest.TestCase):
     """完整 console 必須在上限前輪替，且按新舊順序保留固定份數。"""
 

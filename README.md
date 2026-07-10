@@ -30,6 +30,8 @@ Dashboard 啟動 loop（或直接執行 loop.py）
 
 每輪都會保護 `goal.md`、計畫與 state。驗證失敗或偵測到竄改時，會回到最後綠點。`--reset-state` 和 Dashboard 的 plan 匯入都是交易式操作：新流程未通過啟動檢查時，舊進度仍保留。
 
+Loop 另以 OS 鎖維持單 writer：同一 workspace 或同一 Git worktree 不能同時跑兩個 loop（即使來自不同 Dashboard／終端機）。不同 Git worktree 可各自運行，保留日後有限並行的隔離邊界；目前不會自動拆任務、合併分支或建立多份協調 state。
+
 ## 快速開始
 
 ### 1. 準備 target repo
@@ -59,7 +61,7 @@ python3 loop.py \
   --validate-cmd "python3 -m unittest discover -s tests -t . -q"
 ```
 
-Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace log。中斷後重新執行相同命令即可從 `state.json` 繼續。
+Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace log。每輪都有獨立 token，舊輪殘留命令不會被下一輪誤收；CLI 主程序退出時也會清理同 process-group 的背景子行程。中斷後重新執行相同命令即可從 `state.json` 繼續。
 
 常用選項：
 

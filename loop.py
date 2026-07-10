@@ -9,12 +9,14 @@
 
 收斂機制(共識 AND gate):
 - 規劃期:agent call plan-ok 且該輪無任何異動 → flag+1;call create-plan(不論成敗)
-  或有任何異動 → flag 歸零;flag > 10 → 執行期。
+  或有任何異動/異常退出 → flag 歸零;flag > 10 → 執行期。
 - 執行期:per-task 內圈——agent call done(task id 正確)且 HEAD 沒動、工作樹乾淨、
-  驗證綠 → done+1;有異動/驗證紅 → done 歸零;done ≥ threshold(預設 3)→ 派下一個任務。
+  驗證綠、CLI 正常退出 → done+1;有異動/驗證紅/異常退出 → done 歸零;
+  done ≥ threshold(預設 3)→ 派下一個任務。
 
 防線(全部機械、可關可調):
 - preflight:validate 必須綠、工作樹必須乾淨、goal/初步規劃書必須已 commit,否則第一行就擋。
+- 每輪 coordinator 訊號帶唯一 token;舊 CLI 延遲命令無法污染下一輪。CLI 結束即清同 process-group 子孫。
 - 紅燈連跳 N 輪(預設 20)→ git reset --hard 回最後綠點。
 - HEAD 停滯 N 輪(預設 300)→ 同上。reset 後依「task 完成 sha」回退任務指標,不用一個一個退。
 - 同一任務 reset 次數達上限停機:預設關,開啟時預設 100 次。
@@ -56,6 +58,7 @@ CONSOLE_BACKUPS = 3                    # 保留 console.log.1～.3
 
 _CONSOLE_PATH = None
 _CONSOLE_LOCK = threading.Lock()
+_RUN_LOCKS = []
 
 
 def now_ts() -> str:
@@ -119,6 +122,42 @@ def fail(msg: str):
     log(f"⛔ 流程停止｜{msg}")
     # 原因已同步寫到 stdout 與 console.log；只回 exit code，避免 stderr 再印一次相同訊息。
     raise SystemExit(1)
+
+
+def release_run_locks() -> None:
+    """正常退出時最後釋放；SIGKILL 時 kernel 也會自動釋放 flock。"""
+    while _RUN_LOCKS:
+        lock_file = _RUN_LOCKS.pop()
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
+
+
+def acquire_run_lock(path: Path, label: str) -> None:
+    """取得跨 Dashboard/terminal process 的單 writer 鎖；不等待、不猜 pid。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(path, "a+b")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.seek(0)
+        owner = lock_file.read().decode("utf-8", errors="replace").strip()
+        lock_file.close()
+        owner_note = f"（owner {owner}）" if owner else ""
+        fail(f"preflight：{label} 已有另一個 loop 持有單 writer 鎖{owner_note}。"
+             "不要同時操作同一份 state/worktree；要並行請使用不同 Git worktree 與 workspace")
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(json.dumps({"pid": os.getpid(), "started_at": datetime.now().isoformat(timespec="seconds")},
+                               ensure_ascii=False).encode("utf-8"))
+    lock_file.flush()
+    _RUN_LOCKS.append(lock_file)  # 強引用持有到 atexit；只留下 lock file，不靠檔案存在與否判斷
+
+
+# 此 handler 比 main 內稍後註冊的 state stopped handler 更早註冊；atexit 為 LIFO，
+# 因此會先把 state.pid 清掉並存檔，最後才釋放單 writer 鎖。
+atexit.register(release_run_locks)
 
 
 def sh(args, cwd, check=True):
@@ -234,21 +273,45 @@ class Workspace:
 
     # ---- 輪間訊號(work.py 寫、loop 讀) ----
     def clear_signals(self):
-        for f in ("called_create_plan", "pending_plan.json", "signal_plan_ok", "signal_done"):
-            (self.dir / f).unlink(missing_ok=True)
+        """清掉已結束 round 的 coordinator 產物。
 
-    def signal(self, name) -> bool:
-        return (self.dir / name).exists()
+        訊號檔名帶 round token；就算舊 CLI 的背景子行程在 clear 後才醒來，
+        它也只能重建舊 token 的檔案，下一輪不會誤收。
+        """
+        names = ("called_create_plan", "pending_plan", "signal_plan_ok", "signal_done", "pending_issues")
+        for name in names:
+            (self.dir / name).unlink(missing_ok=True)  # 清理舊版固定檔名
+            for path in self.dir.glob(f"{name}.*"):
+                path.unlink(missing_ok=True)
+        # work.py 在 proposal 原子 replace 前若被 SIGKILL，可能留下隱藏 tmp；永不讀取，
+        # 但長跑也不該讓它們無限累積。
+        for path in self.dir.glob(".pending_plan.*.tmp.*"):
+            path.unlink(missing_ok=True)
 
-    def take_pending_plan(self):
-        p = self.dir / "pending_plan.json"
-        if p.exists():
+    def signal(self, name, round_token) -> bool:
+        return (self.dir / f"{name}.{round_token}").exists()
+
+    def take_pending_plan(self, round_token):
+        p = self.dir / f"pending_plan.{round_token}.json"
+        if not p.exists():
+            return None
+        try:
             return json.loads(p.read_text(encoding="utf-8"))
-        return None
+        except (OSError, json.JSONDecodeError):
+            # work.py 理論上只會原子寫入校驗過的 JSON；磁碟/外力仍可能破壞檔案。
+            # 壞 proposal 只應讓本輪不採用，不能讓跑整夜的 loop 整支 crash。
+            return None
 
-    def write_dispatch(self, phase, task_id=""):
-        (self.dir / "phase").write_text(phase, encoding="utf-8")
-        (self.dir / "current_task").write_text(task_id, encoding="utf-8")
+    def pending_issues(self, round_token):
+        return self.dir / f"pending_issues.{round_token}"
+
+    def write_dispatch(self, phase, task_id, round_token):
+        """dispatch 是 work.py 的原子真相；另保留舊唯讀檔供既有 wrapper 觀測。"""
+        payload = json.dumps({"phase": phase, "task_id": task_id, "round_token": round_token},
+                             ensure_ascii=False).encode("utf-8")
+        atomic_write_bytes(self.dir / "dispatch.json", payload)
+        atomic_write_bytes(self.dir / "phase", phase.encode("utf-8"))
+        atomic_write_bytes(self.dir / "current_task", task_id.encode("utf-8"))
 
     # ---- 受保護檔案快照(goal / 初步規劃書) ----
     def snapshot_protected(self, repo, rel_paths):
@@ -282,43 +345,68 @@ def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs, on_started=No
     逾時 SIGKILL 整個 process group(start_new_session 保證殺得到子孫)。
     回傳 (rc, 秒數, 是否逾時)。"""
     t0 = time.monotonic()
-    flag = {"timed_out": False}
+    timed_out = False
     with open(log_path, "w", encoding="utf-8") as lf, open(prompt_path, "rb") as pin:
         p = subprocess.Popen(cmd, cwd=str(repo), env=env, stdin=pin,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              start_new_session=True)
-        if on_started:
-            on_started(p.pid)
+        process_group = p.pid  # start_new_session=True → pgid 固定等於 child pid
+        reader_errors = []
+        escaped_pipe = False
 
-        def _kill():
-            if p.poll() is None:
-                flag["timed_out"] = True
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-
-        timer = threading.Timer(timeout_secs, _kill) if timeout_secs else None
-        if timer:
-            timer.start()
-        try:
-            for raw in p.stdout:
-                line = raw.decode("utf-8", errors="replace")
-                agent_log(line.rstrip("\n"))
-                lf.write(line)
-                lf.flush()  # 逐行落盤,dashboard 才 tail 得到即時輸出
-        except KeyboardInterrupt:
-            # 人(或 dashboard)停掉 loop:把跑到一半的 agent 整個 process group 帶走,不留孤兒
+        def _kill_group():
             try:
-                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                os.killpg(process_group, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
+
+        def _stream_output():
+            try:
+                for raw in p.stdout:
+                    line = raw.decode("utf-8", errors="replace")
+                    agent_log(line.rstrip("\n"))
+                    lf.write(line)
+                    lf.flush()  # 逐行落盤,dashboard 才 tail 得到即時輸出
+            except Exception as e:  # noqa: BLE001 — 主執行緒清理 process group 後再轉拋
+                reader_errors.append(e)
+
+        # stdout 由 reader thread 處理，主執行緒直接等 CLI 主程序。否則 CLI 已退出、
+        # 背景孫行程仍握著 stdout pipe 時，`for raw in stdout` 會把 round 卡到孫行程結束。
+        reader = threading.Thread(target=_stream_output, name="agent-output", daemon=True)
+        reader.start()
+        try:
+            if on_started:
+                on_started(p.pid)
+            try:
+                p.wait(timeout=timeout_secs if timeout_secs else None)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_group()
+                p.wait()
+        except KeyboardInterrupt:
+            # 人(或 dashboard)停掉 loop:把跑到一半的 agent 整個 process group 帶走,不留孤兒
+            _kill_group()
             raise
         finally:
-            p.wait()
-            if timer:
-                timer.cancel()
-    return p.returncode, time.monotonic() - t0, flag["timed_out"]
+            # CLI 主程序不論正常、錯誤或超時退出，round 到此即封口；清掉仍存活的同組
+            # 子孫，避免它們在 Validate 或下一輪期間繼續改 repo/寫 coordinator 訊號。
+            _kill_group()
+            if p.poll() is None:
+                p.wait()
+            reader.join(timeout=5)
+            if reader.is_alive():
+                # 有子行程刻意 setsid 逃離 process group 且仍握著 pipe；不能讓它反過來
+                # 卡死 loop，也不能帶著未知 writer 繼續下一輪。不要在此直接 close BufferedReader：
+                # reader thread 可能正持有其 lock，close 本身反而會永久阻塞。
+                escaped_pipe = True
+                log("⛔ Agent 有逃離 process group 的背景程序仍持有 stdout；為避免跨輪競寫，loop 停止")
+            else:
+                p.stdout.close()
+        if escaped_pipe:
+            raise RuntimeError("Agent 背景程序逃離 process group，無法安全進入下一輪")
+        if reader_errors:
+            raise reader_errors[0]
+    return p.returncode, time.monotonic() - t0, timed_out
 
 
 def notify(cmd, status, name):
@@ -427,6 +515,7 @@ def main():
     # 檢查通過後才設定 console，導致「pid 出現後立刻停止」卻完全看不到原因。
     ws = Workspace(args.name or repo.name)
     configure_console(ws.dir / "console.log")
+    acquire_run_lock(ws.dir / ".run.lock", f"workspace '{ws.dir.name}'")
     startup_ready = ws.dir / "startup_ready.json"
     startup_ready.unlink(missing_ok=True)
 
@@ -435,6 +524,10 @@ def main():
         fail(f"preflight：{repo} 不是 git repo")
     if git(repo, "rev-parse", "HEAD", check=False).returncode != 0:
         fail(f"preflight：{repo} 沒有任何 commit")
+    git_dir = Path(git(repo, "rev-parse", "--git-dir").stdout.strip())
+    if not git_dir.is_absolute():
+        git_dir = (repo / git_dir).resolve()
+    acquire_run_lock(git_dir / "loop-agent-lite.run.lock", f"Git worktree {repo}")
     if is_dirty(repo):
         fail("preflight：工作樹不乾淨。之後的 reset --hard 會吃掉你的 WIP，先 commit 或 stash 再來")
     for rel in protected:
@@ -564,7 +657,7 @@ def main():
     create_cmd = f"{py} {shlex.quote(str(work_py))} create-plan"
     planok_cmd = f"{py} {shlex.quote(str(work_py))} plan-ok"
     issue_cmd = f"{py} {shlex.quote(str(work_py))} issue"
-    env = {**os.environ, "LOOP_WS": str(ws.dir)}
+    base_env = {**os.environ, "LOOP_WS": str(ws.dir)}
 
     phase_name = "規劃期" if state["phase"] == "plan" else "執行期"
     log(f"📍 恢復進度｜階段：{phase_name}｜已完成 round {state['round']}")
@@ -596,15 +689,16 @@ def main():
             notify(args.notify_cmd, "goal_missing", ws.dir.name)
             fail(f"{args.goal} 不存在（每輪啟動前檢查）——請補回並 commit 後再啟動")
 
-        # 派工資訊落地(work.py 靠這兩個檔做當場驗:phase 凍結 + task id 核對)
+        # 派工資訊落地(work.py 靠原子 dispatch 做 phase/task/token 當場核對)
         cur_task = next((t for t in state["plan"] if t["order"] == state["current_order"]), None)
         if phase == "exec" and cur_task is None:
             ws.save_state(state)
             fail(f"執行期找不到 current_order={state['current_order']} 的任務"
                  f"（plan {len(state['plan'])} 條）——state 不合法，停機交由人員確認")
         task_id = f"task-{state['current_order']}" if (phase == "exec" and cur_task) else ""
-        ws.write_dispatch(phase, task_id)
         ws.clear_signals()
+        round_token = uuid.uuid4().hex
+        ws.write_dispatch(phase, task_id, round_token)
         ws.save_state(state)  # spawn 前先落地:agent 讀得到最新 round/phase,tamper 基準同步更新
 
         notes_text = "\n\n".join(notes) if notes else "(無)"
@@ -649,7 +743,8 @@ def main():
         task_summary = f"｜{task_id}：{cur_task['task']}" if cur_task else ""
         log(f"🔄 第 {rnd} 輪開始｜{phase_name}{task_summary}｜flag={state['flag']}｜done={state['done_count']}")
         log(f"🤖 啟動 Agent｜命令：{shlex.join(agent_cmd)}")
-        rc, secs, timed_out = run_agent(agent_cmd, prompt_path, repo, env,
+        round_env = {**base_env, "LOOP_ROUND_TOKEN": round_token}
+        rc, secs, timed_out = run_agent(agent_cmd, prompt_path, repo, round_env,
                                         ws.dir / "logs" / f"round-{rnd:04d}.log",
                                         args.round_timeout * 60, on_started=mark_startup_ready)
         log(f"🤖 Agent 結束｜exit code={rc}｜耗時 {secs:.0f} 秒" + "｜超時，已強制終止" * timed_out)
@@ -687,10 +782,21 @@ def main():
             log("⚠️ 偵測到 Agent 直接修改 state.json｜已用 loop 保存的狀態還原")
         if tampered:
             # 竄改輪整輪作廢:本輪任何偷渡的 signal / pending plan 一律不採信(#2)。
-            # reset --hard 只清 repo,pending_plan.json 在 workspace 目錄清不到,必須顯式丟棄——
+            # reset --hard 只清 repo，token-scoped pending plan 在 workspace 清不到，必須顯式丟棄——
             # 否則規劃期會把「同一輪偷改 goal + create-plan」提交的髒 plan 當成真相收進去。
             ws.clear_signals()
             log(f"⚠️ 本輪作廢｜偵測到不允許的變更：{', '.join(tampered)}｜相關 signal 已丟棄")
+
+        # CLI 非零退出/逾時代表 round 沒有正常走完；即使它在 crash 前曾打過 done/plan-ok，
+        # 也不能把不完整的一輪算成共識票。執行期 repo 產出不回滾，仍留給下一輪收拾驗證。
+        agent_failed = rc != 0 or timed_out
+        if agent_failed:
+            ws.clear_signals()
+            state["notes"].append(
+                f"⚠️ 上一輪 Agent 未正常結束(exit code={rc}"
+                + (f",逾時 {args.round_timeout:g} 分鐘" if timed_out else "")
+                + ")，該輪 coordinator 訊號已作廢；repo 殘留交下一輪檢查。")
+            log("⚠️ Agent round 異常｜本輪 coordinator 訊號已全部作廢")
 
         head_after = head_sha(repo)
         dirty = is_dirty(repo)
@@ -700,10 +806,10 @@ def main():
         event = ""
         if phase == "plan":
             # create-plan 只要被 call(不論成敗)就歸零 —— fail-closed
-            if ws.signal("called_create_plan"):
+            if ws.signal("called_create_plan", round_token):
                 log("📨 Agent 指令｜create-plan（提交新計畫）")
                 state["flag"] = 0
-                pending = ws.take_pending_plan()
+                pending = ws.take_pending_plan(round_token)
                 if pending is not None:
                     state["plan"] = pending
                     state["plan_version"] += 1
@@ -712,9 +818,9 @@ def main():
                 else:
                     event = "❌ create-plan 校驗未通過｜保留原計畫"
                     log(event)
-            elif tampered or changed:  # 規劃期 repo 異動已在上面整輪 reset,這裡只確保 flag 歸零
+            elif tampered or changed or agent_failed:
                 state["flag"] = 0
-            elif ws.signal("signal_plan_ok"):
+            elif ws.signal("signal_plan_ok", round_token):
                 log("📨 Agent 指令｜plan-ok（確認目前計畫）")
                 if state["plan"]:
                     state["flag"] += 1
@@ -737,11 +843,11 @@ def main():
                 event = f"✅ 規劃收斂(plan v{state['plan_version']},{len(state['plan'])} 條)→ 執行期"
                 log(event)
         else:
-            if ws.signal("signal_done"):
+            if ws.signal("signal_done", round_token):
                 log(f"📨 Agent 指令｜done {task_id}（回報任務完成）")
             else:
                 log(f"ℹ️ Agent 本輪未送出 done {task_id}")
-            if ws.signal("called_create_plan"):
+            if ws.signal("called_create_plan", round_token):
                 log("📨 Agent 指令｜create-plan｜執行期計畫已凍結，將忽略此指令")
             log(f"🧪 執行驗證｜命令：{shlex.join(validate_cmd)}")
             ok, vtail, validate_timed_out = run_validate(validate_cmd, repo, args.validate_timeout)
@@ -761,13 +867,16 @@ def main():
                 state["notes"].append(
                     f"❌ 上一輪結束後 `{' '.join(validate_cmd)}` 失敗。先判斷是前一個 commit 沒做好、"
                     f"還是前一個 agent 沒做完,把它修好讓驗證過了再繼續。輸出尾段:\n```\n{vtail}\n```")
-            if ws.signal("called_create_plan"):
+            if ws.signal("called_create_plan", round_token):
                 state["notes"].append("執行期計畫已凍結,create-plan 被忽略。任務本身有問題請在 log/commit 說明,交人處理。")
-            if tampered or changed:
+            if tampered or changed or agent_failed or ws.signal("called_create_plan", round_token):
                 state["done_count"] = 0
-                reason = "本輪被判定作廢" if tampered else "偵測到程式碼或 commit 變更，等待下一輪確認"
+                reason = ("本輪被判定作廢" if tampered else
+                          "Agent round 未正常結束" if agent_failed else
+                          "執行期誤打 create-plan，不能同時算完成票" if ws.signal("called_create_plan", round_token) else
+                          "偵測到程式碼或 commit 變更，等待下一輪確認")
                 log(f"↩️ done 共識歸零｜{reason}")
-            elif ws.signal("signal_done") and ok:
+            elif ws.signal("signal_done", round_token) and ok:
                 state["done_count"] += 1
                 log(f"✅ done 共識累計｜{state['done_count']} / {args.done_threshold}")
 
@@ -825,7 +934,7 @@ def main():
                          f"停機交由人員確認。詳見 {ws.history}")
 
         # agent 回報的 issue(work.py issue):落 state 給人類看,不影響任何計數
-        pend = ws.dir / "pending_issues"
+        pend = ws.pending_issues(round_token)
         if pend.exists():
             issue_lines = []
             for iline in pend.read_text(encoding="utf-8").splitlines():
@@ -842,8 +951,8 @@ def main():
 
         line = (f"{datetime.now().isoformat(timespec='seconds')} round={rnd} phase={phase} "
                 f"task={task_id or '-'} rc={rc} changed={changed} "
-                f"signal={'create' if ws.signal('called_create_plan') else 'ok' if ws.signal('signal_plan_ok') else 'done' if ws.signal('signal_done') else '-'} "
-                f"tamper={bool(tampered)} validate={validate_note} "
+                f"signal={'create' if ws.signal('called_create_plan', round_token) else 'ok' if ws.signal('signal_plan_ok', round_token) else 'done' if ws.signal('signal_done', round_token) else '-'} "
+                f"tamper={bool(tampered)} agent_ok={not agent_failed} validate={validate_note} "
                 f"flag={state['flag']} done={state['done_count']}"
                 + (f"  << {event}" if event else ""))
         with open(ws.history, "a", encoding="utf-8") as hf:
