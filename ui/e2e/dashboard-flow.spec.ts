@@ -85,6 +85,19 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await page.getByRole("button", { name: "⏹ 停止" }).click();
   await expect(page.getByRole("button", { name: "▶ 運行" })).toBeVisible();
 
+  await page.getByRole("button", { name: "🕒 輪次紀錄" }).click();
+  const historyModal = page.getByRole("dialog", { name: "輪次紀錄" });
+  await expect(historyModal).toBeVisible();
+  const firstHistoryRow = historyModal.locator("tbody tr").first();
+  await expect(firstHistoryRow).toContainText("執行");
+  await expect(firstHistoryRow).toContainText("task-1");
+  await expect(firstHistoryRow).toContainText("done");
+  await expect(firstHistoryRow).toContainText("✅");
+  await historyModal.getByRole("button", { name: "重新整理" }).click();
+  await expect(firstHistoryRow).toContainText("task-1");
+  await historyModal.getByRole("button", { name: "關閉對話框" }).click();
+  await expect(historyModal).toBeHidden();
+
   await page.getByRole("button", { name: "＋ 啟動／管理" }).click();
   await page.getByRole("dialog", { name: "啟動與管理" }).getByRole("tab", { name: "執行中的 jobs" }).click();
   await expect(page.getByRole("dialog", { name: "啟動與管理" }).getByText("e2e-workspace")).toBeVisible();
