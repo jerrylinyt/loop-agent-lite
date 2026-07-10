@@ -47,6 +47,7 @@ def prepare_fixture():
         "phase = (ws / 'phase').read_text().strip()\n"
         "task = (ws / 'current_task').read_text().strip()\n"
         "print(f'E2E fake agent started phase={phase} task={task}', flush=True)\n"
+        "print('\\x1b[32mE2E-ANSI-GREEN\\x1b[0m plain-tail', flush=True)\n"
         f"subprocess.run([sys.executable, {str(work_py)!r}, 'issue', 'E2E structured issue'], env=os.environ, check=True)\n"
         "if phase == 'plan':\n"
         "    marker = ws / '.e2e-plan-updated'\n"

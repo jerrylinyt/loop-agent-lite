@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { hasAnsi, renderAnsi } from "./ansi";
 
 export type ConsoleFilter = "agent" | "other" | "all";
 
@@ -44,6 +45,10 @@ export default function ConsolePane({
   const visibleText = useMemo(
     () => searchConsoleText(filterConsoleText(text, showFilters ? filter : defaultFilter), search),
     [text, filter, showFilters, defaultFilter, search]
+  );
+  const renderedText = useMemo(
+    () => (hasAnsi(visibleText) ? renderAnsi(visibleText) : visibleText),
+    [visibleText]
   );
 
   useEffect(() => {
@@ -98,7 +103,7 @@ export default function ConsolePane({
         </div>
       </header>
       <pre ref={consoleRef} className="console-output" onScroll={onScroll} tabIndex={0}>
-        {visibleText || (search.trim() ? "沒有符合過濾條件的行。"
+        {visibleText ? renderedText : (search.trim() ? "沒有符合過濾條件的行。"
           : hasWorkspace ? "此分類尚無執行紀錄。" : "建立或選擇 workspace 後，執行紀錄會顯示在這裡。")}
       </pre>
       {!follow && (

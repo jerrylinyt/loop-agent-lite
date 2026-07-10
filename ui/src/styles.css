@@ -317,3 +317,43 @@ tr.flash td { animation: flash 2.4s ease-out; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+/* ANSI console 色盤(深色為預設,淺色主題覆蓋) */
+:root, :root[data-theme="dark"] {
+  --ansi-black: #6e7681; --ansi-red: #ff7b72; --ansi-green: #3fb950; --ansi-yellow: #d29922;
+  --ansi-blue: #58a6ff; --ansi-magenta: #bc8cff; --ansi-cyan: #39c5cf; --ansi-white: #b1bac4;
+  --ansi-bright-black: #8b949e; --ansi-bright-red: #ffa198; --ansi-bright-green: #56d364; --ansi-bright-yellow: #e3b341;
+  --ansi-bright-blue: #79c0ff; --ansi-bright-magenta: #d2a8ff; --ansi-bright-cyan: #56d4dd; --ansi-bright-white: #f0f6fc;
+}
+:root[data-theme="light"] {
+  --ansi-black: #57606a; --ansi-red: #cf222e; --ansi-green: #1a7f37; --ansi-yellow: #9a6700;
+  --ansi-blue: #0969da; --ansi-magenta: #8250df; --ansi-cyan: #1b7c83; --ansi-white: #8c959f;
+  --ansi-bright-black: #6e7781; --ansi-bright-red: #a40e26; --ansi-bright-green: #2da44e; --ansi-bright-yellow: #bf8700;
+  --ansi-bright-blue: #218bff; --ansi-bright-magenta: #a475f9; --ansi-bright-cyan: #3192aa; --ansi-bright-white: #a8b1bb;
+}
+.ansi-fg-black { color: var(--ansi-black); } .ansi-fg-red { color: var(--ansi-red); }
+.ansi-fg-green { color: var(--ansi-green); } .ansi-fg-yellow { color: var(--ansi-yellow); }
+.ansi-fg-blue { color: var(--ansi-blue); } .ansi-fg-magenta { color: var(--ansi-magenta); }
+.ansi-fg-cyan { color: var(--ansi-cyan); } .ansi-fg-white { color: var(--ansi-white); }
+.ansi-fg-bright-black { color: var(--ansi-bright-black); } .ansi-fg-bright-red { color: var(--ansi-bright-red); }
+.ansi-fg-bright-green { color: var(--ansi-bright-green); } .ansi-fg-bright-yellow { color: var(--ansi-bright-yellow); }
+.ansi-fg-bright-blue { color: var(--ansi-bright-blue); } .ansi-fg-bright-magenta { color: var(--ansi-bright-magenta); }
+.ansi-fg-bright-cyan { color: var(--ansi-bright-cyan); } .ansi-fg-bright-white { color: var(--ansi-bright-white); }
+.ansi-bg-black { background: color-mix(in srgb, var(--ansi-black) 30%, transparent); }
+.ansi-bg-red { background: color-mix(in srgb, var(--ansi-red) 30%, transparent); }
+.ansi-bg-green { background: color-mix(in srgb, var(--ansi-green) 30%, transparent); }
+.ansi-bg-yellow { background: color-mix(in srgb, var(--ansi-yellow) 30%, transparent); }
+.ansi-bg-blue { background: color-mix(in srgb, var(--ansi-blue) 30%, transparent); }
+.ansi-bg-magenta { background: color-mix(in srgb, var(--ansi-magenta) 30%, transparent); }
+.ansi-bg-cyan { background: color-mix(in srgb, var(--ansi-cyan) 30%, transparent); }
+.ansi-bg-white { background: color-mix(in srgb, var(--ansi-white) 30%, transparent); }
+.ansi-bg-bright-black { background: color-mix(in srgb, var(--ansi-bright-black) 30%, transparent); }
+.ansi-bg-bright-red { background: color-mix(in srgb, var(--ansi-bright-red) 30%, transparent); }
+.ansi-bg-bright-green { background: color-mix(in srgb, var(--ansi-bright-green) 30%, transparent); }
+.ansi-bg-bright-yellow { background: color-mix(in srgb, var(--ansi-bright-yellow) 30%, transparent); }
+.ansi-bg-bright-blue { background: color-mix(in srgb, var(--ansi-bright-blue) 30%, transparent); }
+.ansi-bg-bright-magenta { background: color-mix(in srgb, var(--ansi-bright-magenta) 30%, transparent); }
+.ansi-bg-bright-cyan { background: color-mix(in srgb, var(--ansi-bright-cyan) 30%, transparent); }
+.ansi-bg-bright-white { background: color-mix(in srgb, var(--ansi-bright-white) 30%, transparent); }
+.ansi-bold { font-weight: 700; } .ansi-dim { opacity: .65; }
+.ansi-italic { font-style: italic; } .ansi-underline { text-decoration: underline; }
