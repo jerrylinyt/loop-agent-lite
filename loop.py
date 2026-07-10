@@ -376,7 +376,14 @@ def main():
     # preflight:validate。綠點錨定 fail-closed(#1)——resume 不能只看 last_green_sha 非空,
     # 否則舊 green 若已不存在/非 HEAD 祖先/protected 已分歧,reset 回去會製造髒工作樹或錯版 goal。
     ok, vtail = run_validate(validate_cmd, repo)
-    if ok and not is_dirty(repo):
+    # validate 本身若修改 tracked/untracked(non-ignored)檔案,不論 rc 綠紅都不能放行。否則 rc=0
+    # 會落出下列分支直接續跑;rc!=0 + 舊 green 合法也會帶髒工作樹進 loop,把 validator 的副作用
+    # 誤判成 agent 異動。preflight 起點必須在 validate 前後都乾淨。
+    if is_dirty(repo):
+        sys.exit(f"❌ preflight:validate 命令 `{' '.join(validate_cmd)}` 執行後弄髒工作樹——"
+                 "validate 必須只產生 ignored build artifacts,不能修改 tracked/untracked 原始碼。"
+                 f"輸出尾段:\n{vtail}")
+    if ok:
         # 當前 HEAD 綠且乾淨:它就是最新、protected 必然與啟動快照一致的錨點,直接錨在這。
         # 同時修掉「停機期間人改 goal、舊 green 已分歧」——丟棄舊 green,不沿用過時錨點。
         state["last_green_sha"] = head_sha(repo)

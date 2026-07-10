@@ -71,13 +71,22 @@ def _state_lock(name):
         return lk
 
 
-def with_state_lock(fn):
-    """裝飾 api_*(self, body):以 body['name'] 對應的 workspace 鎖序列化整段 read-modify-write。"""
-    @functools.wraps(fn)
-    def wrapper(self, body):
-        with _state_lock(str(body.get("name") or "")):
-            return fn(self, body)
-    return wrapper
+def with_state_lock(fn=None, *, repo_fallback=False):
+    """裝飾 api_*(self, body):以 workspace name 鎖序列化整段 read/check/mutate/spawn。
+
+    launch 允許 name 留空,此時用 repo 目錄名作 lock key,確保它和同 workspace 的 run/edit/phase
+    取得同一把鎖。支援 @with_state_lock 與 @with_state_lock(repo_fallback=True) 兩種寫法。
+    """
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapper(self, body):
+            name = str(body.get("name") or "").strip()
+            if not name and repo_fallback:
+                name = Path(str(body.get("repo") or "")).expanduser().name
+            with _state_lock(name):
+                return func(self, body)
+        return wrapper
+    return decorate(fn) if fn is not None else decorate
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -535,6 +544,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    @with_state_lock(repo_fallback=True)
     def api_launch(self, body):
         cfg = load_config()
         if "error" in cfg:
@@ -660,6 +670,7 @@ class Handler(BaseHTTPRequestHandler):
         print(f"▶ 啟動 loop:{name}(pid {p.pid})repo={repo}", flush=True)
         self._out(200, json.dumps({"ok": True, "name": name, "pid": p.pid}, ensure_ascii=False))
 
+    @with_state_lock
     def api_run(self, body):
         """一鍵重跑既有 workspace:設定全部從 state.json 拿,agent 命令先過 config 白名單。"""
         name = str(body.get("name") or "")

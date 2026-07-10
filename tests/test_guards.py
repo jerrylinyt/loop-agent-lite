@@ -10,6 +10,7 @@
 """
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 import loop as L  # noqa: E402
+import dashboard as D  # noqa: E402
 
 WORK_PY = str(REPO_ROOT / "work.py")
 LOOP_PY = str(REPO_ROOT / "loop.py")
@@ -131,6 +133,72 @@ class TestAtomicWriteConcurrency(unittest.TestCase):
 
             self.assertEqual(errs, [], f"並發原子寫不應丟例外,實得:{errs[:5]}...")
             json.loads(target.read_bytes())  # 最終檔完整、未被 truncate
+
+
+class TestDashboardStateLockCoverage(unittest.TestCase):
+    """#3 run/launch 必須和 edit/phase 共用 workspace lock,不能在 stopped check 後競態。"""
+
+    def test_all_workspace_mutations_are_decorated(self):
+        for method in ("api_launch", "api_run", "api_edit_state", "api_edit_config", "api_phase", "api_set_task"):
+            self.assertTrue(hasattr(getattr(D.Handler, method), "__wrapped__"), f"{method} 必須套 workspace lock")
+
+    def test_launch_blank_name_locks_repo_basename(self):
+        entered = threading.Event()
+
+        @D.with_state_lock(repo_fallback=True)
+        def action(_self, _body):
+            entered.set()
+
+        lock = D._state_lock("demo-repo")
+        lock.acquire()
+        thread = threading.Thread(target=action, args=(object(), {"name": "", "repo": "/tmp/demo-repo"}))
+        thread.start()
+        try:
+            self.assertFalse(entered.wait(0.05), "name 留空的 launch 應被 repo basename 對應的鎖擋住")
+        finally:
+            lock.release()
+        thread.join(timeout=1)
+        self.assertTrue(entered.is_set())
+
+
+class TestValidateMustStayClean(unittest.TestCase):
+    """preflight validate 不得靠副作用修改原始碼後仍放行,不論 rc 綠紅。"""
+
+    def _assert_dirty_validator_blocked(self, rc):
+        with tempfile.TemporaryDirectory() as d:
+            repo = make_repo(d)
+            (repo / "tracked.txt").write_text("clean\n")
+            git(repo, "add", "tracked.txt")
+            git(repo, "commit", "-qm", "tracked")
+            name = f"verifytmp_validate_dirty_{Path(d).name}_{rc}"
+            wsd = WS_ROOT / name
+            shutil.rmtree(wsd, ignore_errors=True)
+            try:
+                common = [sys.executable, LOOP_PY, "--repo", str(repo), "--name", name,
+                          "--goal", "goal.md", "--agent-cmd", "true", "--max-rounds", "1"]
+                if rc:
+                    # 先建立一個可信 last_green_sha；舊行為會因 green 合法而放行紅色 dirty validator。
+                    seeded = subprocess.run(common + ["--validate-cmd", "true"], capture_output=True, text=True)
+                    self.assertEqual(seeded.returncode, 0, seeded.stdout + seeded.stderr)
+                validator = Path(d) / "dirty_validator.py"
+                validator.write_text(
+                    "from pathlib import Path\n"
+                    "p = Path('tracked.txt')\n"
+                    "p.write_text(p.read_text() + 'dirty\\n')\n"
+                    f"raise SystemExit({rc})\n"
+                )
+                result = subprocess.run(common + ["--validate-cmd", shlex.join([sys.executable, str(validator)])],
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, "validate 弄髒工作樹必須 fail-closed")
+                self.assertIn("執行後弄髒工作樹", result.stdout + result.stderr)
+            finally:
+                shutil.rmtree(wsd, ignore_errors=True)
+
+    def test_green_validator_that_dirties_tree_is_blocked(self):
+        self._assert_dirty_validator_blocked(0)
+
+    def test_red_validator_with_old_green_that_dirties_tree_is_blocked(self):
+        self._assert_dirty_validator_blocked(1)
 
 
 # fake agent 腳本:被 loop 當一輪 agent spawn(cwd=repo,LOOP_WS 由 loop 設)。
