@@ -71,6 +71,7 @@ def project_status(name: str):
         "last_state_recovery": state.get("last_state_recovery"),
         "goal_changed": bool(state.get("goal_changed")),
         "issues": len(issues),
+        "unread_issues": loop.unread_issue_count(state),
         "last_green_sha": state.get("last_green_sha"),
         "loop_pid": pid,
         "loop_session_id": loop_state.get("session_id"),
@@ -129,13 +130,14 @@ def summarize_status(results):
         "attention": sum(1 for result in valid if (
             result.get("red_streak", 0) > 0 or
             result.get("stall_rounds", 0) > 0 or
-            result.get("issues", 0) > 0 or
+            result.get("unread_issues", result.get("issues", 0)) > 0 or
             result.get("agent_failure_streak", 0) > 0 or
             result.get("state_recovery_count", 0) > 0 or
             result.get("state_recovery_pending") or
             result.get("goal_changed") or
             result.get("stale_loop_pid"))),
         "issues": sum(result.get("issues", 0) for result in valid),
+        "unread_issues": sum(result.get("unread_issues", result.get("issues", 0)) for result in valid),
         "agent_failures": sum(result.get("agent_failure_streak", 0) for result in valid),
         "state_recoveries": sum(result.get("state_recovery_count", 0) for result in valid),
         "goal_changes": sum(1 for result in valid if result.get("goal_changed")),
@@ -152,7 +154,7 @@ def projection_needs_attention(result) -> bool:
         "error" in result or
         result.get("red_streak", 0) > 0 or
         result.get("stall_rounds", 0) > 0 or
-        result.get("issues", 0) > 0 or
+        result.get("unread_issues", result.get("issues", 0)) > 0 or
         result.get("agent_failure_streak", 0) > 0 or
         result.get("state_recovery_count", 0) > 0 or
         result.get("state_recovery_pending") or
@@ -188,9 +190,12 @@ def render_human(result, *, timestamp=False) -> None:
     running = "執行中" if result["running"] else "⚠ PID 殘留" if result.get("stale_loop_pid") else "已停止"
     prefix = f"[{time.strftime('%H:%M:%S')}] " if timestamp else ""
     task = f"｜task-{result['current_order']}：{result['current_task']}" if result.get("current_task") else ""
+    issue_note = (f"issues {result['issues']}（未讀 {result['unread_issues']}）"
+                  if result.get("unread_issues", result["issues"]) != result["issues"]
+                  else f"issues {result['issues']}")
     print(f"{prefix}{result['name']}｜{phase}｜round {result['round']}｜"
           f"任務 {result['completed']}/{result['plan_len']}{task}｜{running}｜"
-          f"紅連跳 {result['red_streak']}｜停滯 {result['stall_rounds']}｜issues {result['issues']}", flush=True)
+          f"紅連跳 {result['red_streak']}｜停滯 {result['stall_rounds']}｜{issue_note}", flush=True)
     if result["state_recovery_pending"]:
         print("🛟 primary state 不可讀，目前只投影 last-good checkpoint（未修改檔案）", flush=True)
     if result.get("agent_failure_streak", 0):
@@ -205,7 +210,7 @@ def render_fleet_summary(summary) -> None:
     """輸出 --all 的一行摘要，方便人類快速掌握 fleet 健康度。"""
     print(f"fleet｜workspaces {summary['workspace_count']}｜執行中 {summary['running']}｜"
           f"規劃/執行/完成 {summary['planning']}/{summary['executing']}/{summary['done']}｜"
-          f"需關注 {summary['attention']}｜issues {summary['issues']}｜"
+          f"需關注 {summary['attention']}｜issues {summary['issues']}（未讀 {summary['unread_issues']}）｜"
           f"Agent 異常 {summary['agent_failures']}｜state 復原 {summary['state_recoveries']}｜"
           f"goal 變更 {summary['goal_changes']}｜stale PID {summary['stale_loops']}｜"
           f"任務 {summary['tasks_completed']}/{summary['tasks_total']} "

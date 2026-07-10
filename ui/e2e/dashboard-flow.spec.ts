@@ -249,7 +249,10 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await page.getByRole("button", { name: /issues/ }).click();
   let issues = page.getByRole("dialog", { name: "Issues" });
   await expect(issues.getByText("E2E structured issue").first()).toBeVisible();
+  await issues.getByRole("button", { name: "標記已讀" }).click();
+  await expect(issues.getByRole("status")).toContainText("稽核紀錄仍保留");
   await issues.getByRole("button", { name: "關閉對話框" }).click();
+  await expect(page.getByRole("button", { name: /issues/ })).toContainText("已讀");
   await page.getByRole("button", { name: /issues/ }).click();
   issues = page.getByRole("dialog", { name: "Issues" });
   await acceptConfirmation(page, () => issues.getByRole("button", { name: "清空全部" }).click());

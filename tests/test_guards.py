@@ -491,6 +491,20 @@ class TestStateSchemaGuard(unittest.TestCase):
             finally:
                 L.WORKSPACE_ROOT = old_root
 
+    def test_invalid_issue_acknowledgement_watermark_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d)
+                ws = L.Workspace("schema-issue-ack")
+                invalid = {"phase": "plan", "issues_acknowledged_round": False}
+                ws.state_path.write_text(json.dumps(invalid), encoding="utf-8")
+                ws.checkpoint_path.write_text(json.dumps(invalid), encoding="utf-8")
+                with self.assertRaises(L.StateLoadError):
+                    ws.load_state()
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
 
 class TestConsoleRotation(unittest.TestCase):
     """完整 console 必須在上限前輪替，且按新舊順序保留固定份數。"""
@@ -796,6 +810,41 @@ class TestStatusCli(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("不可搭配 --watch", result.stderr)
 
+    def test_acknowledged_issues_stay_in_projection_without_failing_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d) / "workspace"
+                ws = L.Workspace("ack-status")
+                state = ws.fresh_state()
+                state.update(round=3, issues=[{"round": 2, "text": "kept for audit"}],
+                             issues_acknowledged_round=3)
+                ws.save_state(state)
+                env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
+                result = subprocess.run(
+                    [sys.executable, STATUS_PY, "--all", "--json", "--check"],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["summary"]["issues"], 1)
+                self.assertEqual(payload["summary"]["unread_issues"], 0)
+                self.assertEqual(payload["summary"]["attention"], 0)
+                self.assertEqual(payload["workspaces"][0]["issues"], 1)
+                self.assertEqual(payload["workspaces"][0]["unread_issues"], 0)
+
+                state["round"] = 4
+                state["issues"].append({"round": 4, "text": "new issue"})
+                ws.save_state(state)
+                result = subprocess.run(
+                    [sys.executable, STATUS_PY, "--all", "--json", "--check"],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["summary"]["unread_issues"], 1)
+                self.assertEqual(payload["summary"]["attention"], 1)
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
     def test_all_sort_attention_places_alerts_first(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -882,6 +931,7 @@ class TestStatusCli(unittest.TestCase):
                     "done": 0,
                     "attention": 0,
                     "issues": 0,
+                    "unread_issues": 0,
                     "agent_failures": 0,
                     "state_recoveries": 0,
                     "goal_changes": 0,
@@ -1241,6 +1291,7 @@ class TestFleetHealthProjection(unittest.TestCase):
                 self.assertEqual(projection["error_count"], 1)
                 self.assertEqual(projection["attention"], 2)
                 self.assertEqual(projection["issues"], 2)
+                self.assertEqual(projection["unread_issues"], 2)
                 self.assertEqual(projection["agent_failures"], 3)
                 self.assertEqual(projection["state_recoveries"], 4)
                 self.assertEqual(projection["goal_changes"], 1)
@@ -1316,6 +1367,70 @@ class TestIssueRetention(unittest.TestCase):
                         os.environ.pop(key, None)
                     else:
                         os.environ[key] = value
+
+
+class TestIssueAcknowledgement(unittest.TestCase):
+    """標記已讀只更新 round watermark；issue 稽核資料保留，新 round 仍會重新告警。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_ack_preserves_records_and_only_suppresses_old_issue_attention(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            (root / "demo").mkdir(parents=True)
+            state = L.Workspace.__new__(L.Workspace).fresh_state()
+            state.update(round=4, issues=[
+                {"round": 2, "where": "task-1", "text": "old", "ts": "2026-07-10T10:00:00"},
+                {"round": 4, "where": "task-2", "text": "current", "ts": "2026-07-10T11:00:00"},
+            ])
+            old_roots = D.ROOT, L.WORKSPACE_ROOT
+            D.ROOT = L.WORKSPACE_ROOT = root
+            try:
+                D.write_state("demo", state)
+                before = D.list_workspaces()[0]
+                self.assertEqual(before["issues"], 2)
+                self.assertEqual(before["unread_issues"], 2)
+                self.assertEqual(D.fleet_health_projection()["status"], "degraded")
+
+                handler = self.ResponseCapture()
+                D.Handler.api_edit_state(handler, {"name": "demo", "ack_issues": True})
+                self.assertEqual(handler.response[0], 200, handler.response)
+                saved, error = D.read_state("demo", repair=False)
+                self.assertIsNone(error)
+                self.assertEqual(len(saved["issues"]), 2, "標記已讀不得刪除 issue")
+                self.assertEqual(saved["issues_acknowledged_round"], 4)
+                self.assertEqual(L.unread_issue_count(saved), 0)
+                after = D.list_workspaces()[0]
+                self.assertEqual(after["issues"], 2)
+                self.assertEqual(after["unread_issues"], 0)
+                health = D.fleet_health_projection()
+                self.assertEqual(health["status"], "ok")
+                self.assertEqual(health["issues"], 2)
+                self.assertEqual(health["unread_issues"], 0)
+
+                saved["round"] = 5
+                saved["issues"].append({"round": 5, "where": "task-2", "text": "new"})
+                D.write_state("demo", saved)
+                latest = D.list_workspaces()[0]
+                self.assertEqual(latest["unread_issues"], 1)
+                self.assertEqual(D.fleet_health_projection()["status"], "degraded")
+
+                clear = self.ResponseCapture()
+                D.Handler.api_edit_state(clear, {"name": "demo", "clear_issues": True})
+                self.assertEqual(clear.response[0], 200, clear.response)
+                cleared, error = D.read_state("demo", repair=False)
+                self.assertIsNone(error)
+                self.assertEqual(cleared["issues"], [])
+                self.assertEqual(cleared["issues_acknowledged_round"], -1)
+            finally:
+                D.ROOT, L.WORKSPACE_ROOT = old_roots
 
 
 class TestStopIdempotency(unittest.TestCase):

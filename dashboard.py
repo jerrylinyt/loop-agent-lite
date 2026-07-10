@@ -913,6 +913,7 @@ def list_workspaces():
             "agent_backoff_seconds": 0,
             "state_recovery_count": 0,
             "state_recovery_pending": False,
+            "unread_issues": 0,
             "goal_changed": False,
             "loop_pid": None,
             "loop_started_at": None,
@@ -938,6 +939,7 @@ def list_workspaces():
                         done_count=st.get("done_count", 0), repo=c.get("repo"),
                         red_streak=st.get("red_streak", 0), stall_rounds=st.get("stall_rounds", 0),
                         issues=len(st.get("issues") or []),
+                        unread_issues=loop_mod.unread_issue_count(st),
                         agent_failure_streak=st.get("agent_failure_streak", 0),
                         agent_backoff_seconds=st.get("agent_backoff_seconds", 0),
                         state_recovery_count=st.get("state_recovery_count", 0),
@@ -959,10 +961,11 @@ def _workspace_needs_attention(info):
     """以 Dashboard fleet projection 的欄位判斷需關注項目；不讀寫 workspace。"""
     if info.get("error"):
         return True
+    unread_issues = info.get("unread_issues", info.get("issues", 0)) or 0
     return bool(
         (info.get("red_streak") or 0) > 0 or
         (info.get("stall_rounds") or 0) > 0 or
-        (info.get("issues") or 0) > 0 or
+        unread_issues > 0 or
         (info.get("agent_failure_streak") or 0) > 0 or
         (info.get("state_recovery_count") or 0) > 0 or
         info.get("state_recovery_pending") or
@@ -985,6 +988,7 @@ def fleet_health_projection(workspaces=None):
         "attention": attention,
         "error_count": error_count,
         "issues": sum(item.get("issues") or 0 for item in items),
+        "unread_issues": sum(item.get("unread_issues", item.get("issues", 0)) or 0 for item in items),
         "agent_failures": sum(item.get("agent_failure_streak") or 0 for item in items),
         "state_recoveries": sum(item.get("state_recovery_count") or 0 for item in items),
         "goal_changes": sum(1 for item in items if item.get("goal_changed")),
@@ -1593,7 +1597,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @with_state_lock
     def api_edit_state(self, body):
-        """停止狀態下的人工編輯:plan 任務文字敘述 + done 計數。執行中全部鎖死。"""
+        """停止狀態下的人工編輯:plan、done 計數與 issue 已讀/清除；執行中全部鎖死。"""
         name = str(body.get("name") or "")
         st, err = read_state(name)
         if err:
@@ -1626,6 +1630,12 @@ class Handler(BaseHTTPRequestHandler):
             if st.get("issues"):
                 changed.append(f"清除 {len(st['issues'])} 條 issues")
                 st["issues"] = []
+                st["issues_acknowledged_round"] = -1
+        if body.get("ack_issues") and st.get("issues"):
+            current_round = st.get("round", 0)
+            if st.get("issues_acknowledged_round", -1) != current_round:
+                st["issues_acknowledged_round"] = current_round
+                changed.append(f"標記 {len(st['issues'])} 條 issues 已讀")
         if body.get("done_count") is not None:
             try:
                 dc = int(body["done_count"])

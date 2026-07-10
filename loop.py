@@ -591,6 +591,10 @@ def validate_state_shape(state, label: str):
         value = state.get(field)
         if field in state and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
             raise StateLoadError(f"{label} {field} 必須是非負整數")
+    if "issues_acknowledged_round" in state:
+        value = state["issues_acknowledged_round"]
+        if (not isinstance(value, int) or isinstance(value, bool) or value < -1):
+            raise StateLoadError(f"{label} issues_acknowledged_round 必須是 ≥ -1 的整數")
     if "current_order" in state and state["current_order"] is not None:
         value = state["current_order"]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -628,6 +632,24 @@ def validate_state_shape(state, label: str):
     if "goal_changed" in state and not isinstance(state["goal_changed"], bool):
         raise StateLoadError(f"{label} goal_changed 必須是 boolean")
     return state
+
+
+def unread_issue_count(state) -> int:
+    """計算尚未被人員標記已讀的 issue；舊版 state 沒 watermark 時全部視為未讀。"""
+    issues = state.get("issues") if isinstance(state, dict) and isinstance(state.get("issues"), list) else []
+    acknowledged = state.get("issues_acknowledged_round", -1) if isinstance(state, dict) else -1
+    if not isinstance(acknowledged, int) or isinstance(acknowledged, bool):
+        acknowledged = -1
+    unread = 0
+    for issue in issues:
+        if not isinstance(issue, dict):
+            unread += 1
+            continue
+        round_number = issue.get("round")
+        if (not isinstance(round_number, int) or isinstance(round_number, bool) or
+                round_number > acknowledged):
+            unread += 1
+    return unread
 
 
 def decode_state_bytes(data: bytes, label: str):
@@ -749,6 +771,7 @@ class Workspace:
             "task_reset_counts": {},    # {order(str): 次數}
             "notes": [],
             "issues": [],               # agent 用 work.py issue 回報,給人類看,不影響計數
+            "issues_acknowledged_round": -1,
         }
 
     def load_state(self):
@@ -1611,7 +1634,8 @@ def main():
             for issue_text in issue_lines:
                 log(f"⚠️ Agent 回報 issue｜{issue_text}")
             if issue_lines:
-                log(f"📌 Issue 累計｜目前有 {len(state.get('issues', []))} 條未清")
+                log(f"📌 Issue 累計｜目前有 {len(state.get('issues', []))} 條，"
+                    f"未讀 {unread_issue_count(state)} 條")
 
         will_retry = (agent_failed and state["phase"] != "done" and
                       not (args.max_rounds and state["round"] >= args.max_rounds))

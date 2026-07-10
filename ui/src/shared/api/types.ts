@@ -16,6 +16,7 @@ export interface WorkspaceSummary {
   red_streak?: number;
   stall_rounds?: number;
   issues?: number;
+  unread_issues?: number;
   agent_failure_streak?: number;
   agent_backoff_seconds?: number;
   state_recovery_count?: number;
@@ -36,6 +37,7 @@ export interface FleetHealth {
   attention: number;
   error_count: number;
   issues: number;
+  unread_issues: number;
   agent_failures: number;
   state_recoveries: number;
   goal_changes: number;
@@ -117,6 +119,7 @@ export interface WorkspaceState {
   plan?: PlanTask[];
   completed?: CompletedTask[];
   issues?: Issue[];
+  issues_acknowledged_round?: number;
   task_reset_counts?: Record<string, number>;
   config?: DashboardConfig;
 }

@@ -140,6 +140,9 @@ export default function WorkspaceView({
 
   const completed = (state.completed ?? []).length;
   const total = (state.plan ?? []).length;
+  const issues = state.issues ?? [];
+  const issuesAcknowledgedRound = state.issues_acknowledged_round ?? -1;
+  const unreadIssues = issues.filter((issue) => !Number.isInteger(issue.round) || issue.round > issuesAcknowledgedRound).length;
   const redLimit = state.config?.red_limit ?? 20;
   const stallLimit = state.config?.stall_limit ?? 300;
   const healthIntensity = Math.min(1, Math.max((state.red_streak ?? 0) / redLimit, (state.stall_rounds ?? 0) / stallLimit));
@@ -182,7 +185,7 @@ export default function WorkspaceView({
             {!!state.state_recovery_count && <span className="chip warning" title={state.last_state_recovery ?? undefined}>🛟 state 復原 {state.state_recovery_count}</span>}
             {state.state_recovery_pending && <span className="chip warning">🛟 正從 checkpoint 唯讀顯示</span>}
             {workspace?.stale_loop_pid && <span className="chip warning" title={`state 保留 PID ${workspace.loop_pid ?? "?"}${workspace.loop_started_at ? `（啟動於 ${workspace.loop_started_at}）` : ""}，但目前程序不存在`}>⚠ PID 殘留</span>}
-            {!!state.issues?.length && <button type="button" className="chip issue-chip" onClick={() => setIssuesOpen(true)}>⚠ issues {state.issues.length}</button>}
+            {!!issues.length && <button type="button" className={`chip ${unreadIssues > 0 ? "issue-chip" : "subdued"}`} onClick={() => setIssuesOpen(true)}>{unreadIssues > 0 ? `⚠ issues ${unreadIssues}/${issues.length}` : `✓ issues ${issues.length}（已讀）`}</button>}
             {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setHistoryOpen(true)}>🕒 輪次紀錄</button>}
             {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setPromptOpen(true)}>📨 prompt</button>}
           </div>
@@ -207,7 +210,7 @@ export default function WorkspaceView({
           />
         </div>
       </div>
-      {issuesOpen && workspace && <IssuesModal workspace={workspace.name} issues={state.issues ?? []} readonly={readonly || workspace.running} onClose={() => setIssuesOpen(false)} onChanged={onRefresh} />}
+      {issuesOpen && workspace && <IssuesModal workspace={workspace.name} issues={issues} unreadIssues={unreadIssues} readonly={readonly || workspace.running} onClose={() => setIssuesOpen(false)} onChanged={onRefresh} />}
       {historyOpen && workspace && <HistoryModal workspace={workspace.name} onClose={() => setHistoryOpen(false)} />}
       {goalOpen && workspace && <GoalModal workspace={workspace.name} onClose={() => setGoalOpen(false)} />}
       {promptOpen && workspace && <PromptModal workspace={workspace.name} onClose={() => setPromptOpen(false)} />}

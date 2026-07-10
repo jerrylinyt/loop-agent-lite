@@ -16,7 +16,7 @@ function needsAttention(workspace: WorkspaceSummary): boolean {
     workspace.error ||
     (workspace.red_streak ?? 0) > 0 ||
     (workspace.stall_rounds ?? 0) > 0 ||
-    (workspace.issues ?? 0) > 0 ||
+    (workspace.unread_issues ?? workspace.issues ?? 0) > 0 ||
     (workspace.agent_failure_streak ?? 0) > 0 ||
     (workspace.state_recovery_count ?? 0) > 0 ||
     workspace.state_recovery_pending ||
@@ -114,6 +114,7 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
           {visibleWorkspaces.map((workspace) => {
             const { done: cardDone, total, pct } = progress(workspace);
             const alert = needsAttention(workspace);
+            const unreadIssues = workspace.unread_issues ?? workspace.issues ?? 0;
             const activity = currentActivity(workspace);
             return (
               <button key={workspace.name} type="button" className={`fleet-card phase-${workspace.phase ?? "unknown"}${workspace.running ? " running" : ""}`} onClick={() => onSelect(workspace.name)}>
@@ -138,7 +139,7 @@ export default function FleetOverview({ workspaces, fleetHistory, onSelect }: {
                   <div className="fleet-card-alerts">
                     {(workspace.red_streak ?? 0) > 0 && <span className="chip warning">紅連跳 {workspace.red_streak}</span>}
                     {(workspace.stall_rounds ?? 0) > 0 && <span className="chip subdued">停滯 {workspace.stall_rounds}</span>}
-                    {(workspace.issues ?? 0) > 0 && <span className="chip issue-chip">issues {workspace.issues}</span>}
+                    {unreadIssues > 0 && <span className="chip issue-chip">issues 未讀 {unreadIssues}</span>}
                     {(workspace.agent_failure_streak ?? 0) > 0 && <span className="chip warning">Agent 異常 {workspace.agent_failure_streak}</span>}
                     {(workspace.state_recovery_count ?? 0) > 0 && <span className="chip warning">🛟 state 復原 {workspace.state_recovery_count}</span>}
                     {workspace.state_recovery_pending && <span className="chip warning">🛟 checkpoint</span>}
