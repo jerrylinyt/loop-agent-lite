@@ -136,6 +136,12 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await historyModal.getByRole("button", { name: "關閉對話框" }).click();
   await expect(historyModal).toBeHidden();
 
+  await expect(page.locator(".round-sparkline svg rect").first()).toBeVisible();
+  await page.locator(".round-sparkline").click();
+  await expect(historyModal).toBeVisible();
+  await historyModal.getByRole("button", { name: "關閉對話框" }).click();
+  await expect(historyModal).toBeHidden();
+
   await page.getByRole("button", { name: "🎯 goal" }).click();
   const goalModal = page.getByRole("dialog", { name: "Goal" });
   await expect(goalModal).toBeVisible();

@@ -11,6 +11,7 @@ import IssuesModal from "./IssuesModal";
 import PlanTable from "./PlanTable";
 import PromptModal from "./PromptModal";
 import ReportModal from "./ReportModal";
+import RoundSparkline from "./RoundSparkline";
 import useStatusPulse from "./useStatusPulse";
 
 const PHASE_NAMES = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
@@ -167,6 +168,7 @@ export default function WorkspaceView({
             {state.phase === "done" && <button type="button" className="chip report-chip" onClick={() => setReportOpen(true)}>📄 完成報告</button>}
           </div>
           <div className="health-status">
+            {state.round > 0 && workspace && <RoundSparkline workspace={workspace.name} round={state.round} onOpen={() => setHistoryOpen(true)} />}
             <span key={`${state.red_streak}-${state.stall_rounds}`} className={`chip subdued${state.phase === "plan" && state.plan_version >= 10 ? " warning" : ""}${pulse.has("health") ? " status-pulse" : ""}`}>紅連跳 {state.red_streak} · 停滯 {state.stall_rounds} · plan v{state.plan_version}{state.phase === "plan" && state.plan_version >= 10 ? " ⚠ 可能震盪" : ""}</span>
             {!!state.agent_failure_streak && <span key={`${state.agent_failure_streak}-${state.agent_backoff_seconds}`} className={`chip warning${pulse.has("health") ? " status-pulse" : ""}`}>Agent 異常 {state.agent_failure_streak}{state.agent_backoff_seconds ? ` · ${state.agent_backoff_seconds} 秒後重試` : ""}</span>}
             {!!state.state_recovery_count && <span className="chip warning" title={state.last_state_recovery ?? undefined}>🛟 state 復原 {state.state_recovery_count}</span>}

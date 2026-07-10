@@ -170,6 +170,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 button.chip { border: 0; color: inherit; }
 .issue-chip { color: var(--danger); background: var(--danger-soft); }
 .report-chip { color: var(--success); background: var(--success-soft); }
+.round-sparkline { display: inline-flex; align-items: center; padding: 3px 5px; border: 0; border-radius: 6px; background: transparent; cursor: pointer; line-height: 0; }
+.round-sparkline:hover { background: var(--surface-subtle); }
+.round-sparkline .spark-pass { fill: var(--success); }
+.round-sparkline .spark-fail { fill: var(--danger); }
+.round-sparkline .spark-plan { fill: var(--muted); opacity: .55; }
+.round-sparkline .spark-reset { fill: var(--warning); }
 .notify-entry-row, .notify-test-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
 .notify-entry-row .label-help { overflow: hidden; max-width: 60%; text-overflow: ellipsis; white-space: nowrap; }
 .report-content { margin: 0; color: var(--text); font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
