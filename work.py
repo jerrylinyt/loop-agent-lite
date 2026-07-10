@@ -149,8 +149,19 @@ def cmd_issue(ws, argv):
     text = " ".join(argv).strip() or sys.stdin.read().strip()
     if not text:
         die("用法:work.py issue <一句話描述問題>(或由 stdin 餵入)")
+    if len(text) > loop_mod.ISSUE_MAX_CHARS:
+        die(f"issue 描述不可超過 {loop_mod.ISSUE_MAX_CHARS} 字")
+    pending_path = ws / f"pending_issues.{token}"
     try:
-        loop_mod.append_regular_text(ws / f"pending_issues.{token}", text.replace("\n", " ") + "\n")
+        pending = loop_mod.read_regular_text(pending_path, "pending issues")
+    except FileNotFoundError:
+        pending = ""
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        die(f"協調檔案不安全或無法讀取:{e}")
+    if len(pending.splitlines()) >= loop_mod.ISSUES_MAX_PENDING:
+        die(f"本輪 issue 不可超過 {loop_mod.ISSUES_MAX_PENDING} 條")
+    try:
+        loop_mod.append_regular_text(pending_path, text.replace("\n", " ") + "\n")
     except (OSError, ValueError) as e:
         die(f"協調檔案不安全或無法寫入:{e}")
     print("⚠ 已記錄 issue,輪末落入 state 供人類在 dashboard 檢視(不影響本輪計數)。")

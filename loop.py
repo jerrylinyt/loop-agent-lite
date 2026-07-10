@@ -64,6 +64,9 @@ TASK_LIST_TRUNC = 80                   # prompt 任務總覽單行截斷長度
 CONSOLE_MAX_BYTES = 5 * 1024 * 1024   # console.log 單檔 5 MiB
 CONSOLE_BACKUPS = 3                    # 保留 console.log.1～.3
 HISTORY_MAX_BYTES = 10 * 1024 * 1024  # history.log 當前 run 上限；只保留最新完整尾段
+ISSUE_MAX_CHARS = 2000                # 單一 issue 文字上限
+ISSUES_MAX_PENDING = 100              # 單一 round 最多 ingest 的 issue 行數
+ISSUES_MAX_COUNT = 200                # state 保留最新 issue 數量
 STOP_AFTER_ROUND_FILE = "stop-after-round.json"
 STOP_AFTER_ROUND_CLAIMED_FILE = "stop-after-round.claimed.json"
 WORKSPACE_OPS_DIR = ".ops"
@@ -1590,10 +1593,17 @@ def main():
             issue_lines = []
             for iline in issue_text.splitlines():
                 if iline.strip():
-                    issue_lines.append(iline.strip())
-                    state.setdefault("issues", []).append(
-                        {"round": rnd, "where": task_id or phase, "text": iline.strip(),
-                         "ts": datetime.now().isoformat(timespec="seconds")})
+                    issue_lines.append(iline.strip()[:ISSUE_MAX_CHARS])
+            if len(issue_lines) > ISSUES_MAX_PENDING:
+                issue_lines = issue_lines[-ISSUES_MAX_PENDING:]
+                log(f"⚠️ pending issues 超過單輪上限 {ISSUES_MAX_PENDING}，只保留最新項目")
+            for iline in issue_lines:
+                state.setdefault("issues", []).append(
+                    {"round": rnd, "where": task_id or phase, "text": iline,
+                     "ts": datetime.now().isoformat(timespec="seconds")})
+            if len(state.get("issues", [])) > ISSUES_MAX_COUNT:
+                state["issues"] = state["issues"][-ISSUES_MAX_COUNT:]
+                log(f"⚠️ issues 已達保留上限 {ISSUES_MAX_COUNT}，只保留最新項目")
             pend.unlink()
             for issue_text in issue_lines:
                 log(f"⚠️ Agent 回報 issue｜{issue_text}")

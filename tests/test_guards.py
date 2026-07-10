@@ -26,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 import loop as L  # noqa: E402
 import dashboard as D  # noqa: E402
+import work as W  # noqa: E402
 
 WORK_PY = str(REPO_ROOT / "work.py")
 LOOP_PY = str(REPO_ROOT / "loop.py")
@@ -1141,6 +1142,33 @@ class TestHistoryRetention(unittest.TestCase):
             self.assertIn("round=5", current)
             self.assertNotIn("round=0", current)
             self.assertEqual(previous.read_text(encoding="utf-8"), "previous-run\n")
+
+
+class TestIssueRetention(unittest.TestCase):
+    """Agent issue 輸入與 coordinator state 都有界，避免異常輸出撐大 state。"""
+
+    def test_work_issue_rejects_oversized_text_and_pending_flood(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_env = {key: os.environ.get(key) for key in ("LOOP_WS", "LOOP_ROUND_TOKEN")}
+            try:
+                ws = L.Workspace("issue-limits")
+                token = "issue-token"
+                ws.write_dispatch("exec", "task-1", token)
+                os.environ["LOOP_WS"] = str(ws.dir)
+                os.environ["LOOP_ROUND_TOKEN"] = token
+                with self.assertRaises(SystemExit):
+                    W.cmd_issue(ws.dir, ["x" * (L.ISSUE_MAX_CHARS + 1)])
+                pending = ws.pending_issues(token)
+                for _ in range(L.ISSUES_MAX_PENDING):
+                    L.append_regular_text(pending, "existing\n")
+                with self.assertRaises(SystemExit):
+                    W.cmd_issue(ws.dir, ["one more"])
+            finally:
+                for key, value in old_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
 
 
 class TestStopIdempotency(unittest.TestCase):
