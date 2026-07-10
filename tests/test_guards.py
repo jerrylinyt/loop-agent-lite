@@ -8,6 +8,7 @@
 
 跑法:  python3 -m unittest tests.test_guards      # 或  python3 tests/test_guards.py
 """
+import io
 import json
 import os
 import signal
@@ -2169,6 +2170,37 @@ class TestJobHistoryRetention(unittest.TestCase):
             self.assertEqual(list(D.JOBS), ["active", "finished-2", "finished-3"])
         finally:
             D.JOBS = old_jobs
+
+
+class TestDashboardRequestLimit(unittest.TestCase):
+    """POST body 過大時應在讀取 payload 前拒絕，避免無界記憶體使用。"""
+
+    class FakeHandler:
+        readonly = False
+        path = "/api/launch"
+
+        def __init__(self, length):
+            self.headers = {"Content-Length": str(length)}
+            self.rfile = io.BytesIO(b"should not be read")
+            self.response = None
+            self.close_connection = False
+
+        def _err(self, message, code=400):
+            self.response = code, message
+
+    def test_oversized_body_returns_413_without_reading(self):
+        handler = self.FakeHandler(D.MAX_REQUEST_BYTES + 1)
+        D.Handler.do_POST(handler)
+        self.assertEqual(handler.response[0], 413)
+        self.assertIn("8 MiB", handler.response[1])
+        self.assertEqual(handler.rfile.tell(), 0)
+        self.assertTrue(handler.close_connection)
+
+    def test_negative_content_length_is_rejected_as_json_error(self):
+        handler = self.FakeHandler(-1)
+        D.Handler.do_POST(handler)
+        self.assertEqual(handler.response[0], 400)
+        self.assertIn("JSON", handler.response[1])
 
 
 if __name__ == "__main__":

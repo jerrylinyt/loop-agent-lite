@@ -106,6 +106,7 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 - 「匯入 plan」會建立全新的 state；可選擇從規劃期或執行期開始。
 - 迴圈完成、停止或發生啟動錯誤時，Dashboard 會顯示結果與 log 尾段；啟動成功前不會關閉視窗。
 - 「執行中的 jobs」分頁會保留最近 50 個已結束 job 的尾段供稽核；更早的 job 會自動淘汰，活躍中的 job 不受限制，workspace state 與 history 不會被清除。
+- Dashboard 的 REST POST body 上限為 8 MiB；超過會在讀取 JSON 前回 413，避免過大的 goal/plan 或異常請求拖垮長跑服務。
 
 ## 團隊設定與個人設定
 

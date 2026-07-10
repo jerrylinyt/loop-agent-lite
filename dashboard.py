@@ -48,6 +48,7 @@ PERSONAL_CONFIG_PATH = Path(CONFIG_OVERRIDE or HERE / "dashboard.config.local.js
 LEGACY_CONFIG_PATH = (HERE / "dashboard.config.json").resolve()
 CONFIG_PATH = PERSONAL_CONFIG_PATH  # 舊程式/錯誤訊息相容名稱；UI 會分別顯示團隊版與個人版
 MAX_CHUNK = 512 * 1024  # 單次 tail 最多回傳量
+MAX_REQUEST_BYTES = 8 * 1024 * 1024  # POST JSON 上限，避免 goal/plan 或惡意 body 吃光 dashboard 記憶體
 ARCHIVE_DIR_NAME = ".archive"
 ARCHIVE_OPS_LOCK_NAME = ".ops.lock"
 ARCHIVE_ID_RE = re.compile(
@@ -1198,6 +1199,12 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         try:
             length = int(self.headers.get("Content-Length", 0))
+            if length < 0:
+                raise ValueError("Content-Length 不可為負數")
+            if length > MAX_REQUEST_BYTES:
+                self.close_connection = True
+                self._err(f"request body 太大（上限 {MAX_REQUEST_BYTES // (1024 * 1024)} MiB）", 413)
+                return
             body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
         except (ValueError, json.JSONDecodeError):
             self._err("body 必須是 JSON")
