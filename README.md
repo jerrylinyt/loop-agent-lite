@@ -77,6 +77,9 @@ Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace 
 --preflight-only          只跑啟動前健檢（git／鎖／乾淨樹／validate）就退出，不動任何進度
 ```
 
+所有數值參數都會在建立 workspace 或啟動 Agent 前驗證；收斂／reset 門檻必須至少為 1，
+round timeout、退避與測試輪數不可為負，所有秒數／分鐘數都必須是有限數字。
+
 ## Dashboard 操作
 
 - 左側是 Loop 狀態；右側是 Agent 輸出，可切換 Agent／其他／全部，並可用「過濾…」輸入框對長 log 做文字過濾。

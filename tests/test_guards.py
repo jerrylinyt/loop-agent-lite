@@ -1244,6 +1244,63 @@ class TestPreflightOnly(unittest.TestCase):
             self.assertIn("工作樹不乾淨", r.stdout)
 
 
+class TestCliArgumentGuards(unittest.TestCase):
+    """直接 CLI 不得用非法數值繞過共識或在 preflight 後才 runtime crash。"""
+
+    def test_invalid_numbers_fail_before_workspace_or_agent_spawn(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            marker = root / "agent-started"
+            agent = root / "agent.py"
+            agent.write_text(f"from pathlib import Path\nPath({str(marker)!r}).write_text('started')\n")
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            cases = [
+                ("--flag-threshold", "0"), ("--done-threshold", "0"),
+                ("--red-limit", "0"), ("--stall-limit", "0"),
+                ("--stuck-stop-count", "0"), ("--max-rounds", "-1"),
+                ("--round-timeout", "-0.1"), ("--round-timeout", "nan"),
+                ("--agent-backoff-max", "-1"), ("--agent-backoff-max", "inf"),
+                ("--validate-timeout", "0"), ("--validate-timeout", "nan"),
+            ]
+            for index, (option, value) in enumerate(cases):
+                name = f"bad-number-{index}"
+                result = subprocess.run(
+                    [sys.executable, LOOP_PY, "--repo", str(repo), "--name", name,
+                     "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                     "--validate-cmd", "true", option, value],
+                    capture_output=True, text=True, env=env,
+                )
+                with self.subTest(option=option, value=value):
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn(option, result.stderr)
+                    self.assertFalse((workspace_root / name).exists(), "參數錯誤不得先建立 workspace")
+            self.assertFalse(marker.exists(), "參數錯誤不得 spawn Agent")
+
+    def test_zero_done_threshold_cannot_complete_imported_exec_plan(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            plan = root / "plan.json"
+            plan.write_text(json.dumps([{"order": 1, "task": "不得被零門檻跳過"}]))
+            marker = root / "agent-started"
+            agent = root / "noop_agent.py"
+            agent.write_text(f"from pathlib import Path\nPath({str(marker)!r}).write_text('started')\n")
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            result = subprocess.run(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "zero-done",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]), "--validate-cmd", "true",
+                 "--import-plan", str(plan), "--start-phase", "exec", "--done-threshold", "0"],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("--done-threshold", result.stderr)
+            self.assertFalse((workspace_root / "zero-done" / "state.json").exists())
+            self.assertFalse(marker.exists(), "零門檻不得有機會繞過 work.py done 共識")
+
+
 class TestGoalProjection(unittest.TestCase):
     """goal 唯讀投影:從 state.config 的 repo+goal 讀人類真相;缺 config/缺檔回明確 error。"""
 

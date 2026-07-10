@@ -27,6 +27,7 @@ import atexit
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shlex
 import signal
@@ -687,10 +688,23 @@ def main():
                     help="只跑啟動前健檢(git/鎖/乾淨樹/goal 已 commit/validate)就退出;"
                          "不建 state、不動 snapshots、不啟動 agent")
     args = ap.parse_args()
-    if args.validate_timeout <= 0:
-        ap.error("--validate-timeout 必須 > 0")
-    if args.agent_backoff_max < 0:
-        ap.error("--agent-backoff-max 必須 ≥ 0")
+    # CLI 也必須和 Dashboard 一樣 fail-closed：這些值直接控制共識/timeout，0、負數或 NaN
+    # 不能被解讀成「立刻收斂」或讓 subprocess.wait() 在 preflight 之後才崩潰。
+    for attr, option in (("flag_threshold", "--flag-threshold"),
+                         ("done_threshold", "--done-threshold"),
+                         ("red_limit", "--red-limit"),
+                         ("stall_limit", "--stall-limit"),
+                         ("stuck_stop_count", "--stuck-stop-count")):
+        if getattr(args, attr) < 1:
+            ap.error(f"{option} 必須 ≥ 1")
+    if args.max_rounds < 0:
+        ap.error("--max-rounds 必須 ≥ 0")
+    for attr, option, positive in (("round_timeout", "--round-timeout", False),
+                                   ("agent_backoff_max", "--agent-backoff-max", False),
+                                   ("validate_timeout", "--validate-timeout", True)):
+        value = getattr(args, attr)
+        if not math.isfinite(value) or value < 0 or (positive and value == 0):
+            ap.error(f"{option} 必須是{' > 0' if positive else ' ≥ 0'} 的有限數字")
 
     repo = Path(args.repo).resolve()
     agent_cmd = shlex.split(args.agent_cmd) if args.agent_cmd else AGENT_CMD
