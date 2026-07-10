@@ -6,8 +6,10 @@ const PLAN = JSON.stringify([
 ], null, 2);
 
 async function acceptConfirmation(page: Page, action: () => Promise<void>) {
-  page.once("dialog", (dialog) => dialog.accept());
   await action();
+  const dialog = page.getByRole("dialog", { name: "請確認" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: /繼續|清空/ }).click();
 }
 
 test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、phase 與進度", async ({ page }) => {
@@ -27,6 +29,21 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(launcher.getByText("沒有由這個 dashboard 啟動的 job")).toBeVisible();
   await launcher.getByRole("tab", { name: "啟動新 loop" }).click();
 
+  await launcher.getByRole("button", { name: "管理 Agent CLI" }).click();
+  let cliManager = page.getByRole("dialog", { name: "Agent CLI 管理" });
+  await cliManager.getByRole("button", { name: "執行測試" }).click();
+  const launchAgentCheck = page.getByRole("dialog", { name: "Agent CLI 執行確認" });
+  await expect(launchAgentCheck.getByRole("status")).toContainText("E2E Agent CLI test result");
+  await launchAgentCheck.getByRole("button", { name: "關閉" }).click();
+  await cliManager.getByRole("button", { name: "儲存 CLI 設定" }).click();
+  await expect(cliManager).toBeHidden();
+  await launcher.getByRole("button", { name: "管理 Code Repo Roots" }).click();
+  const rootsManager = page.getByRole("dialog", { name: "Code Repo Roots 管理" });
+  await expect(rootsManager.getByLabel("Repo root 1")).toBeVisible();
+  await rootsManager.getByRole("button", { name: "取消" }).click();
+  await launcher.locator(".validate-command-field").getByRole("button", { name: "執行確認" }).click();
+  await expect(launcher.locator(".validate-result")).toContainText("Validate 通過");
+
   const plan = launcher.getByLabel("匯入 plan.json 選填");
   await plan.fill("not-json");
   await expect(launcher.getByRole("alert")).toContainText("JSON 解析失敗");
@@ -44,13 +61,24 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await launcher.getByLabel("在新 branch 跑（loop/<workspace 名>）").check();
   await launcher.getByRole("button", { name: "▶ 啟動" }).click();
 
+  await expect(launcher).toBeHidden();
   await expect(page.getByRole("heading", { name: "e2e-workspace" })).toBeVisible();
   await expect(page.getByRole("button", { name: "⏹ 停止" })).toBeVisible();
-  const consolePane = page.getByLabel("完整執行紀錄");
-  await expect(consolePane).toContainText("E2E fake agent started");
-  await expect(consolePane).toContainText("🤖 啟動 Agent｜命令：");
-  await expect(consolePane).toContainText("📨 Agent 指令｜done task-1");
-  await expect(consolePane).toContainText("✅ 驗證通過");
+  const agentConsole = page.getByLabel("Agent 執行輸出");
+  const loopConsole = page.getByLabel("Loop 狀態紀錄");
+  await expect(agentConsole).toContainText("E2E fake agent started");
+  await expect(loopConsole).toContainText("🤖 啟動 Agent｜命令：");
+  await expect(loopConsole).toContainText("📨 Agent 指令｜done task-1");
+  await expect(loopConsole).toContainText("✅ 驗證通過");
+  await expect(agentConsole).not.toContainText("📨 Agent 指令｜done task-1");
+
+  await agentConsole.getByRole("button", { name: "其他", exact: true }).click();
+  await expect(agentConsole).toContainText("📨 Agent 指令｜done task-1");
+  await expect(agentConsole).not.toContainText("🤖 Agent｜E2E fake agent started");
+  await agentConsole.getByRole("button", { name: "全部", exact: true }).click();
+  await expect(agentConsole).toContainText("📨 Agent 指令｜done task-1");
+  await expect(agentConsole).toContainText("E2E fake agent started");
+  await agentConsole.getByRole("button", { name: "Agent", exact: true }).click();
   await expect(page.getByRole("button", { name: /issues/ })).toBeVisible();
 
   await page.getByRole("button", { name: "⏹ 停止" }).click();
@@ -71,23 +99,29 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await page.getByRole("button", { name: "⚙ 設定" }).click();
   settings = page.getByRole("dialog", { name: "Workspace 設定" });
   await settings.getByLabel("Agent 命令").selectOption("0");
+  await settings.getByRole("button", { name: "管理 Agent CLI" }).click();
+  cliManager = page.getByRole("dialog", { name: "Agent CLI 管理" });
+  await expect(cliManager).toBeVisible();
+  await cliManager.getByRole("button", { name: "取消" }).click();
   await settings.getByLabel("Validate 命令").fill("true");
+  await settings.locator(".validate-command-field").getByRole("button", { name: "執行確認" }).click();
+  await expect(settings.getByRole("status")).toContainText("Validate 通過");
   await settings.getByLabel("flag 收斂（>）").fill("7");
   await settings.getByLabel("done 收斂（≥）").fill("888");
   await settings.getByLabel("單輪上限（分）").fill("2");
+  await settings.getByLabel("Validate 上限（秒）").fill("15");
   await settings.getByLabel("紅燈連跳 reset").fill("21");
   await settings.getByLabel("HEAD 停滯 reset").fill("301");
   await settings.getByRole("button", { name: "儲存設定" }).click();
-  await expect(settings.getByRole("status")).toContainText("✅ 已儲存");
-  await expect(consolePane).toContainText("🖥️ Dashboard｜更新 Workspace 設定");
-  await settings.getByRole("button", { name: "關閉對話框" }).click();
   await expect(settings).toBeHidden();
+  await expect(loopConsole).toContainText("🖥️ Dashboard｜更新 Workspace 設定");
 
   await page.getByRole("button", { name: "⚙ 設定" }).click();
   settings = page.getByRole("dialog", { name: "Workspace 設定" });
   await expect(settings.getByLabel("flag 收斂（>）")).toHaveValue("7");
   await expect(settings.getByLabel("done 收斂（≥）")).toHaveValue("888");
   await expect(settings.getByLabel("單輪上限（分）")).toHaveValue("2");
+  await expect(settings.getByLabel("Validate 上限（秒）")).toHaveValue("15");
   await expect(settings.getByLabel("紅燈連跳 reset")).toHaveValue("21");
   await expect(settings.getByLabel("HEAD 停滯 reset")).toHaveValue("301");
   await settings.getByRole("button", { name: "關閉對話框" }).press("Escape");
@@ -122,8 +156,8 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page.getByRole("status", { name: "計畫已更新 v2" })).toBeVisible();
   await expect(page.locator('tr[data-order="2"]')).toHaveClass(/flash/);
   await expect(page.getByRole("button", { name: "由 Agent 重新分析的第二項功能" })).toBeVisible();
-  await expect(consolePane).toContainText("📨 Agent 指令｜create-plan");
-  await expect(consolePane).toContainText("📝 計畫已更新｜v2｜共 2 條任務");
+  await expect(loopConsole).toContainText("📨 Agent 指令｜create-plan");
+  await expect(loopConsole).toContainText("📝 計畫已更新｜v2｜共 2 條任務");
   await page.getByRole("button", { name: "⏹ 停止" }).click();
   await expect(page.getByRole("button", { name: "▶ 運行" })).toBeVisible();
   await acceptConfirmation(page, () => page.getByRole("button", { name: "⏩ 進執行期" }).click());
@@ -141,9 +175,22 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   const after = await page.locator(".workspace-pane").evaluate((element) => element.getBoundingClientRect().width);
   expect(after).toBeGreaterThan(before);
 
+  const rowSplitter = page.getByRole("separator", { name: "調整任務與狀態紀錄高度" });
+  const heightBefore = await page.locator(".status-console-wrap").evaluate((element) => element.getBoundingClientRect().height);
+  await rowSplitter.press("ArrowUp");
+  const heightAfter = await page.locator(".status-console-wrap").evaluate((element) => element.getBoundingClientRect().height);
+  expect(heightAfter).toBeGreaterThan(heightBefore);
+
+  await loopConsole.getByRole("button", { name: "收合Loop 狀態紀錄" }).click();
+  await expect(page.getByRole("button", { name: "展開Loop 狀態紀錄" })).toBeVisible();
+  await page.getByRole("button", { name: "展開Loop 狀態紀錄" }).click();
+  await agentConsole.getByRole("button", { name: "收合Agent 執行輸出" }).click();
+  await expect(page.getByRole("button", { name: "展開Agent 執行輸出" })).toBeVisible();
+  await page.getByRole("button", { name: "展開Agent 執行輸出" }).click();
+
   await page.getByRole("button", { name: "▶ 運行" }).click();
   await expect(page.getByRole("button", { name: "⏹ 停止" })).toBeVisible();
-  await expect(page.getByLabel("完整執行紀錄")).toContainText("E2E fake agent started");
+  await expect(page.getByLabel("Agent 執行輸出")).toContainText("E2E fake agent started");
   await expect(page.locator(".chip.status-pulse").filter({ hasText: /^done / })).toBeVisible();
   await page.getByRole("button", { name: "⏹ 停止" }).click();
   await expect(page.getByRole("button", { name: "▶ 運行" })).toBeVisible();

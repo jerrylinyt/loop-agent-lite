@@ -1,8 +1,9 @@
 # 執行期狀態與產物(每個 workspace 的 state/log/prompt/snapshot)——不是原始碼
 workspace/
 
-# dashboard 本機設定(agent 白名單、repo_roots、notify;每台機器不同)
+# dashboard 舊版與個人設定；團隊版 dashboard.config.shared.json 刻意進版控
 dashboard.config.json
+dashboard.config.local.json
 
 # 範例計畫(依專案而異,不進版控)
 examples/

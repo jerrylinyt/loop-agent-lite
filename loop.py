@@ -48,6 +48,7 @@ RED_LIMIT = 20                         # 連續驗證紅 N 輪 → reset
 STALL_LIMIT = 300                      # HEAD 連續 N 輪沒前進 → reset
 STUCK_STOP_COUNT = 100                 # --stuck-stop 開啟時,同一任務 reset 達此次數停機
 ROUND_TIMEOUT_MIN = 30                 # 單輪 agent 上限(分鐘);0=不限
+VALIDATE_TIMEOUT_SEC = 120             # 啟動前/每輪驗證上限(秒);避免 validator 永久卡住
 VALIDATE_TAIL = 50                     # 驗證失敗餵給下一輪的輸出尾行數
 TASK_LIST_TRUNC = 80                   # prompt 任務總覽單行截斷長度
 CONSOLE_MAX_BYTES = 5 * 1024 * 1024   # console.log 單檔 5 MiB
@@ -116,7 +117,8 @@ def agent_log(msg: str) -> None:
 
 def fail(msg: str):
     log(f"⛔ 流程停止｜{msg}")
-    raise SystemExit(msg)
+    # 原因已同步寫到 stdout 與 console.log；只回 exit code，避免 stderr 再印一次相同訊息。
+    raise SystemExit(1)
 
 
 def sh(args, cwd, check=True):
@@ -274,7 +276,7 @@ class Workspace:
                 target.write_bytes(snap)
 
 
-def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs):
+def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs, on_started=None):
     """跑一輪 agent:prompt 從檔案餵 stdin(避免大 payload 塞管線),
     stdout/stderr 逐行同步印上 console 並落 log 檔。
     逾時 SIGKILL 整個 process group(start_new_session 保證殺得到子孫)。
@@ -285,6 +287,8 @@ def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs):
         p = subprocess.Popen(cmd, cwd=str(repo), env=env, stdin=pin,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              start_new_session=True)
+        if on_started:
+            on_started(p.pid)
 
         def _kill():
             if p.poll() is None:
@@ -329,11 +333,35 @@ def notify(cmd, status, name):
         log(f"⚠ notify 失敗(不影響結果):{e}")
 
 
-def run_validate(cmd, repo):
-    r = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
-    out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+def run_validate(cmd, repo, timeout_secs=VALIDATE_TIMEOUT_SEC):
+    """執行正式 validator；逾時或中斷時清掉整個 validator process group。"""
+    try:
+        p = subprocess.Popen(cmd, cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, start_new_session=True)
+    except FileNotFoundError:
+        return False, f"找不到 Validate 命令：{cmd[0]}", False
+    timed_out = False
+    try:
+        out, _ = p.communicate(timeout=timeout_secs)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        out, _ = p.communicate()
+    except KeyboardInterrupt:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        p.wait()
+        raise
+    out = (out or "").strip()
     tail = "\n".join(out.splitlines()[-VALIDATE_TAIL:])
-    return r.returncode == 0, tail
+    if timed_out:
+        tail = (f"Validate 執行超過 {timeout_secs:g} 秒，已終止" + (f"\n{tail}" if tail else ""))
+    return p.returncode == 0 and not timed_out, tail, timed_out
 
 
 def render_task_list(state):
@@ -376,13 +404,18 @@ def main():
     ap.add_argument("--stuck-stop-count", type=int, default=STUCK_STOP_COUNT)
     ap.add_argument("--round-timeout", type=float, default=ROUND_TIMEOUT_MIN,
                     help="單輪 agent 上限(分鐘;0=不限,預設 30)")
+    ap.add_argument("--validate-timeout", type=float, default=VALIDATE_TIMEOUT_SEC,
+                    help="啟動前與每輪 Validate 上限(秒;必須 >0,預設 120)")
     ap.add_argument("--notify-cmd", default="", help="終態通知命令,佔位符 {status} {name}(空=不通知)")
     ap.add_argument("--import-plan", default="", help="匯入 plan.json(重置 state;等同 dashboard 貼上匯入)")
+    ap.add_argument("--consume-import-plan", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--start-phase", choices=("plan", "exec"), default="plan",
                     help="搭配 --import-plan:從規劃期(讓 agent 補完)或直接執行期開跑")
     ap.add_argument("--max-rounds", type=int, default=0, help="總輪數上限;0=不限(測試用)")
     ap.add_argument("--reset-state", action="store_true", help="清掉 workspace state 從頭跑")
     args = ap.parse_args()
+    if args.validate_timeout <= 0:
+        ap.error("--validate-timeout 必須 > 0")
 
     repo = Path(args.repo).resolve()
     agent_cmd = shlex.split(args.agent_cmd) if args.agent_cmd else AGENT_CMD
@@ -390,24 +423,33 @@ def main():
     protected = [args.goal] + ([args.plan_doc] if args.plan_doc else [])
     plan_doc_display = str(repo / args.plan_doc) if args.plan_doc else "(未提供——以 goal、現有計畫與實際程式碼為準)"
 
-    # ===== preflight:第一行就擋,不合格不進迴圈 =====
-    if git(repo, "rev-parse", "--is-inside-work-tree", check=False).returncode != 0:
-        sys.exit(f"❌ preflight:{repo} 不是 git repo")
-    if git(repo, "rev-parse", "HEAD", check=False).returncode != 0:
-        sys.exit(f"❌ preflight:{repo} 沒有任何 commit")
-    if is_dirty(repo):
-        sys.exit("❌ preflight:工作樹不乾淨。之後的 reset --hard 會吃掉你的 WIP,先 commit 或 stash 再來")
-    for rel in protected:
-        if not tracked_in_head(repo, rel):
-            sys.exit(f"❌ preflight:{rel} 不在 HEAD 裡。流程是:模板產初版 → 你審 → commit → 才 run loop")
-
+    # preflight 失敗也必須出現在 dashboard 的完整 console。舊流程直到所有 git
+    # 檢查通過後才設定 console，導致「pid 出現後立刻停止」卻完全看不到原因。
     ws = Workspace(args.name or repo.name)
     configure_console(ws.dir / "console.log")
+    startup_ready = ws.dir / "startup_ready.json"
+    startup_ready.unlink(missing_ok=True)
+
+    # ===== preflight:第一行就擋,不合格不進迴圈 =====
+    if git(repo, "rev-parse", "--is-inside-work-tree", check=False).returncode != 0:
+        fail(f"preflight：{repo} 不是 git repo")
+    if git(repo, "rev-parse", "HEAD", check=False).returncode != 0:
+        fail(f"preflight：{repo} 沒有任何 commit")
+    if is_dirty(repo):
+        fail("preflight：工作樹不乾淨。之後的 reset --hard 會吃掉你的 WIP，先 commit 或 stash 再來")
+    for rel in protected:
+        if not tracked_in_head(repo, rel):
+            fail(f"preflight：{rel} 不在 HEAD 裡。流程是：模板產初版 → 你審 → commit → 才 run loop")
+
     log(f"🚀 Loop 啟動｜workspace={ws.dir.name}｜repo={repo}")
-    if args.reset_state and ws.state_path.exists():
-        ws.state_path.unlink()
-        log("🧹 已依設定重置既有 state")
-    state = ws.load_state()
+    if args.reset_state:
+        # Reset 必須是交易式的：先在記憶體建立全新 state，等所有 preflight（尤其 validate）
+        # 通過後才由下方第一個 save_state 原子取代舊檔。若驗證失敗，舊 state 仍完整可讀，
+        # 不會留下只有 workspace 目錄、沒有 state.json 的幽靈分頁。
+        state = ws.fresh_state()
+        log("🧹 準備重置既有 state｜啟動前檢查通過後才會正式清除舊進度")
+    else:
+        state = ws.load_state()
 
     # repo identity fail-closed:workspace 只按 name 載入,若既有 state 綁的是別的 repo,
     # 續跑會拿別人的 plan/completed/last_green_sha 去 reset --hard——寧可停也不帶病前進。
@@ -434,13 +476,16 @@ def main():
             state["current_order"] = normalized[0]["order"]
         log(f"📝 匯入計畫｜{len(normalized)} 條｜從 {'規劃期' if args.start_phase == 'plan' else '執行期'} 開始")
 
-    # 每次啟動重拍受保護檔快照:停機期間的人工修改視為合法(綠點一致性驗證要用,故先拍)
-    ws.snapshot_protected(repo, protected)
+    fresh_start = bool(args.reset_state or args.import_plan)
+    # 一般 resume 要先拍快照供舊綠點驗證；reset/import 延後到 Validate 綠後，
+    # 失敗的 staged 啟動就不會改掉舊 state 對應的 protected snapshot。
+    if not fresh_start:
+        ws.snapshot_protected(repo, protected)
 
     # preflight:validate。綠點錨定 fail-closed(#1)——resume 不能只看 last_green_sha 非空,
     # 否則舊 green 若已不存在/非 HEAD 祖先/protected 已分歧,reset 回去會製造髒工作樹或錯版 goal。
     log(f"🔎 啟動前檢查｜執行驗證：{shlex.join(validate_cmd)}")
-    ok, vtail = run_validate(validate_cmd, repo)
+    ok, vtail, validate_timed_out = run_validate(validate_cmd, repo, args.validate_timeout)
     # validate 本身若修改 tracked/untracked(non-ignored)檔案,不論 rc 綠紅都不能放行。否則 rc=0
     # 會落出下列分支直接續跑;rc!=0 + 舊 green 合法也會帶髒工作樹進 loop,把 validator 的副作用
     # 誤判成 agent 異動。preflight 起點必須在 validate 前後都乾淨。
@@ -465,8 +510,12 @@ def main():
         else:
             why = ("沒有綠點可錨定" if not green else
                    f"綠點 {green[:8]} 未通過驗證(不存在/非 HEAD 祖先/protected 與現況分歧)")
-            fail(f"啟動驗證 `{shlex.join(validate_cmd)}` 失敗，{why}——"
+            timeout_note = f"（逾時 {args.validate_timeout:g} 秒）" if validate_timed_out else ""
+            fail(f"啟動驗證 `{shlex.join(validate_cmd)}` 失敗{timeout_note}，{why}——"
                  f"起點必須是可信綠點。先把工作樹修到 validate 綠再 resume。輸出尾段:\n{vtail}")
+
+    if fresh_start:
+        ws.snapshot_protected(repo, protected)
 
     # goal 變更偵測:停機期間人改 goal 是合法的,但既有計畫是舊 goal 收斂的——大聲提醒
     goal_hash = sha256_bytes((repo / args.goal).read_bytes())
@@ -480,6 +529,7 @@ def main():
     state["config"] = {"flag_threshold": args.flag_threshold, "done_threshold": args.done_threshold,
                        "red_limit": args.red_limit, "stall_limit": args.stall_limit,
                        "round_timeout": args.round_timeout,
+                       "validate_timeout": args.validate_timeout,
                        "repo": str(repo), "agent_cmd": shlex.join(agent_cmd),
                        "validate_cmd": shlex.join(validate_cmd),
                        "goal": args.goal, "plan_doc": args.plan_doc}
@@ -489,9 +539,28 @@ def main():
         state["loop"]["pid"] = None  # 正常/Ctrl-C 退出都清 pid;被 SIGKILL 留殘值,由 dashboard ps 檢查兜底
         ws.save_state(state)
     atexit.register(_mark_stopped)
+    # preflight 已通過：此刻才原子提交 reset/import 的全新 state。Agent 尚未啟動時若失敗，
+    # state 仍是完整、可再次 Run 的 stopped workspace，不會是半套 import state。
+    ws.save_state(state)
+    if args.reset_state or args.import_plan:
+        (ws.dir / "pending_issues").unlink(missing_ok=True)
+    if args.import_plan and getattr(args, "consume_import_plan", False):
+        Path(args.import_plan).unlink(missing_ok=True)
+
+    startup_marked = False
+
+    def mark_startup_ready(_agent_pid):
+        nonlocal startup_marked
+        if startup_marked:
+            return
+        atomic_write_bytes(startup_ready, json.dumps({"pid": os.getpid()}).encode("utf-8"))
+        startup_marked = True
+        log("🟢 啟動完成｜preflight、Validate 與 Agent spawn 均成功")
 
     work_py = HERE / "work.py"
-    py = shlex.quote(sys.executable)
+    # Prompt 中的 coordinator 命令會交給另一個 CLI agent 執行；使用絕對路徑，
+    # 避免不同使用者、IDE 或非互動 shell 的 PATH 指到另一套 Python。
+    py = shlex.quote(str(Path(sys.executable).expanduser().resolve()))
     create_cmd = f"{py} {shlex.quote(str(work_py))} create-plan"
     planok_cmd = f"{py} {shlex.quote(str(work_py))} plan-ok"
     issue_cmd = f"{py} {shlex.quote(str(work_py))} issue"
@@ -502,7 +571,7 @@ def main():
     log(f"⚙️ 執行設定｜Agent：{shlex.join(agent_cmd)}｜驗證：{shlex.join(validate_cmd)}")
     log(f"⚙️ 收斂門檻｜flag>{args.flag_threshold}｜done≥{args.done_threshold}｜red-limit={args.red_limit}｜"
         f"stall-limit={args.stall_limit}  stuck-stop={'on(' + str(args.stuck_stop_count) + ')' if args.stuck_stop else 'off'}  "
-        f"round-timeout={args.round_timeout:g}min")
+        f"round-timeout={args.round_timeout:g}min  validate-timeout={args.validate_timeout:g}s")
 
     goal_text = (repo / args.goal).read_text(encoding="utf-8")
 
@@ -565,8 +634,15 @@ def main():
             })
         prompt_path = ws.dir / "prompts" / f"round-{rnd:04d}.md"
         prompt_path.write_text(prompt, encoding="utf-8")
-        for old in sorted((ws.dir / "prompts").glob("round-*.md"))[:-5]:
-            old.unlink(missing_ok=True)  # prompt 留最近 5 輪當稽核,其餘清掉
+        # reset 後 rnd 會回到 1，但目錄可能仍有 round-0034..0038。若只按檔名排序取
+        # 最後五個，剛寫好的 round-0001 會立刻被當成「最舊」刪掉，接著 spawn Agent
+        # 就 FileNotFoundError。當前 prompt 永遠保留，另外最多留四份舊稽核檔。
+        previous_prompts = sorted(
+            (path for path in (ws.dir / "prompts").glob("round-*.md") if path != prompt_path),
+            reverse=True,
+        )
+        for old in previous_prompts[4:]:
+            old.unlink(missing_ok=True)
 
         head_before = head_sha(repo)
         phase_name = "規劃期" if phase == "plan" else "執行期"
@@ -575,7 +651,7 @@ def main():
         log(f"🤖 啟動 Agent｜命令：{shlex.join(agent_cmd)}")
         rc, secs, timed_out = run_agent(agent_cmd, prompt_path, repo, env,
                                         ws.dir / "logs" / f"round-{rnd:04d}.log",
-                                        args.round_timeout * 60)
+                                        args.round_timeout * 60, on_started=mark_startup_ready)
         log(f"🤖 Agent 結束｜exit code={rc}｜耗時 {secs:.0f} 秒" + "｜超時，已強制終止" * timed_out)
         if timed_out:
             state["notes"].append(f"⚠️ 上一輪 agent 超過 {args.round_timeout:g} 分鐘被強制終止,"
@@ -668,7 +744,7 @@ def main():
             if ws.signal("called_create_plan"):
                 log("📨 Agent 指令｜create-plan｜執行期計畫已凍結，將忽略此指令")
             log(f"🧪 執行驗證｜命令：{shlex.join(validate_cmd)}")
-            ok, vtail = run_validate(validate_cmd, repo)
+            ok, vtail, validate_timed_out = run_validate(validate_cmd, repo, args.validate_timeout)
             validate_note = "PASS" if ok else "FAIL"
             if ok:
                 log("✅ 驗證通過")
@@ -676,7 +752,8 @@ def main():
                 if not dirty:
                     state["last_green_sha"] = head_after
             else:
-                log(f"❌ 驗證失敗｜紅燈連續 {state['red_streak'] + 1} 輪")
+                timeout_note = f"｜逾時 {args.validate_timeout:g} 秒" if validate_timed_out else ""
+                log(f"❌ 驗證失敗{timeout_note}｜紅燈連續 {state['red_streak'] + 1} 輪")
                 if vtail:
                     log(f"驗證錯誤尾段：\n{vtail}")
                 state["red_streak"] += 1

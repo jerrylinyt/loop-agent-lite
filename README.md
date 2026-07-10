@@ -1,173 +1,125 @@
 # loop-agent-lite
 
-markdown/JSON 規劃 + python 無窮迴圈的極簡 agent 迴圈。
-程式笨、agent 聰明:python 只管計數、派工、當場校驗、竄改還原與 reset;
-所有語意判斷(計畫好壞、前人工作完整性)留給每輪全新 context 的 agent。
+用 Python 協調 agent 的規劃／執行迴圈，並提供一個可在瀏覽器操作的 Dashboard。
 
 ## 流程
 
-```
-(loop 外)模板 templates/ + 一般 agent session → 產 goal.md + PLAN.md → 人審 → commit 進 repo
-    │
-    ▼
-python3 loop.py --repo <repo>
-    │  preflight:validate 綠 + 工作樹乾淨 + goal/PLAN 已 commit,不合格第一行就擋
-    ▼
-規劃期:agent 讀 goal/PLAN/現有計畫 → create-plan(當場校驗 order)或 plan-ok
-    │  共識:plan-ok 且無任何異動 → flag+1;create-plan 被 call(不論成敗)/有異動 → 歸零
-    ▼  flag > 10
-執行期:依 order 派工 task-N → agent 收拾現場 → 實作+commit,或 done task-N
-    │  共識:done 且 HEAD 沒動+工作樹乾淨+驗證綠 → done+1;有異動/驗證紅 → 歸零
-    │  done ≥ 3 → 記完成(含 sha)→ 派下一個
-    ▼  最後一個任務收斂
-REPORT.md
+```text
+準備 target repo
+  └─ goal.md + PLAN.md 已審核並 commit
+          │
+          ▼
+Dashboard 啟動 loop（或直接執行 loop.py）
+          │
+          ├─ preflight：validate、工作樹、goal/PLAN commit 檢查
+          │       └─ 失敗：保留舊 state，不啟動新工作
+          │
+          ▼
+規劃期：agent 建立或確認計畫
+          │  flag 達門檻後進入執行期
+          ▼
+執行期：依序處理 task-N，完成後 validate
+          │  done 達門檻後記錄完成 SHA，繼續下一個任務
+          ▼
+全部任務收斂 → REPORT.md；完成後 loop 自動停止
 ```
 
-防線(全機械):驗證連紅 20 輪或 HEAD 停滯 300 輪 → `git reset --hard` 回最後綠點,
-任務指標依「完成 sha 是否仍在歷史裡」一次退到位;同一任務 reset 達 100 次停機(`--stuck-stop`,預設關)。
-goal / state.json 是受保護真相:agent 直接改檔會被偵測、還原、該輪作廢——
-計畫只能透過 `work.py create-plan` 寫入(執行期凍結)。goal 另有雙重守門:
-**每輪 spawn 前**不存在就 fail-closed 停機;**每輪結束後**消失就整輪 `reset --hard` 回輪初 sha
-(該輪所有變更含 commit 一併作廢)。
-
-流程加固:
-- preflight:**首跑必須綠**;resume 已有綠點可錨定就放行紅燈啟動(紅燈連跳防線會自行 reset 回綠),
-  紅燈訊息餵給下一輪 agent 先修;
-- **goal 變更偵測**:停機期間改了 goal(commit)再 resume,會偵測 hash 變化 → console 警告+
-  note 餵下輪 agent + dashboard 顯示「⚠ goal 已變更」chip;回規劃期或 plan 重新收斂後解除;
-- prompts/ 只留最近 5 輪(稽核夠用不爆量);round log 只留當前輪;
-- `loop.py --import-plan plan.json --start-phase exec`:dashboard 匯入的 CLI 等價(重置 state);
-- 所有預設值(flag/done/timeout/red/stall/stuck)統一住 `dashboard.config.json` 的 `defaults` 區塊,
-  表單可覆蓋前三顆,防線參數只在 config 改。
+每輪都會保護 `goal.md`、計畫與 state。驗證失敗或偵測到竄改時，會回到最後綠點。`--reset-state` 和 Dashboard 的 plan 匯入都是交易式操作：新流程未通過啟動檢查時，舊進度仍保留。
 
 ## 快速開始
 
+### 1. 準備 target repo
+
+在 target repo 建立並 commit `goal.md`、`PLAN.md`，確認驗證命令可在該 repo 執行。
+
+### 2. 啟動 Dashboard（推薦）
+
 ```bash
-# 1) 用 templates/ 對應模板,在一般 session 產 goal.md + PLAN.md,審完 commit 進 target repo
-# 2) 跑(公司 CLI 用 --agent-cmd 換掉;prompt 走 stdin)
-python3 loop.py --repo /path/to/repo \
-  --agent-cmd "your-agent-cli -p" \
-  --validate-cmd "mvn -q test"
+python3 dashboard.py --port 8766
 ```
 
-常用參數:`--flag-threshold 10`、`--done-threshold 3`、`--red-limit 20`、`--stall-limit 300`、
-`--round-timeout 30`(分鐘,0=不限;逾時 SIGKILL 整個 process group,殘留交下一輪判斷)、
-`--stuck-stop --stuck-stop-count 100`、`--reset-state`、`--name <workspace>`。
-agent 的 stdout/stderr 逐行直播在 console(前綴 `│`),同時落 `workspace/<name>/logs/`。
-中斷直接 Ctrl-C,state 已落地,重跑同一條命令續跑;停機期間人工改 goal/PLAN 記得 commit(重啟會重拍快照)。
+開啟 <http://127.0.0.1:8766/>，在「啟動／管理」設定：
 
-## Dashboard(唯讀,選用)
+- target repo
+- Agent CLI（例如 `claude -p`）
+- validate command（例如 `python3 -m unittest discover -s tests -t . -q`）
+
+找不到 CLI 時，點 Agent CLI 旁的齒輪，設定 CLI 命令及其 PATH 目錄；也可以直接填可執行檔的絕對路徑，再按「測試」。
+
+### 3. 直接執行 loop（可選）
 
 ```bash
-python3 dashboard.py            # 一個進程管 workspace/ 底下全部;--name 只是預選;--port 8765 起自動找
+python3 loop.py \
+  --repo /path/to/repo \
+  --agent-cmd "claude -p" \
+  --validate-cmd "python3 -m unittest discover -s tests -t . -q"
 ```
 
-Dashboard 前端是獨立的 React + TypeScript + Vite 專案，原始碼在 `ui/src/`；
-`dashboard.py` 只提供既有 `/api/*` 與本機 `ui/dist/` 靜態資源。Production 不需要 Node、
-不連 CDN，也不會在執行時下載字型、icon 或其他資源。重新 build 前端:
+Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace log。中斷後重新執行相同命令即可從 `state.json` 繼續。
+
+常用選項：
+
+```text
+--name <workspace>       指定 workspace 名稱
+--reset-state             清除舊進度後重新開始（驗證成功才套用）
+--import-plan <file>      匯入 plan JSON 並建立新 state
+--start-phase exec        搭配匯入 plan，直接進入執行期
+--round-timeout <分鐘>    單輪上限，0 表示不限
+--validate-timeout <秒>   驗證命令上限
+--stuck-stop              同一任務反覆 reset 達上限時停機
+```
+
+## Dashboard 操作
+
+- 左側是 Loop 狀態；右側是 Agent 輸出，可切換 Agent／其他／全部。
+- 分隔線可拖曳調整欄寬；箭頭可收合，設定會保存在瀏覽器。
+- 停止後可編輯計畫、切換階段或修改 agent／validate 設定，再按 ▶ 運行。
+- 「重置 workspace state」會保留舊 state，直到新流程通過 preflight。
+- 「匯入 plan」會建立全新的 state；可選擇從規劃期或執行期開始。
+- 迴圈完成、停止或發生啟動錯誤時，Dashboard 會顯示結果與 log 尾段；啟動成功前不會關閉視窗。
+
+## 團隊設定與個人設定
+
+- `dashboard.config.shared.json`：團隊共用、應提交到 Git 的預設值。
+- `dashboard.config.local.json`：個人 CLI、PATH、repo roots 與通知設定，已加入 `.gitignore`，不應提交。
+
+第一次使用請在 Dashboard 的設定頁完成個人 CLI／PATH／repo roots 設定；不同電腦只需各自建立 local 設定，不會改動團隊檔案。
+
+## Workspace 檔案
+
+```text
+workspace/<name>/
+├── state.json       目前進度與執行設定
+├── console.log      完整流程紀錄
+├── logs/             每輪 Agent 原始輸出
+├── prompts/          最近幾輪送出的 prompt
+└── REPORT.md        全部任務完成後的摘要
+```
+
+## 常見問題
+
+**Agent CLI 顯示找不到檔案**
+
+在 Agent CLI 管理器填入正確命令，並把 CLI 所在目錄加入 PATH；按「測試」確認後再啟動。GUI 啟動的 PATH 可能和終端機不同。
+
+**validate 失敗或逾時**
+
+先在 target repo 手動執行同一個 command，確認工作目錄與依賴正確，再回 Dashboard 修改命令或 timeout。逾時會終止 validator 的整個 process group。
+
+**workspace 顯示沒有 state.json**
+
+請從 Dashboard 的啟動表單重新啟動，或使用 `--reset-state`；不要在 loop 執行中手動刪除 workspace 檔案。
+
+## 開發與測試
 
 ```bash
+# Python 協調層
+python3 -m unittest tests.test_guards
+
+# Dashboard 前端（需要 Node.js）
 cd ui
 npm install
-npm run build
+npm run check
 ```
 
-前端 build 需要 Node.js 20.19 以上；這項需求只存在開發／建置機。
-`ui/dist/` 會進版控，讓只有 Python 的內網環境可直接執行 dashboard。開發模式可先跑
-`python3 dashboard.py --port 8765`，再於另一個 terminal 執行 `cd ui && npm run dev`；
-Vite 會把 `/api` proxy 到本機 dashboard。
-
-介面提供深色／淺色／跟隨系統三種主題，偏好、左右欄寬與完成任務的展開狀態
-都只存在瀏覽器 `localStorage`，不會修改 workspace truth。
-
-頂部 tabs = fleet 總覽(每個 workspace 的 phase 色點+進度),點擊即切換(支援 #hash 深連結)。
-主畫面的 fleet/state/完整 console 由單向 SSE (`/api/events`) 增量推送；瀏覽器斷線會自動重連，
-寫入操作仍使用既有 REST POST。只有「執行中的 jobs」面板在打開時每 2 秒查詢一次。
-**版面鎖 100vh**:頁面永不捲動,左(計畫表格)右(console)兩欄各自內部 scroll。
-多個 loop 同時跑各自 workspace,開一個 dashboard 就夠;`--read-only` 起唯讀實例分享給別人看。
-
-左欄(計畫表格):
-- 已完成任務預設收合成一行(點擊展開/收合,記憶偏好);切進 workspace 自動捲到進行中任務;
-- 任務文字 clamp 3 行(點擊展開;進行中任務不縮);React 保留未變區塊與你的捲動位置;
-  捲離進行中任務時出現「→ 回到執行中」浮鈕一鍵跳回;
-- header 有 任務 n/N 進度、⚠ issues 紅章——點擊開**彈窗表格**(round/位置/內容/時間,最新在上、
-  可捲動、開著會隨 SSE 即時更新,內含清空鈕);issues 來自 agent 的 `work.py issue` 結構化回報;
-- 規劃期 plan 更新時**變動列亮一閃、表頭脈衝並顯示「計畫已更新 vN」**；
-  Agent 指令造成 flag、done、phase、任務進度或健康狀態變動時，對應狀態 chip 也會短暫脈衝；
-  plan 版本異常增長(≥10)標黃提示可能震盪。
-
-右欄(完整執行紀錄):
-- 依時間顯示 Dashboard 操作、loop 中文流程、Agent stdout、協調指令、驗證與 reset，不再只顯示 Agent；
-- 超長 log 首抓只載尾段(64KB)秒開;在底部就跟著 tail,永遠看得到最新 print;
-- 往上翻閱時出現「⤓ 跟到最新」浮鈕一鍵回底;顯示緩衝上限 300KB,最舊自動丟棄。
-
-**Launcher(＋ 啟動/管理)**:表單填一填直接開 loop。
-- agent 命令 = `dashboard.config.json` 固定選項(前端只能選,塞不進任意命令);
-- validate = 預設選項(mvn compile / mvn test / react 三層)或手寫;
-- repo = config `repo_roots` 掃出來的 git repo 下拉點選,或手動輸入;
-- goal.md(gate#1):表單選檔,**隨啟動自動 commit**(固定檔名、指定 pathspec 絕不掃到其他 WIP;
-  內容沒變不產生新 commit;留空=沿用 repo 已 commit 的版本);
-- 「在新 branch 跑」勾選:啟動前 `git checkout -b loop/<ws>`(已存在就 checkout 續用),不弄髒主線,
-  deliver=你自己 merge;
-- config `notify_cmd`:終態通知(completed / stuck_stop / goal_missing),佔位符 `{status}` `{name}`,
-  跑整夜結果推到 webhook,失敗只記 warning 不擋主流程;
-- **匯入 plan.json**(v4 import plan 的 lite 版):貼上任務清單 JSON(create-plan 同一套校驗;
-  貼上當下即時紅框警告格式錯誤,「📋 複製範本」一鍵拿格式),
-  = 建全新 state(舊進度清除),並由你選擇**從規劃期開始(讓 agent 補完)或直接進執行期**;
-- 「重置 workspace state」勾選 = `--reset-state`(沒貼 plan.json 時才有意義);
-- 同名/同 repo 已在跑會擋;preflight 失敗直接顯示在 job 輸出;
-- ⚠️ **關閉 dashboard 會停掉由它啟動的全部 loop**:先 SIGINT 優雅收尾(loop 存 state、
-  殺掉自己的 agent process group),8 秒沒死再 SIGKILL。state 已落地,重啟即續跑。
-
-**Workspace 控制(header 按鈕;全部只在停止時可用,執行中鎖死)**:
-- workspace 清單=掃 `workspace/*/state.json`(loop 會把 repo path/agent/validate 命令與
-  自己的 pid 寫進去),所以**外部啟動的 loop 一樣能看到、能停**;
-- ▶ 運行:設定全部取自 state.json,agent 命令執行前再過一次 config 白名單
-  (state 是 agent 摸得到的檔案,白名單不過=拒跑、改走啟動表單);
-- ⏹ 停止:SIGINT 優雅收尾(dashboard job 或外部 pid 皆可);
-- ✎ 編輯計畫:改任務文字敘述與 done 計數(不能增刪任務);
-- ⚙ 設定:改 agent 命令(config 白名單)、validate 命令、五顆旋鈕(flag/done/timeout/red/stall),
-  存回 state.config、下次 ▶ 運行生效——就是啟動表單那些設定,停止後隨時能調;
-- ⏪ 回規劃期 / ⏩ 進執行期:phase 切換;回規劃期會把執行進度全部歸零(計畫保留);
-- **進度管理(任務列 ⏵)**:退回 task-N=清掉 N 起的完成紀錄重做(code 不動,交輪次驗收);
-  往前跳=中間任務標「✔ 人工」,且**先跑 validate、綠燈才放行**(同 preflight 原則)。
-  loop 每輪只保留當前輪的 agent 原始輸出(round-*.log),舊輪自動清除；完整流程則持續追加到 console.log。
-
-## Workspace 佈局(`workspace/<name>/`)
-
-- `state.json` — 唯一真相:phase / flag / plan / 進度 / 完成 sha / reset 統計
-- `console.log` — Dashboard 操作、loop 中文階段訊息、Agent stdout 與驗證結果的完整時間序；單檔 5 MiB，自動輪替並保留 `.1`～`.3`
-- `history.log` — 一輪一行的機械摘要;`prompts/`、`logs/` — 每輪 prompt 原文與 Agent 原始 stdout
-- `REPORT.md` — 收斂後的總結
-
-## agent 可用命令(prompt 內已附完整指令)
-
-- `work.py create-plan [json檔]` — 整包重交計畫(stdin 或檔案);order 必須 1..N 連續不重複
-- `work.py plan-ok` — 宣告計畫完整
-- `work.py done task-N` — 宣告當前任務完成(task id 核對,錯了當場退)
-
-## 測試
-
-協調層防線的回歸測試(stdlib only,真 git + 真 loop/work,不做 mock):
-
-```
-python3 -m unittest tests.test_guards        # 或  python3 tests/test_guards.py
-```
-
-覆蓋:綠點錨定 fail-closed(green 須存在/是 HEAD 祖先/protected blob 與快照相符)、
-竄改輪整輪作廢(同輪偷改 goal + create-plan,竄改的 plan 不得存活,正常規劃不誤殺)、
-原子寫並發(多執行緒不共用 tmp)。
-
-Dashboard Playwright E2E 使用 production build、隔離的暫存 git repo/workspace、真 Python API/SSE
-與 fake agent，不會讀寫你的實際 workspace:
-
-```bash
-cd ui
-npx playwright install chromium   # 每台測試機首次執行一次
-npm run test:e2e                  # build + 完整 E2E
-npm run test:e2e:headed           # 需要看瀏覽器操作時
-```
-
-覆蓋:空狀態與主題、Launcher/plan 校驗/goal 匯入/new branch、loop 啟動與 SSE console/issues、
-停止與重啟、jobs 管理、Workspace 設定取消/關閉/儲存、計畫編輯、事件收合、issues 清除、
-規劃/執行 phase 切換、人工進度跳轉、splitter 鍵盤操作，以及 read-only UI/API 防線。
+`ui/dist/` 已包含 production 靜態檔，只有 Python 的環境也能直接執行 Dashboard。
