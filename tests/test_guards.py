@@ -892,6 +892,28 @@ class TestStateSchemaGuard(unittest.TestCase):
             finally:
                 L.WORKSPACE_ROOT = old_root
 
+    def test_invalid_nested_runtime_collections_fail_closed(self):
+        invalid_states = [
+            {"phase": "plan", "notes": [None]},
+            {"phase": "plan", "issues": ["legacy string"]},
+            {"phase": "plan", "issues": [{"round": True, "text": "bad"}]},
+            {"phase": "plan", "issues": [{"round": 1, "text": ""}]},
+            {"phase": "exec", "task_reset_counts": {"1": "2"}},
+            {"phase": "exec", "task_reset_counts": {"not-an-order": 2}},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d)
+                for index, invalid in enumerate(invalid_states):
+                    ws = L.Workspace(f"schema-runtime-collection-{index}")
+                    ws.state_path.write_text(json.dumps(invalid), encoding="utf-8")
+                    ws.checkpoint_path.write_text(json.dumps(invalid), encoding="utf-8")
+                    with self.subTest(state=invalid), self.assertRaises(L.StateLoadError):
+                        ws.load_state()
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
 
 class TestConsoleRotation(unittest.TestCase):
     """完整 console 必須在上限前輪替，且按新舊順序保留固定份數。"""

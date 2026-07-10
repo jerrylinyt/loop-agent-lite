@@ -798,9 +798,27 @@ def validate_state_shape(state, label: str):
             completed_orders.append(entry["order"])
         if len(completed_orders) != len(set(completed_orders)):
             raise StateLoadError(f"{label} completed.order 不可重複")
+    if "notes" in state and any(not isinstance(note, str) for note in state["notes"]):
+        raise StateLoadError(f"{label} notes 每一項都必須是字串")
+    if "issues" in state:
+        for index, issue in enumerate(state["issues"]):
+            if (not isinstance(issue, dict) or
+                    not isinstance(issue.get("round"), int) or
+                    isinstance(issue.get("round"), bool) or issue["round"] < 0 or
+                    not isinstance(issue.get("text"), str) or not issue["text"].strip() or
+                    ("where" in issue and not isinstance(issue["where"], str)) or
+                    ("ts" in issue and not isinstance(issue["ts"], str))):
+                raise StateLoadError(
+                    f"{label} issues[{index}] 必須含有合法 round/text/where/ts")
     for field in ("task_reset_counts", "config", "loop"):
         if field in state and not isinstance(state[field], dict):
             raise StateLoadError(f"{label} {field} 必須是 object")
+    if "task_reset_counts" in state:
+        for key, count in state["task_reset_counts"].items():
+            if (not isinstance(key, str) or not key.isdigit() or int(key) < 1 or
+                    not isinstance(count, int) or isinstance(count, bool) or count < 0):
+                raise StateLoadError(
+                    f"{label} task_reset_counts 必須是正整數字串到非負整數的對應")
     if "loop" in state:
         loop_state = state["loop"]
         if "pid" in loop_state:
