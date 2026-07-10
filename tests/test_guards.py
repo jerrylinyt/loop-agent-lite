@@ -1301,6 +1301,140 @@ class TestCliArgumentGuards(unittest.TestCase):
             self.assertFalse(marker.exists(), "零門檻不得有機會繞過 work.py done 共識")
 
 
+class TestWorkspaceNameGuards(unittest.TestCase):
+    """workspace 名稱是 coordinator root 的安全邊界，dot-leading 不得逸出或碰保留目錄。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_workspace_constructor_rejects_unsafe_names_without_creating_paths(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            workspace_root = root / "workspace"
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = workspace_root
+                for name in ("", ".", "..", ".archive", ".hidden", "a/b", r"a\b"):
+                    with self.subTest(name=name), self.assertRaises(ValueError):
+                        L.Workspace(name)
+                self.assertFalse(workspace_root.exists(), "非法名稱不得先建立 coordinator 根目錄")
+                self.assertFalse((root / "logs").exists(), ".. 不得把 logs 寫到 workspace 外")
+                workspace_root.mkdir()
+                outside = root / "outside"
+                outside.mkdir()
+                (workspace_root / "linked").symlink_to(outside, target_is_directory=True)
+                with self.assertRaises(ValueError):
+                    L.Workspace("linked")
+                self.assertFalse((outside / "logs").exists(), "symlink workspace 不得把 coordinator 寫到 root 外")
+                for name in ("legacy-orders", "a.b", "_scratch", "-scratch"):
+                    with self.subTest(valid_name=name):
+                        self.assertEqual(L.Workspace(name).dir, workspace_root / name)
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_cli_rejects_dot_leading_names_before_workspace_or_agent(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            marker = root / "agent-started"
+            agent = root / "agent.py"
+            agent.write_text(f"from pathlib import Path\nPath({str(marker)!r}).write_text('started')\n")
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            for name in (".", "..", ".archive", ".hidden"):
+                result = subprocess.run(
+                    [sys.executable, LOOP_PY, "--repo", str(repo), "--name", name,
+                     "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                     "--validate-cmd", "true", "--preflight-only"],
+                    capture_output=True, text=True, env=env,
+                )
+                with self.subTest(name=name):
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("--name", result.stderr)
+                    self.assertFalse(workspace_root.exists(), "非法名稱不得建立 workspace")
+                    self.assertFalse((root / "logs").exists(), ".. 不得在 workspace 外建立 logs")
+            workspace_root.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            (workspace_root / "linked").symlink_to(outside, target_is_directory=True)
+            result = subprocess.run(
+                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "linked",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--preflight-only"],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("symbolic link", result.stderr)
+            self.assertFalse((outside / "logs").exists(), "CLI 不得經由 symlink 寫出 workspace root")
+            self.assertFalse(marker.exists(), "非法名稱不得 spawn Agent")
+
+    def test_dashboard_rejects_dot_leading_names_and_hides_legacy_hidden_directories(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            valid = workspace_root / "valid"
+            hidden = workspace_root / ".hidden"
+            archived = workspace_root / ".archive"
+            for directory in (valid, hidden, archived):
+                directory.mkdir(parents=True)
+                (directory / "state.json").write_text(json.dumps({"phase": "done"}), encoding="utf-8")
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "state.json").write_text(json.dumps({"phase": "done"}), encoding="utf-8")
+            (workspace_root / "linked").symlink_to(outside, target_is_directory=True)
+            old_values = (D.ROOT, L.WORKSPACE_ROOT, D.load_config)
+            try:
+                D.ROOT = workspace_root
+                L.WORKSPACE_ROOT = workspace_root
+                D.load_config = lambda: {
+                    "agent_cmds": [{"label": "true", "cmd": "true"}],
+                    "validate_cmds": [{"label": "true", "cmd": "true"}],
+                    "extra_path_dirs": [], "notify_cmd": "", "defaults": {"validate_timeout": 5},
+                }
+                state, error = D.read_state("..")
+                self.assertIsNone(state)
+                self.assertIn("不合法", error)
+                D.workspace_console_log("..", "不得寫到 workspace 外")
+                self.assertFalse((root / "console.log").exists())
+                with self.assertRaises(ValueError):
+                    D.write_state("..", {"phase": "done"})
+                state, error = D.read_state("linked")
+                self.assertIsNone(state)
+                self.assertIn("symbolic link", error)
+                D.workspace_console_log("linked", "不得經由連結寫出 root")
+                self.assertFalse((outside / "console.log").exists())
+
+                handler = self.ResponseCapture()
+                D.Handler.api_launch(handler, {
+                    "repo": str(repo), "name": ".archive", "agent_idx": 0, "validate_idx": 0,
+                })
+                self.assertEqual(handler.response[0], 400)
+                self.assertIn("不合法", handler.response[1]["error"])
+                self.assertNotIn(".archive", D.JOBS, "非法名稱不得建立 dashboard job")
+
+                handler = self.ResponseCapture()
+                D.Handler.api_launch(handler, {
+                    "repo": str(repo), "name": "linked", "agent_idx": 0, "validate_idx": 0,
+                })
+                self.assertEqual(handler.response[0], 400)
+                self.assertIn("symbolic link", handler.response[1]["error"])
+                self.assertNotIn("linked", D.JOBS)
+
+                handler = self.ResponseCapture()
+                self.assertIsNone(D.Handler._ws_dir(handler, {"ws": [".archive"]}))
+                self.assertEqual(handler.response[0], 400)
+                self.assertEqual([item["name"] for item in D.list_workspaces()], ["valid"])
+            finally:
+                D.ROOT, L.WORKSPACE_ROOT, D.load_config = old_values
+
+
 class TestGoalProjection(unittest.TestCase):
     """goal 唯讀投影:從 state.config 的 repo+goal 讀人類真相;缺 config/缺檔回明確 error。"""
 

@@ -29,8 +29,10 @@ import hashlib
 import json
 import math
 import os
+import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -41,6 +43,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 WORKSPACE_ROOT = Path(os.environ.get("LOOP_AGENT_WORKSPACE_ROOT", HERE / "workspace")).expanduser().resolve()
+WORKSPACE_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+WORKSPACE_NAME_RULE = "只允許英數、.、_、-，且不可 . / .. 或以 . 開頭"
 
 # ===== 預設值(全部可用命令列覆蓋) =====
 AGENT_CMD = ["claude", "-p"]          # prompt 走 stdin;公司 CLI 用 --agent-cmd 覆蓋
@@ -63,6 +67,33 @@ STOP_AFTER_ROUND_CLAIMED_FILE = "stop-after-round.claimed.json"
 _CONSOLE_PATH = None
 _CONSOLE_LOCK = threading.Lock()
 _RUN_LOCKS = []
+
+
+def valid_workspace_name(name) -> bool:
+    """workspace 是 ROOT 下單一子目錄；拒絕 dot-leading 保留目錄與路徑逸出。"""
+    return isinstance(name, str) and not name.startswith(".") and bool(WORKSPACE_NAME_RE.fullmatch(name))
+
+
+def require_workspace_name(name: str) -> str:
+    """回傳已驗證名稱，讓所有建立 coordinator 檔案的入口 fail-closed。"""
+    if not valid_workspace_name(name):
+        raise ValueError(f"workspace 名稱不合法：{WORKSPACE_NAME_RULE}")
+    return name
+
+
+def workspace_path(root: Path, name: str) -> Path:
+    """取得 root 直屬且非 symlink 的 workspace 路徑，避免合法名稱被連結導出 root。"""
+    name = require_workspace_name(name)
+    path = Path(root) / name
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return path
+    except OSError as e:
+        raise ValueError(f"無法檢查 workspace 目錄：{e}") from e
+    if stat.S_ISLNK(mode):
+        raise ValueError("workspace 目錄不可為 symbolic link（避免逸出 workspace root）")
+    return path
 
 
 def now_ts() -> str:
@@ -380,7 +411,8 @@ class Workspace:
     """workspace/<name>/ 底下所有 python-owned 檔案的單一寫入點。"""
 
     def __init__(self, name: str):
-        self.dir = WORKSPACE_ROOT / name
+        self.name = require_workspace_name(name)
+        self.dir = workspace_path(WORKSPACE_ROOT, self.name)
         (self.dir / "logs").mkdir(parents=True, exist_ok=True)
         (self.dir / "prompts").mkdir(parents=True, exist_ok=True)
         (self.dir / "snapshots").mkdir(parents=True, exist_ok=True)
@@ -660,7 +692,8 @@ def agent_failure_backoff(streak, maximum_seconds) -> float:
 def main():
     ap = argparse.ArgumentParser(description="loop-agent-lite:規劃/執行雙段共識迴圈")
     ap.add_argument("--repo", required=True, help="target code repo(git、乾淨、validate 綠)")
-    ap.add_argument("--name", default=None, help="workspace 名稱(預設=repo 目錄名)")
+    ap.add_argument("--name", default=None,
+                    help="workspace 名稱(預設=repo 目錄名;不可 . / .. 或以 . 開頭)")
     ap.add_argument("--goal", default="goal.md", help="goal 檔(相對 repo,須已 commit)")
     ap.add_argument("--plan-doc", default="", help="選配:參考分析文件(相對 repo);提供的話須已 commit 且受保護")
     ap.add_argument("--agent-cmd", default=None, help="agent CLI 命令(整串;prompt 走 stdin)")
@@ -707,6 +740,11 @@ def main():
             ap.error(f"{option} 必須是{' > 0' if positive else ' ≥ 0'} 的有限數字")
 
     repo = Path(args.repo).resolve()
+    workspace_name = args.name or repo.name
+    try:
+        require_workspace_name(workspace_name)
+    except ValueError as e:
+        ap.error(f"--name {e}")
     agent_cmd = shlex.split(args.agent_cmd) if args.agent_cmd else AGENT_CMD
     validate_cmd = shlex.split(args.validate_cmd) if args.validate_cmd else VALIDATE_CMD
     protected = [args.goal] + ([args.plan_doc] if args.plan_doc else [])
@@ -714,7 +752,10 @@ def main():
 
     # preflight 失敗也必須出現在 dashboard 的完整 console。舊流程直到所有 git
     # 檢查通過後才設定 console，導致「pid 出現後立刻停止」卻完全看不到原因。
-    ws = Workspace(args.name or repo.name)
+    try:
+        ws = Workspace(workspace_name)
+    except ValueError as e:
+        ap.error(f"--name {e}")
     configure_console(ws.dir / "console.log")
     acquire_run_lock(ws.dir / ".run.lock", f"workspace '{ws.dir.name}'")
     startup_ready = ws.dir / "startup_ready.json"

@@ -111,6 +111,11 @@ def command_error(raw, label, cfg):
         return command_not_found(label, cmd[0], cfg)
     return None
 
+
+def safe_workspace_dir(name):
+    """Dashboard 的 ROOT 也必須套用 loop 共用的名稱與 symlink 邊界。"""
+    return loop_mod.workspace_path(ROOT, name)
+
 JOBS = {}          # name -> Job(由本 dashboard 啟動的 loop)
 JOBS_LOCK = threading.Lock()
 CONFIG_LOCK = threading.Lock()
@@ -230,6 +235,8 @@ def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout
                red_limit=20, stall_limit=300, stuck_stop=False, stuck_count=100,
                agent_backoff_max=60, env=None):
     """spawn loop.py 並登記進 JOBS(呼叫方需持 JOBS_LOCK)。"""
+    loop_mod.require_workspace_name(name)
+    workspace_dir = safe_workspace_dir(name)
     cmd = [sys.executable, str(HERE / "loop.py"), "--repo", str(repo), "--name", name,
            "--agent-cmd", agent_cmd, "--validate-cmd", validate_cmd,
            "--flag-threshold", str(ft), "--done-threshold", str(dt), "--round-timeout", str(rt),
@@ -244,7 +251,6 @@ def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout
         cmd += ["--import-plan", str(import_plan), "--start-phase", start_phase, "--consume-import-plan"]
     if notify_cmd:
         cmd += ["--notify-cmd", notify_cmd]
-    workspace_dir = ROOT / name
     (workspace_dir / "startup_ready.json").unlink(missing_ok=True)
     if not import_plan:
         (workspace_dir / "import-plan.pending.json").unlink(missing_ok=True)
@@ -273,6 +279,8 @@ def run_command_check(cmd, cwd, prompt="", timeout=60, env=None):
 
 def job_startup_status(name, pid):
     """回報特定 spawn 是否真的通過 preflight/Validate 並成功啟動第一個 Agent。"""
+    if not loop_mod.valid_workspace_name(name):
+        return {"status": "failed", "error": f"workspace 名稱不合法：{loop_mod.WORKSPACE_NAME_RULE}"}
     try:
         expected_pid = int(pid)
     except (TypeError, ValueError):
@@ -287,7 +295,10 @@ def job_startup_status(name, pid):
         return {"status": "failed", "rc": info["rc"],
                 "error": f"loop 啟動失敗（rc={info['rc']}）",
                 "tail": "\n".join(list(job.out)[-80:])}
-    ready = ROOT / name / "startup_ready.json"
+    try:
+        ready = safe_workspace_dir(name) / "startup_ready.json"
+    except ValueError as e:
+        return {"status": "failed", "error": str(e)}
     try:
         marker = json.loads(ready.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
@@ -299,9 +310,12 @@ def job_startup_status(name, pid):
 
 def read_state(name, *, repair=True):
     """讀 workspace state；主檔壞時可由 last-good checkpoint 復原。"""
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
-        return None, f"workspace 名稱 {name or '(空)'} 不合法"
-    state_path = ROOT / name / "state.json"
+    if not loop_mod.valid_workspace_name(name):
+        return None, f"workspace 名稱 {name or '(空)'} 不合法：{loop_mod.WORKSPACE_NAME_RULE}"
+    try:
+        state_path = safe_workspace_dir(name) / "state.json"
+    except ValueError as e:
+        return None, str(e)
     try:
         state, _data, recovered = loop_mod.load_checkpointed_state(state_path, repair=repair)
     except FileNotFoundError:
@@ -322,17 +336,20 @@ def read_state(name, *, repair=True):
 
 def write_state(name, st):
     """原子寫 workspace 主 state 與 last-good checkpoint。"""
+    loop_mod.require_workspace_name(name)
     data = json.dumps(st, ensure_ascii=False, indent=2).encode("utf-8")
-    loop_mod.write_checkpointed_state(ROOT / name / "state.json", data)
+    loop_mod.write_checkpointed_state(safe_workspace_dir(name) / "state.json", data)
 
 
 def read_report(name):
     """REPORT.md 唯讀投影:只在全部任務收斂完成後由 loop 產生,不存在回明確 error。"""
+    if not loop_mod.valid_workspace_name(name):
+        return {"error": f"workspace 名稱不合法：{loop_mod.WORKSPACE_NAME_RULE}"}
     try:
-        return {"content": (ROOT / name / "REPORT.md").read_text(encoding="utf-8")}
+        return {"content": (safe_workspace_dir(name) / "REPORT.md").read_text(encoding="utf-8")}
     except FileNotFoundError:
         return {"error": "REPORT.md 不存在——全部任務收斂完成後才會由 loop 產生"}
-    except OSError as e:
+    except (OSError, ValueError) as e:
         return {"error": f"REPORT.md 讀取失敗:{e}"}
 
 
@@ -357,17 +374,21 @@ def read_goal(name):
 
 def read_prompt(name):
     """最近一輪送出的 prompt 唯讀投影(loop 只保留最近幾份,取 round 編號最大者)。"""
+    if not loop_mod.valid_workspace_name(name):
+        return {"error": f"workspace 名稱不合法：{loop_mod.WORKSPACE_NAME_RULE}"}
+
     def round_num(path):
         m = re.search(r"round-(\d+)", path.name)
         return int(m.group(1)) if m else -1
 
     try:
-        latest = max((ROOT / name / "prompts").glob("round-*.md"), key=round_num, default=None)
+        latest = max((safe_workspace_dir(name) / "prompts").glob("round-*.md"),
+                     key=round_num, default=None)
         if latest is None:
             return {"error": "尚無 prompt 紀錄——loop 送出第一輪後才會出現"}
         return {"content": latest.read_text(encoding="utf-8"),
                 "round": round_num(latest), "file": latest.name}
-    except OSError as e:
+    except (OSError, ValueError) as e:
         return {"error": f"prompt 讀取失敗:{e}"}
 
 
@@ -375,13 +396,13 @@ def workspace_console_log(name, message):
     """將 Dashboard 操作與 loop/Agent 寫進同一條 workspace console 時序。"""
     line = f"[{time.strftime('%H:%M:%S')}] 🖥️ Dashboard｜{message}"
     print(line, flush=True)
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
+    if not loop_mod.valid_workspace_name(name):
         return
     try:
-        workspace_dir = ROOT / name
+        workspace_dir = safe_workspace_dir(name)
         workspace_dir.mkdir(parents=True, exist_ok=True)
         loop_mod.append_console(workspace_dir / "console.log", line)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         print(f"⚠ console.log 寫入失敗:{e}", flush=True)
 
 
@@ -520,7 +541,7 @@ def list_workspaces():
         return []
     out = []
     for d in sorted(ROOT.iterdir()):
-        if not d.is_dir():
+        if not loop_mod.valid_workspace_name(d.name) or d.is_symlink() or not d.is_dir():
             continue
         if not ((d / "state.json").is_file() or (d / "state.last-good.json").is_file()):
             continue
@@ -621,17 +642,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def _ws_dir(self, q):
         name = q.get("ws", [""])[0]
-        valid = {d.name for d in ROOT.iterdir() if d.is_dir()} if ROOT.is_dir() else set()
+        if not loop_mod.valid_workspace_name(name):
+            self._err(f"workspace 名稱 {name or '(空)'} 不合法：{loop_mod.WORKSPACE_NAME_RULE}")
+            return None
+        valid = ({d.name for d in ROOT.iterdir()
+                  if loop_mod.valid_workspace_name(d.name) and not d.is_symlink() and d.is_dir()}
+                 if ROOT.is_dir() else set())
         if name not in valid:
             self._err(f"未知 workspace:{name or '(空)'},可用:{sorted(valid)}")
             return None
-        return ROOT / name
+        try:
+            return safe_workspace_dir(name)
+        except ValueError as e:
+            self._err(str(e))
+            return None
 
     def _serve_events(self, q):
         """SSE:主畫面單向推送 fleet/state/完整 console 增量；寫入操作仍走 REST。"""
         workspace = q.get("ws", [""])[0]
-        if workspace and not re.fullmatch(r"[A-Za-z0-9._-]+", workspace):
-            self._err("workspace 名稱不合法")
+        if workspace and not loop_mod.valid_workspace_name(workspace):
+            self._err(f"workspace 名稱不合法：{loop_mod.WORKSPACE_NAME_RULE}")
+            return
+        try:
+            workspace_dir = safe_workspace_dir(workspace) if workspace else None
+        except ValueError as e:
+            self._err(str(e))
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -680,7 +715,7 @@ class Handler(BaseHTTPRequestHandler):
                     if sig != state_sig:
                         emit("state", projected)
                         state_sig = sig
-                    console_path = ROOT / workspace / "console.log"
+                    console_path = workspace_dir / "console.log"
                     identity_before = file_identity(console_path)
                     if console_identity is not None and identity_before != console_identity:
                         console_offset = 0  # rotation 後從新 console.log 開頭接續
@@ -731,8 +766,8 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/api/job-startup":
                 name = q.get("name", [""])[0]
                 pid = q.get("pid", [""])[0]
-                if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
-                    self._err("workspace 名稱不合法")
+                if not loop_mod.valid_workspace_name(name):
+                    self._err(f"workspace 名稱不合法：{loop_mod.WORKSPACE_NAME_RULE}")
                     return
                 self._out(200, json.dumps(job_startup_status(name, pid), ensure_ascii=False))
             elif u.path == "/api/repo-status":
@@ -893,8 +928,13 @@ class Handler(BaseHTTPRequestHandler):
             self._err(f"{repo} 不是 git repo(preflight 之後還會再驗一次)")
             return
         name = (body.get("name") or "").strip() or repo.name
-        if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
-            self._err(f"workspace 名稱 {name} 不合法,只允許英數 . _ -,例:legacy-orders")
+        if not loop_mod.valid_workspace_name(name):
+            self._err(f"workspace 名稱 {name} 不合法：{loop_mod.WORKSPACE_NAME_RULE}，例:legacy-orders")
+            return
+        try:
+            safe_workspace_dir(name)
+        except ValueError as e:
+            self._err(str(e))
             return
         d = cfg.get("defaults") or {}
         try:
@@ -1249,8 +1289,13 @@ class Handler(BaseHTTPRequestHandler):
             self._err(f"{repo} 不是 git repo")
             return
         name = str(body.get("name") or "").strip() or repo.name
-        if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
-            self._err(f"workspace 名稱 {name} 不合法,只允許英數 . _ -")
+        if not loop_mod.valid_workspace_name(name):
+            self._err(f"workspace 名稱 {name} 不合法：{loop_mod.WORKSPACE_NAME_RULE}")
+            return
+        try:
+            safe_workspace_dir(name)
+        except ValueError as e:
+            self._err(str(e))
             return
         values = cfg.get("validate_cmds") or []
         try:
@@ -1609,7 +1654,11 @@ class Handler(BaseHTTPRequestHandler):
         if ws_running(name, st):
             self._err(f"{name} 執行中,不能封存——先停止")
             return
-        wsd = ROOT / name
+        try:
+            wsd = safe_workspace_dir(name)
+        except ValueError as e:
+            self._err(str(e))
+            return
         # pid 偵測可能失準(SIGKILL 殘值/ps 誤判);flock 是 loop 單 writer 的機械真相,
         # 拿不到鎖就代表還有 loop 活著,寧可擋下也不搬走執行中的 state。
         try:
@@ -1661,11 +1710,16 @@ class Handler(BaseHTTPRequestHandler):
         if job is not None and job.alive() and int(pid) != job.popen.pid:
             self._err(f"{name} 尚在啟動中，請等待執行狀態就緒後再要求本輪後停止")
             return
-        if loop_mod.stop_after_round_claimed(ROOT / name, pid, session_id):
+        try:
+            workspace_dir = safe_workspace_dir(name)
+        except ValueError as e:
+            self._err(str(e))
+            return
+        if loop_mod.stop_after_round_claimed(workspace_dir, pid, session_id):
             self._out(200, json.dumps({"ok": True, "name": name, "pid": pid,
                                        "requested": True, "claimed": True}, ensure_ascii=False))
             return
-        if loop_mod.stop_after_round_requested(ROOT / name, pid, session_id):
+        if loop_mod.stop_after_round_requested(workspace_dir, pid, session_id):
             self._out(200, json.dumps({"ok": True, "name": name, "pid": pid,
                                        "requested": True, "already_requested": True},
                                       ensure_ascii=False))
@@ -1673,7 +1727,7 @@ class Handler(BaseHTTPRequestHandler):
         payload = {"pid": int(pid), "session_id": session_id,
                    "requested_at": datetime.now().isoformat(timespec="seconds")}
         loop_mod.atomic_write_bytes(
-            ROOT / name / loop_mod.STOP_AFTER_ROUND_FILE,
+            workspace_dir / loop_mod.STOP_AFTER_ROUND_FILE,
             json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
         workspace_console_log(name, f"已要求本輪完整結束後停止｜pid={pid}")
@@ -1698,19 +1752,24 @@ class Handler(BaseHTTPRequestHandler):
         if not session_id:
             self._err(f"{name} 是由舊版 loop 啟動，請先立即停止並用目前版本重新運行")
             return
-        if loop_mod.stop_after_round_claimed(ROOT / name, pid, session_id):
+        try:
+            workspace_dir = safe_workspace_dir(name)
+        except ValueError as e:
+            self._err(str(e))
+            return
+        if loop_mod.stop_after_round_claimed(workspace_dir, pid, session_id):
             self._err(f"{name} 的停止請求已被 loop 取走，這一輪會在完成後停止，無法再撤銷", 409)
             return
         # 先無副作用確認，才以 consume=True 原子 claim。loop 若先 claim，絕不假裝已撤銷。
-        if not loop_mod.stop_after_round_requested(ROOT / name, pid, session_id):
-            if loop_mod.stop_after_round_claimed(ROOT / name, pid, session_id):
+        if not loop_mod.stop_after_round_requested(workspace_dir, pid, session_id):
+            if loop_mod.stop_after_round_claimed(workspace_dir, pid, session_id):
                 self._err(f"{name} 的停止請求已被 loop 取走，這一輪會在完成後停止，無法再撤銷", 409)
                 return
             self._out(200, json.dumps({"ok": True, "name": name, "not_requested": True},
                                       ensure_ascii=False))
             return
-        if not loop_mod.stop_after_round_requested(ROOT / name, pid, session_id, consume=True):
-            if not loop_mod.stop_after_round_claimed(ROOT / name, pid, session_id):
+        if not loop_mod.stop_after_round_requested(workspace_dir, pid, session_id, consume=True):
+            if not loop_mod.stop_after_round_claimed(workspace_dir, pid, session_id):
                 self._err(f"{name} 的停止請求狀態剛變更，請重新整理後確認是否仍在收尾", 409)
                 return
             self._err(f"{name} 的停止請求已被 loop 取走，這一輪會在完成後停止，無法再撤銷", 409)
@@ -1721,6 +1780,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_stop(self, body):
         name = str(body.get("name") or "")
+        if not loop_mod.valid_workspace_name(name):
+            self._err(f"workspace 名稱 {name or '(空)'} 不合法：{loop_mod.WORKSPACE_NAME_RULE}")
+            return
         with JOBS_LOCK:
             j = JOBS.get(name)
         if j is not None and j.alive():
@@ -1769,7 +1831,11 @@ def main():
 
     load_config()  # 不存在就先建預設檔,讓人有得改
     if args.name:
-        names = {d.name for d in ROOT.iterdir() if d.is_dir()} if ROOT.is_dir() else set()
+        if not loop_mod.valid_workspace_name(args.name):
+            sys.exit(f"❌ workspace 名稱不合法：{loop_mod.WORKSPACE_NAME_RULE}")
+        names = ({d.name for d in ROOT.iterdir()
+                  if loop_mod.valid_workspace_name(d.name) and not d.is_symlink() and d.is_dir()}
+                 if ROOT.is_dir() else set())
         if args.name not in names:
             sys.exit(f"❌ workspace {args.name} 不存在,可用:{sorted(names) or '(無)'}")
     Handler.preselect = args.name
