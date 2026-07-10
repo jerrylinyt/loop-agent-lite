@@ -2222,6 +2222,36 @@ class TestDashboardFileBoundaries(unittest.TestCase):
             finally:
                 D.ROOT, L.WORKSPACE_ROOT, D.load_config = old_values
 
+    def test_goal_precheck_happens_before_new_branch_checkout(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(td)
+            outside = root / "outside-goal.md"
+            outside.write_text("do not overwrite\n", encoding="utf-8")
+            goal = repo / "goal.md"
+            goal.unlink()
+            goal.symlink_to(outside)
+            old_values = (D.ROOT, L.WORKSPACE_ROOT, D.load_config)
+            try:
+                D.ROOT = root / "workspace"
+                L.WORKSPACE_ROOT = D.ROOT
+                D.load_config = lambda: {
+                    "agent_cmds": [{"label": "true", "cmd": "true"}],
+                    "validate_cmds": [{"label": "true", "cmd": "true"}],
+                    "extra_path_dirs": [], "notify_cmd": "",
+                    "defaults": {"validate_timeout": 5},
+                }
+                handler = self.ResponseCapture()
+                D.Handler.api_launch(handler, {
+                    "repo": str(repo), "name": "goal-link-branch", "agent_idx": 0,
+                    "validate_idx": 0, "new_branch": True, "goal_content": "must not escape\n",
+                })
+                self.assertEqual(handler.response[0], 400)
+                self.assertEqual(git(repo, "branch", "--show-current").stdout.strip(), "main")
+                self.assertNotEqual(git(repo, "rev-parse", "--verify", "--quiet", "loop/goal-link-branch").returncode, 0)
+            finally:
+                D.ROOT, L.WORKSPACE_ROOT, D.load_config = old_values
+
 
 class TestJobHistoryRetention(unittest.TestCase):
     """Dashboard 長跑時只保留有限已結束 job，活躍 job 與 workspace 真相不受影響。"""

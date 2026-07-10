@@ -29,6 +29,7 @@ Dashboard 啟動 loop（或直接執行 loop.py）
 ```
 
 每輪都會保護 `goal.md`、計畫與 state。驗證失敗或偵測到竄改時，會回到最後綠點。`--reset-state` 和 Dashboard 的 plan 匯入都是交易式操作：新流程未通過啟動檢查時，舊進度仍保留。
+Dashboard 啟動若同時要求匯入 goal 與新 branch，會先完成 goal 路徑安全檢查，再進行 branch checkout；任何 goal 錯誤都不會留下半套 Git branch mutation。
 
 Loop 另以 OS 鎖維持單 writer：同一 workspace 或同一 Git worktree 不能同時跑兩個 loop（即使來自不同 Dashboard／終端機）。不同 Git worktree 可各自運行，保留日後有限並行的隔離邊界；目前不會自動拆任務、合併分支或建立多份協調 state。
 

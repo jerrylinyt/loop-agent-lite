@@ -1336,6 +1336,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._err("plan.json 校驗未過:\n- " + "\n- ".join(errs))
                 return
         goal_content = str(body.get("goal_content") or "")
+        goal_path = None
+        if goal_content.strip():
+            # 所有可失敗的 goal 檢查先於 new_branch checkout；失敗的 launch 不得留下
+            # 使用者未要求的 branch mutation。atomic_write 仍會在真正寫入時重驗一次。
+            try:
+                goal_path = loop_mod.repo_relative_path(repo, "goal.md")
+            except (OSError, ValueError) as e:
+                self._err(f"goal.md 不安全或無法寫入:{e}")
+                return
         # 衝突檢查 + git mutation + spawn 全包進同一個 lock,且順序=先檢查再 mutate(#2):
         # 對正在跑的 repo 再按啟動時,必須在切 branch/改 goal 前就擋下,否則現有 loop 會被動到。
         with JOBS_LOCK:
@@ -1366,7 +1375,6 @@ class Handler(BaseHTTPRequestHandler):
             # 內容與 HEAD 相同就不產生新 commit。
             if goal_content.strip():
                 try:
-                    goal_path = loop_mod.repo_relative_path(repo, "goal.md")
                     loop_mod.atomic_write_bytes(goal_path, goal_content.encode("utf-8"))
                 except (OSError, ValueError) as e:
                     self._err(f"goal.md 不安全或無法寫入:{e}")
