@@ -2,6 +2,10 @@
 
 用 Python 協調 agent 的規劃／執行迴圈，並提供一個可在瀏覽器操作的 Dashboard。
 
+![Dashboard 執行中展示](docs/dashboard-running.jpg)
+
+Dashboard 執行中時，左側顯示 Loop 狀態與驗證紀錄，右側顯示 Agent 輸出；兩側可拖曳調整寬度或收合。
+
 ## 流程
 
 ```text
