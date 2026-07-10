@@ -476,6 +476,21 @@ class TestStateSchemaGuard(unittest.TestCase):
             finally:
                 L.WORKSPACE_ROOT = old_root
 
+    def test_invalid_temporal_metadata_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d)
+                ws = L.Workspace("schema-time")
+                invalid = {"phase": "plan", "agent_backoff_until": 123,
+                           "last_state_recovery": {"bad": True}}
+                ws.state_path.write_text(json.dumps(invalid), encoding="utf-8")
+                ws.checkpoint_path.write_text(json.dumps(invalid), encoding="utf-8")
+                with self.assertRaises(L.StateLoadError):
+                    ws.load_state()
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
 
 class TestConsoleRotation(unittest.TestCase):
     """完整 console 必須在上限前輪替，且按新舊順序保留固定份數。"""

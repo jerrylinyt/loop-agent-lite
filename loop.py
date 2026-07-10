@@ -622,6 +622,9 @@ def validate_state_shape(state, label: str):
         if (isinstance(delay, bool) or not isinstance(delay, (int, float)) or
                 not math.isfinite(delay) or delay < 0):
             raise StateLoadError(f"{label} agent_backoff_seconds 必須是有限非負數")
+    for field in ("agent_backoff_until", "last_state_recovery"):
+        if field in state and state[field] is not None and not isinstance(state[field], str):
+            raise StateLoadError(f"{label} {field} 必須是字串或 null")
     if "goal_changed" in state and not isinstance(state["goal_changed"], bool):
         raise StateLoadError(f"{label} goal_changed 必須是 boolean")
     return state
