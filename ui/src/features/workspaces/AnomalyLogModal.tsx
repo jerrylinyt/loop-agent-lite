@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import type { AnomalyListResponse, AnomalyLogResponse, AnomalyRecord } from "../../shared/api/types";
 import Modal from "../../shared/components/Modal";
@@ -18,6 +18,7 @@ export default function AnomalyLogModal({ workspace, run = "current", onClose }:
   const [selected, setSelected] = useState<AnomalyRecord | null>(null);
   const [log, setLog] = useState<AnomalyLogResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  const logRequestSeq = useRef(0);
 
   useEffect(() => {
     let active = true;
@@ -34,6 +35,8 @@ export default function AnomalyLogModal({ workspace, run = "current", onClose }:
   }, [run, workspace]);
 
   const openRecord = async (record: AnomalyRecord) => {
+    const seq = logRequestSeq.current + 1;
+    logRequestSeq.current = seq;
     setSelected(record);
     if (!record.log_id) {
       setLog({ error: "此異常發生在 log 保留功能啟用前，只有輪次判定，沒有 Agent log。" });
@@ -43,6 +46,7 @@ export default function AnomalyLogModal({ workspace, run = "current", onClose }:
     const response = await getJson<AnomalyLogResponse>(
       `/api/anomaly-log?ws=${encodeURIComponent(record.workspace)}&id=${encodeURIComponent(record.log_id)}`
     );
+    if (seq !== logRequestSeq.current) return;
     setLog(response ?? { error: "異常 log 讀取失敗" });
   };
 
