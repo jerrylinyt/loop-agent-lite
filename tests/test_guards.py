@@ -2023,5 +2023,61 @@ class TestFleetHistoryProjection(unittest.TestCase):
                 D.ROOT = old_root
 
 
+class TestFreshStartClearsRoundArtifacts(unittest.TestCase):
+    """reset/import 是交易式「從頭跑」:preflight 通過後舊 run 的 history/REPORT/prompt/log
+    不得混進新 run(history 輪替保留 .1);preflight 失敗時全數保留。"""
+
+    def _seed(self, workspace_root, name):
+        wsd = workspace_root / name
+        (wsd / "prompts").mkdir(parents=True)
+        (wsd / "logs").mkdir(parents=True)
+        (wsd / "state.json").write_text(json.dumps({"phase": "plan", "round": 7}), encoding="utf-8")
+        (wsd / "history.log").write_text(
+            "2026-07-09T22:00:00 round=7 phase=plan task=- rc=0 changed=False "
+            "signal=- tamper=False agent_ok=True validate=- flag=3 done=0\n", encoding="utf-8")
+        (wsd / "REPORT.md").write_text("stale report\n", encoding="utf-8")
+        (wsd / "prompts" / "round-0007.md").write_text("stale prompt\n", encoding="utf-8")
+        (wsd / "logs" / "round-0007.log").write_text("stale log\n", encoding="utf-8")
+        return wsd
+
+    def _run_reset(self, repo, workspace_root, name, validate_cmd):
+        env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+        agent = f"{sys.executable} -c pass"
+        return subprocess.run(
+            [sys.executable, LOOP_PY, "--repo", str(repo), "--name", name,
+             "--agent-cmd", agent, "--validate-cmd", validate_cmd,
+             "--reset-state", "--max-rounds", "1"],
+            capture_output=True, text=True, env=env)
+
+    def test_successful_reset_rotates_history_and_clears_artifacts(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = make_repo(d)
+            workspace_root = Path(d) / "ws"
+            wsd = self._seed(workspace_root, "fresh-clear")
+            r = self._run_reset(repo, workspace_root, "fresh-clear", "true")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            history = (wsd / "history.log").read_text(encoding="utf-8")
+            self.assertIn("round=1", history, "新 run 應從 round=1 開始")
+            self.assertNotIn("round=7", history, "舊 run 的輪次不得混入")
+            self.assertIn("round=7", (wsd / "history.log.1").read_text(encoding="utf-8"),
+                          "舊 history 應輪替保留一代")
+            self.assertFalse((wsd / "REPORT.md").exists(), "過期 REPORT 應清除")
+            prompts = sorted(p.name for p in (wsd / "prompts").glob("round-*.md"))
+            self.assertEqual(prompts, ["round-0001.md"], "舊 prompt 不得蓋過新 run 的投影")
+
+    def test_failed_preflight_preserves_previous_artifacts(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = make_repo(d)
+            workspace_root = Path(d) / "ws"
+            wsd = self._seed(workspace_root, "fresh-keep")
+            r = self._run_reset(repo, workspace_root, "fresh-keep", "false")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("round=7", (wsd / "history.log").read_text(encoding="utf-8"),
+                          "preflight 失敗時舊 history 原封不動")
+            self.assertFalse((wsd / "history.log.1").exists())
+            self.assertTrue((wsd / "REPORT.md").exists())
+            self.assertTrue((wsd / "prompts" / "round-0007.md").exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

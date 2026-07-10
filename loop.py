@@ -1175,8 +1175,19 @@ def main():
     # preflight 已通過：此刻才原子提交 reset/import 的全新 state。Agent 尚未啟動時若失敗，
     # state 仍是完整、可再次 Run 的 stopped workspace，不會是半套 import state。
     ws.save_state(state)
-    if args.reset_state or args.import_plan:
+    if fresh_start:
+        # reset/import=「從頭跑」:round 重新從 1 起算,上一輪 run 的逐輪產物不得混進新 run——
+        # 舊 history 會污染輪次紀錄/sparkline/事件流,舊 prompt(round 編號較大)會蓋過新 run 的
+        # prompt 投影。history 具稽核價值,輪替保留一代 .1;其餘直接清除。
+        # 清理與上面的 save_state 同屬 preflight 通過後的交易提交點:啟動檢查失敗時全數保留。
         (ws.dir / "pending_issues").unlink(missing_ok=True)
+        (ws.dir / "REPORT.md").unlink(missing_ok=True)
+        if ws.history.exists():
+            os.replace(ws.history, ws.history.with_name(f"{ws.history.name}.1"))
+        for old in (ws.dir / "logs").glob("round-*.log"):
+            old.unlink(missing_ok=True)
+        for old in (ws.dir / "prompts").glob("round-*.md"):
+            old.unlink(missing_ok=True)
     if args.import_plan and getattr(args, "consume_import_plan", False):
         Path(args.import_plan).unlink(missing_ok=True)
 
