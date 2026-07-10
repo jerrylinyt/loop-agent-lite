@@ -1616,6 +1616,67 @@ class TestWorkspaceNameGuards(unittest.TestCase):
                 D.ROOT, L.WORKSPACE_ROOT, D.load_config = old_values
 
 
+class TestProtectedPathGuards(unittest.TestCase):
+    """goal/plan-doc 只能落在 target repo 內的 regular file，不得穿越或跟隨 symlink。"""
+
+    def test_cli_rejects_escape_absolute_and_symlink_paths_before_workspace(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            outside = root / "outside.md"
+            outside.write_text("outside secret\n", encoding="utf-8")
+            (repo / "goal-link").symlink_to(outside)
+            workspace_root = root / "workspace"
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            cases = [
+                ("--goal", "../outside.md"),
+                ("--goal", str(outside)),
+                ("--goal", "goal-link"),
+                ("--plan-doc", "../outside.md"),
+            ]
+            for index, (option, value) in enumerate(cases):
+                result = subprocess.run(
+                    [sys.executable, LOOP_PY, "--repo", str(repo), "--name", f"protected-{index}",
+                     "--agent-cmd", "true", "--validate-cmd", "true", "--preflight-only",
+                     option, value],
+                    capture_output=True, text=True, env=env,
+                )
+                with self.subTest(option=option, value=value):
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn(option, result.stderr)
+                    self.assertFalse(workspace_root.exists(), "非法 protected path 不得建立 workspace")
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside secret\n")
+
+    def test_workspace_and_dashboard_reject_unsafe_goal_projection(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            outside = root / "outside.md"
+            outside.write_text("do not expose\n", encoding="utf-8")
+            workspace_root = root / "workspace"
+            old_values = (L.WORKSPACE_ROOT, D.ROOT)
+            try:
+                L.WORKSPACE_ROOT = workspace_root
+                ws = L.Workspace("protected")
+                with self.assertRaises(ValueError):
+                    ws.snapshot_protected(repo, ["../outside.md"])
+                with self.assertRaises(ValueError):
+                    ws.snapshot_protected(repo, [str(outside)])
+
+                D.ROOT = workspace_root
+                dashboard_workspace = workspace_root / "dashboard"
+                dashboard_workspace.mkdir(parents=True)
+                (dashboard_workspace / "state.json").write_text(json.dumps({
+                    "phase": "done",
+                    "config": {"repo": str(repo), "goal": "../outside.md"},
+                }), encoding="utf-8")
+                projection = D.read_goal("dashboard")
+                self.assertIn("goal 路徑不合法", projection["error"])
+                self.assertNotIn("do not expose", json.dumps(projection, ensure_ascii=False))
+            finally:
+                L.WORKSPACE_ROOT, D.ROOT = old_values
+
+
 class TestGoalProjection(unittest.TestCase):
     """goal 唯讀投影:從 state.config 的 repo+goal 讀人類真相;缺 config/缺檔回明確 error。"""
 

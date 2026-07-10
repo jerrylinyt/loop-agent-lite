@@ -590,7 +590,10 @@ def read_goal(name):
     repo, goal_rel = c.get("repo"), c.get("goal") or "goal.md"
     if not repo:
         return {"error": "state 缺 repo 設定(舊版 state)——用啟動表單跑過一次後即可檢視 goal"}
-    goal_path = Path(repo).expanduser() / goal_rel
+    try:
+        goal_path = loop_mod.repo_relative_path(Path(repo).expanduser(), goal_rel)
+    except ValueError as e:
+        return {"error": f"goal 路徑不合法:{e}"}
     try:
         return {"content": goal_path.read_text(encoding="utf-8"), "path": str(goal_path),
                 "goal_changed": bool(st.get("goal_changed"))}

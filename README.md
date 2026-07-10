@@ -81,6 +81,7 @@ Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace 
 round timeout、退避與測試輪數不可為負，所有秒數／分鐘數都必須是有限數字。
 workspace 名稱只允許英數、`.`、`_`、`-`，且不可為 `.`、`..` 或以 `.` 開頭；若 repo
 目錄本身是 hidden 目錄，請明確以 `--name` 指定一個符合規則的名稱。
+`--goal` 與 `--plan-doc` 也必須是 target repo 內的相對 regular file；不得使用 `..`、絕對路徑或 symlink。
 
 ## Dashboard 操作
 

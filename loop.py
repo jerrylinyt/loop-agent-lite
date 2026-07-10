@@ -98,6 +98,42 @@ def workspace_path(root: Path, name: str) -> Path:
     return path
 
 
+def repo_relative_path(repo: Path, rel: str) -> Path:
+    """解析受保護檔案；只接受 repo 內的相對 regular file，拒絕 traversal 與 symlink。"""
+    if not isinstance(rel, str) or not rel:
+        raise ValueError("受保護檔案路徑不可為空")
+    candidate = Path(rel)
+    if candidate.is_absolute() or not candidate.parts or ".." in candidate.parts:
+        raise ValueError(f"受保護檔案路徑 {rel!r} 必須是 repo 內的相對路徑")
+    root = Path(repo).resolve()
+    current = root
+    try:
+        for part in candidate.parts:
+            current = current / part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                break
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError(f"受保護檔案路徑 {rel!r} 不可經由 symbolic link")
+        resolved = (root / candidate).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as e:
+            raise ValueError(f"受保護檔案路徑 {rel!r} 不得逸出 repo") from e
+    except OSError as e:
+        raise ValueError(f"受保護檔案路徑 {rel!r} 無法檢查:{e}") from e
+    try:
+        final_info = (root / candidate).lstat()
+    except FileNotFoundError:
+        return root / candidate
+    except OSError as e:
+        raise ValueError(f"受保護檔案路徑 {rel!r} 無法讀取:{e}") from e
+    if not stat.S_ISREG(final_info.st_mode):
+        raise ValueError(f"受保護檔案路徑 {rel!r} 必須是 regular file")
+    return root / candidate
+
+
 class WorkspaceOperationLockError(RuntimeError):
     """另一個 archive/restore 或 CLI 正在改同名 workspace 的 root entry。"""
 
@@ -582,14 +618,19 @@ class Workspace:
     # ---- 受保護檔案快照(goal / 初步規劃書) ----
     def snapshot_protected(self, repo, rel_paths):
         for rel in rel_paths:
-            (self.dir / "snapshots" / rel.replace("/", "__")).write_bytes((repo / rel).read_bytes())
+            target = repo_relative_path(repo, rel)
+            (self.dir / "snapshots" / rel.replace("/", "__")).write_bytes(target.read_bytes())
 
     def protected_changed(self, repo, rel_paths):
         """純偵測:回傳被刪或被改的受保護檔案清單(空 = 沒人亂動)。不寫回。"""
         hit = []
         for rel in rel_paths:
             snap = (self.dir / "snapshots" / rel.replace("/", "__")).read_bytes()
-            target = repo / rel
+            try:
+                target = repo_relative_path(repo, rel)
+            except ValueError:
+                hit.append(rel)
+                continue
             if (not target.exists()) or target.read_bytes() != snap:
                 hit.append(rel)
         return hit
@@ -599,7 +640,7 @@ class Workspace:
         寫回前先建父目錄:green 不含該子目錄時 write_bytes 會 FileNotFoundError(#1)。"""
         for rel in rel_paths:
             snap = (self.dir / "snapshots" / rel.replace("/", "__")).read_bytes()
-            target = repo / rel
+            target = repo_relative_path(repo, rel)
             if (not target.exists()) or target.read_bytes() != snap:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(snap)
@@ -809,7 +850,15 @@ def main():
     agent_cmd = shlex.split(args.agent_cmd) if args.agent_cmd else AGENT_CMD
     validate_cmd = shlex.split(args.validate_cmd) if args.validate_cmd else VALIDATE_CMD
     protected = [args.goal] + ([args.plan_doc] if args.plan_doc else [])
-    plan_doc_display = str(repo / args.plan_doc) if args.plan_doc else "(未提供——以 goal、現有計畫與實際程式碼為準)"
+    for option, rel in (("--goal", args.goal), ("--plan-doc", args.plan_doc)):
+        if not rel:
+            continue
+        try:
+            repo_relative_path(repo, rel)
+        except ValueError as e:
+            ap.error(f"{option} {e}")
+    plan_doc_display = (str(repo_relative_path(repo, args.plan_doc)) if args.plan_doc
+                        else "(未提供——以 goal、現有計畫與實際程式碼為準)")
 
     # preflight 失敗也必須出現在 dashboard 的完整 console。舊流程直到所有 git
     # 檢查通過後才設定 console，導致「pid 出現後立刻停止」卻完全看不到原因。
@@ -938,7 +987,8 @@ def main():
         ws.snapshot_protected(repo, protected)
 
     # goal 變更偵測:停機期間人改 goal 是合法的,但既有計畫是舊 goal 收斂的——大聲提醒
-    goal_hash = sha256_bytes((repo / args.goal).read_bytes())
+    goal_path = repo_relative_path(repo, args.goal)
+    goal_hash = sha256_bytes(goal_path.read_bytes())
     if state.get("goal_hash") and state["goal_hash"] != goal_hash and state.get("plan"):
         state["goal_changed"] = True
         log("⚠ goal 已變更,但計畫是舊 goal 收斂的——建議回規劃期重新收斂(dashboard ⏪);刻意如此可忽略")
@@ -1012,7 +1062,7 @@ def main():
         f"round-timeout={args.round_timeout:g}min  agent-backoff≤{args.agent_backoff_max:g}s  "
         f"validate-timeout={args.validate_timeout:g}s")
 
-    goal_text = (repo / args.goal).read_text(encoding="utf-8")
+    goal_text = goal_path.read_text(encoding="utf-8")
 
     while state["phase"] != "done":
         # 接住「上一輪落盤後、下一輪 while 開始前」送達的請求，不再 spawn 新 Agent。
@@ -1037,7 +1087,12 @@ def main():
                 old.unlink(missing_ok=True)
 
         # 每輪 spawn 前檢查:goal 是人類真相,不存在就 fail-closed 停機(輪末 revert 防線的 backstop)
-        if not (repo / args.goal).exists():
+        try:
+            goal_path = repo_relative_path(repo, args.goal)
+        except ValueError as e:
+            ws.save_state(state)
+            fail(f"goal 路徑不合法：{e}")
+        if not goal_path.exists():
             ws.save_state(state)
             notify(args.notify_cmd, "goal_missing", ws.dir.name)
             fail(f"{args.goal} 不存在（每輪啟動前檢查）——請補回並 commit 後再啟動")
