@@ -1464,6 +1464,29 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     preselect = ""
     readonly = False
+    # 路由表讓 endpoint 清單可一次掃讀；值用 method 名稱以避免 class 建立前引用尚未宣告的方法。
+    POST_ROUTES = {
+        "/api/launch": "api_launch",
+        "/api/drain": "api_drain",
+        "/api/cancel-drain": "api_cancel_drain",
+        "/api/stop": "api_stop",
+        "/api/run": "api_run",
+        "/api/edit-state": "api_edit_state",
+        "/api/edit-config": "api_edit_config",
+        "/api/validate": "api_validate",
+        "/api/preflight": "api_preflight",
+        "/api/test-agent": "api_test_agent",
+        "/api/test-cli": "api_test_cli",
+        "/api/edit-cli-config": "api_edit_cli_config",
+        "/api/edit-repo-roots": "api_edit_repo_roots",
+        "/api/edit-notify": "api_edit_notify",
+        "/api/test-notify": "api_test_notify",
+        "/api/phase": "api_phase",
+        "/api/set-task": "api_set_task",
+        "/api/archive-workspace": "api_archive_workspace",
+        "/api/restore-workspace": "api_restore_workspace",
+        "/api/delete-archive": "api_delete_archive",
+    }
 
     def log_message(self, *a):
         """停用 BaseHTTPRequestHandler 預設 access log，避免污染 operator console。"""
@@ -1803,48 +1826,12 @@ class Handler(BaseHTTPRequestHandler):
             self._err("body 必須是 JSON")
             return
         try:
-            if u.path == "/api/launch":
-                self.api_launch(body)
-            elif u.path == "/api/drain":
-                self.api_drain(body)
-            elif u.path == "/api/cancel-drain":
-                self.api_cancel_drain(body)
-            elif u.path == "/api/stop":
-                self.api_stop(body)
-            elif u.path == "/api/run":
-                self.api_run(body)
-            elif u.path == "/api/edit-state":
-                self.api_edit_state(body)
-            elif u.path == "/api/edit-config":
-                self.api_edit_config(body)
-            elif u.path == "/api/validate":
-                self.api_validate(body)
-            elif u.path == "/api/preflight":
-                self.api_preflight(body)
-            elif u.path == "/api/test-agent":
-                self.api_test_agent(body)
-            elif u.path == "/api/test-cli":
-                self.api_test_cli(body)
-            elif u.path == "/api/edit-cli-config":
-                self.api_edit_cli_config(body)
-            elif u.path == "/api/edit-repo-roots":
-                self.api_edit_repo_roots(body)
-            elif u.path == "/api/edit-notify":
-                self.api_edit_notify(body)
-            elif u.path == "/api/test-notify":
-                self.api_test_notify(body)
-            elif u.path == "/api/phase":
-                self.api_phase(body)
-            elif u.path == "/api/set-task":
-                self.api_set_task(body)
-            elif u.path == "/api/archive-workspace":
-                self.api_archive_workspace(body)
-            elif u.path == "/api/restore-workspace":
-                self.api_restore_workspace(body)
-            elif u.path == "/api/delete-archive":
-                self.api_delete_archive(body)
-            else:
+            handler_name = Handler.POST_ROUTES.get(u.path)
+            if handler_name is None:
                 self._err("not found", 404)
+                return
+            # 以 Handler 取未綁定 method，測試可繼續用輕量 fake handler 驗證 request 邊界。
+            getattr(Handler, handler_name)(self, body)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
