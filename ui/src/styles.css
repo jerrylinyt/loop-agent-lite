@@ -612,3 +612,12 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .sr-status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .bulk-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin: 0 0 10px; }
 .bulk-toolbar select[multiple] { min-width: 230px; max-height: 92px; padding: 4px; }
+.notification-trigger { position: relative; }
+.notification-trigger b { display: inline-grid; min-width: 17px; height: 17px; margin-left: 4px; padding: 0 4px; place-items: center; border-radius: 9px; background: var(--danger); color: white; font-size: 10px; }
+.notification-list { display: grid; gap: 5px; max-height: 58vh; overflow: auto; }
+.notification-item { display: grid; gap: 4px; width: 100%; padding: 9px 11px; border: 1px solid var(--border-soft); border-left: 3px solid var(--accent); border-radius: 8px; background: var(--surface-subtle); color: var(--text); text-align: left; cursor: pointer; }
+.notification-item.warning { border-left-color: var(--warning); }
+.notification-item.success { border-left-color: var(--success); }
+.notification-item.read { opacity: .65; }
+.notification-item > span { display: flex; justify-content: space-between; gap: 8px; }
+.notification-item small, .notification-item p { margin: 0; color: var(--muted); }
