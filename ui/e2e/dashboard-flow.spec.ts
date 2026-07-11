@@ -152,6 +152,10 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(palette).toBeHidden();
   await page.keyboard.press("ControlOrMeta+KeyG");
   await expect(page.locator(".navigation-chord")).toContainText("按 0 回總覽");
+  // chord 超時必須自行解除，避免很久之後輸入數字仍意外切換 workspace。
+  await expect(page.locator(".navigation-chord")).toBeHidden({ timeout: 2500 });
+  await page.keyboard.press("ControlOrMeta+KeyG");
+  await expect(page.locator(".navigation-chord")).toBeVisible();
   await page.keyboard.press("0");
   await expect(page.getByRole("main", { name: "工作區總覽" })).toBeVisible();
   await page.keyboard.press("ControlOrMeta+KeyG");
