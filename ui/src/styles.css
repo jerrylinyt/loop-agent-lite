@@ -611,15 +611,6 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .incident-card div { display: flex; flex-wrap: wrap; gap: 5px; }
 .bulk-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin: 0 0 10px; }
 .bulk-toolbar select[multiple] { min-width: 230px; max-height: 92px; padding: 4px; }
-.notification-trigger { position: relative; }
-.notification-trigger b { display: inline-grid; min-width: 17px; height: 17px; margin-left: 4px; padding: 0 4px; place-items: center; border-radius: 9px; background: var(--danger); color: white; font-size: 10px; }
-.notification-list { display: grid; gap: 5px; max-height: 58vh; overflow: auto; }
-.notification-item { display: grid; gap: 4px; width: 100%; padding: 9px 11px; border: 1px solid var(--border-soft); border-left: 3px solid var(--accent); border-radius: 8px; background: var(--surface-subtle); color: var(--text); text-align: left; cursor: pointer; }
-.notification-item.warning { border-left-color: var(--warning); }
-.notification-item.success { border-left-color: var(--success); }
-.notification-item.read { opacity: .65; }
-.notification-item > span { display: flex; justify-content: space-between; gap: 8px; }
-.notification-item small, .notification-item p { margin: 0; color: var(--muted); }
 .skip-link { position: fixed; z-index: 10000; top: 8px; left: 8px; padding: 8px 11px; border-radius: 7px; background: var(--accent); color: white; transform: translateY(-150%); }
 .skip-link:focus { transform: translateY(0); }
 :where(button, input, select, textarea, a, [tabindex]):focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 75%, white); outline-offset: 2px; }
@@ -628,7 +619,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 }
 @media (forced-colors: active) {
   .health-strip-fill, .fleet-progress-fill { forced-color-adjust: none; background: Highlight !important; }
-  .phase-badge, .chip, .notification-trigger b { border: 1px solid ButtonText; }
+  .phase-badge, .chip { border: 1px solid ButtonText; }
 }
 .getting-started { width: min(760px, calc(100vw - 40px)); margin-top: 20px; padding: 16px; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--surface-subtle); text-align: left; }
 .getting-started-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; }

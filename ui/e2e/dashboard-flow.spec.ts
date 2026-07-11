@@ -303,12 +303,6 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(incidents).toContainText("e2e-workspace");
   await incidents.getByRole("button", { name: "關閉對話框" }).click();
 
-  await page.getByRole("button", { name: /🔔 通知/ }).click();
-  const notifications = page.getByRole("dialog", { name: "通知中心" });
-  await expect(notifications).toContainText("e2e-workspace");
-  await notifications.getByRole("button", { name: "全部標記已讀" }).click();
-  await notifications.getByRole("button", { name: "關閉對話框" }).click();
-
   await page.getByRole("button", { name: "⌕ 全域搜尋" }).click();
   const globalSearch = page.getByRole("dialog", { name: "全域搜尋" });
   await globalSearch.getByLabel("全域搜尋文字").fill("E2E structured issue");

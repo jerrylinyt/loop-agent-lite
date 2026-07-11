@@ -11,7 +11,6 @@ import WorkspaceDoctorModal from "../features/workspaces/WorkspaceDoctorModal";
 import GlobalSearchModal from "../features/workspaces/GlobalSearchModal";
 import CommandPalette from "../features/workspaces/CommandPalette";
 import IncidentCenterModal from "../features/workspaces/IncidentCenterModal";
-import NotificationCenterModal, { notificationItems, readNotificationSeen } from "../features/workspaces/NotificationCenterModal";
 import useDashboardData from "./useDashboardData";
 import useStatusFavicon from "./useStatusFavicon";
 import GettingStarted from "../features/launcher/GettingStarted";
@@ -24,8 +23,6 @@ export default function App() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [incidentsOpen, setIncidentsOpen] = useState(false);
-  const [notificationsOpen, setNotificationsOpen] = useState(false);
-  const [notificationVersion, setNotificationVersion] = useState(0);
   const [overviewOpen, setOverviewOpen] = useState(() => localStorage.getItem("fleet-overview") === "1");
   const [attentionRequest, setAttentionRequest] = useState(0);
   const [leftWidth, setLeftWidth] = useState(() => +(localStorage.getItem("left-pane-width") || Math.round(window.innerWidth * 0.44)));
@@ -107,10 +104,6 @@ export default function App() {
     { id: "archives", label: "查看已封存", hint: "還原或永久刪除", run: () => setArchivesOpen(true) },
     ...(!dashboard.bootstrap.readonly ? [{ id: "launch", label: "啟動／管理", hint: "建立或重新啟動 loop", run: () => setLauncherOpen(true) }] : [])
   ], [dashboard.bootstrap.readonly]);
-  const unreadNotifications = useMemo(() => {
-    const seen = readNotificationSeen();
-    return notificationItems(dashboard.workspaces, dashboard.fleetHistory).filter((item) => !seen.has(item.id)).length;
-  }, [dashboard.fleetHistory, dashboard.workspaces, notificationVersion]);
 
   return (
     <>
@@ -131,7 +124,6 @@ export default function App() {
             <button type="button" className="secondary-button" onClick={() => setSearchOpen(true)}>⌕ 全域搜尋</button>
             <button type="button" className="secondary-button" onClick={() => setDoctorOpen(true)}>🩺 問題中心</button>
             <button type="button" className="secondary-button" onClick={() => setIncidentsOpen(true)}>⚡ Incidents</button>
-            <button type="button" className="secondary-button notification-trigger" onClick={() => setNotificationsOpen(true)}>🔔 通知{unreadNotifications > 0 && <b aria-label={`${unreadNotifications} 則未讀`}>{Math.min(unreadNotifications, 99)}</b>}</button>
             <button type="button" className={`secondary-button${overviewOpen ? " active-toggle" : ""}`} aria-pressed={overviewOpen} onClick={toggleOverview}>📺 總覽</button>
             <button type="button" className="secondary-button" onClick={() => setArchivesOpen(true)}>🗃 已封存</button>
             {!dashboard.bootstrap.readonly && <button type="button" className="success-button" onClick={() => setLauncherOpen(true)}>＋ 啟動／管理</button>}
@@ -166,7 +158,6 @@ export default function App() {
       {searchOpen && <GlobalSearchModal onClose={() => setSearchOpen(false)} onSelect={selectFromSearch} />}
       {paletteOpen && <CommandPalette workspaces={dashboard.workspaces} commands={paletteCommands} onClose={() => setPaletteOpen(false)} onSelectWorkspace={(name) => { dashboard.selectWorkspace(name); setOverviewOpen(false); }} />}
       {incidentsOpen && <IncidentCenterModal workspaces={dashboard.workspaces} history={dashboard.fleetHistory} onClose={() => setIncidentsOpen(false)} onSelect={selectFromOverview} />}
-      {notificationsOpen && <NotificationCenterModal workspaces={dashboard.workspaces} history={dashboard.fleetHistory} onClose={() => setNotificationsOpen(false)} onSelect={selectFromOverview} onSeenChanged={() => setNotificationVersion((value) => value + 1)} />}
     </>
   );
 }
