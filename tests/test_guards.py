@@ -11,6 +11,7 @@
 import io
 import json
 import os
+import select
 import signal
 import shlex
 import shutil
@@ -1161,10 +1162,20 @@ class TestStatusCli(unittest.TestCase):
                     [sys.executable, STATUS_PY, "--name", "watch-status", "--json",
                      "--watch", "--interval", "0.01"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+                captured = []
                 try:
-                    time.sleep(0.08)
+                    # 等 CLI 真正進入 watch loop 並輸出兩筆，再驗證 Ctrl-C；固定 sleep
+                    # 可能在較慢機器的 Python import 階段就送 SIGINT，造成與產品無關的 -2。
+                    deadline = time.monotonic() + 2
+                    while len(captured) < 2 and time.monotonic() < deadline:
+                        ready, _, _ = select.select([process.stdout], [], [], 0.1)
+                        if ready:
+                            line = process.stdout.readline()
+                            if line:
+                                captured.append(line)
                     process.send_signal(signal.SIGINT)
                     output, error = process.communicate(timeout=2)
+                    output = "".join(captured) + output
                 finally:
                     if process.poll() is None:
                         process.kill()
