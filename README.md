@@ -38,9 +38,12 @@ Loop 另以 OS 鎖維持單 writer：同一 workspace 或同一 Git worktree 不
 專案參考 v3 的 Python package／console-script 方式安裝；lite 版只公開 Dashboard：
 
 ```bash
-python3 -m pip install -e .
+pipx install --editable .
 loop dashboard
 ```
+
+`pipx` 會建立隔離環境並把 `loop` 放進使用者 PATH，不會修改 Homebrew 管理的 Python。
+若尚未安裝 pipx，可先執行 `brew install pipx`。
 
 開啟終端顯示的本機網址（預設從 <http://127.0.0.1:8765/> 開始；port 被占用會自動往上找）。
 安裝後不需要直接操作任何 Python 檔案；`loop` 目前唯一公開子命令就是 `dashboard`。
