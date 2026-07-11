@@ -1448,6 +1448,54 @@ def establish_startup_green_anchor(repo: Path, workspace, state, protected,
          f"起點必須是可信綠點。先把工作樹修到 validate 綠再 resume。輸出尾段:\n{tail}")
 
 
+def ingest_pending_issues(workspace, state, round_token: str, round_number: int,
+                          task_id: str, phase: str) -> None:
+    """安全讀取單輪 issue signal、套用數量/長度上限，並合併進 coordinator state。"""
+    pending_path = workspace.pending_issues(round_token)
+    try:
+        pending_text = read_regular_text(pending_path, "pending issue")
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        # 外力若把 signal 換成 symlink/FIFO，只忽略該 round，不可跟隨到 workspace 外。
+        log(f"⚠️ 忽略不安全的 pending issue：{e}")
+        return
+
+    issue_lines = [line.strip()[:ISSUE_MAX_CHARS]
+                   for line in pending_text.splitlines() if line.strip()]
+    if len(issue_lines) > ISSUES_MAX_PENDING:
+        issue_lines = issue_lines[-ISSUES_MAX_PENDING:]
+        log(f"⚠️ pending issues 超過單輪上限 {ISSUES_MAX_PENDING}，只保留最新項目")
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    issues = state.setdefault("issues", [])
+    issues.extend({"round": round_number, "where": task_id or phase,
+                   "text": line, "ts": timestamp} for line in issue_lines)
+    if len(issues) > ISSUES_MAX_COUNT:
+        state["issues"] = issues[-ISSUES_MAX_COUNT:]
+        log(f"⚠️ issues 已達保留上限 {ISSUES_MAX_COUNT}，只保留最新項目")
+    pending_path.unlink()
+    for line in issue_lines:
+        log(f"⚠️ Agent 回報 issue｜{line}")
+    if issue_lines:
+        log(f"📌 Issue 累計｜目前有 {len(state.get('issues', []))} 條，"
+            f"未讀 {unread_issue_count(state)} 條")
+
+
+def write_run_report(repo: Path, workspace, state) -> Path:
+    """由最終 state 產生人類可讀報告並原子寫入 workspace。"""
+    report = (f"# loop-agent-lite RUN REPORT\n\n"
+              f"- repo: {repo}\n- 結束時間: {datetime.now().isoformat(timespec='seconds')}\n"
+              f"- 總輪數: {state['round']}\n- plan 版本: v{state['plan_version']}\n"
+              f"- 完成任務:\n"
+              + "".join(f"  - task-{entry['order']} @ {entry['sha'][:8]}(round {entry['round']})\n"
+                        for entry in state["completed"])
+              + f"- reset 統計: {state['task_reset_counts'] or '無'}\n"
+                f"- 逐輪紀錄: {workspace.history}\n")
+    report_path = workspace_file(workspace.dir / "REPORT.md", "REPORT.md")
+    atomic_write_bytes(report_path, report.encode("utf-8"))
+    return report_path
+
+
 def main():
     """解析 CLI、執行 preflight，然後進入規劃/執行雙階段 coordinator loop。"""
     options = parse_runtime_options()
@@ -1937,38 +1985,7 @@ def main():
                     fail(f"stuck-stop：task-{state['current_order']} 已 reset {state['task_reset_counts'][key]} 次，"
                          f"停機交由人員確認。詳見 {ws.history}")
 
-        # agent 回報的 issue(work.py issue):落 state 給人類看,不影響任何計數
-        pend = ws.pending_issues(round_token)
-        try:
-            issue_text = read_regular_text(pend, "pending issue")
-        except FileNotFoundError:
-            issue_text = None
-        except (OSError, ValueError, UnicodeDecodeError) as e:
-            # 外力若把 signal 換成 symlink/FIFO，只忽略該 round 的 issue；不可讀檔不應
-            # 阻斷整個 loop，也不可跟隨到 workspace 外。
-            log(f"⚠️ 忽略不安全的 pending issue：{e}")
-            issue_text = None
-        if issue_text is not None:
-            issue_lines = []
-            for iline in issue_text.splitlines():
-                if iline.strip():
-                    issue_lines.append(iline.strip()[:ISSUE_MAX_CHARS])
-            if len(issue_lines) > ISSUES_MAX_PENDING:
-                issue_lines = issue_lines[-ISSUES_MAX_PENDING:]
-                log(f"⚠️ pending issues 超過單輪上限 {ISSUES_MAX_PENDING}，只保留最新項目")
-            for iline in issue_lines:
-                state.setdefault("issues", []).append(
-                    {"round": rnd, "where": task_id or phase, "text": iline,
-                     "ts": datetime.now().isoformat(timespec="seconds")})
-            if len(state.get("issues", [])) > ISSUES_MAX_COUNT:
-                state["issues"] = state["issues"][-ISSUES_MAX_COUNT:]
-                log(f"⚠️ issues 已達保留上限 {ISSUES_MAX_COUNT}，只保留最新項目")
-            pend.unlink()
-            for issue_text in issue_lines:
-                log(f"⚠️ Agent 回報 issue｜{issue_text}")
-            if issue_lines:
-                log(f"📌 Issue 累計｜目前有 {len(state.get('issues', []))} 條，"
-                    f"未讀 {unread_issue_count(state)} 條")
+        ingest_pending_issues(ws, state, round_token, rnd, task_id, phase)
 
         will_retry = (agent_failed and state["phase"] != "done" and
                       not (args.max_rounds and state["round"] >= args.max_rounds))
@@ -2033,17 +2050,8 @@ def main():
             break
 
     if state["phase"] == "done":
-        report = (f"# loop-agent-lite RUN REPORT\n\n"
-                  f"- repo: {repo}\n- 結束時間: {datetime.now().isoformat(timespec='seconds')}\n"
-                  f"- 總輪數: {state['round']}\n- plan 版本: v{state['plan_version']}\n"
-                  f"- 完成任務:\n"
-                  + "".join(f"  - task-{e['order']} @ {e['sha'][:8]}(round {e['round']})\n"
-                            for e in state["completed"])
-                  + f"- reset 統計: {state['task_reset_counts'] or '無'}\n"
-                  f"- 逐輪紀錄: {ws.history}\n")
-        report_path = workspace_file(ws.dir / "REPORT.md", "REPORT.md")
-        atomic_write_bytes(report_path, report.encode("utf-8"))
-        log(f"🏁 全部任務收斂。報告:{ws.dir / 'REPORT.md'}")
+        report_path = write_run_report(repo, ws, state)
+        log(f"🏁 全部任務收斂。報告:{report_path}")
         notify(args.notify_cmd, "completed", ws.dir.name)
 
 
