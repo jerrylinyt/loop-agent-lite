@@ -263,12 +263,6 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .dashboard-grid > .console-collapsed .console-expand-button { flex-direction: column; }
 .dashboard-grid > .console-collapsed .console-expand-button strong { writing-mode: vertical-rl; font-size: 12px; letter-spacing: .08em; }
 
-.edit-plan-list { flex: 1; min-height: 0; overflow: auto; padding: 10px; }
-.edit-plan-list label { display: grid; grid-template-columns: 70px 1fr; align-items: start; gap: 8px; margin-bottom: 8px; color: var(--muted); }
-.edit-plan-list textarea { min-height: 68px; resize: vertical; }
-.edit-plan-footer { display: flex; min-height: 50px; align-items: center; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--border); background: var(--surface); }
-.edit-plan-footer label { display: flex; align-items: center; gap: 6px; }
-.edit-plan-footer input { width: 75px; }
 .inline-message { min-width: 0; overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 
 .modal-backdrop { position: fixed; z-index: 100; inset: 0; display: grid; place-items: start center; overflow: auto; padding: 6vh 24px; background: var(--overlay); }
@@ -276,7 +270,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .modal-wide { width: min(760px, calc(100vw - 48px)); }
 .modal-extra-wide { width: min(1040px, calc(100vw - 48px)); }
 .modal-full-screen { width: calc(100vw - 32px); height: calc(100vh - 32px); max-height: none; }
-.modal-full-screen .modal-body { min-height: 0; }
+.modal-full-screen .modal-body { flex: 1; min-height: 0; }
 .modal-compact { width: min(480px, calc(100vw - 48px)); }
 .modal-header { display: flex; flex: none; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 14px 16px; border-bottom: 1px solid var(--border); background: var(--surface); }
 .modal-header h2 { margin: 0; font-size: 16px; }
@@ -304,7 +298,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 
 .form-grid { display: grid; gap: 10px; }
 .form-grid label, .form-field { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
-.form-grid input:not([type="checkbox"]):not([type="radio"]), .form-grid select, .form-grid textarea, .edit-plan-list textarea, .edit-plan-footer input {
+.form-grid input:not([type="checkbox"]):not([type="radio"]), .form-grid select, .form-grid textarea {
   width: 100%; min-height: 32px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 13px;
 }
 .form-grid textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
@@ -608,6 +602,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .plan-editor-actions { display: flex; gap: 5px; }
 .plan-editor-task label { display: grid; grid-template-columns: 100px minmax(0, 1fr); align-items: start; gap: 8px; color: var(--muted); font-size: 12px; }
 .plan-editor-task textarea { min-height: 68px; resize: vertical; }
+.plan-editor-task textarea, .plan-editor-task input, .plan-editor-summary input { width: 100%; min-height: 32px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 13px; }
 .insert-task-button { justify-self: center; margin-bottom: -25px; z-index: 1; padding: 4px 10px; border: 1px dashed var(--accent); border-radius: 999px; background: var(--surface-raised); color: var(--accent); cursor: pointer; }
 .plan-editor-summary { align-self: start; display: grid; gap: 12px; padding: 13px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-subtle); }
 .plan-editor-summary h3 { margin: 0; }
