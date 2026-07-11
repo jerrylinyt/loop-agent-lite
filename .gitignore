@@ -27,3 +27,6 @@ venv/
 ui/node_modules/
 ui/test-results/
 ui/playwright-report/
+
+# Claude Code session 資料與 agent worktree
+.claude/
