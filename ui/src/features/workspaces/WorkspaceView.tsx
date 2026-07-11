@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { postJson, waitForJobStartup } from "../../shared/api/client";
-import ActionDialog from "../../shared/components/ActionDialog";
+import ActionDialog, { type ActionPreviewItem } from "../../shared/components/ActionDialog";
 import type { PlanTask, StartupResponse, WorkspaceState, WorkspaceSummary } from "../../shared/api/types";
 import ConsolePane from "../console/ConsolePane";
 import HorizontalSplitter from "../layout/HorizontalSplitter";
@@ -47,6 +47,7 @@ export default function WorkspaceView({
     title: string;
     message: string;
     confirmLabel?: string;
+    preview?: ActionPreviewItem[];
     onConfirm?: () => void;
   } | null>(null);
   const canChange = !!workspace && !readonly && !workspace.running;
@@ -95,6 +96,15 @@ export default function WorkspaceView({
       title: "請確認",
       message,
       confirmLabel: "繼續",
+      preview: phase === "plan" ? [
+        { label: "清除進度", value: `${completed} 筆完成紀錄、done ${state.done_count}`, tone: completed || state.done_count ? "warning" : undefined },
+        { label: "重設暫態", value: `flag ${state.flag}、紅連跳 ${state.red_streak}、停滯 ${state.stall_rounds} → 0` },
+        { label: "保留", value: `plan v${state.plan_version}（${total} 項）與 target repo 程式碼`, tone: "safe" },
+      ] : [
+        { label: "開始任務", value: state.plan?.[0] ? `task-${state.plan[0].order}：${state.plan[0].task}` : "無計畫" },
+        { label: "重設暫態", value: `flag、done、紅連跳、停滯 → 0` },
+        { label: "保留", value: `plan v${state.plan_version} 與 target repo 程式碼`, tone: "safe" },
+      ],
       onConfirm: () => {
         setDialog(null);
         void mutate("/api/phase", { name: workspace?.name, phase });
@@ -107,10 +117,17 @@ export default function WorkspaceView({
     const message = skipped.length
       ? `跳到 task-${order}：task ${skipped.join(", ")} 會標記為人工確認完成，並先跑 validate。繼續？`
       : `退回 task-${order}：這個任務以後的完成紀錄會清除，code 不會動。繼續？`;
+    const removed = (state.completed ?? []).filter((entry) => entry.order >= order).map((entry) => `task-${entry.order}`);
     setDialog({
       title: "請確認",
       message,
       confirmLabel: "繼續",
+      preview: [
+        ...(skipped.length ? [{ label: "人工標記完成", value: skipped.map((value) => `task-${value}`).join(", "), tone: "warning" as const }] : []),
+        ...(skipped.length ? [{ label: "執行 Validate", value: `${state.config?.validate_cmd ?? "未設定"}（timeout ${state.config?.validate_timeout ?? 120} 秒）` }] : []),
+        { label: "清除完成紀錄", value: removed.length ? removed.join(", ") : "無", tone: removed.length ? "warning" : undefined },
+        { label: "保留", value: "target repo、commit 與工作樹內容完全不變", tone: "safe" },
+      ],
       onConfirm: () => {
         setDialog(null);
         void mutate("/api/set-task", { name: workspace?.name, order });
@@ -128,6 +145,12 @@ export default function WorkspaceView({
       title: "請確認",
       message: `封存 ${workspace?.name}？整個 workspace 會移到 workspace/.archive/，可從「🗃 已封存」安全還原；target repo 與程式碼不受影響。`,
       confirmLabel: "封存",
+      preview: [
+        { label: "搬移來源", value: `workspace/${workspace?.name}` },
+        { label: "目前狀態", value: `${state.phase} · round ${state.round} · 任務 ${completed}/${total}` },
+        { label: "不受影響", value: state.config?.repo ? `target repo：${state.config.repo}` : "target repo 與程式碼", tone: "safe" },
+        { label: "可復原", value: "可從「已封存」以原 workspace 名稱還原", tone: "safe" },
+      ],
       onConfirm: () => {
         setDialog(null);
         void (async () => {
@@ -225,7 +248,7 @@ export default function WorkspaceView({
       {promptOpen && workspace && <PromptModal workspace={workspace.name} onClose={() => setPromptOpen(false)} />}
       {reportOpen && workspace && <ReportModal workspace={workspace.name} onClose={() => setReportOpen(false)} />}
       {configOpen && workspace && <ConfigModal workspace={workspace.name} config={state.config ?? {}} onClose={() => setConfigOpen(false)} onChanged={onRefresh} />}
-      {dialog && <ActionDialog title={dialog.title} message={dialog.message} confirmLabel={dialog.confirmLabel} onClose={() => setDialog(null)} onConfirm={dialog.onConfirm} />}
+      {dialog && <ActionDialog title={dialog.title} message={dialog.message} confirmLabel={dialog.confirmLabel} preview={dialog.preview} onClose={() => setDialog(null)} onConfirm={dialog.onConfirm} />}
     </section>
   );
 }

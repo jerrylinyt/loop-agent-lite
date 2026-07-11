@@ -92,6 +92,11 @@ export default function ArchivesModal({
         title="確認還原"
         message={`還原 ${pending.name}？這會把完整 workspace 搬回工作區，但不會自動啟動 loop。`}
         confirmLabel="還原"
+        preview={[
+          { label: "來源", value: pending.id },
+          { label: "還原位置", value: `workspace/${pending.name}` },
+          { label: "啟動行為", value: "只還原資料，不會自動啟動 loop", tone: "safe" },
+        ]}
         onClose={() => !restoring && setPending(null)}
         onConfirm={() => void restore(pending)}
       />}
@@ -100,6 +105,11 @@ export default function ArchivesModal({
         message={`永久刪除 ${pendingDelete.name} 的封存？完整 workspace 會被移除，無法還原；target repo 與程式碼不受影響。`}
         confirmLabel="永久刪除"
         danger
+        preview={[
+          { label: "永久刪除", value: pendingDelete.id, tone: "warning" },
+          { label: "包含", value: "state、history、console、prompt、異常 log 與完成報告" },
+          { label: "不受影響", value: "target repo 與程式碼", tone: "safe" },
+        ]}
         onClose={() => !deleting && setPendingDelete(null)}
         onConfirm={() => void deleteArchive(pendingDelete)}
       />}

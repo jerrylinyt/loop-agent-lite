@@ -1,11 +1,18 @@
 import Modal from "./Modal";
 
+export interface ActionPreviewItem {
+  label: string;
+  value: string;
+  tone?: "warning" | "safe";
+}
+
 export default function ActionDialog({
   title,
   message,
   confirmLabel = "確定",
   cancelLabel = "取消",
   danger = false,
+  preview,
   onConfirm,
   onClose
 }: {
@@ -14,6 +21,7 @@ export default function ActionDialog({
   confirmLabel?: string;
   cancelLabel?: string;
   danger?: boolean;
+  preview?: ActionPreviewItem[];
   onConfirm?: () => void;
   onClose: () => void;
 }) {
@@ -31,6 +39,11 @@ export default function ActionDialog({
       )}
     >
       <p className="dialog-message">{message}</p>
+      {!!preview?.length && <dl className="action-preview" aria-label="操作影響預覽">
+        {preview.map((item) => <div className={item.tone ? `tone-${item.tone}` : ""} key={`${item.label}-${item.value}`}>
+          <dt>{item.label}</dt><dd>{item.value}</dd>
+        </div>)}
+      </dl>}
     </Modal>
   );
 }
