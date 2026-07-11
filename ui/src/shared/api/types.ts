@@ -59,21 +59,25 @@ export interface FleetHistoryEntry {
   metrics?: Omit<RoundMetrics, "samples">;
 }
 
-export interface FleetRoundMetrics {
+/** 輪次耗時／完成統計的共同核心；per-run（RoundMetrics）與 fleet 聚合（FleetRoundMetrics）各自再擴充。 */
+export interface RoundMetricsBase {
   limit: number;
-  workspace_count: number;
   sample_count: number;
   average_seconds: number | null;
   p50_seconds: number | null;
   p95_seconds: number | null;
   max_seconds: number | null;
   slowest_round: number | null;
-  slowest_workspace: string | null;
   timeout_count: number;
   timeout_rate_pct: number;
   missing_done_count: number;
   missing_done_rate_pct: number;
   history_truncated: boolean;
+}
+
+export interface FleetRoundMetrics extends RoundMetricsBase {
+  workspace_count: number;
+  slowest_workspace: string | null;
 }
 
 export interface RoundTelemetrySample {
@@ -113,21 +117,9 @@ export interface AnomalyLogResponse {
   data?: string;
 }
 
-export interface RoundMetrics {
+export interface RoundMetrics extends RoundMetricsBase {
   error?: string;
   run?: "current" | "previous";
-  limit: number;
-  sample_count: number;
-  average_seconds: number | null;
-  p50_seconds: number | null;
-  p95_seconds: number | null;
-  max_seconds: number | null;
-  slowest_round: number | null;
-  timeout_count: number;
-  timeout_rate_pct: number;
-  missing_done_count: number;
-  missing_done_rate_pct: number;
-  history_truncated: boolean;
   samples: RoundTelemetrySample[];
 }
 
