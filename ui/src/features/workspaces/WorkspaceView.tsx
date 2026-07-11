@@ -19,6 +19,7 @@ import { deriveRoundTiming, useRoundNow } from "./roundTiming";
 import useStatusPulse from "./useStatusPulse";
 
 const PHASE_NAMES = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
+type WorkspaceModal = "config" | "goal" | "history" | "issues" | "report" | "prompt" | "timeline" | "runCompare";
 
 export default function WorkspaceView({
   workspace,
@@ -35,14 +36,8 @@ export default function WorkspaceView({
   onRefresh: () => void;
   onRefreshWorkspaces: () => void | Promise<void>;
 }) {
-  const [configOpen, setConfigOpen] = useState(false);
-  const [goalOpen, setGoalOpen] = useState(false);
-  const [historyOpen, setHistoryOpen] = useState(false);
-  const [issuesOpen, setIssuesOpen] = useState(false);
-  const [reportOpen, setReportOpen] = useState(false);
-  const [promptOpen, setPromptOpen] = useState(false);
-  const [timelineOpen, setTimelineOpen] = useState(false);
-  const [runCompareOpen, setRunCompareOpen] = useState(false);
+  // 這些 Modal 在操作流程上互斥；用 union 讓「同時開兩個」成為不可表示的狀態。
+  const [activeModal, setActiveModal] = useState<WorkspaceModal | null>(null);
   const [statusHeight, setStatusHeight] = useState(() => +(localStorage.getItem("status-console-height") || 220));
   const [statusCollapsed, setStatusCollapsed] = useState(() => localStorage.getItem("status-console-collapsed") === "1");
   const [busyAction, setBusyAction] = useState<"run" | "drain" | "cancelDrain" | "stop" | null>(null);
@@ -200,21 +195,21 @@ export default function WorkspaceView({
             <button type="button" className={workspace.running ? "danger-button" : "success-button"} disabled={busyAction !== null} onClick={() => void mutate(workspace.running ? "/api/stop" : "/api/run", { name: workspace.name })}>{busyAction === "stop" ? "停止中…" : busyAction === "run" ? "啟動中…" : workspace.running ? "⏹ 立即停止" : "▶ 運行"}</button>
             {canChange && state.phase === "plan" && total > 0 && <button type="button" className="secondary-button" onClick={() => changePhase("exec")}>⏩ 進執行期</button>}
             {canChange && (state.phase === "exec" || state.phase === "done") && <button type="button" className="secondary-button" onClick={() => changePhase("plan")}>⏪ 回規劃期</button>}
-            {canChange && <button type="button" className="secondary-button" onClick={() => setConfigOpen(true)}>⚙ 設定</button>}
+            {canChange && <button type="button" className="secondary-button" onClick={() => setActiveModal("config")}>⚙ 設定</button>}
             {canChange && <button type="button" className="secondary-button" onClick={archiveWorkspace}>🗄 封存</button>}
           </div>}
         </div>
         <div className="workspace-status-row">
           <div className="primary-status">
-            <button type="button" className="chip subdued" onClick={() => setGoalOpen(true)}>🎯 goal</button>
+            <button type="button" className="chip subdued" onClick={() => setActiveModal("goal")}>🎯 goal</button>
             <span className="chip">round {state.round}</span>
             {state.phase !== "plan" && total > 0 && <span key={`${completed}-${state.current_order}`} className={`chip${pulse.has("task") ? " status-pulse" : ""}`}>任務 {completed}/{total}</span>}
             {state.phase === "plan" && <span key={state.flag} className={`chip${pulse.has("flag") ? " status-pulse" : ""}`}>flag {state.flag} / &gt;{state.config?.flag_threshold ?? 10}</span>}
             {state.phase === "exec" && <span key={state.done_count} className={`chip${pulse.has("done") ? " status-pulse" : ""}`}>done {state.done_count} / ≥{state.config?.done_threshold ?? 3}</span>}
-            {state.phase === "done" && <button type="button" className="chip report-chip" onClick={() => setReportOpen(true)}>📄 完成報告</button>}
+            {state.phase === "done" && <button type="button" className="chip report-chip" onClick={() => setActiveModal("report")}>📄 完成報告</button>}
           </div>
           <div className="health-status">
-            {state.round > 0 && workspace && <RoundSparkline workspace={workspace.name} round={state.round} onOpen={() => setHistoryOpen(true)} />}
+            {state.round > 0 && workspace && <RoundSparkline workspace={workspace.name} round={state.round} onOpen={() => setActiveModal("history")} />}
             {state.phase !== "done" && <span key={`${state.red_streak}-${state.stall_rounds}`} className={`chip subdued${state.phase === "plan" && state.plan_version >= 10 ? " warning" : ""}${pulse.has("health") ? " status-pulse" : ""}`}>紅連跳 {state.red_streak} · 停滯 {state.stall_rounds} · plan v{state.plan_version}{state.phase === "plan" && state.plan_version >= 10 ? " ⚠ 可能震盪" : ""}</span>}
             {!!state.agent_failure_streak && <span key={`${state.agent_failure_streak}-${state.agent_backoff_seconds}`} className={`chip warning${pulse.has("health") ? " status-pulse" : ""}`}>Agent 異常 {state.agent_failure_streak}{state.agent_backoff_seconds ? ` · ${state.agent_backoff_seconds} 秒後重試` : ""}</span>}
             {roundTiming && <span data-testid="round-timer" className={`chip round-timer ${roundTiming.warning || roundTiming.interrupted ? "warning" : "subdued"}`} title={`開始 ${state.round_started_at}${state.round_deadline_at ? ` · deadline ${state.round_deadline_at}` : ""}`}>{roundTiming.label}</span>}
@@ -222,11 +217,11 @@ export default function WorkspaceView({
             {!!state.state_recovery_count && <span className="chip warning" title={state.last_state_recovery ?? undefined}>🛟 state 復原 {state.state_recovery_count}</span>}
             {state.state_recovery_pending && <span className="chip warning">🛟 正從 checkpoint 唯讀顯示</span>}
             {workspace?.stale_loop_pid && <span className="chip warning" title={`state 保留 PID ${workspace.loop_pid ?? "?"}${workspace.loop_started_at ? `（啟動於 ${workspace.loop_started_at}）` : ""}，但目前程序不存在`}>⚠ PID 殘留</span>}
-            {!!issues.length && <button type="button" className={`chip ${unreadIssues > 0 ? "issue-chip" : "subdued"}`} onClick={() => setIssuesOpen(true)}>{unreadIssues > 0 ? `⚠ issues ${unreadIssues}/${issues.length}` : `✓ issues ${issues.length}（已讀）`}</button>}
-            {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setHistoryOpen(true)}>🕒 輪次紀錄</button>}
-            {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setTimelineOpen(true)}>🧭 時間軸</button>}
-            {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setRunCompareOpen(true)}>⇄ Run 對比</button>}
-            {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setPromptOpen(true)}>📨 prompt</button>}
+            {!!issues.length && <button type="button" className={`chip ${unreadIssues > 0 ? "issue-chip" : "subdued"}`} onClick={() => setActiveModal("issues")}>{unreadIssues > 0 ? `⚠ issues ${unreadIssues}/${issues.length}` : `✓ issues ${issues.length}（已讀）`}</button>}
+            {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setActiveModal("history")}>🕒 輪次紀錄</button>}
+            {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setActiveModal("timeline")}>🧭 時間軸</button>}
+            {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setActiveModal("runCompare")}>⇄ Run 對比</button>}
+            {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setActiveModal("prompt")}>📨 prompt</button>}
           </div>
         </div>
         {state.goal_changed && <div className="goal-warning">⚠ goal 已變更；點「🎯 goal」查看差異，建議回規劃期重新收斂</div>}
@@ -249,14 +244,14 @@ export default function WorkspaceView({
           />
         </div>
       </div>
-      {issuesOpen && workspace && <IssuesModal workspace={workspace.name} issues={issues} unreadIssues={unreadIssues} readonly={readonly || workspace.running} onClose={() => setIssuesOpen(false)} onChanged={onRefresh} />}
-      {historyOpen && workspace && <HistoryModal workspace={workspace.name} onClose={() => setHistoryOpen(false)} />}
-      {timelineOpen && workspace && <TimelineModal workspace={workspace.name} consoleText={consoleText} onClose={() => setTimelineOpen(false)} />}
-      {runCompareOpen && workspace && <RunCompareModal workspace={workspace.name} onClose={() => setRunCompareOpen(false)} />}
-      {goalOpen && workspace && <GoalModal workspace={workspace.name} onClose={() => setGoalOpen(false)} />}
-      {promptOpen && workspace && <PromptModal workspace={workspace.name} onClose={() => setPromptOpen(false)} />}
-      {reportOpen && workspace && <ReportModal workspace={workspace.name} onClose={() => setReportOpen(false)} />}
-      {configOpen && workspace && <ConfigModal workspace={workspace.name} config={state.config ?? {}} onClose={() => setConfigOpen(false)} onChanged={onRefresh} />}
+      {activeModal === "issues" && workspace && <IssuesModal workspace={workspace.name} issues={issues} unreadIssues={unreadIssues} readonly={readonly || workspace.running} onClose={() => setActiveModal(null)} onChanged={onRefresh} />}
+      {activeModal === "history" && workspace && <HistoryModal workspace={workspace.name} onClose={() => setActiveModal(null)} />}
+      {activeModal === "timeline" && workspace && <TimelineModal workspace={workspace.name} consoleText={consoleText} onClose={() => setActiveModal(null)} />}
+      {activeModal === "runCompare" && workspace && <RunCompareModal workspace={workspace.name} onClose={() => setActiveModal(null)} />}
+      {activeModal === "goal" && workspace && <GoalModal workspace={workspace.name} onClose={() => setActiveModal(null)} />}
+      {activeModal === "prompt" && workspace && <PromptModal workspace={workspace.name} onClose={() => setActiveModal(null)} />}
+      {activeModal === "report" && workspace && <ReportModal workspace={workspace.name} onClose={() => setActiveModal(null)} />}
+      {activeModal === "config" && workspace && <ConfigModal workspace={workspace.name} config={state.config ?? {}} onClose={() => setActiveModal(null)} onChanged={onRefresh} />}
       {dialog && <ActionDialog title={dialog.title} message={dialog.message} confirmLabel={dialog.confirmLabel} preview={dialog.preview} onClose={() => setDialog(null)} onConfirm={dialog.onConfirm} />}
     </section>
   );
