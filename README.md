@@ -120,6 +120,11 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 - 瀏覽器 tab 標題與 favicon 會隨狀態變燈（執行＝綠、紅燈連跳＝紅、完成＝旗、停止＝灰），掛在背景 tab 也能監控。
 - workspace header 有輪次 sparkline（綠紅灰橙＝驗證綠／紅／規劃／reset，點擊開逐輪判定）與頂部健康色帶（越紅越接近 reset 防線）；進行中 round 會每秒顯示 elapsed 與 timeout 剩餘時間，最後 60 秒轉為警示。立即停止會凍結並保留中斷輪次時間；SIGKILL 無法留下停止時間時顯示「至少」已執行多久。若 loop 被強制終止後留下 stale PID，詳細頁也會保留警示。
 - 工具列「📺 總覽」切換電視牆模式：頂部在「任務完成」右側整合所有 workspace 依時間最新 500 筆輪次的平均、P50、P95、最慢、逾時率、未回 DONE 次數與全域異常率；點「未回 DONE」可展開異常 workspace／round 清單，再點輪次查看保留的 Agent log。下方各 workspace 卡片仍各自顯示近期最多 100 輪摘要及相同異常統計，點卡片切入；輪次紀錄中的異常數也可開啟同一種清單與 log 檢視。整合卡只透過 SSE 傳統計結果，不傳 500 筆原始樣本；卡片與事件推播共用同一連線，不另開輪詢，輪次計時由瀏覽器依 state 時間戳本地更新，不為時鐘製造高頻 SSE；可用名稱搜尋與「全部／需關注／執行中／已完成」篩選卡片，選擇會保存在瀏覽器；頁首只有在真的有問題時才顯示可點擊的「工作區需處理」，點下會直接篩出問題卡片，卡片列出原因並可切入指定 workspace。已完成 workspace 的歷史停滯／紅燈不再誤算為目前告警；未讀 issues、checkpoint、goal 變更、stale PID 與 state 錯誤仍會標示。搭配 `--read-only` 適合掛牆監控。
+- 總覽可將目前的狀態篩選、名稱搜尋、排序與緊湊卡片設定存成命名監控視圖；視圖只存在目前瀏覽器，最多保留 20 組，可套用或刪除。
+- 工具列「🩺 問題中心」會依 workspace 當前 truth 整理 state 錯誤、未讀 issues、停滯、逾時、stale PID、checkpoint 與 goal 變更，並同時列出證據、影響及建議處置；它不會把已完成 workspace 的歷史異常誤報成現行問題。
+- 工具列「⌕ 全域搜尋」可跨 workspace 搜尋 state 錯誤、計畫任務、issues、完成 commit、history、console 與最近異常 log；後端以 8 MiB 掃描預算及數量／檔案大小上限保持查詢有界。
+- workspace 狀態列的「🧭 時間軸」把歷史輪次、異常與目前 console 的操作紀錄整合成單一時間序；只有時間而沒有日期的 console 紀錄會明確標示為本機時間，避免把推定時間當成精確事實。
+- 階段切換、任務跳轉、Validate、封存、還原與永久刪除等操作，在確認視窗先列出將改變的 state、命令、timeout、workspace 目錄與不受影響的 target repo，讓操作者能在送出前核對影響範圍。
 - 分隔線可拖曳調整欄寬；箭頭可收合，設定會保存在瀏覽器。
 - 狀態列的「🎯 goal」「🕒 輪次紀錄」「📨 prompt」chips 分別顯示目前 goal 內容、history.log 逐輪判定（含每輪 Agent 耗時／逾時／是否未回 phase DONE）、以及最近一輪送給 Agent 的完整 prompt（全部唯讀）；「輪次紀錄」保留最近 100 輪的樣本數、平均、P50、P95、最慢輪、逾時率、未回 DONE 次數與異常率完整分析，Overview 卡片同步提供快速摘要。goal 在停機期間變更時，Goal 視窗會用保存的計畫基準 hash 從 Git 歷史重建並顯示 unified diff。
 - Issues 視窗可「標記已讀」而不刪除稽核紀錄；只有未讀 issues 會讓 fleet 顯示需關注，仍可用「清空全部」永久移除紀錄。
