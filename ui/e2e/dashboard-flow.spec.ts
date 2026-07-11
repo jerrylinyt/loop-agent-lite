@@ -442,8 +442,12 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   planEditor = page.getByRole("dialog", { name: "Plan 編輯器" });
   await planEditor.locator(".plan-editor-task").first().getByRole("button", { name: "＋ 插入在此任務之後" }).click();
   await planEditor.locator(".plan-editor-task").nth(1).getByLabel("任務內容").fill("插入的 E2E 任務");
-  await planEditor.getByRole("button", { name: "下移 task-2" }).click();
-  await planEditor.locator(".plan-editor-task", { hasText: "驗證 E2E 第二項功能" }).getByRole("button", { name: "刪除" }).click();
+  const originalPendingTask = planEditor.locator(".plan-editor-task", { hasText: "驗證 E2E 第二項功能" });
+  const originalPendingBounds = await originalPendingTask.boundingBox();
+  await planEditor.getByRole("button", { name: "拖移 task-2" }).dragTo(originalPendingTask, {
+    targetPosition: { x: 20, y: Math.max(20, (originalPendingBounds?.height ?? 80) - 10) }
+  });
+  await originalPendingTask.getByRole("button", { name: "刪除" }).click();
   await expect(planEditor.locator(".plan-editor-summary")).toContainText("新增1 項");
   await expect(planEditor.locator(".plan-editor-summary")).toContainText("刪除1 項");
   await planEditor.getByLabel("done 計數").fill("0");

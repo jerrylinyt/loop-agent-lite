@@ -23,6 +23,8 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
   const [confirmClose, setConfirmClose] = useState(false);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dropIndex, setDropIndex] = useState<number | null>(null);
   const nextId = useRef(1);
   const existingOrders = new Set(drafts.flatMap((task) => task.order === null ? [] : [task.order]));
   const deleted = original.slice(lockedCount).filter((task) => !existingOrders.has(task.order));
@@ -41,6 +43,19 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
     [next[index], next[target]] = [next[target], next[index]];
     return next;
   });
+  const dropAt = (targetIndex: number) => {
+    if (!draggingId) return;
+    setDrafts((items) => {
+      const sourceIndex = items.findIndex((item) => item.id === draggingId);
+      if (sourceIndex < lockedCount || targetIndex < lockedCount || sourceIndex < 0) return items;
+      const next = [...items];
+      const [dragged] = next.splice(sourceIndex, 1);
+      const adjustedTarget = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex;
+      next.splice(Math.max(lockedCount, Math.min(adjustedTarget, next.length)), 0, dragged);
+      return next;
+    });
+    setDraggingId(null); setDropIndex(null);
+  };
   const insertAfter = (index: number) => setDrafts((items) => {
     const next = [...items];
     next.splice(index + 1, 0, { id: `new-${nextId.current++}`, order: null, task: "", ref: null });
@@ -66,8 +81,12 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
         <div className="plan-editor-list">
           {drafts.map((task, index) => {
             const locked = index < lockedCount;
-            return <div className={`plan-editor-task${locked ? " locked" : ""}`} key={task.id}>
-              <header><span><strong>task-{index + 1}</strong>{task.order === null && <em>新增</em>}{locked && <em>已完成／目前任務，鎖定</em>}</span><span className="plan-editor-actions">
+            return <div className={`plan-editor-task${locked ? " locked" : ""}${draggingId === task.id ? " dragging" : ""}${dropIndex === index ? " drop-before" : ""}`} key={task.id}
+              onDragOver={(event) => { if (!locked && draggingId) { event.preventDefault(); event.dataTransfer.dropEffect = "move"; const bounds = event.currentTarget.getBoundingClientRect(); setDropIndex(event.clientY > bounds.top + bounds.height / 2 ? index + 1 : index); } }}
+              onDrop={(event) => { event.preventDefault(); const bounds = event.currentTarget.getBoundingClientRect(); dropAt(event.clientY > bounds.top + bounds.height / 2 ? index + 1 : index); }}>
+              <header><span>{!locked && <span className="plan-drag-handle" role="button" tabIndex={0} draggable aria-label={`拖移 task-${index + 1}`} title="按住這裡拖移任務"
+                onDragStart={(event) => { setDraggingId(task.id); setDropIndex(index); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", task.id); }}
+                onDragEnd={() => { setDraggingId(null); setDropIndex(null); }}>⠿</span>}<strong>task-{index + 1}</strong>{task.order === null && <em>新增</em>}{locked && <em>已完成／目前任務，鎖定</em>}</span><span className="plan-editor-actions">
                 <button type="button" className="icon-button" aria-label={`上移 task-${index + 1}`} disabled={locked || index === lockedCount} onClick={() => move(index, -1)}>↑</button>
                 <button type="button" className="icon-button" aria-label={`下移 task-${index + 1}`} disabled={locked || index === drafts.length - 1} onClick={() => move(index, 1)}>↓</button>
                 <button type="button" className="danger-button compact-button" disabled={locked} onClick={() => remove(index)}>刪除</button>
@@ -77,6 +96,9 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
               {canInsert && index >= lockedCount - 1 && <button type="button" className="insert-task-button" onClick={() => insertAfter(index)}>＋ 插入在此任務之後</button>}
             </div>;
           })}
+          {draggingId && <div className={`plan-drop-tail${dropIndex === drafts.length ? " active" : ""}`}
+            onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropIndex(drafts.length); }}
+            onDrop={(event) => { event.preventDefault(); dropAt(drafts.length); }}>拖到最後</div>}
         </div>
         <aside className="plan-editor-summary">
           <h3>變更摘要</h3>
