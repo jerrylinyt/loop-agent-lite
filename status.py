@@ -322,8 +322,8 @@ def render_fleet_summary(summary) -> None:
           f"({summary['task_completion_pct']}%)｜錯誤 {summary['error_count']}", flush=True)
 
 
-def main(argv=None) -> int:
-    """解析唯讀 status CLI，支援單次、watch、on-change 與健康檢查 exit code。"""
+def parse_status_args(argv=None):
+    """解析 status CLI 並在開始讀 workspace 前驗證互斥選項與數值邊界。"""
     parser = argparse.ArgumentParser(description="唯讀查詢 loop-agent-lite workspace 狀態")
     parser.add_argument("--name", default=None, help="workspace 名稱（與 --all 擇一）")
     parser.add_argument("--all", action="store_true", help="列出 workspace root 下全部合法 workspace")
@@ -359,53 +359,55 @@ def main(argv=None) -> int:
         parser.error(f"--metrics 必須是 0～{loop.ROUND_METRICS_MAX_SAMPLES} 的整數")
     if args.workspace_root:
         loop.WORKSPACE_ROOT = Path(args.workspace_root).expanduser().resolve()
+    return args
+
+
+def render_status_iteration(args, previous_signature):
+    """建立並輸出一次 projection，回傳新 signature 與未經 filter 縮小的健康判斷。"""
+    if args.all:
+        all_results = project_all_status(args.metrics)
+        summary = summarize_status(all_results)
+        check_failed = summary["error_count"] > 0 or summary["attention"] > 0
+        results = sort_status_results(filter_status_results(all_results, args.filter), args.sort)
+        projection = {"schema_version": STATUS_SCHEMA_VERSION,
+                      "summary": summary, "workspaces": results}
+        if args.filter != "all":
+            projection["filter"] = args.filter
+            projection["matched_count"] = len(results)
+    else:
+        result = project_status(args.name, args.metrics)
+        check_failed = projection_needs_attention(result)
+        projection = {"schema_version": STATUS_SCHEMA_VERSION, **result}
+
+    signature = json.dumps(projection, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if signature == previous_signature and args.on_change:
+        return signature, check_failed
+    if args.as_json:
+        print(json.dumps(projection, ensure_ascii=False, separators=(",", ":")), flush=True)
+    elif args.all:
+        render_fleet_summary(summary)
+        if args.filter != "all":
+            print(f"filter {args.filter}｜符合 {len(results)}/{summary['workspace_count']}", flush=True)
+        if not results:
+            print("（沒有符合篩選的 workspace）" if args.filter != "all" else "（沒有合法 workspace）",
+                  flush=True)
+        for result in results:
+            if "error" in result:
+                print(f"❌ {result['name']}｜{result['error']}", flush=True)
+            else:
+                render_human(result, timestamp=args.watch)
+    else:
+        render_human(result, timestamp=args.watch)
+    return signature, check_failed
+
+
+def main(argv=None) -> int:
+    """執行單次或 watch status；projection 與呈現由 render_status_iteration 統一處理。"""
+    args = parse_status_args(argv)
     previous_signature = None
     try:
         while True:
-            if args.all:
-                all_results = project_all_status(args.metrics)
-                summary = summarize_status(all_results)
-                check_failed = summary["error_count"] > 0 or summary["attention"] > 0
-                results = sort_status_results(filter_status_results(all_results, args.filter), args.sort)
-                projection = {"schema_version": STATUS_SCHEMA_VERSION,
-                              "summary": summary, "workspaces": results}
-                if args.filter != "all":
-                    projection["filter"] = args.filter
-                    projection["matched_count"] = len(results)
-                signature = json.dumps(projection, ensure_ascii=False, sort_keys=True,
-                                       separators=(",", ":"))
-                changed = signature != previous_signature
-                previous_signature = signature
-                if args.as_json:
-                    if changed or not args.on_change:
-                        print(json.dumps(projection, ensure_ascii=False, separators=(",", ":")), flush=True)
-                else:
-                    if changed or not args.on_change:
-                        render_fleet_summary(summary)
-                        if args.filter != "all":
-                            print(f"filter {args.filter}｜符合 {len(results)}/{summary['workspace_count']}", flush=True)
-                        if not results:
-                            print("（沒有符合篩選的 workspace）" if args.filter != "all" else "（沒有合法 workspace）",
-                                  flush=True)
-                        for result in results:
-                            if "error" in result:
-                                print(f"❌ {result['name']}｜{result['error']}", flush=True)
-                            else:
-                                render_human(result, timestamp=args.watch)
-            else:
-                result = project_status(args.name, args.metrics)
-                check_failed = projection_needs_attention(result)
-                projection = {"schema_version": STATUS_SCHEMA_VERSION, **result}
-                signature = json.dumps(projection, ensure_ascii=False, sort_keys=True,
-                                       separators=(",", ":"))
-                changed = signature != previous_signature
-                previous_signature = signature
-                if args.as_json:
-                    if changed or not args.on_change:
-                        print(json.dumps(projection, ensure_ascii=False, separators=(",", ":")), flush=True)
-                else:
-                    if changed or not args.on_change:
-                        render_human(result, timestamp=args.watch)
+            previous_signature, check_failed = render_status_iteration(args, previous_signature)
             if not args.watch:
                 return 1 if args.check and check_failed else 0
             time.sleep(args.interval)
