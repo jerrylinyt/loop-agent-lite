@@ -1,8 +1,9 @@
 /** 停止狀態下的 workspace 設定編輯器：載入可選命令、追蹤非同步測試，儲存時由後端重驗數值與白名單。 */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import CliManagerModal from "../cli/CliManagerModal";
 import Modal from "../../shared/components/Modal";
 import { getJson, postJson } from "../../shared/api/client";
+import useStaleGuard from "../../shared/hooks/useStaleGuard";
 import type { ConfigResponse, DashboardConfig } from "../../shared/api/types";
 
 interface ValidateResponse { ok?: boolean; rc?: number; timeout?: boolean; timeout_seconds?: number; tail?: string }
@@ -34,11 +35,11 @@ export default function ConfigModal({
   const [validating, setValidating] = useState(false);
   const [validateResult, setValidateResult] = useState<{ ok: boolean; text: string; tail: string } | null>(null);
   const [cliManagerOpen, setCliManagerOpen] = useState(false);
-  const validateRequestSeq = useRef(0);
+  const validateGuard = useStaleGuard();
 
   useEffect(() => { void getJson<ConfigResponse>("/api/config").then(setAvailable); }, []);
   useEffect(() => {
-    validateRequestSeq.current += 1;
+    validateGuard.cancelPending();
     setValidating(false);
     setValidateResult(null);
   }, [draft.validate_cmd, draft.validate_timeout]);
@@ -58,8 +59,7 @@ export default function ConfigModal({
   );
 
   const verifyValidate = async () => {
-    const seq = validateRequestSeq.current + 1;
-    validateRequestSeq.current = seq;
+    const isCurrent = validateGuard.begin();
     setValidating(true);
     setValidateResult(null);
     const response = await postJson<ValidateResponse>("/api/validate", {
@@ -67,7 +67,7 @@ export default function ConfigModal({
       validate_cmd: draft.validate_cmd,
       validate_timeout: draft.validate_timeout
     });
-    if (seq !== validateRequestSeq.current) return;
+    if (!isCurrent()) return;
     setValidating(false);
     if (response.error) {
       setValidateResult({ ok: false, text: `❌ ${response.error}`, tail: "" });

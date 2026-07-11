@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import CliManagerModal from "../cli/CliManagerModal";
 import Modal from "../../shared/components/Modal";
 import { getJson, postJson, waitForJobStartup } from "../../shared/api/client";
+import useStaleGuard from "../../shared/hooks/useStaleGuard";
 import type { ConfigResponse, StartupResponse, WorkspaceState, WorkspaceSummary } from "../../shared/api/types";
 import PlanImportField from "./PlanImportField";
 import NotifyModal from "./NotifyModal";
@@ -79,8 +80,8 @@ export default function LauncherModal({
   const [managerModal, setManagerModal] = useState<"cli" | "repoRoots" | "notify" | null>(null);
   const [promptTemplateMode, setPromptTemplateMode] = useState<PromptTemplateMode | null>(null);
   const hydratedRepo = useRef("");
-  const validateRequestSeq = useRef(0);
-  const preflightRequestSeq = useRef(0);
+  const validateGuard = useStaleGuard();
+  const preflightGuard = useStaleGuard();
 
   const repo = repoChoice === "__custom__" ? customRepo.trim() : repoChoice;
   const matchingWorkspace = useMemo(() => workspaces.find((workspace) => workspace.repo === repo), [repo, workspaces]);
@@ -156,13 +157,13 @@ export default function LauncherModal({
   }, [config, matchingWorkspace, repo, repoStatus]);
 
   useEffect(() => {
-    validateRequestSeq.current += 1;
+    validateGuard.cancelPending();
     setValidating(false);
     setValidateResult(null);
   }, [customValidate, repo, validateChoice, settings.validateTimeout]);
 
   useEffect(() => {
-    preflightRequestSeq.current += 1;
+    preflightGuard.cancelPending();
     setPreflighting(false);
     setPreflightResult(null);
   }, [repo, name, validateChoice, settings.validateTimeout, goalFile, planJson, resetState, newBranch]);
@@ -210,15 +211,14 @@ export default function LauncherModal({
   };
 
   const verifyValidate = async () => {
-    const seq = validateRequestSeq.current + 1;
-    validateRequestSeq.current = seq;
+    const isCurrent = validateGuard.begin();
     const validateCmd = validateChoice === "__custom__"
       ? customValidate.trim()
       : config?.validate_cmds[+validateChoice]?.cmd ?? "";
     setValidating(true);
     setValidateResult(null);
     const response = await postJson<ValidateResponse>("/api/validate", { repo, validate_cmd: validateCmd, validate_timeout: settings.validateTimeout });
-    if (seq !== validateRequestSeq.current) return;
+    if (!isCurrent()) return;
     setValidating(false);
     if (response.error) {
       setValidateResult({ ok: false, text: `❌ ${response.error}`, tail: "" });
@@ -240,8 +240,7 @@ export default function LauncherModal({
       ? "完整健檢只使用已儲存的 Validate 命令；請先把手寫命令加入清單"
       : "檢查目前 repo 的 git、單 writer lock、乾淨工作樹、已 commit 的 goal 與 Validate；不建立 state 或啟動 Agent";
   const runPreflight = async () => {
-    const seq = preflightRequestSeq.current + 1;
-    preflightRequestSeq.current = seq;
+    const isCurrent = preflightGuard.begin();
     setPreflighting(true);
     setPreflightResult(null);
     const response = await postJson<PreflightResponse>("/api/preflight", {
@@ -250,7 +249,7 @@ export default function LauncherModal({
       validate_idx: +validateChoice,
       validate_timeout: settings.validateTimeout
     });
-    if (seq !== preflightRequestSeq.current) return;
+    if (!isCurrent()) return;
     setPreflighting(false);
     if (response.error) {
       setPreflightResult({ ok: false, text: `❌ ${response.error}`, tail: "" });

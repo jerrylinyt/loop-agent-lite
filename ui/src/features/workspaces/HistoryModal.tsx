@@ -1,7 +1,8 @@
 /** 輪次歷史檢視器：切換 current/previous run，並行讀取 bounded history 與 metrics，顯示 coordinator 判定。 */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import Modal from "../../shared/components/Modal";
+import useStaleGuard from "../../shared/hooks/useStaleGuard";
 import type { IncrementalResponse, RoundMetrics } from "../../shared/api/types";
 import AnomalyLogModal from "./AnomalyLogModal";
 import { parseHistory, type HistoryRow } from "./historyParser";
@@ -17,13 +18,12 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
   const [metrics, setMetrics] = useState<RoundMetrics | null>(null);
   const [note, setNote] = useState("");
   const [loading, setLoading] = useState(true);
-  const requestSeq = useRef(0);
+  const guard = useStaleGuard();
   const [anomaliesOpen, setAnomaliesOpen] = useState(false);
 
   const load = useCallback(async () => {
     // 切換 run 分頁/按重新整理會連發請求;舊請求晚回不得覆蓋新分頁的結果
-    const seq = requestSeq.current + 1;
-    requestSeq.current = seq;
+    const isCurrent = guard.begin();
     setLoading(true);
     setMetrics(null);
     const encodedWorkspace = encodeURIComponent(workspace);
@@ -31,7 +31,7 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
       getJson<IncrementalResponse>(`/api/history?ws=${encodedWorkspace}&offset=-1&run=${run}`),
       getJson<RoundMetrics>(`/api/round-metrics?ws=${encodedWorkspace}&run=${run}&limit=100`)
     ]);
-    if (seq !== requestSeq.current) return;
+    if (!isCurrent()) return;
     setLoading(false);
     if (!response || response.error) {
       setNote("❌ 讀取 history.log 失敗");
