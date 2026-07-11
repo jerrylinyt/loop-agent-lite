@@ -16,6 +16,7 @@ export interface WorkspaceSummary {
   red_streak?: number;
   stall_rounds?: number;
   issues?: number;
+  latest_issue?: string;
   unread_issues?: number;
   agent_failure_streak?: number;
   agent_backoff_seconds?: number;

@@ -211,6 +211,18 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await fleetSearch.fill("does-not-exist");
   await expect(overview.getByText("沒有符合搜尋的 workspace")).toBeVisible();
   await fleetSearch.fill("");
+  await overview.getByLabel("Workspace 排序").selectOption("progress");
+  await overview.getByLabel("精簡卡片").check();
+  await overview.getByRole("button", { name: "儲存目前視圖" }).click();
+  await overview.getByLabel("監控視圖名稱").fill("E2E 值班牆");
+  await overview.getByRole("button", { name: "儲存", exact: true }).click();
+  await expect(overview.getByLabel("已儲存監控視圖")).toHaveValue(/view-/);
+  await overview.getByLabel("Workspace 排序").selectOption("name");
+  await overview.getByLabel("精簡卡片").uncheck();
+  await overview.getByLabel("已儲存監控視圖").selectOption({ label: "E2E 值班牆" });
+  await expect(overview.getByLabel("Workspace 排序")).toHaveValue("progress");
+  await expect(overview.getByLabel("精簡卡片")).toBeChecked();
+  await overview.getByLabel("精簡卡片").uncheck();
   const fleetCard = overview.locator(".fleet-card", { hasText: "e2e-workspace" });
   await expect(fleetCard).toBeVisible();
   await expect(fleetCard.locator(".breathing-dot")).toBeVisible();
@@ -265,6 +277,23 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await consoleSearch.fill("");
   await expect(page.getByRole("button", { name: /issues/ })).toBeVisible();
 
+  await page.getByRole("button", { name: "🩺 問題中心" }).click();
+  const doctor = page.getByRole("dialog", { name: "Workspace Doctor" });
+  await expect(doctor).toBeVisible();
+  await expect(doctor).toContainText("E2E structured issue");
+  await expect(doctor).toContainText("建議：");
+  await doctor.getByRole("button", { name: "前往處理" }).click();
+  await expect(doctor).toBeHidden();
+
+  await page.getByRole("button", { name: "⌕ 全域搜尋" }).click();
+  const globalSearch = page.getByRole("dialog", { name: "全域搜尋" });
+  await globalSearch.getByLabel("全域搜尋文字").fill("E2E structured issue");
+  await globalSearch.getByRole("button", { name: "搜尋", exact: true }).click();
+  const searchResult = globalSearch.locator(".global-search-result", { hasText: "Issue · round" }).first();
+  await expect(searchResult).toContainText("Issue");
+  await searchResult.click();
+  await expect(globalSearch).toBeHidden();
+
   const attentionButton = page.getByRole("button", { name: /工作區需處理/ });
   await expect(attentionButton).toBeVisible();
   await attentionButton.click();
@@ -280,6 +309,15 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(loopConsole).toContainText("已依要求停止");
   await expect(page).toHaveTitle(/^⚪ e2e-workspace/);
   await expect(roundTimer).toBeHidden();
+
+  await page.getByRole("button", { name: "🧭 時間軸" }).click();
+  const timeline = page.getByRole("dialog", { name: "e2e-workspace｜統一時間軸" });
+  await expect(timeline).toContainText("round 1");
+  await expect(timeline).toContainText("Dashboard 人工操作");
+  await timeline.getByRole("button", { name: "人工操作" }).click();
+  await expect(timeline.locator(".timeline-item.operator").first()).toBeVisible();
+  await timeline.getByRole("button", { name: "關閉對話框" }).click();
+  await expect(timeline).toBeHidden();
 
   await page.getByRole("button", { name: "🕒 輪次紀錄" }).click();
   const historyModal = page.getByRole("dialog", { name: "輪次紀錄" });
@@ -406,7 +444,11 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(issues.getByText("無 issues")).toBeVisible();
   await issues.getByRole("button", { name: "關閉對話框" }).click();
 
-  await acceptConfirmation(page, () => page.getByRole("button", { name: "⏪ 回規劃期" }).click());
+  await page.getByRole("button", { name: "⏪ 回規劃期" }).click();
+  let operationDialog = page.getByRole("dialog", { name: "請確認" });
+  await expect(operationDialog.locator(".action-preview > div", { hasText: "清除進度" })).toContainText("完成紀錄");
+  await expect(operationDialog.locator(".action-preview > div", { hasText: "保留" })).toContainText("target repo");
+  await operationDialog.getByRole("button", { name: "繼續" }).click();
   await expect(page.getByText("規劃期", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "▶ 運行" }).click();
   await expect(page.getByRole("button", { name: "⏹ 立即停止" })).toBeVisible();
@@ -420,7 +462,11 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await acceptConfirmation(page, () => page.getByRole("button", { name: "⏩ 進執行期" }).click());
   await expect(page.getByText("執行期", { exact: true })).toBeVisible();
 
-  await acceptConfirmation(page, () => page.getByRole("button", { name: "把進度設到 task-2" }).click());
+  await page.getByRole("button", { name: "把進度設到 task-2" }).click();
+  operationDialog = page.getByRole("dialog", { name: "請確認" });
+  await expect(operationDialog.locator(".action-preview > div", { hasText: "人工標記完成" })).toContainText("task-1");
+  await expect(operationDialog.locator(".action-preview > div", { hasText: "執行 Validate" })).toContainText("timeout");
+  await operationDialog.getByRole("button", { name: "繼續" }).click();
   await expect(page.getByText("→ 進行中", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: /已完成 1 條/ }).click();
   await expect(page.getByRole("row", { name: /已由 E2E 更新的第一項功能.*✔ 人工/ })).toBeVisible();

@@ -7,11 +7,39 @@ import { workspaceNeedsAttention } from "./workspaceDiagnostics";
 
 const PHASE_NAMES: Record<string, string> = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
 type FleetFilter = "all" | "attention" | "running" | "done";
+type FleetSort = "name" | "attention" | "running" | "progress";
+interface SavedFleetView {
+  id: string;
+  name: string;
+  filter: FleetFilter;
+  search: string;
+  sort: FleetSort;
+  compact: boolean;
+}
 const FLEET_FILTERS: FleetFilter[] = ["all", "attention", "running", "done"];
+const FLEET_SORTS: FleetSort[] = ["name", "attention", "running", "progress"];
 
 function initialFleetFilter(): FleetFilter {
   const saved = localStorage.getItem("fleet-filter") as FleetFilter | null;
   return saved && FLEET_FILTERS.includes(saved) ? saved : "all";
+}
+
+function initialFleetSort(): FleetSort {
+  const saved = localStorage.getItem("fleet-sort") as FleetSort | null;
+  return saved && FLEET_SORTS.includes(saved) ? saved : "name";
+}
+
+function loadSavedViews(): SavedFleetView[] {
+  try {
+    const value = JSON.parse(localStorage.getItem("fleet-saved-views") ?? "[]") as unknown;
+    if (!Array.isArray(value)) return [];
+    return value.filter((item): item is SavedFleetView => !!item && typeof item === "object" &&
+      typeof (item as SavedFleetView).id === "string" && typeof (item as SavedFleetView).name === "string" &&
+      FLEET_FILTERS.includes((item as SavedFleetView).filter) && FLEET_SORTS.includes((item as SavedFleetView).sort) &&
+      typeof (item as SavedFleetView).search === "string" && typeof (item as SavedFleetView).compact === "boolean").slice(0, 20);
+  } catch {
+    return [];
+  }
 }
 
 function formatMetric(seconds: number | null): string {
@@ -51,6 +79,13 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
     Boolean(workspace.round_started_at && !workspace.round_interrupted_at)));
   const [filter, setFilter] = useState<FleetFilter>(initialFleetFilter);
   const [search, setSearch] = useState(() => localStorage.getItem("fleet-search") ?? "");
+  const [sort, setSort] = useState<FleetSort>(initialFleetSort);
+  const [compact, setCompact] = useState(() => localStorage.getItem("fleet-compact") === "1");
+  const [savedViews, setSavedViews] = useState<SavedFleetView[]>(loadSavedViews);
+  const [selectedView, setSelectedView] = useState("");
+  const [savingView, setSavingView] = useState(false);
+  const [viewName, setViewName] = useState("");
+  const [viewMessage, setViewMessage] = useState("");
   const [anomaliesOpen, setAnomaliesOpen] = useState(false);
 
   useEffect(() => {
@@ -64,11 +99,65 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
 
   const changeFilter = (next: FleetFilter) => {
     setFilter(next);
+    setSelectedView("");
     localStorage.setItem("fleet-filter", next);
   };
   const changeSearch = (next: string) => {
     setSearch(next);
+    setSelectedView("");
     localStorage.setItem("fleet-search", next);
+  };
+  const changeSort = (next: FleetSort) => {
+    setSort(next);
+    setSelectedView("");
+    localStorage.setItem("fleet-sort", next);
+  };
+  const changeCompact = (next: boolean) => {
+    setCompact(next);
+    setSelectedView("");
+    localStorage.setItem("fleet-compact", next ? "1" : "0");
+  };
+  const persistViews = (views: SavedFleetView[]) => {
+    setSavedViews(views);
+    localStorage.setItem("fleet-saved-views", JSON.stringify(views));
+  };
+  const saveView = () => {
+    const name = viewName.trim();
+    if (!name) return setViewMessage("請輸入視圖名稱");
+    if (name.length > 40) return setViewMessage("視圖名稱不可超過 40 字");
+    const existing = savedViews.find((item) => item.name === name);
+    const next: SavedFleetView = {
+      id: existing?.id ?? `view-${Date.now().toString(36)}`,
+      name, filter, search, sort, compact
+    };
+    const views = existing ? savedViews.map((item) => item.id === existing.id ? next : item)
+      : [...savedViews, next].slice(-20);
+    persistViews(views);
+    setSelectedView(next.id);
+    setSavingView(false);
+    setViewName("");
+    setViewMessage(`已儲存「${name}」`);
+  };
+  const applyView = (id: string) => {
+    setSelectedView(id);
+    const view = savedViews.find((item) => item.id === id);
+    if (!view) return;
+    setFilter(view.filter);
+    setSearch(view.search);
+    setSort(view.sort);
+    setCompact(view.compact);
+    localStorage.setItem("fleet-filter", view.filter);
+    localStorage.setItem("fleet-search", view.search);
+    localStorage.setItem("fleet-sort", view.sort);
+    localStorage.setItem("fleet-compact", view.compact ? "1" : "0");
+    setViewMessage(`已套用「${view.name}」`);
+  };
+  const deleteView = () => {
+    const selected = savedViews.find((item) => item.id === selectedView);
+    if (!selected) return;
+    persistViews(savedViews.filter((item) => item.id !== selected.id));
+    setSelectedView("");
+    setViewMessage(`已刪除「${selected.name}」`);
   };
 
   const running = workspaces.filter((workspace) => workspace.running).length;
@@ -85,8 +174,17 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
           : workspaces;
     const query = search.trim().toLowerCase();
     if (query) visible = visible.filter((workspace) => workspace.name.toLowerCase().includes(query));
-    return visible;
-  }, [filter, search, workspaces]);
+    return [...visible].sort((left, right) => {
+      if (sort === "attention") return Number(workspaceNeedsAttention(right)) - Number(workspaceNeedsAttention(left)) || left.name.localeCompare(right.name);
+      if (sort === "running") return Number(right.running) - Number(left.running) || left.name.localeCompare(right.name);
+      if (sort === "progress") {
+        const leftProgress = progress(left);
+        const rightProgress = progress(right);
+        return rightProgress.pct - leftProgress.pct || left.name.localeCompare(right.name);
+      }
+      return left.name.localeCompare(right.name);
+    });
+  }, [filter, search, sort, workspaces]);
   const filters: Array<{ id: FleetFilter; label: string; count: number }> = [
     { id: "all", label: "全部", count: workspaces.length },
     { id: "attention", label: "需關注", count: alerts },
@@ -96,7 +194,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
   const taskPct = totalTasks > 0 ? Math.round((doneTasks / totalTasks) * 100) : 0;
 
   return (
-    <main className="fleet-overview" aria-label="工作區總覽">
+    <main className={`fleet-overview${compact ? " compact-cards" : ""}`} aria-label="工作區總覽">
       <div className="fleet-stats" role="list" aria-label="工作區統計">
         <div className="fleet-stat" role="listitem"><strong>{workspaces.length}</strong><span>workspaces</span></div>
         <div className="fleet-stat running" role="listitem"><strong>{running}</strong><span>執行中</span></div>
@@ -138,7 +236,21 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
         </div>
         <input className="fleet-search" type="search" aria-label="搜尋 workspace" placeholder="搜尋 workspace…"
           value={search} onChange={(event) => changeSearch(event.target.value)} />
+        <select className="fleet-sort" aria-label="Workspace 排序" value={sort} onChange={(event) => changeSort(event.target.value as FleetSort)}>
+          <option value="name">名稱排序</option><option value="attention">需關注優先</option><option value="running">執行中優先</option><option value="progress">完成度優先</option>
+        </select>
+        <label className="compact-toggle"><input type="checkbox" checked={compact} onChange={(event) => changeCompact(event.target.checked)} /> 精簡卡片</label>
         <span className="muted">顯示 {visibleWorkspaces.length} / {workspaces.length}</span>
+      </div>
+      <div className="saved-view-row">
+        <select aria-label="已儲存監控視圖" value={selectedView} onChange={(event) => applyView(event.target.value)}>
+          <option value="">已儲存視圖…</option>
+          {savedViews.map((view) => <option key={view.id} value={view.id}>{view.name}</option>)}
+        </select>
+        {!savingView && <button type="button" className="secondary-button compact-button" onClick={() => { setSavingView(true); setViewMessage(""); }}>儲存目前視圖</button>}
+        {savingView && <><input aria-label="監控視圖名稱" placeholder="例如：值班問題牆" value={viewName} onChange={(event) => setViewName(event.target.value)} maxLength={40} /><button type="button" className="primary-button compact-button" onClick={saveView}>儲存</button><button type="button" className="secondary-button compact-button" onClick={() => setSavingView(false)}>取消</button></>}
+        <button type="button" className="danger-button compact-button" disabled={!selectedView} onClick={deleteView}>刪除視圖</button>
+        <span className="muted" role="status">{viewMessage || `${savedViews.length}/20 個個人視圖`}</span>
       </div>
       <div className="fleet-body">
         <div className="fleet-grid">

@@ -1184,11 +1184,15 @@ def list_workspaces():
                                  if isinstance(t, dict) and t.get("order") == current_order), "")
             if len(current_task) > 120:
                 current_task = current_task[:120] + "…"
+            latest_issue = ((st.get("issues") or [])[-1].get("text") or "") if st.get("issues") else ""
+            if len(latest_issue) > 240:
+                latest_issue = latest_issue[:240] + "…"
             info.update(phase=st.get("phase"), round=st.get("round", 0), flag=st.get("flag", 0),
                         completed=len(st.get("completed") or []), plan_len=len(st.get("plan") or []),
                         done_count=st.get("done_count", 0), repo=c.get("repo"),
                         red_streak=st.get("red_streak", 0), stall_rounds=st.get("stall_rounds", 0),
                         issues=len(st.get("issues") or []),
+                        latest_issue=latest_issue,
                         unread_issues=loop_mod.unread_issue_count(st),
                         agent_failure_streak=st.get("agent_failure_streak", 0),
                         agent_backoff_seconds=st.get("agent_backoff_seconds", 0),

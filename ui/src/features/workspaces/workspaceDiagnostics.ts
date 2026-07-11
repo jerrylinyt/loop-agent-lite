@@ -22,7 +22,7 @@ export function workspaceDiagnostics(workspace: WorkspaceSummary): WorkspaceDiag
   const unreadIssues = workspace.unread_issues ?? workspace.issues ?? 0;
   if (unreadIssues > 0) add({
     id: "issues", severity: "warning", title: `${unreadIssues} 條 issue 尚未讀取`,
-    evidence: `目前保留 ${workspace.issues ?? unreadIssues} 條 Agent 結構化回報。`,
+    evidence: workspace.latest_issue ? `最新回報：${workspace.latest_issue}` : `目前保留 ${workspace.issues ?? unreadIssues} 條 Agent 結構化回報。`,
     recommendation: "進入 workspace 開啟 Issues，確認阻擋原因後標記已讀或清除。"
   });
   if (workspace.state_recovery_pending) add({
