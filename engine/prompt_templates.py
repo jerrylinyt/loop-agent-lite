@@ -144,6 +144,18 @@ BUILTIN_PROMPT_TEMPLATES = [
 - 建立「變更 → 受影響面 → 驗證」對照，讓每個確認受影響項都能追到 task／DoD，N/A 也需證據。""",
     },
     {
+        "id": "incident-root-cause",
+        "label": "分析生產事故根因",
+        "category": "分析",
+        "description": "以 log、metrics 與時間線證據重建事故因果鏈，區分緩解與根修並補上防復發驗證。",
+        "requirement_placeholder": "例：昨晚 21:00 起訂單服務大量 timeout，約 40 分鐘後自行恢復，請找出根因並提出防復發方案。",
+        "instructions": """- 先固定事故時間窗、影響面（服務、資料、使用者）與可取得的 log、metrics、trace、部署／設定變更紀錄；缺少的觀測資料列為待確認，不得以「查無資料」推定無事發生。
+- 以證據重建時間線：第一個異常訊號、擴散路徑、緩解動作與恢復點；區分觸發條件、根因、放大因素與巧合事件，每項附 log 片段位置或 `檔案:行號`。
+- 對候選根因沿程式碼與資料流驗證因果鏈；能安全重現時規劃非生產環境的重現步驟，無法重現者標示信心等級與還缺的證據，不得把相關性寫成因果。
+- 區分立即緩解與根本修復；根修依 Bug 慣例在同一任務含回歸測試，臨時緩解要列出移除條件與追蹤方式，避免永久化。
+- 檢查同類故障的其他入口與監控缺口；規劃能在復發前攔截的告警或測試，並把時間線、根因與行動項寫成可保存的事故報告。""",
+    },
+    {
         "id": "security-boundary-analysis",
         "label": "分析安全／信任邊界",
         "category": "品質",
@@ -153,6 +165,18 @@ BUILTIN_PROMPT_TEMPLATES = [
 - 逐入口檢查驗證、正規化、授權、symlink／路徑邊界、命令參數、資源上限與敏感資料輸出。
 - 每個風險附可定位的程式證據、可利用前提、影響與現有緩解；不確定時標示待驗證。
 - 依 impact × exploitability 排序，驗證方式必須安全且非破壞性；若原需求包含修復，任務才需加入負向測試並確認 fail-closed 不破壞合法流程。""",
+    },
+    {
+        "id": "security-scan-remediation",
+        "label": "資安掃描分診與修復",
+        "category": "品質",
+        "description": "把 SAST／資安掃描報告逐筆分診成有證據的真偽陽性判定，規劃不破壞行為的修復與重掃驗證。",
+        "requirement_placeholder": "例：分診本次 Fortify 掃描的 30 筆發現，判定真偽陽性並規劃修復與抑制留痕。",
+        "instructions": """- 先固定掃描工具與版本、規則集／政策、掃描範圍與報告對應的 revision；報告與目前程式碼版本不一致時列為影響判讀的待確認事項。
+- 逐筆把發現對應到實際程式路徑與資料流，分類為已確認可利用、真陽性但已有緩解、誤報或待確認；不得把工具嚴重度直接當結論，也不得為清零而批次標誤報。
+- 誤報與可接受風險的判定必須附程式證據與理由（如輸入不可達、上游已驗證），並依工具的正式機制（審核註記／抑制設定）留痕，不得靜默忽略。
+- 修復優先用集中式防護（驗證層、encoder、parameterized query）並合併同一 root cause 的多筆發現；每項修復列出行為不變條件與對應回歸測試。
+- 修復任務含負向測試證明攻擊路徑已封閉；以相同規則集重跑掃描並比對前後結果作為機器 DoD，殘餘風險與接受決策列 human gate。""",
     },
     {
         "id": "java-generic",
@@ -234,7 +258,7 @@ BUILTIN_PROMPT_TEMPLATES = [
         "description": "依待部署服務的實際需求與參考專案慣例，建立可逐環境 render、schema 驗證且不含明文憑證的 Kubernetes 設定。",
         "requirement_placeholder": "例：參考 payment-service 的 Helm chart，為 order-service 完成 base／sit／prod 部署設置，需通過 helm lint 與 helm template。",
         "instructions": """- 明確區分待部署服務與參考專案，固定目標 Kubernetes／API 版本、namespace、環境清單、可用 CRD 與政策限制；服務值只從待部署服務取證，參考專案只提供結構慣例。
-- 產出格式依原始需求 → 待部署 repo 既有慣例 → 參考 repo 依序判定；仍衝突時比較 pure YAML、Kustomize、Helm 三種方案並列 human gate，不得自行選定。
+- 產出格式依原始需求 → 待部署 repo 既有慣例 → 參考 repo 依序判定；三個來源互相衝突或都無訊號時，比較 pure YAML、Kustomize、Helm 三種方案並列 human gate，不得自行選定。
 - 盤點 workload、Service、Ingress、ServiceAccount／RBAC、ConfigMap、Secret 外部引用、volume／PVC、HPA、PDB、NetworkPolicy、securityContext、probe、rollout、affinity／toleration 與 image 注入點；N/A 項附證據。
 - 從待部署服務確認 image、command／args、port、健康檢查、資源、環境變數、掛載與外部依賴，附 `檔案:行號`；不得複製參考服務的識別碼或專屬值。
 - 共用內容放 base／chart defaults，環境差異只放 overlay／values 並逐環境列出；Secret 僅用佔位或受控外部引用，不得輸出明文憑證。

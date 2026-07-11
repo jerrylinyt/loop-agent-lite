@@ -101,6 +101,7 @@ class TestPromptTemplateCatalog(unittest.TestCase):
             "project-logic-analysis", "code-logic-analysis",
             "change-impact-analysis", "db-migration", "schema-data-rollout",
             "dependency-upgrade", "k8s-deployment-config",
+            "incident-root-cause", "security-scan-remediation",
         }.issubset(ids))
         self.assertTrue(all(item["source"] == "builtin" for item in templates))
 
@@ -125,6 +126,9 @@ class TestPromptTemplateCatalog(unittest.TestCase):
         self.assertIn("autoconfiguration", catalog["dependency-upgrade"]["instructions"])
         self.assertIn("具備證據後才能判 N/A", catalog["dependency-upgrade"]["instructions"])
         self.assertIn("pure YAML、Kustomize、Helm 三種", catalog["k8s-deployment-config"]["instructions"])
+        self.assertIn("不得把相關性寫成因果", catalog["incident-root-cause"]["instructions"])
+        self.assertIn("不得靜默忽略", catalog["security-scan-remediation"]["instructions"])
+        self.assertIn("重跑掃描並比對前後結果", catalog["security-scan-remediation"]["instructions"])
         self.assertIn("helm lint <chart-dir> -f <values-file>", catalog["k8s-deployment-config"]["instructions"])
         self.assertIn("helm template <release> <chart-dir> -f <values-file>", catalog["k8s-deployment-config"]["instructions"])
 
