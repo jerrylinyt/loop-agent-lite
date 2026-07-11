@@ -303,15 +303,6 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(incidents).toContainText("e2e-workspace");
   await incidents.getByRole("button", { name: "關閉對話框" }).click();
 
-  await page.getByRole("button", { name: "⌕ 全域搜尋" }).click();
-  const globalSearch = page.getByRole("dialog", { name: "全域搜尋" });
-  await globalSearch.getByLabel("全域搜尋文字").fill("E2E structured issue");
-  await globalSearch.getByRole("button", { name: "搜尋", exact: true }).click();
-  const searchResult = globalSearch.locator(".global-search-result", { hasText: "Issue · round" }).first();
-  await expect(searchResult).toContainText("Issue");
-  await searchResult.click();
-  await expect(globalSearch).toBeHidden();
-
   const attentionButton = page.getByRole("button", { name: /工作區需處理/ });
   await expect(attentionButton).toBeVisible();
   await attentionButton.click();

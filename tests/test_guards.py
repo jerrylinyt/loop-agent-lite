@@ -3610,66 +3610,6 @@ class TestAnomalyLogProjection(unittest.TestCase):
                 D.ROOT = old_root
 
 
-class TestGlobalSearchProjection(unittest.TestCase):
-    class ResponseCapture:
-        response = None
-
-        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
-            self.response = code, json.loads(body)
-
-        def _err(self, msg, code=400):
-            self.response = code, {"error": msg}
-
-    def test_searches_structured_state_logs_and_preserved_anomaly_content(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "workspace"
-            old_roots = L.WORKSPACE_ROOT, D.ROOT
-            L.WORKSPACE_ROOT = root
-            D.ROOT = root
-            try:
-                ws = L.Workspace("alpha")
-                state = ws.fresh_state()
-                state.update({
-                    "plan": [{"order": 1, "task": "implement payment retry", "ref": None}],
-                    "issues": [{"round": 2, "where": "task-1", "text": "structured blocker", "ts": "2026-07-10T10:00:00"}],
-                    "completed": [{"order": 1, "sha": "a" * 40, "round": 3}],
-                })
-                ws.save_state(state)
-                (ws.dir / "console.log").write_text(
-                    "[10:00:00] 🖥️ Dashboard｜manual operation marker\n", encoding="utf-8")
-                (ws.dir / "history.log").write_text(
-                    "2026-07-10T10:01:00 round=3 phase=exec task=task-1 validate=PASS << history marker\n",
-                    encoding="utf-8")
-                round_log = ws.dir / "logs" / "round-0003.log"
-                round_log.write_text("preserved anomaly search needle\n", encoding="utf-8")
-                L.preserve_anomaly_log(
-                    ws.dir, round_log, round_number=3, phase="exec", task="task-1",
-                    timestamp="2026-07-10T10:01:00")
-
-                cases = {
-                    "payment retry": "task",
-                    "structured blocker": "issue",
-                    "aaaaaaaa": "commit",
-                    "manual operation marker": "console",
-                    "history marker": "history",
-                    "anomaly search needle": "anomaly",
-                }
-                for query, expected_kind in cases.items():
-                    projection = D.global_search_projection(query)
-                    with self.subTest(query=query):
-                        self.assertEqual(projection["count"], 1)
-                        self.assertEqual(projection["results"][0]["kind"], expected_kind)
-                        self.assertEqual(projection["results"][0]["workspace"], "alpha")
-
-                handler = self.ResponseCapture()
-                handler.path = "/api/search?q=x"
-                D.Handler.do_GET(handler)
-                self.assertEqual(handler.response[0], 400)
-                self.assertIn("2～200", handler.response[1]["error"])
-            finally:
-                L.WORKSPACE_ROOT, D.ROOT = old_roots
-
-
 class TestFreshStartClearsRoundArtifacts(unittest.TestCase):
     """reset/import 是交易式「從頭跑」:preflight 通過後舊 run 的 history/REPORT/prompt/log
     不得混進新 run(history 輪替保留 .1);preflight 失敗時全數保留。"""

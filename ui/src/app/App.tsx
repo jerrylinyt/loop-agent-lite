@@ -8,7 +8,6 @@ import FleetOverview from "../features/workspaces/FleetOverview";
 import WorkspaceTabs from "../features/workspaces/WorkspaceTabs";
 import WorkspaceView from "../features/workspaces/WorkspaceView";
 import WorkspaceDoctorModal from "../features/workspaces/WorkspaceDoctorModal";
-import GlobalSearchModal from "../features/workspaces/GlobalSearchModal";
 import CommandPalette from "../features/workspaces/CommandPalette";
 import IncidentCenterModal from "../features/workspaces/IncidentCenterModal";
 import useDashboardData from "./useDashboardData";
@@ -20,7 +19,6 @@ export default function App() {
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [archivesOpen, setArchivesOpen] = useState(false);
   const [doctorOpen, setDoctorOpen] = useState(false);
-  const [searchOpen, setSearchOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [incidentsOpen, setIncidentsOpen] = useState(false);
   const [overviewOpen, setOverviewOpen] = useState(() => localStorage.getItem("fleet-overview") === "1");
@@ -74,12 +72,6 @@ export default function App() {
     setOverviewOpen(false);
     localStorage.setItem("fleet-overview", "0");
   };
-  const selectFromSearch = (name: string) => {
-    setSearchOpen(false);
-    dashboard.selectWorkspace(name);
-    setOverviewOpen(false);
-    localStorage.setItem("fleet-overview", "0");
-  };
   const showAttention = () => {
     localStorage.setItem("fleet-filter", "attention");
     localStorage.setItem("fleet-search", "");
@@ -98,7 +90,6 @@ export default function App() {
   }, []);
   const paletteCommands = useMemo(() => [
     { id: "overview", label: "開啟 Fleet 總覽", hint: "監控所有 workspace", run: () => { setOverviewOpen(true); localStorage.setItem("fleet-overview", "1"); } },
-    { id: "search", label: "全域搜尋", hint: "搜尋 task、issue、log", run: () => setSearchOpen(true) },
     { id: "doctor", label: "開啟問題中心", hint: "診斷需處理訊號", run: () => setDoctorOpen(true) },
     { id: "incidents", label: "開啟 Incident 中心", hint: "查看關聯異常", run: () => setIncidentsOpen(true) },
     { id: "archives", label: "查看已封存", hint: "還原或永久刪除", run: () => setArchivesOpen(true) },
@@ -121,7 +112,6 @@ export default function App() {
             </button>}
             <ThemePicker />
             <button type="button" className="secondary-button command-palette-trigger" aria-keyshortcuts="Meta+K Control+K" onClick={() => setPaletteOpen(true)}>⌘K</button>
-            <button type="button" className="secondary-button" onClick={() => setSearchOpen(true)}>⌕ 全域搜尋</button>
             <button type="button" className="secondary-button" onClick={() => setDoctorOpen(true)}>🩺 問題中心</button>
             <button type="button" className="secondary-button" onClick={() => setIncidentsOpen(true)}>⚡ Incidents</button>
             <button type="button" className={`secondary-button${overviewOpen ? " active-toggle" : ""}`} aria-pressed={overviewOpen} onClick={toggleOverview}>📺 總覽</button>
@@ -155,7 +145,6 @@ export default function App() {
       {launcherOpen && <LauncherModal workspaces={dashboard.workspaces} onClose={() => setLauncherOpen(false)} onLaunched={launched} />}
       {archivesOpen && <ArchivesModal readonly={dashboard.bootstrap.readonly} onClose={() => setArchivesOpen(false)} onRestored={restored} />}
       {doctorOpen && <WorkspaceDoctorModal workspaces={dashboard.workspaces} onClose={() => setDoctorOpen(false)} onSelect={selectFromDoctor} />}
-      {searchOpen && <GlobalSearchModal onClose={() => setSearchOpen(false)} onSelect={selectFromSearch} />}
       {paletteOpen && <CommandPalette workspaces={dashboard.workspaces} commands={paletteCommands} onClose={() => setPaletteOpen(false)} onSelectWorkspace={(name) => { dashboard.selectWorkspace(name); setOverviewOpen(false); }} />}
       {incidentsOpen && <IncidentCenterModal workspaces={dashboard.workspaces} history={dashboard.fleetHistory} onClose={() => setIncidentsOpen(false)} onSelect={selectFromOverview} />}
     </>

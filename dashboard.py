@@ -1293,102 +1293,6 @@ def read_incremental(path: Path, offset: int):
         return {"size": 0, "data": "", "error": f"workspace log 不安全:{e}"}
 
 
-SEARCH_MAX_RESULTS = 100
-SEARCH_SCAN_BUDGET = 8 * 1024 * 1024
-SEARCH_ANOMALY_FILES_PER_WORKSPACE = 10
-SEARCH_ANOMALY_BYTES = 64 * 1024
-
-
-def global_search_projection(query: str, limit=SEARCH_MAX_RESULTS):
-    """在固定 I/O 預算內跨 workspace 搜尋 coordinator projection 與近期 log。"""
-    if not isinstance(query, str) or not 2 <= len(query.strip()) <= 200:
-        raise ValueError("搜尋文字長度必須介於 2～200 字")
-    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= SEARCH_MAX_RESULTS:
-        raise ValueError(f"搜尋結果上限必須介於 1～{SEARCH_MAX_RESULTS}")
-    needle = query.strip().casefold()
-    results = []
-    scanned_bytes = 0
-    truncated = False
-
-    def add(workspace, kind, title, text, **extra):
-        if len(results) >= limit:
-            return False
-        folded = str(text).casefold()
-        position = folded.find(needle)
-        if position < 0:
-            return True
-        start = max(0, position - 100)
-        end = min(len(str(text)), position + len(needle) + 180)
-        snippet = str(text)[start:end].strip().replace("\x00", "")
-        results.append({
-            "id": f"{workspace}-{kind}-{len(results)}",
-            "workspace": workspace, "kind": kind, "title": title,
-            "snippet": snippet, **extra,
-        })
-        return len(results) < limit
-
-    if not ROOT.is_dir():
-        return {"query": query.strip(), "limit": limit, "count": 0, "truncated": False, "results": []}
-    for directory in sorted(ROOT.iterdir()):
-        if (len(results) >= limit or scanned_bytes >= SEARCH_SCAN_BUDGET):
-            truncated = True
-            break
-        if (not loop_mod.valid_workspace_name(directory.name) or directory.is_symlink() or
-                not directory.is_dir()):
-            continue
-        state, error = read_state(directory.name, repair=False)
-        if error:
-            add(directory.name, "state", "State 錯誤", error)
-            continue
-        for task in state.get("plan") or []:
-            if not add(directory.name, "task", f"task-{task['order']}", task.get("task") or "",
-                       order=task["order"]):
-                break
-        for issue in state.get("issues") or []:
-            if not add(directory.name, "issue", f"Issue · round {issue['round']}", issue.get("text") or "",
-                       round=issue["round"], timestamp=issue.get("ts")):
-                break
-        for completed in state.get("completed") or []:
-            if not add(directory.name, "commit", f"task-{completed['order']} 完成 commit",
-                       completed.get("sha") or "", order=completed["order"], round=completed["round"]):
-                break
-        for filename, kind, title in (("history.log", "history", "輪次紀錄"),
-                                      ("console.log", "console", "Console")):
-            projection = read_incremental(directory / filename, -1)
-            data = projection.get("data") or ""
-            scanned_bytes += len(data.encode("utf-8", errors="replace"))
-            for line in reversed(data.splitlines()):
-                if not add(directory.name, kind, title, line):
-                    break
-        try:
-            metadata = read_preserved_anomaly_metadata(directory)[:SEARCH_ANOMALY_FILES_PER_WORKSPACE]
-        except (OSError, ValueError):
-            metadata = []
-        for item in metadata:
-            if len(results) >= limit or scanned_bytes >= SEARCH_SCAN_BUDGET:
-                truncated = True
-                break
-            path = directory / "logs" / "anomalies" / item["log_file"]
-            try:
-                fd = loop_mod._open_regular(path, os.O_RDONLY)
-                with os.fdopen(fd, "rb", closefd=True) as stream:
-                    size = os.fstat(stream.fileno()).st_size
-                    stream.seek(max(0, size - SEARCH_ANOMALY_BYTES))
-                    data = stream.read(SEARCH_ANOMALY_BYTES).decode("utf-8", errors="replace")
-            except (FileNotFoundError, OSError, ValueError):
-                continue
-            scanned_bytes += len(data.encode("utf-8", errors="replace"))
-            for line in reversed(data.splitlines()):
-                if not add(directory.name, "anomaly", f"異常輪 round {item['round']}", line,
-                           round=item["round"], timestamp=item["timestamp"], log_id=item["id"]):
-                    break
-    return {
-        "query": query.strip(), "limit": limit, "count": len(results),
-        "truncated": truncated or scanned_bytes >= SEARCH_SCAN_BUDGET,
-        "results": results,
-    }
-
-
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     preselect = ""
@@ -1727,15 +1631,6 @@ class Handler(BaseHTTPRequestHandler):
                     self._err(str(e), 404)
                     return
                 except ValueError as e:
-                    self._err(str(e))
-                    return
-                self._out(200, json.dumps(projection, ensure_ascii=False))
-            elif u.path == "/api/search":
-                query = q.get("q", [""])[0]
-                try:
-                    limit = int(q.get("limit", [str(SEARCH_MAX_RESULTS)])[0])
-                    projection = global_search_projection(query, limit)
-                except (TypeError, ValueError) as e:
                     self._err(str(e))
                     return
                 self._out(200, json.dumps(projection, ensure_ascii=False))

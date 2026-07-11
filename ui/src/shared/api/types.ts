@@ -112,27 +112,6 @@ export interface AnomalyLogResponse {
   data?: string;
 }
 
-export interface GlobalSearchResult {
-  id: string;
-  workspace: string;
-  kind: "state" | "task" | "issue" | "commit" | "history" | "console" | "anomaly";
-  title: string;
-  snippet: string;
-  order?: number;
-  round?: number;
-  timestamp?: string;
-  log_id?: string;
-}
-
-export interface GlobalSearchResponse {
-  error?: string;
-  query: string;
-  limit: number;
-  count: number;
-  truncated: boolean;
-  results: GlobalSearchResult[];
-}
-
 export interface RoundMetrics {
   error?: string;
   run?: "current" | "previous";
