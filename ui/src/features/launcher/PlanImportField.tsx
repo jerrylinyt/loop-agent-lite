@@ -1,3 +1,4 @@
+/** plan.json 匯入欄位：即時顯示格式錯誤與起始 phase；前端檢查只是回饋，後端仍是最終防線。 */
 import { useState } from "react";
 import { PLAN_TEMPLATE, validatePlan } from "./planValidation";
 

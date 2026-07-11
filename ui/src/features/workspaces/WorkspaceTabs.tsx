@@ -1,3 +1,4 @@
+/** Workspace 分頁列：依 fleet 順序顯示狀態與選取項，實際切換由 App 資料層處理。 */
 import type { WorkspaceSummary } from "../../shared/api/types";
 
 function workspaceMeta(workspace: WorkspaceSummary) {

@@ -1,3 +1,4 @@
+/** 垂直分隔線：調整任務與 Agent console 寬度，並提供鍵盤等價操作。 */
 import { useRef } from "react";
 
 export default function Splitter({ onResize }: { onResize: (pixels: number) => void }) {

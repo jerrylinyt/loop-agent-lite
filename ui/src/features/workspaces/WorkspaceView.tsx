@@ -1,3 +1,4 @@
+/** 單一 workspace 操作面：把 state 投影成計畫、健康、console 與安全操作，所有 mutation 都走後端 API。 */
 import { useState } from "react";
 import { postJson, waitForJobStartup } from "../../shared/api/client";
 import ActionDialog, { type ActionPreviewItem } from "../../shared/components/ActionDialog";
@@ -70,6 +71,7 @@ export default function WorkspaceView({
   if (state.error) return <section className="workspace-pane"><div className="loading-state error">{state.error === "busy" ? "state 更新中…" : state.error}</div></section>;
 
   const mutate = async (url: string, body: unknown) => {
+    // run/stop/drain 共用 startup/error 處理；若是啟動操作，不能只看 POST 成功，還要等 ready marker。
     setBusyAction(url === "/api/stop" ? "stop" : url === "/api/drain" ? "drain" : url === "/api/cancel-drain" ? "cancelDrain" : url === "/api/run" ? "run" : null);
     try {
       const response = await postJson<StartupResponse>(url, body);
@@ -91,6 +93,7 @@ export default function WorkspaceView({
     }
   };
   const changePhase = (phase: "plan" | "exec") => {
+    // phase 變更會重設不同範圍的 coordinator 計數，先用結構化 preview 明列清除與保留內容。
     const message = phase === "exec"
       ? "直接進入執行期，從第一個任務開始。繼續？"
       : "回到規劃期會清除執行進度與完成紀錄，計畫保留。繼續？";
@@ -114,6 +117,8 @@ export default function WorkspaceView({
     });
   };
   const gotoTask = (order: number) => {
+    // 往後跳代表略過尚未完成任務，後端必須先 Validate 並標成人工完成；
+    // 往前退則清除目標含以後的完成紀錄，但絕不改動 target repo。
     const done = new Set((state.completed ?? []).map((entry) => entry.order));
     const skipped = (state.plan ?? []).map((task) => task.order).filter((value) => value < order && !done.has(value));
     const message = skipped.length

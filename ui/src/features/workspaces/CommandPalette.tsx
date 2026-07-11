@@ -1,3 +1,4 @@
+/** 快捷指令面板：在固定上限內合併全域操作與 workspace，Enter 執行目前第一筆結果。 */
 import { useMemo, useState } from "react";
 import type { WorkspaceSummary } from "../../shared/api/types";
 import Modal from "../../shared/components/Modal";

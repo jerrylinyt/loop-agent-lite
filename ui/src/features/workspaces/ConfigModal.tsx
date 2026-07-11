@@ -1,3 +1,4 @@
+/** 停止狀態下的 workspace 設定編輯器：載入可選命令、追蹤非同步測試，儲存時由後端重驗數值與白名單。 */
 import { useEffect, useRef, useState } from "react";
 import CliManagerModal from "../cli/CliManagerModal";
 import Modal from "../../shared/components/Modal";

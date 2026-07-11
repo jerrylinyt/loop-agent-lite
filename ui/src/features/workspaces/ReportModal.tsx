@@ -1,3 +1,4 @@
+/** 完成報告檢視器：只讀取 REPORT.md 投影，缺檔與不安全檔案由後端回傳明確錯誤。 */
 import { useEffect, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import Modal from "../../shared/components/Modal";

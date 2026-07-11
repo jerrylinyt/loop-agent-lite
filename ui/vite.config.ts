@@ -1,3 +1,4 @@
+/** Vite 僅負責編譯 React 與開發期代理；production 靜態檔由 Python Dashboard 提供。 */
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 

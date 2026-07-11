@@ -1,3 +1,5 @@
+"""Prompt 模板目錄與團隊/個人設定邊界的回歸測試。"""
+
 import json
 import tempfile
 import unittest

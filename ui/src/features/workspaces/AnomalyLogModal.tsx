@@ -1,3 +1,4 @@
+/** 異常輪檢視器：列出 bounded anomaly metadata，並用 request sequence 避免慢回應覆蓋新選擇。 */
 import { useEffect, useRef, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import type { AnomalyListResponse, AnomalyLogResponse, AnomalyRecord } from "../../shared/api/types";

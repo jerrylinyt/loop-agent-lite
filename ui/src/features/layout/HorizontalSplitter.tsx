@@ -1,3 +1,4 @@
+/** 水平分隔線：支援滑鼠拖曳與方向鍵微調，尺寸範圍由元件內限制避免面板消失。 */
 import { useRef } from "react";
 
 export default function HorizontalSplitter({ onResize }: { onResize: (pixels: number) => void }) {

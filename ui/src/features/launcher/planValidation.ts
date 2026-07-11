@@ -1,3 +1,4 @@
+/** 匯入前的輕量 plan 格式檢查；規則與 work.py 契約一致，但不能取代伺服器端校驗。 */
 export const PLAN_TEMPLATE = JSON.stringify([
   { order: 1, task: "任務描述：寫到一個無前後文的工程師能直接動工，含驗收標準（DoD）", ref: "docs/analysis.md#段落（選填）" },
   { order: 2, task: "第二個任務，依依賴順序排列", ref: null },
@@ -5,6 +6,7 @@ export const PLAN_TEMPLATE = JSON.stringify([
 ], null, 2);
 
 export function validatePlan(text: string) {
+  // 空字串代表不匯入；有內容時要求非空陣列、連續 order 與 task/ref 型別正確。
   if (!text.trim()) return "";
   let plan: unknown;
   try { plan = JSON.parse(text); } catch (error) { return `JSON 解析失敗：${(error as Error).message}`; }

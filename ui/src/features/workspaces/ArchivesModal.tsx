@@ -1,3 +1,4 @@
+/** 封存管理器：唯讀列舉、安全還原與雙重確認刪除；每個破壞性操作都先顯示影響範圍。 */
 import { useCallback, useEffect, useState } from "react";
 import { getJson, postJson } from "../../shared/api/client";
 import type { ArchiveSummary, ArchivesResponse, DeleteArchiveResponse, RestoreArchiveResponse } from "../../shared/api/types";

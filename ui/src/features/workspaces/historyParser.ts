@@ -1,3 +1,4 @@
+/** history.log 的容錯 parser：逐 token 接受已知欄位、忽略未來欄位，缺少核心欄位的行才列為無法解析。 */
 export interface HistoryRow {
   round: number;
   ts: string;

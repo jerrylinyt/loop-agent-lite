@@ -121,6 +121,7 @@ def command_env(cfg):
 
 
 def command_not_found(label, executable, cfg):
+    """建立包含目前 PATH 設定與可操作修正方式的找不到命令錯誤。"""
     raw, resolved = configured_path_dirs(cfg)
     shown = ", ".join(raw) or "（未設定）"
     resolved_shown = os.pathsep.join(resolved) or "（無）"
@@ -152,11 +153,13 @@ class ArchiveOperationError(RuntimeError):
     """封存操作的可預期 fail-closed 錯誤；status 直接對應 REST 回應。"""
 
     def __init__(self, message, status=400):
+        """保存可直接映射為 HTTP response 的訊息與狀態碼。"""
         super().__init__(message)
         self.status = status
 
 
 def _lstat(path: Path, label: str):
+    """不跟隨 symlink 取得檔案資訊；不存在回 None，其餘錯誤轉為封存操作錯誤。"""
     try:
         return path.lstat()
     except FileNotFoundError:
@@ -219,12 +222,14 @@ def archive_metadata(archive_id):
 
 
 def new_archive_id(name: str) -> str:
+    """以 workspace 名、UTC 時間與 UUID 建立不碰撞且可稽核的封存 ID。"""
     loop_mod.require_workspace_name(name)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{name}--{stamp}--{uuid.uuid4().hex}"
 
 
 def _lstat_at(directory_fd, name: str, label: str):
+    """相對已開啟 directory fd 執行 lstat，避免路徑在檢查與使用之間被替換。"""
     try:
         return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -318,6 +323,7 @@ def _require_same_directory_entry(parent_fd, name: str, opened_fd, label: str):
 
 
 def _require_absent_entry(parent_fd, name: str, label: str):
+    """確認目的名稱不存在；任何已存在類型都 fail closed，絕不覆蓋。"""
     if _lstat_at(parent_fd, name, label) is not None:
         raise ArchiveOperationError(f"{label}已存在，已拒絕覆寫", 409)
 
@@ -417,6 +423,7 @@ _STATE_LOCKS_GUARD = threading.Lock()
 
 
 def _state_lock(name):
+    """取得每 workspace 共用的 process-local mutation lock，不同 workspace 可並行。"""
     with _STATE_LOCKS_GUARD:
         lk = _STATE_LOCKS.get(name)
         if lk is None:
@@ -431,8 +438,10 @@ def with_state_lock(fn=None, *, repo_fallback=False):
     取得同一把鎖。支援 @with_state_lock 與 @with_state_lock(repo_fallback=True) 兩種寫法。
     """
     def decorate(func):
+        """建立保留原函式 metadata 的鎖定 decorator。"""
         @functools.wraps(func)
         def wrapper(self, body):
+            """從 request 推導鎖 key，涵蓋 launch 名稱留空時的 repo basename。"""
             name = str(body.get("name") or "").strip()
             if not name and repo_fallback:
                 name = Path(str(body.get("repo") or "")).expanduser().name
@@ -449,7 +458,10 @@ class DashboardServer(ThreadingHTTPServer):
 
 
 class Job:
+    """Dashboard 啟動之 loop process 與 bounded 輸出尾段的生命週期封裝。"""
+
     def __init__(self, name, repo, popen):
+        """保存 process 並啟動 daemon reader，避免 stdout pipe 塞滿阻塞 child。"""
         self.name = name
         self.repo = repo
         self.popen = popen
@@ -459,6 +471,7 @@ class Job:
         t.start()
 
     def _reader(self):
+        """持續讀取 stdout 到固定長度 deque，process 結束後關閉 pipe。"""
         try:
             for line in self.popen.stdout:
                 self.out.append(line.rstrip("\n"))
@@ -466,9 +479,11 @@ class Job:
             self.popen.stdout.close()
 
     def alive(self):
+        """以 poll 判斷 child 是否仍在執行。"""
         return self.popen.poll() is None
 
     def info(self):
+        """輸出前端 jobs 分頁使用的安全摘要與最近八行。"""
         return {"name": self.name, "repo": self.repo, "pid": self.popen.pid,
                 "alive": self.alive(), "rc": self.popen.returncode,
                 "tail": "\n".join(list(self.out)[-8:])}
@@ -483,6 +498,7 @@ class Job:
             return True
 
         def _force():
+            """SIGINT 寬限期後仍存活時終止整個 process group。"""
             if self.alive():
                 try:
                     os.killpg(os.getpgid(self.popen.pid), signal.SIGKILL)
@@ -666,6 +682,7 @@ def aggregate_fleet_round_metrics(samples, *, history_truncated=False):
     durations = sorted(sample["seconds"] for sample in samples)
 
     def percentile(percent):
+        """以整數 nearest-rank 計算 fleet percentile，空樣本回 None。"""
         if not durations:
             return None
         index = max(0, (len(durations) * percent + 99) // 100 - 1)
@@ -775,6 +792,7 @@ def read_preserved_anomaly_metadata(workspace_dir: Path):
 
 
 def anomaly_records_for_workspace(workspace_dir: Path, *, run="current", round_limit=100):
+    """從指定 run 的 bounded history 取出未回 DONE 異常並連結保存的 log metadata。"""
     history_name = "history.log" if run == "current" else "history.log.1"
     metrics = loop_mod.read_round_metrics(workspace_dir / history_name, round_limit)
     preserved = {
@@ -836,6 +854,7 @@ def read_anomaly_records(workspace_dir: Path = None, *, run="current"):
 
 
 def read_preserved_anomaly_log(workspace_dir: Path, anomaly_id: str):
+    """依嚴格 anomaly ID 讀取保存 log 尾段，拒絕任意路徑與 symlink。"""
     if not isinstance(anomaly_id, str) or not ANOMALY_ID_RE.fullmatch(anomaly_id):
         raise ValueError("異常 log id 不合法")
     metadata = next((item for item in read_preserved_anomaly_metadata(workspace_dir)
@@ -934,6 +953,7 @@ def read_prompt(name):
         return {"error": f"workspace 名稱不合法：{loop_mod.WORKSPACE_NAME_RULE}"}
 
     def round_num(path):
+        """由 prompt 檔名擷取 round；不符格式時排到最後。"""
         m = re.search(r"round-(\d+)", path.name)
         return int(m.group(1)) if m else -1
 
@@ -982,6 +1002,7 @@ def ws_running(name, st=None):
 
 
 def stop_all_jobs():
+    """Dashboard 關閉時對所有活躍 job 發出優雅停止並給共同十秒寬限。"""
     with JOBS_LOCK:
         jobs = [j for j in JOBS.values() if j.alive()]
     if not jobs:
@@ -997,6 +1018,7 @@ def stop_all_jobs():
 def load_config():
     """讀取團隊版 + 個人版；個人版只允許覆蓋 PERSONAL_CONFIG_KEYS。"""
     def read_json(path, label):
+        """安全讀取單一設定 JSON object；缺檔與格式錯誤分開回報。"""
         try:
             raw = loop_mod.read_regular_text(path, label)
         except FileNotFoundError:
@@ -1061,6 +1083,7 @@ def load_config():
 
 
 def config_projection(cfg):
+    """移除後端內部設定，只投影 Launcher/設定頁需要的安全欄位。"""
     raw_paths, resolved_paths = configured_path_dirs(cfg)
     prompt_templates, prompt_template_warnings = prompt_template_projection(cfg)
     return {"agent_cmds": cfg.get("agent_cmds", []),
@@ -1265,6 +1288,7 @@ TAIL_INIT = 64 * 1024  # offset<0(首抓)時只回檔案尾段,超長 log 秒開
 
 
 def read_incremental(path: Path, offset: int):
+    """依 byte offset bounded 讀取 log；首抓只取完整尾段，輪替/縮檔時從頭重讀。"""
     try:
         path = loop_mod.workspace_file(path, "workspace log")
         fd = loop_mod._open_regular(path, os.O_RDONLY)
@@ -1294,20 +1318,25 @@ def read_incremental(path: Path, offset: int):
 
 
 class Handler(BaseHTTPRequestHandler):
+    """本機 Dashboard 的靜態檔、REST 與 SSE handler；寫入路由可整體切為唯讀。"""
+
     protocol_version = "HTTP/1.1"
     preselect = ""
     readonly = False
 
     def log_message(self, *a):
+        """停用 BaseHTTPRequestHandler 預設 access log，避免污染 operator console。"""
         pass
 
     def handle(self):
+        """把瀏覽器離線造成的正常斷線視為連線結束，不印 traceback。"""
         try:
             super().handle()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 
     def _out(self, code, body, ctype="application/json; charset=utf-8"):
+        """輸出帶 no-store、nosniff 與本機 CSP 的固定長度 response。"""
         data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -1321,6 +1350,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _err(self, msg, code=400):
+        """以一致 JSON shape 回傳使用者可讀錯誤。"""
         self._out(code, json.dumps({"error": msg}, ensure_ascii=False))
 
     def _serve_ui(self, relative_path):
@@ -1344,6 +1374,7 @@ class Handler(BaseHTTPRequestHandler):
         self._out(200, target.read_bytes(), ctype)
 
     def _ws_dir(self, q):
+        """從 query 驗證 workspace 名稱與真實目錄，拒絕隱藏/未知/symlink 目標。"""
         name = q.get("ws", [""])[0]
         if not loop_mod.valid_workspace_name(name):
             self._err(f"workspace 名稱 {name or '(空)'} 不合法：{loop_mod.WORKSPACE_NAME_RULE}")
@@ -1381,6 +1412,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         def emit(event, payload):
+            """送出一筆具事件名稱的 SSE JSON，立即 flush 以降低操作延遲。"""
             data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             self.wfile.write(f"event: {event}\ndata: {data}\n\n".encode("utf-8"))
             self.wfile.flush()
@@ -1391,6 +1423,7 @@ class Handler(BaseHTTPRequestHandler):
         console_identity = None
 
         def file_identity(path):
+            """以 device/inode 偵測 console 輪替，避免沿用舊 byte offset。"""
             try:
                 stat = path.stat()
                 return stat.st_dev, stat.st_ino
@@ -1454,6 +1487,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- GET ----------
     def do_GET(self):
+        """路由所有唯讀投影；每個 artifact reader 自己執行 bounded 與 symlink 檢查。"""
         u = urlparse(self.path)
         q = parse_qs(u.query)
         try:
@@ -1502,6 +1536,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 def fstat(rel):
+                    """區分 repo 檔案已 commit、已修改、未追蹤或缺少。"""
                     in_head = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"HEAD:{rel}"],
                                              capture_output=True).returncode == 0
                     dirty = bool(subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--", rel],
@@ -1641,6 +1676,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- POST ----------
     def do_POST(self):
+        """先套唯讀與 8 MiB body 防線，再將 JSON request 分派到 mutation API。"""
         if self.readonly:
             self._err("唯讀模式:此實例不接受任何操作", 403)
             return
@@ -1705,6 +1741,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @with_state_lock(repo_fallback=True)
     def api_launch(self, body):
+        """交易式啟動/重置 loop：完成所有可失敗 preflight 後才提交 state 與 spawn。"""
         cfg = load_config()
         if "error" in cfg:
             self._err(cfg["error"])
@@ -2826,6 +2863,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "cancelled": True}, ensure_ascii=False))
 
     def api_stop(self, body):
+        """冪等停止本 Dashboard 或外部啟動的 loop；先 SIGINT，逾時才 SIGKILL。"""
         name = str(body.get("name") or "")
         if not loop_mod.valid_workspace_name(name):
             self._err(f"workspace 名稱 {name or '(空)'} 不合法：{loop_mod.WORKSPACE_NAME_RULE}")
@@ -2847,6 +2885,7 @@ class Handler(BaseHTTPRequestHandler):
             os.kill(int(pid), signal.SIGINT)
 
             def _force():
+                """外部 loop 在八秒寬限後仍存活時送 SIGKILL。"""
                 if loop_pid_alive(pid):
                     try:
                         os.kill(int(pid), signal.SIGKILL)
@@ -2869,6 +2908,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    """啟動只監聽 localhost 的 Dashboard，處理 port fallback 與優雅關閉。"""
     ap = argparse.ArgumentParser(description="loop-agent-lite dashboard(fleet + 直播 + launcher)")
     ap.add_argument("--name", default="", help="預選 workspace(可省;頁面內隨時可切)")
     ap.add_argument("--port", type=int, default=8765, help="被占用會自動往上找(最多 +20)")
@@ -2888,6 +2928,7 @@ def main():
     Handler.preselect = args.name
 
     def _sigterm(*_):
+        """將服務管理器 SIGTERM 轉成既有 KeyboardInterrupt 關閉流程。"""
         raise KeyboardInterrupt  # 走與 Ctrl-C 相同的優雅關閉路徑(stop_all_jobs)
     signal.signal(signal.SIGTERM, _sigterm)
 

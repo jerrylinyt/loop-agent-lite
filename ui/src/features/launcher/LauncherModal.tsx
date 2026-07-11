@@ -1,3 +1,4 @@
+/** Loop 啟動中心：彙整 repo/goal/plan/CLI/Validate 設定，先預覽差異與 preflight，再送交易式 launch。 */
 import { useEffect, useMemo, useRef, useState } from "react";
 import CliManagerModal from "../cli/CliManagerModal";
 import Modal from "../../shared/components/Modal";
@@ -85,6 +86,8 @@ export default function LauncherModal({
 
   useEffect(() => {
     if (!config || !repo || !repoStatus || hydratedRepo.current === repo) return;
+    // 同 repo 已有 workspace 時以保存設定回填；否則只套用 repo 偵測出的 Validate 建議。
+    // hydratedRepo 防止 SSE/狀態重繪覆蓋使用者正在修改的表單。
     hydratedRepo.current = repo;
     let active = true;
 
@@ -145,6 +148,7 @@ export default function LauncherModal({
   }, [repo, name, validateChoice, validateTimeout, goalFile, planJson, resetState, newBranch]);
 
   const launch = async () => {
+    // 前端先擋明顯格式錯誤以提供即時回饋；後端仍會重新校驗 plan、路徑、Git 與數值。
     const planError = validatePlan(planJson);
     if (planError) return setMessage(`❌ plan.json 格式不對：${planError}`);
     setLaunching(true);
@@ -172,6 +176,7 @@ export default function LauncherModal({
       return setMessage(`❌ ${response.error ?? "啟動失敗"}`);
     }
     if (response.starting) {
+      // 收到 pid 只代表 process 已 spawn；必須等待 startup handshake 才能關閉表單。
       setMessage("啟動前檢查中…");
       const startup = await waitForJobStartup(response.name, response.pid, response.startup_timeout ?? validateTimeout + 15);
       if (startup.error) {

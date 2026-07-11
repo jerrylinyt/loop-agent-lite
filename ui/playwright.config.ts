@@ -1,3 +1,4 @@
+/** Playwright 使用兩個隔離本機服務：可寫實例驗證完整流程，唯讀實例驗證所有 POST 都被拒絕。 */
 import { defineConfig } from "@playwright/test";
 
 const writableUrl = "http://127.0.0.1:8876";

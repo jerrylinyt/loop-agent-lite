@@ -1,3 +1,4 @@
+/** Goal 唯讀檢視器：顯示目前內容及後端重建的歷史差異，不在瀏覽器自行推測 Git 版本。 */
 import { useEffect, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import Modal from "../../shared/components/Modal";

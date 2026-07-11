@@ -1,3 +1,4 @@
+/** 檢查 production HTML/CSS 不引用外部網路資產，確保 Dashboard 可在離線環境執行。 */
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 

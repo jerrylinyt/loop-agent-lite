@@ -1,3 +1,4 @@
+/** 只解析允許的 ANSI SGR 色彩碼並輸出 React 節點；未知控制碼會被忽略，避免直接注入 HTML。 */
 import type { CSSProperties, ReactNode } from "react";
 
 // SGR(...m)拆出來著色;其他 CSI(游標移動/清行)與 OSC(改標題)序列直接剝除。
@@ -22,6 +23,7 @@ const INITIAL: AnsiState = {
 };
 
 function xterm256(n: number): string {
+  // 0～15 使用系統色；16～231 為 6×6×6 色盤；232～255 為灰階。
   if (n < 16) {
     const base = ["#000", "#c00", "#0a0", "#aa0", "#00c", "#a0a", "#0aa", "#aaa",
       "#555", "#f55", "#5f5", "#ff5", "#55f", "#f5f", "#5ff", "#fff"];
@@ -37,6 +39,7 @@ function xterm256(n: number): string {
 }
 
 function applyCodes(codes: number[], state: AnsiState): AnsiState {
+  // 每次複製 state 後套用 SGR；不支援的碼不改狀態，避免意外清掉已知樣式。
   const next = { ...state };
   for (let i = 0; i < codes.length; i += 1) {
     const code = codes[i];
@@ -76,11 +79,13 @@ function isStyled(state: AnsiState): boolean {
 }
 
 export function hasAnsi(text: string): boolean {
+  /** 快速判斷是否含 ANSI escape，讓純文字路徑避免額外切割。 */
   return text.includes("\x1b");
 }
 
 /** 將含 ANSI escape 的文字轉為 React 節點;無樣式的區段維持純字串。 */
 export function renderAnsi(text: string): ReactNode[] {
+  /** 依 escape 邊界切段並保存跨段樣式；輸出 React text/span，不使用 dangerouslySetInnerHTML。 */
   const nodes: ReactNode[] = [];
   let state = INITIAL;
   let last = 0;

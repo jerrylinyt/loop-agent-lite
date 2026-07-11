@@ -1,3 +1,4 @@
+/** 個人 repo roots 編輯器：清理空白與重複路徑後交由後端做路徑邊界驗證。 */
 import { useState } from "react";
 import Modal from "../../shared/components/Modal";
 import { postJson } from "../../shared/api/client";

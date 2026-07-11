@@ -1,3 +1,4 @@
+/** 將目前 workspace 狀態投影到瀏覽器標題與 favicon；只改 UI，不回寫 coordinator state。 */
 import { useEffect, useRef } from "react";
 import type { WorkspaceState, WorkspaceSummary } from "../shared/api/types";
 
@@ -18,6 +19,7 @@ const TITLE_MARKS: Record<Exclude<Status, "none">, string> = {
 };
 
 function deriveStatus(workspace: WorkspaceSummary | undefined, state: WorkspaceState | null): Status {
+  // 優先序反映操作重要性：完成 > 執行中紅燈 > 執行中 > 停止；無 workspace 不覆蓋預設圖示。
   if (!workspace || !state || state.error) return "none";
   if (state.phase === "done") return "done";
   if (workspace.running && state.red_streak > 0) return "warning";
@@ -26,6 +28,7 @@ function deriveStatus(workspace: WorkspaceSummary | undefined, state: WorkspaceS
 }
 
 function drawFavicon(status: Exclude<Status, "none"> | "plain"): string {
+  // 以 canvas 在本機產生小圖，不依賴外部圖片；狀態圓點與標題 emoji 互相補充。
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = 32;
   const ctx = canvas.getContext("2d");
@@ -56,6 +59,7 @@ function drawFavicon(status: Exclude<Status, "none"> | "plain"): string {
 }
 
 function setFavicon(href: string) {
+  // 重用既有 link，沒有才建立；避免每次 SSE 更新累積多個 favicon 節點。
   if (!href) return;
   let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
   if (!link) {

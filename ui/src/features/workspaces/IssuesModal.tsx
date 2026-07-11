@@ -1,3 +1,4 @@
+/** 結構化 issue 檢視器：標記已讀只更新 watermark，永久清除則要求額外確認。 */
 import { useState } from "react";
 import ActionDialog from "../../shared/components/ActionDialog";
 import Modal from "../../shared/components/Modal";

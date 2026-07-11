@@ -230,6 +230,7 @@ def read_regular_bytes(path: Path, label: str = "workspace 檔案") -> bytes:
 
 
 def read_regular_text(path: Path, label: str = "workspace 檔案") -> str:
+    """安全讀取 UTF-8 regular file；解碼錯誤交由呼叫端決定是否復原或拒絕。"""
     return read_regular_bytes(path, label).decode("utf-8")
 
 
@@ -286,6 +287,7 @@ def round_metrics_from_history(data: str, limit: int = 50, *, history_truncated=
     durations = sorted(sample["seconds"] for sample in samples)
 
     def percentile(ratio):
+        """以 nearest-rank 計算小樣本 percentile；沒有樣本時回傳 None。"""
         if not durations:
             return None
         index = max(0, math.ceil(len(durations) * ratio) - 1)
@@ -491,6 +493,7 @@ def workspace_operation_lock(root: Path, name: str, *, blocking=True):
 
 
 def now_ts() -> str:
+    """產生 console 使用的本機時分秒；具日期的稽核時間另由 state/history 保存。"""
     return datetime.now().strftime("%H:%M:%S")
 
 
@@ -537,6 +540,7 @@ def append_console(path: Path, line: str, *, max_bytes: int = CONSOLE_MAX_BYTES,
 
 
 def _console_line(line: str) -> None:
+    """同步輸出 stdout 與 workspace console；尚未設定 console 時只寫 stdout。"""
     print(line, flush=True)
     if _CONSOLE_PATH is None:
         return
@@ -544,16 +548,19 @@ def _console_line(line: str) -> None:
 
 
 def log(msg: str) -> None:
+    """將一般 coordinator 訊息逐行加上本機時間後輸出。"""
     lines = str(msg).splitlines() or [""]
     for line in lines:
         _console_line(f"[{now_ts()}] {line}")
 
 
 def agent_log(msg: str) -> None:
+    """標記 Agent 來源後寫入共用 console，供前端依來源過濾。"""
     _console_line(f"[{now_ts()}] 🤖 Agent｜{msg}")
 
 
 def fail(msg: str):
+    """記錄單一失敗原因後以 exit 1 結束，避免 stderr 重複列印。"""
     log(f"⛔ 流程停止｜{msg}")
     # 原因已同步寫到 stdout 與 console.log；只回 exit code，避免 stderr 再印一次相同訊息。
     raise SystemExit(1)
@@ -600,6 +607,7 @@ atexit.register(release_run_locks)
 
 
 def sh(args, cwd, check=True):
+    """執行不經 shell 的子程序並擷取輸出；check=True 時把非零狀態轉成例外。"""
     r = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True)
     if check and r.returncode != 0:
         raise RuntimeError(f"命令失敗 rc={r.returncode}: {args}\n{r.stdout}\n{r.stderr}")
@@ -607,14 +615,17 @@ def sh(args, cwd, check=True):
 
 
 def git(repo, *args, check=True):
+    """在指定 repo 執行 Git 子命令，統一沿用 sh 的錯誤語意。"""
     return sh(["git", *args], cwd=repo, check=check)
 
 
 def head_sha(repo) -> str:
+    """讀取目前 HEAD 完整 SHA。"""
     return git(repo, "rev-parse", "HEAD").stdout.strip()
 
 
 def is_dirty(repo) -> bool:
+    """只要 porcelain status 有任何輸出就視為髒工作樹。"""
     return bool(git(repo, "status", "--porcelain").stdout.strip())
 
 
@@ -646,10 +657,12 @@ def green_anchor_valid(repo, green, snap_dir, rel_paths) -> bool:
 
 
 def tracked_in_head(repo, rel_path) -> bool:
+    """判斷相對路徑是否存在於目前 HEAD，而不是只看工作樹是否有檔案。"""
     return git(repo, "cat-file", "-e", f"HEAD:{rel_path}", check=False).returncode == 0
 
 
 def sha256_bytes(data: bytes) -> str:
+    """產生 state/checkpoint 與 goal 內容比對使用的穩定雜湊。"""
     return hashlib.sha256(data).hexdigest()
 
 
@@ -670,6 +683,7 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
 
 
 def _stop_after_round_marker_matches(path: Path, pid, session_id) -> bool:
+    """驗證停止 marker 同時屬於目前 pid 與 session，拒絕舊 session 殘留請求。"""
     try:
         path = workspace_file(path, "stop marker")
         fd = _open_regular(path, os.O_RDONLY)
@@ -746,6 +760,7 @@ class StateLoadError(RuntimeError):
 
 
 def state_checkpoint_path(state_path: Path) -> Path:
+    """由 primary state 路徑取得固定的 last-good checkpoint 路徑。"""
     return state_path.with_name("state.last-good.json")
 
 
@@ -875,6 +890,7 @@ def unread_issue_count(state) -> int:
 
 
 def decode_state_bytes(data: bytes, label: str):
+    """解碼並驗證 state JSON；任何損壞都轉成帶來源標籤的 StateLoadError。"""
     try:
         state = json.loads(data)
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -953,6 +969,7 @@ class Workspace:
     """workspace/<name>/ 底下所有 python-owned 檔案的單一寫入點。"""
 
     def __init__(self, name: str):
+        """建立/驗證 workspace 目錄與受管子目錄，但不自動啟動 loop。"""
         self.name = require_workspace_name(name)
         with workspace_operation_lock(WORKSPACE_ROOT, self.name):
             self.dir = workspace_path(WORKSPACE_ROOT, self.name)
@@ -980,6 +997,7 @@ class Workspace:
 
     # ---- state.json ----
     def fresh_state(self):
+        """建立向後相容的全新規劃期 state，所有收斂與異常計數歸零。"""
         return {
             "phase": "plan", "round": 0, "flag": 0,
             "plan": [], "plan_version": 0,
@@ -1000,6 +1018,7 @@ class Workspace:
         }
 
     def load_state(self):
+        """載入 primary/checkpoint；必要時受控復原並記錄本 session 的防竄改雜湊。"""
         try:
             state, data, recovered = load_checkpointed_state(self.state_path)
         except FileNotFoundError:
@@ -1015,6 +1034,7 @@ class Workspace:
         return state
 
     def save_state(self, state):
+        """同步原子寫入 primary 與 checkpoint，並更新本 session 的防竄改基準。"""
         data = json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")
         write_checkpointed_state(self.state_path, data)
         self._state_hash = sha256_bytes(data)
@@ -1052,6 +1072,7 @@ class Workspace:
             path.unlink(missing_ok=True)
 
     def signal(self, name, round_token) -> bool:
+        """只接受目前 round token 命名的 regular signal file。"""
         try:
             read_regular_bytes(self.dir / f"{name}.{round_token}", f"signal {name}")
             return True
@@ -1059,6 +1080,7 @@ class Workspace:
             return False
 
     def take_pending_plan(self, round_token):
+        """讀取本輪 plan proposal；損壞或不安全時忽略整包而不中止長跑 loop。"""
         p = self.dir / f"pending_plan.{round_token}.json"
         try:
             return json.loads(read_regular_text(p, "pending plan"))
@@ -1068,6 +1090,7 @@ class Workspace:
             return None
 
     def pending_issues(self, round_token):
+        """取得本輪 issue 暫存檔路徑；內容會在輪末集中併入 state。"""
         return self.dir / f"pending_issues.{round_token}"
 
     def write_dispatch(self, phase, task_id, round_token):
@@ -1084,6 +1107,7 @@ class Workspace:
 
     # ---- 受保護檔案快照(goal / 初步規劃書) ----
     def snapshot_protected(self, repo, rel_paths):
+        """複製 goal/plan doc 到 workspace snapshot，供輪末偵測 Agent 越權修改。"""
         for rel in rel_paths:
             target = repo_relative_path(repo, rel)
             snap = workspace_file(self.dir / "snapshots" / rel.replace("/", "__"), "protected snapshot")
@@ -1133,12 +1157,14 @@ def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs, on_started=No
         escaped_pipe = False
 
         def _kill_group():
+            """終止 Agent 的獨立 process group，避免背景子程序持續佔用 pipe。"""
             try:
                 os.killpg(process_group, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
 
         def _stream_output():
+            """逐行鏡像 Agent stdout 到 console 與 round log；錯誤留給主執行緒轉拋。"""
             try:
                 for raw in p.stdout:
                     line = raw.decode("utf-8", errors="replace")
@@ -1231,6 +1257,7 @@ def run_validate(cmd, repo, timeout_secs=VALIDATE_TIMEOUT_SEC):
 
 
 def render_task_list(state):
+    """將 plan 投影成 prompt 內的精簡任務清單，標示完成與目前任務並限制單行長度。"""
     done_orders = {e["order"] for e in state["completed"]}
     lines = []
     for t in state["plan"]:
@@ -1248,6 +1275,7 @@ def render_task_list(state):
 
 
 def build_prompt(tpl_path, mapping):
+    """以固定 placeholder 做純文字替換；不執行模板內容。"""
     text = tpl_path.read_text(encoding="utf-8")
     for k, v in mapping.items():
         text = text.replace(f"<<{k}>>", v)
@@ -1263,6 +1291,7 @@ def agent_failure_backoff(streak, maximum_seconds) -> float:
 
 
 def main():
+    """解析 CLI、執行 preflight，然後進入規劃/執行雙階段 coordinator loop。"""
     ap = argparse.ArgumentParser(description="loop-agent-lite:規劃/執行雙段共識迴圈")
     ap.add_argument("--repo", required=True, help="target code repo(git、乾淨、validate 綠)")
     ap.add_argument("--name", default=None,
@@ -1498,6 +1527,7 @@ def main():
                      "started_at": datetime.now().isoformat(timespec="seconds")}
 
     def _mark_stopped():
+        """正常退出時清 session 控制檔、凍結未完成輪時間並清除 state pid。"""
         # 若「本輪後停止」後又立刻按立即停止，或程序在輪末競態退出，不把請求留給下次 session。
         stop_after_round_requested(ws.dir, os.getpid(), session_id, consume=True)
         clear_stop_after_round_claimed(ws.dir, os.getpid(), session_id)
@@ -1528,6 +1558,7 @@ def main():
     startup_marked = False
 
     def mark_startup_ready(_agent_pid):
+        """第一個 Agent 成功 spawn 後只寫一次 ready marker，完成 Dashboard handshake。"""
         nonlocal startup_marked
         if startup_marked:
             return

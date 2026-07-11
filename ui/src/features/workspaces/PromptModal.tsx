@@ -1,3 +1,4 @@
+/** 最近一輪 prompt 的唯讀檢視器；內容來自 workspace 安全投影，不允許前端修改。 */
 import { useEffect, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import Modal from "../../shared/components/Modal";

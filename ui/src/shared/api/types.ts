@@ -1,3 +1,4 @@
+/** 前後端 JSON 契約型別；可選欄位代表舊 workspace 或錯誤投影可能尚未提供該資料。 */
 export type Phase = "plan" | "exec" | "done";
 
 export interface WorkspaceSummary {

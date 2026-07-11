@@ -1,3 +1,4 @@
+/** 主題選擇器：保存個人偏好，system 模式則跟隨作業系統媒體查詢。 */
 import { useEffect, useState } from "react";
 
 type ThemePreference = "system" | "dark" | "light";

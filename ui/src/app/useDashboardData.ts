@@ -1,3 +1,4 @@
+/** Dashboard 資料層：以 REST 做首次讀取、SSE 接收增量 truth，並確保切換 workspace 時不套用舊連線事件。 */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getJson } from "../shared/api/client";
 import type { BootstrapResponse, FleetHealth, FleetHistoryEntry, FleetRoundMetrics, WorkspaceState, WorkspaceSummary } from "../shared/api/types";
@@ -23,6 +24,7 @@ export default function useDashboardData() {
   useEffect(() => { bootstrapRef.current = bootstrap; }, [bootstrap]);
 
   const selectWorkspace = useCallback((name: string) => {
+    // 先清掉上一個 workspace 的 state/console，避免新 SSE 建立前短暫顯示錯誤內容。
     if (!name || name === selectedRef.current) return;
     setSelected(name);
     setState(null);
@@ -40,6 +42,7 @@ export default function useDashboardData() {
     }
     if (!selectedRef.current || !list.some((workspace) => workspace.name === selectedRef.current)) {
       const hash = decodeURIComponent(location.hash.replace(/^#/, ""));
+      // 選取優先序：明確 hash > 後端 preselect > 本機上次選擇 > fleet 第一筆。
       const preferred = [hash, bootstrapRef.current.preselect, localStorage.getItem("workspace")]
         .find((name) => name && list.some((workspace) => workspace.name === name));
       selectWorkspace(preferred || list[0].name);
@@ -81,6 +84,7 @@ export default function useDashboardData() {
     setConnection("connecting");
     const params = new URLSearchParams({ fleet: "1" });
     if (selected) params.set("ws", selected);
+    // selected 改變就關閉舊 EventSource 並建立新連線；cleanup 是防止跨 workspace 串流混入的關鍵。
     const source = new EventSource(`/api/events?${params.toString()}`);
     source.onopen = () => {
       setConnection("connected");

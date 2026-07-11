@@ -1,3 +1,4 @@
+/** 將固定契約、任務模板與使用者需求組合成可交給外部 Agent 的純文字 prompt。 */
 import type { PromptTemplate } from "../../shared/api/types";
 
 export type PromptTemplateMode = "goal" | "plan";
@@ -60,6 +61,7 @@ export function buildExternalAgentPrompt({
   requirement: string;
   projectContext: string;
 }) {
+  // 固定分析核心與輸出契約永遠存在；團隊模板只能補充任務類型指引。
   const requirementText = requirement.trim() || template.requirement_placeholder || DEFAULT_REQUIREMENT;
   const contextText = projectContext.trim() || DEFAULT_CONTEXT;
   const outputContract = mode === "goal" ? GOAL_OUTPUT_CONTRACT : PLAN_OUTPUT_CONTRACT;
@@ -98,11 +100,13 @@ ${outputContract}
 }
 
 export function promptDownloadName(template: PromptTemplate, mode: PromptTemplateMode) {
+  // 非安全字元轉成連字號，避免模板 id 產生意外路徑或空檔名。
   const safeId = template.id.replace(/[^a-z0-9._-]+/gi, "-").replace(/^-+|-+$/g, "") || "custom";
   return `${safeId}-${mode}-prompt.md`;
 }
 
 export function downloadPromptFile(content: string, filename: string) {
+  // 以暫時 Blob URL 觸發本機下載，完成後立即撤銷 URL。
   const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");

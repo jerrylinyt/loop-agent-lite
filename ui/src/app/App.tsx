@@ -1,3 +1,4 @@
+/** Dashboard 根元件：協調全域工具列、workspace/總覽切換、Modal 與鍵盤導覽；業務資料由 useDashboardData 統一提供。 */
 import { useEffect, useMemo, useRef, useState } from "react";
 import ConsolePane from "../features/console/ConsolePane";
 import Splitter from "../features/layout/Splitter";
@@ -73,6 +74,8 @@ export default function App() {
   };
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
+      // ⌘/Ctrl+K 是立即開啟；⌘/Ctrl+G 則進入 1.5 秒的兩段式導覽模式，
+      // 避免單按數字時意外切走 workspace。表單或 Modal 內一律不攔截。
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault(); setPaletteOpen(true);
         return;
@@ -98,6 +101,7 @@ export default function App() {
         return;
       }
       const next = dashboard.workspaces[Number(event.key) - 1];
+      // 超出現有 workspace 數量時維持原畫面，不把空位置當成錯誤。
       if (!next) return;
       dashboard.selectWorkspace(next.name);
       setOverviewOpen(false);

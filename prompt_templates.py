@@ -1,7 +1,7 @@
-"""External-agent prompt template catalog exposed by the Dashboard config projection.
+"""Dashboard 設定投影使用的外部 Agent prompt 模板目錄。
 
-The shared analysis core and Goal/Plan output contracts live in the UI builder.  Team
-configuration may add task-specific guidance, but cannot replace those contracts.
+共用分析核心與 Goal/Plan 輸出契約固定在 UI builder；團隊設定只能追加任務指引，
+不能取代系統契約。無效的團隊模板會略過並轉成 warning，不讓整個 Dashboard 失效。
 """
 import re
 
@@ -150,6 +150,7 @@ BUILTIN_PROMPT_TEMPLATES = [
 
 
 def _read_text(item, key, index, warnings, *, required=False, maximum=400):
+    """驗證團隊模板文字欄位與長度；錯誤累積為 warning，不拖垮整份設定。"""
     if key not in item:
         if required:
             warnings.append(f"團隊 Prompt 模板第 {index} 筆缺少 {key}，已略過")

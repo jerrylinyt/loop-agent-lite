@@ -1,3 +1,4 @@
+/** 外部 Agent prompt 產生器：在瀏覽器組合、預覽與下載文字，不接觸 repo 或 workspace。 */
 import { useMemo, useState } from "react";
 import Modal from "../../shared/components/Modal";
 import type { PromptTemplate } from "../../shared/api/types";

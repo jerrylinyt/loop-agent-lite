@@ -15,11 +15,13 @@ EXAMPLE = '[{"order": 1, "task": "描述", "ref": "PLAN.md#段落"}, {"order": 2
 
 
 def die(msg):
+    """印出 coordinator 契約錯誤並以 exit 2 結束，表示命令未被接受。"""
     print(f"❌ {msg}", file=sys.stderr)
     sys.exit(1)
 
 
 def ws_dir():
+    """由受控環境變數取得 workspace，並驗證名稱與 root 邊界。"""
     p = os.environ.get("LOOP_WS")
     if not p:
         die("LOOP_WS 未設定或不存在:work.py 只在 loop.py 派發的 agent 環境內有效")
@@ -53,10 +55,12 @@ def current_dispatch(ws):
 
 
 def signal_path(ws, name, token):
+    """建立綁定目前 round token 的 signal 路徑，舊輪檔案不會誤觸新輪。"""
     return ws / f"{name}.{token}"
 
 
 def write_marker(path):
+    """原子寫入空 marker；任何路徑安全錯誤都拒絕本次 Agent 回報。"""
     try:
         loop_mod.atomic_write_bytes(path, b"")
     except (OSError, ValueError) as e:
@@ -96,6 +100,7 @@ def validate_plan(plan):
 
 
 def cmd_create_plan(ws, argv):
+    """接收完整 plan proposal，整包校驗後原子落盤，輪末才由 loop 採用。"""
     dispatch, token = current_dispatch(ws)
     if len(argv) > 1:
         die("用法:work.py create-plan [json檔]；最多只能給一個檔案，或由 stdin 餵入 JSON")
@@ -120,6 +125,7 @@ def cmd_create_plan(ws, argv):
 
 
 def cmd_plan_ok(ws, argv):
+    """在規劃期宣告本輪計畫已完整；實際 flag 是否增加仍由輪末條件決定。"""
     dispatch, token = current_dispatch(ws)
     if argv:
         die("用法:work.py plan-ok（不接受其他參數）")
@@ -130,6 +136,7 @@ def cmd_plan_ok(ws, argv):
 
 
 def cmd_done(ws, argv):
+    """只接受目前 dispatch 的 task id，避免 Agent 誤完成其他任務。"""
     dispatch, token = current_dispatch(ws)
     if len(argv) != 1:
         die("用法:work.py done <task-id>,例:work.py done task-3")
@@ -168,6 +175,7 @@ def cmd_issue(ws, argv):
 
 
 def main():
+    """分派 Agent 可用的最小 coordinator CLI；未知命令或參數一律 fail closed。"""
     if len(sys.argv) < 2:
         die("用法:work.py <create-plan [json檔]|plan-ok|done <task-id>|issue <描述>>")
     ws = ws_dir()

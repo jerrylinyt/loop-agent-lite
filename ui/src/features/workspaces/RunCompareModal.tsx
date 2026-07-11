@@ -1,3 +1,4 @@
+/** Run 對比：只比較後端實際保留的 current/previous metrics 與 anomaly 數，不臆測未保存資料。 */
 import { useEffect, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import type { AnomalyListResponse, RoundMetrics } from "../../shared/api/types";
@@ -5,6 +6,7 @@ import Modal from "../../shared/components/Modal";
 
 function metric(value: number | null, suffix = "s") { return value === null ? "—" : `${value}${suffix}`; }
 function delta(current: number | null, previous: number | null, lowerIsBetter = true) {
+  // 沒有任一側樣本就不比較；耗時/異常採越低越好，樣本數則可反轉判斷。
   if (current === null || previous === null) return { text: "無法比較", tone: "" };
   const value = Math.round((current - previous) * 100) / 100;
   if (value === 0) return { text: "＝ 無變化", tone: "" };

@@ -1,3 +1,4 @@
+/** 輪次歷史檢視器：切換 current/previous run，並行讀取 bounded history 與 metrics，顯示 coordinator 判定。 */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import Modal from "../../shared/components/Modal";

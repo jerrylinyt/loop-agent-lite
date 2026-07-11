@@ -14,10 +14,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def run(*args, cwd):
+    """在 fixture 建立階段執行必要命令，失敗立即讓 E2E server 啟動失敗。"""
     subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True)
 
 
 def prepare_fixture():
+    """建立隔離 repo、假 Agent 與個人設定，確保 E2E 不碰使用者真實 workspace。"""
     fixture = Path(tempfile.mkdtemp(prefix="loop-lite-e2e-"))
     repos = fixture / "repos"
     repo = repos / "demo-repo"
@@ -102,6 +104,7 @@ def prepare_fixture():
 
 
 def main():
+    """啟動可寫或唯讀 E2E Dashboard，退出時清除整個暫存 fixture。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--read-only", action="store_true")

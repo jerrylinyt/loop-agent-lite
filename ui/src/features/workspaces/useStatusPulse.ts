@@ -1,3 +1,4 @@
+/** 比較前後兩份 state，短暫標記真正變動的 phase/task/計數/健康欄位供 UI 動畫提示。 */
 import { useEffect, useRef, useState } from "react";
 import type { WorkspaceState } from "../../shared/api/types";
 

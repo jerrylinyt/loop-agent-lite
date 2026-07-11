@@ -1,3 +1,4 @@
+/** 可堆疊 Modal 基礎元件：管理 inert、焦點圈、Esc、Tab trap 與關閉後焦點回復。 */
 import { useEffect, useId, useRef, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
@@ -37,6 +38,7 @@ export default function Modal({ title, description, onClose, children, footer, w
     previousFocus.current = document.activeElement as HTMLElement | null;
     const shell = document.getElementById("app-shell");
     const id = modalId.current;
+    // stack 只讓最上層 Modal 處理 Esc/Tab；巢狀確認視窗關閉時不會誤關底層編輯器。
     modalStack.push(id);
     shell?.setAttribute("inert", "");
     const panel = panelRef.current;
@@ -52,6 +54,7 @@ export default function Modal({ title, description, onClose, children, footer, w
         return;
       }
       if (event.key !== "Tab" || !panel) return;
+      // offsetParent 過濾 display:none/隱藏控制，避免焦點被困在不可見元素。
       const controls = [...panel.querySelectorAll<HTMLElement>(FOCUSABLE)]
         .filter((element) => element.offsetParent !== null);
       if (!controls.length) return;

@@ -1,3 +1,4 @@
+/** 空 workspace 的三步驟導引；元件本身不建立任何設定，所有變更仍由 Launcher 執行。 */
 export default function GettingStarted({ readonly, onLaunch }: { readonly: boolean; onLaunch: () => void }) {
   return <section className="getting-started" aria-labelledby="getting-started-title">
     <div className="getting-started-head"><div><h2 id="getting-started-title">第一次使用，三步完成</h2><p>每一步都可回頭修改；啟動前仍會執行完整安全檢查。</p></div>{!readonly && <button type="button" className="primary-button" onClick={onLaunch}>開始設定</button>}</div>

@@ -1,3 +1,4 @@
+/** 統一時間軸：合併 history、anomaly 與目前 console 人工操作；缺日期的時間會明確標成推定本機時間。 */
 import { useEffect, useMemo, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import Modal from "../../shared/components/Modal";
@@ -16,6 +17,7 @@ interface TimelineItem {
 }
 
 function dashboardActions(consoleText: string, datePrefix?: string): TimelineItem[] {
+  // console 只有本機時間沒有日期；以最近 history 日期排序只是顯示推定，label 必須明確揭露。
   const items: TimelineItem[] = [];
   for (const [index, line] of consoleText.split("\n").entries()) {
     const matched = line.match(/^\[(\d{2}:\d{2}:\d{2})\] 🖥️ Dashboard｜(.+)$/);

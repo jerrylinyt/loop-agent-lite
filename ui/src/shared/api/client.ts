@@ -1,3 +1,4 @@
+/** Dashboard HTTP client：統一 JSON 錯誤處理，並輪詢 startup handshake，避免 UI 把「已 spawn」誤當成「已可用」。 */
 import type { StartupStatus } from "./types";
 
 export async function getJson<T>(url: string): Promise<T | null> {

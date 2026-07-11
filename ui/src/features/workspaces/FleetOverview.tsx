@@ -1,3 +1,4 @@
+/** Fleet 監控總覽：聚合工作區、效能與事件，並處理本機視圖、篩選、排序及有條件的批次操作。 */
 import { useEffect, useMemo, useState } from "react";
 import type { FleetHistoryEntry, FleetRoundMetrics, WorkspaceSummary } from "../../shared/api/types";
 import AnomalyLogModal from "./AnomalyLogModal";
@@ -21,6 +22,8 @@ const FLEET_FILTERS: FleetFilter[] = ["all", "attention", "running", "done"];
 const FLEET_SORTS: FleetSort[] = ["name", "attention", "running", "progress"];
 
 function workspaceNeedsAttention(workspace: WorkspaceSummary): boolean {
+  // done workspace 不再因歷史紅燈/停滯誤報；但 state 錯誤、未讀 issue、checkpoint、goal 與 stale PID
+  // 仍是操作者現在需要處理的訊號，所以不受 completed 例外影響。
   const completed = workspace.phase === "done";
   return !!(
     workspace.error ||
@@ -39,16 +42,19 @@ function workspaceNeedsAttention(workspace: WorkspaceSummary): boolean {
 }
 
 function initialFleetFilter(): FleetFilter {
+  // localStorage 可能被人工改壞；只有白名單值才採用。
   const saved = localStorage.getItem("fleet-filter") as FleetFilter | null;
   return saved && FLEET_FILTERS.includes(saved) ? saved : "all";
 }
 
 function initialFleetSort(): FleetSort {
+  // 無效或舊版排序值安全退回名稱排序。
   const saved = localStorage.getItem("fleet-sort") as FleetSort | null;
   return saved && FLEET_SORTS.includes(saved) ? saved : "name";
 }
 
 function loadSavedViews(): SavedFleetView[] {
+  // 個人視圖不是 coordinator truth；解析失敗直接回空，且最多載入 20 組。
   try {
     const value = JSON.parse(localStorage.getItem("fleet-saved-views") ?? "[]") as unknown;
     if (!Array.isArray(value)) return [];
@@ -67,6 +73,7 @@ function formatMetric(seconds: number | null): string {
 }
 
 function progress(workspace: WorkspaceSummary): { done: number; total: number; pct: number } {
+  // 空 plan 的百分比定義為 0，避免除以零與誤顯示完成。
   const total = workspace.plan_len ?? 0;
   const done = workspace.completed ?? 0;
   return { done, total, pct: total > 0 ? Math.round((done / total) * 100) : 0 };
@@ -113,6 +120,8 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
   const [bulkAction, setBulkAction] = useState<"ack" | "stop" | "archive" | null>(null);
   const [bulkMessage, setBulkMessage] = useState("");
   const selectedWorkspaces = workspaces.filter((workspace) => selectedNames.includes(workspace.name));
+  // 每種批次操作都有不同前置條件。確認視窗同時列出 eligible 與被跳過項目，
+  // 避免使用者以為「選到了」就一定會被修改。
   const eligible = bulkAction === "ack" ? selectedWorkspaces.filter((workspace) => (workspace.unread_issues ?? workspace.issues ?? 0) > 0 && !workspace.running)
     : bulkAction === "stop" ? selectedWorkspaces.filter((workspace) => workspace.running)
       : bulkAction === "archive" ? selectedWorkspaces.filter((workspace) => !workspace.running) : [];
@@ -120,6 +129,8 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
     if (!bulkAction) return;
     const targets = [...eligible]; setBulkAction(null);
     let failed = 0;
+    // 刻意逐筆呼叫既有單 workspace API：單筆鎖或狀態失敗不回滾其他 workspace，
+    // 也不另開一條能繞過既有安全檢查的批次後端捷徑。
     for (const workspace of targets) {
       const response = bulkAction === "ack" ? await postJson("/api/edit-state", { name: workspace.name, ack_issues: true })
         : bulkAction === "stop" ? await postJson("/api/stop", { name: workspace.name })

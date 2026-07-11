@@ -17,6 +17,7 @@ STATUS_SCHEMA_VERSION = 1
 
 
 def _parse_timestamp(value):
+    """容錯解析 ISO timestamp；缺少 timezone 時沿用本機時區，無效值回 None。"""
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -45,6 +46,7 @@ def round_timing_projection(started_at, deadline_at=None, interrupted_at=None, *
 
 
 def format_clock(seconds):
+    """將秒數格式化成適合終端狀態列的短時間。"""
     seconds = max(0, int(seconds))
     hours, remainder = divmod(seconds, 3600)
     minutes, secs = divmod(remainder, 60)
@@ -138,6 +140,7 @@ def project_status(name: str, metrics_limit=0):
 
 
 def stat_is_directory(mode: int) -> bool:
+    """直接判斷 lstat mode 是否為目錄，不跟隨 symlink。"""
     return stat.S_ISDIR(mode) and not stat.S_ISLNK(mode)
 
 
@@ -227,6 +230,7 @@ def sort_status_results(results, mode: str):
     phase_order = {"plan": 0, "exec": 1, "done": 2}
 
     def key(result):
+        """attention 排序把錯誤與需關注項目前置，再以名稱保持穩定。"""
         if "error" in result:
             return (0, 0, result.get("name", ""))
         if mode == "attention":
@@ -261,6 +265,7 @@ def filter_status_results(results, mode: str):
 
 
 def render_human(result, *, timestamp=False) -> None:
+    """將單 workspace projection 轉成終端可掃讀摘要，不改變任何 state。"""
     phase = {"plan": "規劃期", "exec": "執行期", "done": "完成"}.get(result["phase"], result["phase"] or "未知")
     running = "執行中" if result["running"] else "⚠ PID 殘留" if result.get("stale_loop_pid") else "已停止"
     prefix = f"[{time.strftime('%H:%M:%S')}] " if timestamp else ""
@@ -318,6 +323,7 @@ def render_fleet_summary(summary) -> None:
 
 
 def main(argv=None) -> int:
+    """解析唯讀 status CLI，支援單次、watch、on-change 與健康檢查 exit code。"""
     parser = argparse.ArgumentParser(description="唯讀查詢 loop-agent-lite workspace 狀態")
     parser.add_argument("--name", default=None, help="workspace 名稱（與 --all 擇一）")
     parser.add_argument("--all", action="store_true", help="列出 workspace root 下全部合法 workspace")

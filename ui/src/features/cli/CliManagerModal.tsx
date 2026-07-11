@@ -1,3 +1,4 @@
+/** 個人 Agent CLI 設定編輯器：驗證欄位並透過後端儲存，不修改團隊共用設定。 */
 import { useState } from "react";
 import { postJson } from "../../shared/api/client";
 import type { ConfigResponse, SelectCommand } from "../../shared/api/types";

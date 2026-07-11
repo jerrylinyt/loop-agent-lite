@@ -1,3 +1,4 @@
+/** 將近期 history 判定壓縮成可點擊 sparkline；顏色之外仍以 aria-label 提供狀態資訊。 */
 import { useEffect, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import type { IncrementalResponse } from "../../shared/api/types";

@@ -1,3 +1,4 @@
+/** 通用確認視窗：可列出結構化影響預覽，danger 只改視覺，真正授權仍由呼叫端與後端決定。 */
 import Modal from "./Modal";
 
 export interface ActionPreviewItem {

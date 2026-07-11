@@ -1,3 +1,4 @@
+/** 命令測試結果視窗：顯示 exit/timeout 與 bounded 尾段，不在前端重新執行命令。 */
 import Modal from "./Modal";
 
 export interface CommandTestState {

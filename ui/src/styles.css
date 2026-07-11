@@ -1,3 +1,4 @@
+/* 全域設計 token：dark 是預設，light 與 system 只覆寫變動色彩，避免元件各自硬編碼。 */
 :root,
 [data-theme="dark"] {
   color-scheme: dark;
@@ -53,6 +54,7 @@
 
 * { box-sizing: border-box; }
 html, body, #root { width: 100%; height: 100%; margin: 0; }
+/* 基礎版面與可互動元素：統一 box model、字型、focus 與捲動行為。 */
 body {
   overflow: hidden;
   background: var(--bg);
@@ -75,6 +77,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .resizing-row { cursor: row-resize; user-select: none; }
 
 #app-shell { display: grid; grid-template-rows: auto 1fr; height: 100%; min-width: 920px; }
+/* 頂部導覽：workspace tabs 可水平捲動，右側操作保持可點擊。 */
 .app-toolbar {
   display: flex;
   align-items: center;
@@ -159,6 +162,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .empty-state h1 { margin: 0 0 6px; font-size: 20px; }
 .empty-state p { max-width: 520px; margin: 0 0 18px; color: var(--muted); }
 
+/* 單 workspace 主畫面：任務、可鍵盤調整的 splitter、Agent console 三欄。 */
 .dashboard-grid { display: grid; min-height: 0; }
 .workspace-pane, .console-pane { position: relative; display: flex; min-width: 0; min-height: 0; flex-direction: column; background: var(--bg); }
 .splitter { position: relative; z-index: 3; cursor: col-resize; background: var(--surface); border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
@@ -212,6 +216,7 @@ button.chip { border: 0; color: inherit; }
 .pane-header strong { font-size: 13px; }
 .pane-header span, .console-header span { color: var(--muted); font-size: 12px; }
 .workspace-main { display: flex; flex: 1; min-height: 0; flex-direction: column; }
+/* Plan 與 console 區塊維持內部捲動，避免長內容撐高整個 viewport。 */
 .plan-pane { position: relative; display: flex; flex: 1; min-height: 0; flex-direction: column; }
 .table-scroll { flex: 1; min-height: 0; overflow: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -265,6 +270,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 
 .inline-message { min-width: 0; overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 
+/* Modal 由 portal 掛到 body；backdrop 可捲動，panel 自己限制高度並管理 header/body/footer。 */
 .modal-backdrop { position: fixed; z-index: 100; inset: 0; display: grid; place-items: start center; overflow: auto; padding: 6vh 24px; background: var(--overlay); }
 .modal { display: flex; width: min(600px, calc(100vw - 48px)); max-height: 88vh; flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-raised); box-shadow: var(--shadow); }
 .modal-wide { width: min(760px, calc(100vw - 48px)); }
@@ -296,6 +302,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .modal-table-scroll { max-height: 58vh; overflow: auto; border: 1px solid var(--border-soft); border-radius: 8px; }
 .archive-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
+/* 表單欄位共用視覺；實際合法性仍由各元件與後端判斷。 */
 .form-grid { display: grid; gap: 10px; }
 .form-grid label, .form-field { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
 .form-grid input:not([type="checkbox"]):not([type="radio"]), .form-grid select, .form-grid textarea {
@@ -430,6 +437,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .ansi-italic { font-style: italic; } .ansi-underline { text-decoration: underline; }
 
 /* Fleet 總覽電視牆 */
+/* Fleet 電視牆：上方摘要、中央卡片與右側事件流在窄畫面改為上下排列。 */
 .fleet-overview { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 14px; overflow: auto; padding: 16px 20px; }
 .fleet-stats { display: flex; flex-wrap: wrap; gap: 10px; }
 .fleet-stat { display: flex; min-width: 120px; flex-direction: column; gap: 2px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-raised); }
@@ -518,6 +526,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 /* Health strip:紅連跳/停滯逼近 reset 防線時由綠轉紅 */
 .health-strip { height: 4px; margin: -10px -14px 8px; overflow: hidden; }
 .health-strip-fill { width: 100%; height: 100%; transition: background .5s, opacity .5s; }
+/* 統一時間軸用垂直線與 marker 表達事件類型；文字仍是完整狀態來源。 */
 .timeline-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
 .timeline-toolbar input { min-width: 260px; flex: 1; max-width: 420px; }
 .timeline-list { position: relative; display: grid; gap: 0; max-height: min(70vh, 760px); overflow: auto; padding: 2px 8px 2px 2px; }
@@ -570,6 +579,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .command-palette-list small, .command-palette-list em { color: var(--muted); font-size: 11px; font-style: normal; }
 .bulk-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin: 0 0 10px; }
 .bulk-toolbar select[multiple] { min-width: 230px; max-height: 92px; padding: 4px; }
+/* 鍵盤與輔助科技：skip link 平時移出畫面，focus 時顯示；動畫/高對比遵從系統偏好。 */
 .skip-link { position: fixed; z-index: 10000; top: 8px; left: 8px; padding: 8px 11px; border-radius: 7px; background: var(--accent); color: white; transform: translateY(-150%); }
 .skip-link:focus { transform: translateY(0); }
 :where(button, input, select, textarea, a, [tabindex]):focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 75%, white); outline-offset: 2px; }
@@ -592,6 +602,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .getting-started ul { margin-bottom: 0; color: var(--muted); }
 @media (max-width: 760px) { .getting-started ol { grid-template-columns: 1fr; } }
 .navigation-chord { position: fixed; z-index: 9000; left: 50%; bottom: 24px; transform: translateX(-50%); padding: 9px 14px; border: 1px solid var(--accent); border-radius: 9px; background: var(--surface-raised); color: var(--text); box-shadow: var(--shadow); }
+/* 全畫面 Plan 編輯器：左側 pending 清單、右側變更摘要；拖曳只能從專用把手開始。 */
 .plan-editor-layout { display: grid; grid-template-columns: minmax(0, 1fr) 280px; height: 100%; min-height: 0; gap: 14px; }
 .plan-editor-list { min-height: 0; overflow: auto; padding-right: 5px; }
 .plan-editor-task { position: relative; display: grid; gap: 9px; margin-bottom: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-subtle); }

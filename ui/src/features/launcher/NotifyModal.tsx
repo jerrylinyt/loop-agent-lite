@@ -1,3 +1,4 @@
+/** 終態通知命令編輯器：支援安全試跑與佔位符預覽，實際命令限制由後端再次驗證。 */
 import { useState } from "react";
 import Modal from "../../shared/components/Modal";
 import { postJson } from "../../shared/api/client";

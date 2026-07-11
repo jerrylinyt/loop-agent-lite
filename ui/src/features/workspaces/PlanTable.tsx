@@ -1,3 +1,4 @@
+/** Plan 主視圖：投影完成/目前狀態、追蹤版本更新閃爍，停止時才開啟獨立編輯器。 */
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { PlanEditTask, WorkspaceState } from "../../shared/api/types";
 import PlanEditorModal from "./PlanEditorModal";

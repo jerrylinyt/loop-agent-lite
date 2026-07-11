@@ -1,3 +1,4 @@
+/** 從各 workspace 的 bounded history 尾段推導 Fleet 事件；只做顯示，不建立新的 coordinator truth。 */
 import { parseHistory } from "./historyParser";
 import type { FleetHistoryEntry } from "../../shared/api/types";
 
