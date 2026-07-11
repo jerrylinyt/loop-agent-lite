@@ -10,7 +10,7 @@ import RepoRootsModal from "./RepoRootsModal";
 import { validatePlan } from "./planValidation";
 import type { PromptTemplateMode } from "./promptTemplateBuilder";
 
-interface RepoStatus { goal: "committed" | "modified" | "untracked" | "missing"; tree_clean: boolean; suggested_validate_cmd?: string | null; error?: string }
+interface RepoStatus { goal: "committed" | "modified" | "untracked" | "missing"; tree_clean: boolean; branch?: string; suggested_validate_cmd?: string | null; error?: string }
 interface ValidateResponse { ok?: boolean; rc?: number; timeout?: boolean; timeout_seconds?: number; tail?: string }
 interface PreflightResponse extends ValidateResponse { error?: string }
 
@@ -245,6 +245,17 @@ export default function LauncherModal({
   };
 
   const repoMark = (value?: string) => value === "committed" ? "✅ 已 commit" : value === "modified" ? "⚠ 已修改未 commit" : value === "untracked" ? "⚠ 尚未 commit" : "❌ 缺少";
+  const selectedAgent = config?.agent_cmds[+agentIndex]?.cmd ?? "";
+  const selectedValidate = validateChoice === "__custom__" ? customValidate.trim() : config?.validate_cmds[+validateChoice]?.cmd ?? "";
+  const importedPlanCount = (() => { try { const value = JSON.parse(planJson); return Array.isArray(value) ? value.length : 0; } catch { return 0; } })();
+  const launchChanges = [
+    { label: "goal.md", before: repoStatus?.goal === "committed" ? "沿用已 commit 版本" : repoMark(repoStatus?.goal), after: goalFile ? `以 ${goalFile.name} 取代（${goalFile.size} bytes）` : "不變" },
+    { label: "plan / phase", before: matchingWorkspace ? `${matchingWorkspace.plan_len ?? 0} tasks · ${matchingWorkspace.phase ?? "—"}` : "新 workspace", after: planJson.trim() ? `${importedPlanCount} tasks · ${startPhase}` : resetState ? "重建 state" : "沿用" },
+    { label: "Agent", before: matchingWorkspace ? "已儲存設定" : "預設設定", after: selectedAgent || "—" },
+    { label: "Validate", before: matchingWorkspace ? "已儲存設定" : "預設設定", after: `${selectedValidate || "—"} · ${validateTimeout}s` },
+    { label: "收斂 / timeout", before: matchingWorkspace ? "現有 workspace 設定" : "預設設定", after: `flag>${flagThreshold} · done≥${doneThreshold} · round ${roundTimeout}m · backoff ${agentBackoffMax}s` },
+    { label: "Git branch", before: repoStatus?.branch || "detached / unknown", after: newBranch ? `建立 loop/${name.trim() || repo.split("/").filter(Boolean).slice(-1)[0] || "workspace"}` : "不切換" },
+  ];
   const footer = tab === "launch" ? (
     <>
       <button type="button" className="secondary-button" onClick={onClose}>取消</button>
@@ -295,6 +306,12 @@ export default function LauncherModal({
             <label className="checkbox-row"><input type="checkbox" checked={resetState} onChange={(event) => setResetState(event.target.checked)} />重置 workspace state（清除舊進度）</label>
             <label className="checkbox-row"><input type="checkbox" checked={newBranch} onChange={(event) => setNewBranch(event.target.checked)} />在新 branch 跑（loop/&lt;workspace 名&gt;）</label>
             <div className="notify-entry-row"><button type="button" className="secondary-button" disabled={!config} onClick={() => setNotifyOpen(true)}>🔔 管理終態通知</button><span className="label-help">{config?.notify_cmd ? `目前：${config.notify_cmd}` : "目前未設定通知"}</span></div>
+          </details>
+          <details className="launch-diff" open={hasPendingLaunchMutation}>
+            <summary>執行前變更 Diff <span className="label-help">送出前核對本次與既有狀態差異</span></summary>
+            <div className="launch-diff-grid" role="list">
+              {launchChanges.map((change) => <div className="launch-diff-row" role="listitem" key={change.label}><strong>{change.label}</strong><span className="diff-before">− {change.before}</span><span className="diff-after">＋ {change.after}</span></div>)}
+            </div>
           </details>
         </div>
       ) : (

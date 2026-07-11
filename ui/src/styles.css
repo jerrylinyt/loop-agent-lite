@@ -581,3 +581,10 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .fleet-overview.compact-cards .fleet-card-analysis-empty,
 .fleet-overview.compact-cards .fleet-card-repo { display: none; }
 .fleet-overview.compact-cards .fleet-card { min-height: 0; }
+.launch-diff { border: 1px solid var(--border-soft); border-radius: 9px; padding: 9px 11px; background: var(--surface-subtle); }
+.launch-diff summary { cursor: pointer; font-weight: 650; }
+.launch-diff-grid { display: grid; gap: 6px; margin-top: 10px; }
+.launch-diff-row { display: grid; grid-template-columns: minmax(105px, .55fr) 1fr 1fr; gap: 8px; align-items: start; font-size: 12px; }
+.launch-diff-row span { padding: 5px 7px; border-radius: 6px; overflow-wrap: anywhere; }
+.diff-before { color: var(--muted); background: color-mix(in srgb, var(--danger) 8%, transparent); }
+.diff-after { color: var(--text); background: color-mix(in srgb, var(--success) 10%, transparent); }

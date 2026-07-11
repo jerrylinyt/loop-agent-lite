@@ -1610,6 +1610,9 @@ class Handler(BaseHTTPRequestHandler):
 
                 clean = not subprocess.run(["git", "-C", str(repo), "status", "--porcelain"],
                                            capture_output=True, text=True).stdout.strip()
+                branch_result = subprocess.run(["git", "-C", str(repo), "branch", "--show-current"],
+                                               capture_output=True, text=True)
+                branch = branch_result.stdout.strip() if branch_result.returncode == 0 else ""
                 if (repo / "pom.xml").is_file():
                     suggested_validate = "mvn -q compile"
                 elif (repo / "package.json").is_file():
@@ -1620,6 +1623,7 @@ class Handler(BaseHTTPRequestHandler):
                     suggested_validate = None
                 self._out(200, json.dumps({"goal": fstat("goal.md"),
                                            "tree_clean": clean,
+                                           "branch": branch,
                                            "suggested_validate_cmd": suggested_validate}, ensure_ascii=False))
             elif u.path == "/api/state":
                 d = self._ws_dir(q)
