@@ -1,3 +1,4 @@
+/** 真實瀏覽器端到端流程：使用隔離 fixture 驗證啟動、SSE、操作防線、Plan 編輯與唯讀模式。 */
 import { expect, test, type Page } from "@playwright/test";
 
 const PLAN = JSON.stringify([
@@ -6,6 +7,7 @@ const PLAN = JSON.stringify([
 ], null, 2);
 
 async function acceptConfirmation(page: Page, action: () => Promise<void>) {
+  // 所有破壞性操作應先開啟共用確認視窗；helper 同時驗證這條 UI 契約。
   await action();
   const dialog = page.getByRole("dialog", { name: "請確認" });
   await expect(dialog).toBeVisible();
@@ -446,7 +448,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await planEditor.locator(".plan-editor-task").nth(1).getByLabel("任務內容").fill("插入的 E2E 任務");
   const originalPendingTask = planEditor.locator(".plan-editor-task", { hasText: "驗證 E2E 第二項功能" });
   const originalPendingBounds = await originalPendingTask.boundingBox();
-  await planEditor.getByRole("button", { name: "拖移 task-2" }).dragTo(originalPendingTask, {
+  await planEditor.locator(".plan-editor-task").nth(1).locator(".plan-drag-handle").dragTo(originalPendingTask, {
     targetPosition: { x: 20, y: Math.max(20, (originalPendingBounds?.height ?? 80) - 10) }
   });
   await originalPendingTask.getByRole("button", { name: "刪除" }).click();

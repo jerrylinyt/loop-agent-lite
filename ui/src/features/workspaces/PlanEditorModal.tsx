@@ -1,3 +1,4 @@
+/** 全畫面 Plan 編輯器：鎖住已完成/目前任務，只讓 pending 區段插入、刪除、拖移與送出版本化快照。 */
 import { useMemo, useRef, useState } from "react";
 import type { PlanEditTask, WorkspaceState } from "../../shared/api/types";
 import ActionDialog from "../../shared/components/ActionDialog";
@@ -13,6 +14,8 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
   const original = state.plan ?? [];
   const completed = useMemo(() => new Set((state.completed ?? []).map((entry) => entry.order)), [state.completed]);
   const lockedCount = useMemo(() => {
+    // 鎖定區採「前綴」而不是零散列：完成任務或目前任務之前的順序都屬既有執行歷史，
+    // 即使其中某列不是 completed，也不能讓 pending task 穿越這條邊界。
     const locked = new Set(completed);
     if (state.phase === "exec" && state.current_order) locked.add(state.current_order);
     return Math.max(-1, ...original.map((task, index) => locked.has(task.order) ? index : -1)) + 1;
@@ -27,6 +30,7 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
   const [dropIndex, setDropIndex] = useState<number | null>(null);
   const nextId = useRef(1);
   const existingOrders = new Set(drafts.flatMap((task) => task.order === null ? [] : [task.order]));
+  // 以來源 order 辨識既有任務；新任務的 order=null，真正連續編號只由後端儲存時產生。
   const deleted = original.slice(lockedCount).filter((task) => !existingOrders.has(task.order));
   const inserted = drafts.filter((task) => task.order === null);
   const moved = drafts.slice(lockedCount).filter((task, index) => task.order !== null && task.order !== lockedCount + index + 1);
@@ -38,6 +42,7 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
   const canInsert = state.phase !== "done";
   const update = (index: number, values: Partial<DraftTask>) => setDrafts((items) => items.map((item, itemIndex) => itemIndex === index ? { ...item, ...values } : item));
   const move = (index: number, direction: -1 | 1) => setDrafts((items) => {
+    // 按鈕與拖曳共用相同鎖定邊界；任何來源或目標落在 locked prefix 都直接不動。
     const target = index + direction;
     if (index < lockedCount || target < lockedCount || target >= items.length) return items;
     const next = [...items];
@@ -51,6 +56,7 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
       if (sourceIndex < lockedCount || targetIndex < lockedCount || sourceIndex < 0) return items;
       const next = [...items];
       const [dragged] = next.splice(sourceIndex, 1);
+      // 先移除來源後，若原位置在插入點之前，陣列索引會左移一格，必須修正目標位置。
       const adjustedTarget = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex;
       next.splice(Math.max(lockedCount, Math.min(adjustedTarget, next.length)), 0, dragged);
       return next;
@@ -65,6 +71,7 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
   const remove = (index: number) => setDrafts((items) => index < lockedCount ? items : items.filter((_, itemIndex) => itemIndex !== index));
   const requestClose = () => dirty ? setConfirmClose(true) : onClose();
   const save = async () => {
+    // UI 在送出前先做完整性檢查；後端仍會在 workspace lock 內重做非空、版本與鎖定前綴校驗。
     if (!drafts.length) return setMessage("❌ plan 必須保留至少一項任務");
     if (drafts.some((task) => !task.task.trim())) return setMessage("❌ 每項任務都必須有內容");
     setSaving(true);
@@ -85,7 +92,7 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
             return <div className={`plan-editor-task${locked ? " locked" : ""}${draggingId === task.id ? " dragging" : ""}${dropIndex === index ? " drop-before" : ""}`} key={task.id}
               onDragOver={(event) => { if (!locked && draggingId) { event.preventDefault(); event.dataTransfer.dropEffect = "move"; const bounds = event.currentTarget.getBoundingClientRect(); setDropIndex(event.clientY > bounds.top + bounds.height / 2 ? index + 1 : index); } }}
               onDrop={(event) => { event.preventDefault(); const bounds = event.currentTarget.getBoundingClientRect(); dropAt(event.clientY > bounds.top + bounds.height / 2 ? index + 1 : index); }}>
-              <header><span>{!locked && <span className="plan-drag-handle" role="button" tabIndex={0} draggable aria-label={`拖移 task-${index + 1}`} title="按住這裡拖移任務"
+              <header><span>{!locked && <span className="plan-drag-handle" draggable aria-hidden="true" title="按住這裡拖移任務"
                 onDragStart={(event) => { setDraggingId(task.id); setDropIndex(index); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", task.id); }}
                 onDragEnd={() => { setDraggingId(null); setDropIndex(null); }}>⠿</span>}<strong>task-{index + 1}</strong>{task.order === null && <em>新增</em>}{locked && <em>已完成／目前任務，鎖定</em>}</span><span className="plan-editor-actions">
                 <button type="button" className="icon-button" aria-label={`上移 task-${index + 1}`} disabled={locked || index === lockedCount} onClick={() => move(index, -1)}>↑</button>
