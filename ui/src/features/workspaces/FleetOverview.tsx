@@ -4,6 +4,7 @@ import AnomalyLogModal from "./AnomalyLogModal";
 import { deriveFleetEvents } from "./fleetEvents";
 import { deriveRoundTiming, useRoundNow } from "./roundTiming";
 import { workspaceNeedsAttention } from "./workspaceDiagnostics";
+import { updateUrlState, urlParam } from "../../shared/urlState";
 
 const PHASE_NAMES: Record<string, string> = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
 type FleetFilter = "all" | "attention" | "running" | "done";
@@ -20,12 +21,12 @@ const FLEET_FILTERS: FleetFilter[] = ["all", "attention", "running", "done"];
 const FLEET_SORTS: FleetSort[] = ["name", "attention", "running", "progress"];
 
 function initialFleetFilter(): FleetFilter {
-  const saved = localStorage.getItem("fleet-filter") as FleetFilter | null;
+  const saved = (urlParam("filter") || localStorage.getItem("fleet-filter")) as FleetFilter | null;
   return saved && FLEET_FILTERS.includes(saved) ? saved : "all";
 }
 
 function initialFleetSort(): FleetSort {
-  const saved = localStorage.getItem("fleet-sort") as FleetSort | null;
+  const saved = (urlParam("sort") || localStorage.getItem("fleet-sort")) as FleetSort | null;
   return saved && FLEET_SORTS.includes(saved) ? saved : "name";
 }
 
@@ -78,9 +79,9 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
   const roundNow = useRoundNow(workspaces.some((workspace) =>
     Boolean(workspace.round_started_at && !workspace.round_interrupted_at)));
   const [filter, setFilter] = useState<FleetFilter>(initialFleetFilter);
-  const [search, setSearch] = useState(() => localStorage.getItem("fleet-search") ?? "");
+  const [search, setSearch] = useState(() => urlParam("q") || localStorage.getItem("fleet-search") || "");
   const [sort, setSort] = useState<FleetSort>(initialFleetSort);
-  const [compact, setCompact] = useState(() => localStorage.getItem("fleet-compact") === "1");
+  const [compact, setCompact] = useState(() => urlParam("compact") === "1" || localStorage.getItem("fleet-compact") === "1");
   const [savedViews, setSavedViews] = useState<SavedFleetView[]>(loadSavedViews);
   const [selectedView, setSelectedView] = useState("");
   const [savingView, setSavingView] = useState(false);
@@ -101,21 +102,25 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
     setFilter(next);
     setSelectedView("");
     localStorage.setItem("fleet-filter", next);
+    updateUrlState({ filter: next === "all" ? null : next });
   };
   const changeSearch = (next: string) => {
     setSearch(next);
     setSelectedView("");
     localStorage.setItem("fleet-search", next);
+    updateUrlState({ q: next || null });
   };
   const changeSort = (next: FleetSort) => {
     setSort(next);
     setSelectedView("");
     localStorage.setItem("fleet-sort", next);
+    updateUrlState({ sort: next === "name" ? null : next });
   };
   const changeCompact = (next: boolean) => {
     setCompact(next);
     setSelectedView("");
     localStorage.setItem("fleet-compact", next ? "1" : "0");
+    updateUrlState({ compact: next ? "1" : null });
   };
   const persistViews = (views: SavedFleetView[]) => {
     setSavedViews(views);
@@ -150,6 +155,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
     localStorage.setItem("fleet-search", view.search);
     localStorage.setItem("fleet-sort", view.sort);
     localStorage.setItem("fleet-compact", view.compact ? "1" : "0");
+    updateUrlState({ filter: view.filter === "all" ? null : view.filter, q: view.search || null, sort: view.sort === "name" ? null : view.sort, compact: view.compact ? "1" : null });
     setViewMessage(`已套用「${view.name}」`);
   };
   const deleteView = () => {

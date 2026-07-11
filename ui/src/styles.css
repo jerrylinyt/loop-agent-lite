@@ -609,3 +609,4 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .incident-card > span { display: flex; justify-content: space-between; gap: 12px; }
 .incident-card small, .incident-card p { color: var(--muted); margin: 0; }
 .incident-card div { display: flex; flex-wrap: wrap; gap: 5px; }
+.sr-status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
