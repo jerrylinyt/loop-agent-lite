@@ -15,7 +15,7 @@ EXAMPLE = '[{"order": 1, "task": "描述", "ref": "PLAN.md#段落"}, {"order": 2
 
 
 def die(msg):
-    """印出 coordinator 契約錯誤並以 exit 2 結束，表示命令未被接受。"""
+    """印出 coordinator 契約錯誤並以 exit 1 結束，表示命令未被接受。"""
     print(f"❌ {msg}", file=sys.stderr)
     sys.exit(1)
 
