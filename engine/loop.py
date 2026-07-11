@@ -237,11 +237,16 @@ def read_regular_text(path: Path, label: str = "workspace 檔案") -> str:
     return read_regular_bytes(path, label).decode("utf-8")
 
 
-def round_metrics_from_history(data: str, limit: int = 50, *, history_truncated=False):
-    """從 history 投影近期 Agent round 效能與未回 phase DONE 統計。"""
+def _validate_round_metrics_limit(limit):
+    """守門 round metrics 聚合筆數；bool/非整數/超界一律 fail-closed。"""
     if (not isinstance(limit, int) or isinstance(limit, bool) or
             not 1 <= limit <= ROUND_METRICS_MAX_SAMPLES):
         raise ValueError(f"round metrics limit 必須介於 1～{ROUND_METRICS_MAX_SAMPLES}")
+
+
+def round_metrics_from_history(data: str, limit: int = 50, *, history_truncated=False):
+    """從 history 投影近期 Agent round 效能與未回 phase DONE 統計。"""
+    _validate_round_metrics_limit(limit)
     samples = []
     for line in reversed(data.splitlines()):
         head = line.split("  << ", 1)[0]
@@ -318,9 +323,7 @@ def round_metrics_from_history(data: str, limit: int = 50, *, history_truncated=
 
 def read_round_metrics(path: Path, limit: int = 50):
     """以 O_NOFOLLOW bounded tail read 投影 history metrics；檔案不存在視為無樣本。"""
-    if (not isinstance(limit, int) or isinstance(limit, bool) or
-            not 1 <= limit <= ROUND_METRICS_MAX_SAMPLES):
-        raise ValueError(f"round metrics limit 必須介於 1～{ROUND_METRICS_MAX_SAMPLES}")
+    _validate_round_metrics_limit(limit)
     path = workspace_file(path, "history.log")
     try:
         fd = _open_regular(path, os.O_RDONLY)
@@ -1109,18 +1112,22 @@ class Workspace:
         return claim_stop_after_round(self.dir, pid, session_id)
 
     # ---- 受保護檔案快照(goal / 初步規劃書) ----
+    def _protected_snapshot_path(self, rel):
+        """受保護檔案在 workspace 內的快照路徑；扁平化 rel 並強制 regular file。"""
+        return workspace_file(self.dir / "snapshots" / rel.replace("/", "__"), "protected snapshot")
+
     def snapshot_protected(self, repo, rel_paths):
         """複製 goal/plan doc 到 workspace snapshot，供輪末偵測 Agent 越權修改。"""
         for rel in rel_paths:
             target = repo_relative_path(repo, rel)
-            snap = workspace_file(self.dir / "snapshots" / rel.replace("/", "__"), "protected snapshot")
+            snap = self._protected_snapshot_path(rel)
             snap.write_bytes(target.read_bytes())
 
     def protected_changed(self, repo, rel_paths):
         """純偵測:回傳被刪或被改的受保護檔案清單(空 = 沒人亂動)。不寫回。"""
         hit = []
         for rel in rel_paths:
-            snap = workspace_file(self.dir / "snapshots" / rel.replace("/", "__"), "protected snapshot").read_bytes()
+            snap = self._protected_snapshot_path(rel).read_bytes()
             try:
                 target = repo_relative_path(repo, rel)
             except ValueError:
@@ -1134,7 +1141,7 @@ class Workspace:
         """把受保護檔案寫回快照(供 reset 後補正,green sha 版本理應相同故多為 no-op)。
         寫回前先建父目錄:green 不含該子目錄時 write_bytes 會 FileNotFoundError(#1)。"""
         for rel in rel_paths:
-            snap = workspace_file(self.dir / "snapshots" / rel.replace("/", "__"), "protected snapshot").read_bytes()
+            snap = self._protected_snapshot_path(rel).read_bytes()
             target = repo_relative_path(repo, rel)
             if (not target.exists()) or target.read_bytes() != snap:
                 target.parent.mkdir(parents=True, exist_ok=True)
