@@ -12,6 +12,7 @@ import PlanTable from "./PlanTable";
 import PromptModal from "./PromptModal";
 import ReportModal from "./ReportModal";
 import RoundSparkline from "./RoundSparkline";
+import TimelineModal from "./TimelineModal";
 import { deriveRoundTiming, useRoundNow } from "./roundTiming";
 import useStatusPulse from "./useStatusPulse";
 
@@ -38,6 +39,7 @@ export default function WorkspaceView({
   const [issuesOpen, setIssuesOpen] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
+  const [timelineOpen, setTimelineOpen] = useState(false);
   const [statusHeight, setStatusHeight] = useState(() => +(localStorage.getItem("status-console-height") || 220));
   const [statusCollapsed, setStatusCollapsed] = useState(() => localStorage.getItem("status-console-collapsed") === "1");
   const [busyAction, setBusyAction] = useState<"run" | "drain" | "cancelDrain" | "stop" | null>(null);
@@ -192,6 +194,7 @@ export default function WorkspaceView({
             {workspace?.stale_loop_pid && <span className="chip warning" title={`state 保留 PID ${workspace.loop_pid ?? "?"}${workspace.loop_started_at ? `（啟動於 ${workspace.loop_started_at}）` : ""}，但目前程序不存在`}>⚠ PID 殘留</span>}
             {!!issues.length && <button type="button" className={`chip ${unreadIssues > 0 ? "issue-chip" : "subdued"}`} onClick={() => setIssuesOpen(true)}>{unreadIssues > 0 ? `⚠ issues ${unreadIssues}/${issues.length}` : `✓ issues ${issues.length}（已讀）`}</button>}
             {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setHistoryOpen(true)}>🕒 輪次紀錄</button>}
+            {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setTimelineOpen(true)}>🧭 時間軸</button>}
             {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setPromptOpen(true)}>📨 prompt</button>}
           </div>
         </div>
@@ -217,6 +220,7 @@ export default function WorkspaceView({
       </div>
       {issuesOpen && workspace && <IssuesModal workspace={workspace.name} issues={issues} unreadIssues={unreadIssues} readonly={readonly || workspace.running} onClose={() => setIssuesOpen(false)} onChanged={onRefresh} />}
       {historyOpen && workspace && <HistoryModal workspace={workspace.name} onClose={() => setHistoryOpen(false)} />}
+      {timelineOpen && workspace && <TimelineModal workspace={workspace.name} consoleText={consoleText} onClose={() => setTimelineOpen(false)} />}
       {goalOpen && workspace && <GoalModal workspace={workspace.name} onClose={() => setGoalOpen(false)} />}
       {promptOpen && workspace && <PromptModal workspace={workspace.name} onClose={() => setPromptOpen(false)} />}
       {reportOpen && workspace && <ReportModal workspace={workspace.name} onClose={() => setReportOpen(false)} />}
