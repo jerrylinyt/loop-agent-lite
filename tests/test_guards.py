@@ -1201,13 +1201,27 @@ class TestStatusCli(unittest.TestCase):
                     [sys.executable, STATUS_PY, "--name", "watch-change", "--json",
                      "--watch", "--on-change", "--interval", "0.01"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+                captured = []
                 try:
-                    time.sleep(0.08)
+                    deadline = time.monotonic() + 2
+                    while len(captured) < 1 and time.monotonic() < deadline:
+                        ready, _, _ = select.select([process.stdout], [], [], 0.1)
+                        if ready:
+                            line = process.stdout.readline()
+                            if line:
+                                captured.append(line)
                     state["round"] = 1
                     ws.save_state(state)
-                    time.sleep(0.08)
+                    deadline = time.monotonic() + 2
+                    while len(captured) < 2 and time.monotonic() < deadline:
+                        ready, _, _ = select.select([process.stdout], [], [], 0.1)
+                        if ready:
+                            line = process.stdout.readline()
+                            if line:
+                                captured.append(line)
                     process.send_signal(signal.SIGINT)
                     output, error = process.communicate(timeout=2)
+                    output = "".join(captured) + output
                 finally:
                     if process.poll() is None:
                         process.kill()
