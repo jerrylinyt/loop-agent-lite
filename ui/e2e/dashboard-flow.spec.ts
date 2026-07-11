@@ -56,6 +56,7 @@ test("Goal／Plan Prompt 模板可選類型、共用分析規則並下載", asyn
 test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、phase 與進度", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "尚未建立 workspace" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "第一次使用，三步完成" })).toBeVisible();
   await expect(page.locator(".connection-status")).toHaveCount(0);
   await expect(page.locator(".fleet-health")).toHaveCount(0);
 
@@ -119,6 +120,10 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await launcher.getByLabel("單輪上限（分）").fill("1");
   await launcher.getByLabel("Agent 異常退避上限（秒）").fill("5");
   await launcher.getByLabel("在新 branch 跑（loop/<workspace 名>）").check();
+  const launchDiff = launcher.locator(".launch-diff");
+  await expect(launchDiff).toContainText("執行前變更 Diff");
+  await expect(launchDiff).toContainText("2 tasks · exec");
+  await expect(launchDiff).toContainText("loop/e2e-workspace");
 
   await launcher.getByRole("button", { name: "🔔 管理終態通知" }).click();
   const notifyManager = page.getByRole("dialog", { name: "終態通知管理" });
@@ -135,6 +140,12 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
 
   await expect(launcher).toBeHidden();
   await expect(page.getByRole("heading", { name: "e2e-workspace" })).toBeVisible();
+  await page.keyboard.press("ControlOrMeta+K");
+  const palette = page.getByRole("dialog", { name: "快捷指令" });
+  await expect(palette).toBeVisible();
+  await palette.getByLabel("搜尋快捷指令").fill("e2e-workspace");
+  await expect(palette.getByRole("option")).toContainText("e2e-workspace");
+  await palette.getByRole("button", { name: "關閉對話框" }).click();
   await expect(page.getByRole("img", { name: /^健康度：紅連跳 \d+\/\d+ · 停滯 \d+\/\d+/ })).toBeVisible();
   await expect(page.getByRole("button", { name: "⏹ 立即停止" })).toBeVisible();
   await expect(page.getByRole("button", { name: "⏸ 本輪後停止" })).toBeVisible();
@@ -158,6 +169,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(fleetMetrics).toContainText("P95");
   await expect(fleetMetrics).toContainText("最慢");
   await expect(fleetMetrics).toContainText("逾時");
+  await expect(overview.getByRole("button", { name: "☑ 批次操作" })).toBeVisible();
   await expect(fleetMetrics).toContainText("未回 DONE");
   await expect(fleetMetrics).toContainText("異常率");
   await page.route("**/api/anomalies", async (route) => {
@@ -285,6 +297,18 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await doctor.getByRole("button", { name: "前往處理" }).click();
   await expect(doctor).toBeHidden();
 
+  await page.getByRole("button", { name: "⚡ Incidents" }).click();
+  const incidents = page.getByRole("dialog", { name: "Incident 中心" });
+  await expect(incidents).toContainText("現行事件");
+  await expect(incidents).toContainText("e2e-workspace");
+  await incidents.getByRole("button", { name: "關閉對話框" }).click();
+
+  await page.getByRole("button", { name: /🔔 通知/ }).click();
+  const notifications = page.getByRole("dialog", { name: "通知中心" });
+  await expect(notifications).toContainText("e2e-workspace");
+  await notifications.getByRole("button", { name: "全部標記已讀" }).click();
+  await notifications.getByRole("button", { name: "關閉對話框" }).click();
+
   await page.getByRole("button", { name: "⌕ 全域搜尋" }).click();
   const globalSearch = page.getByRole("dialog", { name: "全域搜尋" });
   await globalSearch.getByLabel("全域搜尋文字").fill("E2E structured issue");
@@ -318,6 +342,12 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(timeline.locator(".timeline-item.operator").first()).toBeVisible();
   await timeline.getByRole("button", { name: "關閉對話框" }).click();
   await expect(timeline).toBeHidden();
+
+  await page.getByRole("button", { name: "⇄ Run 對比" }).click();
+  const runCompare = page.getByRole("dialog", { name: "e2e-workspace｜Run 對比" });
+  await expect(runCompare.getByRole("table", { name: "Run 指標對比" })).toContainText("平均耗時");
+  await expect(runCompare).toContainText("上一個");
+  await runCompare.getByRole("button", { name: "關閉對話框" }).click();
 
   await page.getByRole("button", { name: "🕒 輪次紀錄" }).click();
   const historyModal = page.getByRole("dialog", { name: "輪次紀錄" });

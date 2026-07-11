@@ -14,7 +14,6 @@ import IncidentCenterModal from "../features/workspaces/IncidentCenterModal";
 import NotificationCenterModal, { notificationItems, readNotificationSeen } from "../features/workspaces/NotificationCenterModal";
 import useDashboardData from "./useDashboardData";
 import useStatusFavicon from "./useStatusFavicon";
-import { updateUrlState, urlParam } from "../shared/urlState";
 import GettingStarted from "../features/launcher/GettingStarted";
 
 export default function App() {
@@ -27,8 +26,7 @@ export default function App() {
   const [incidentsOpen, setIncidentsOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [notificationVersion, setNotificationVersion] = useState(0);
-  const [overviewOpen, setOverviewOpen] = useState(() => urlParam("view") === "overview" || localStorage.getItem("fleet-overview") === "1");
-  const [shareMessage, setShareMessage] = useState("");
+  const [overviewOpen, setOverviewOpen] = useState(() => localStorage.getItem("fleet-overview") === "1");
   const [attentionRequest, setAttentionRequest] = useState(0);
   const [leftWidth, setLeftWidth] = useState(() => +(localStorage.getItem("left-pane-width") || Math.round(window.innerWidth * 0.44)));
   const [rightCollapsed, setRightCollapsed] = useState(() => localStorage.getItem("agent-console-collapsed") === "1");
@@ -65,7 +63,6 @@ export default function App() {
   const toggleOverview = () => {
     setOverviewOpen((value) => {
       localStorage.setItem("fleet-overview", value ? "0" : "1");
-      updateUrlState({ view: value ? null : "overview" });
       return !value;
     });
   };
@@ -73,12 +70,6 @@ export default function App() {
     dashboard.selectWorkspace(name);
     setOverviewOpen(false);
     localStorage.setItem("fleet-overview", "0");
-    updateUrlState({ view: null, ws: name });
-  };
-  const copyShareLink = async () => {
-    try { await navigator.clipboard.writeText(location.href); setShareMessage("已複製畫面連結"); }
-    catch { setShareMessage("無法存取剪貼簿"); }
-    window.setTimeout(() => setShareMessage(""), 1800);
   };
   const selectFromDoctor = (name: string) => {
     setDoctorOpen(false);
@@ -137,8 +128,6 @@ export default function App() {
             </button>}
             <ThemePicker />
             <button type="button" className="secondary-button command-palette-trigger" aria-keyshortcuts="Meta+K Control+K" onClick={() => setPaletteOpen(true)}>⌘K</button>
-            <button type="button" className="secondary-button" onClick={() => void copyShareLink()} title="複製目前 workspace、總覽與篩選狀態的連結">🔗 分享畫面</button>
-            <span className="sr-status" role="status" aria-live="polite">{shareMessage}</span>
             <button type="button" className="secondary-button" onClick={() => setSearchOpen(true)}>⌕ 全域搜尋</button>
             <button type="button" className="secondary-button" onClick={() => setDoctorOpen(true)}>🩺 問題中心</button>
             <button type="button" className="secondary-button" onClick={() => setIncidentsOpen(true)}>⚡ Incidents</button>

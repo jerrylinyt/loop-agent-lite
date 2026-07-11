@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getJson } from "../shared/api/client";
 import type { BootstrapResponse, FleetHealth, FleetHistoryEntry, FleetRoundMetrics, WorkspaceState, WorkspaceSummary } from "../shared/api/types";
-import { updateUrlState, urlParam } from "../shared/urlState";
 
 const CONSOLE_LIMIT = 300_000;
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting";
@@ -29,7 +28,7 @@ export default function useDashboardData() {
     setState(null);
     setConsoleText("");
     localStorage.setItem("workspace", name);
-    updateUrlState({ ws: name });
+    history.replaceState(null, "", `#${encodeURIComponent(name)}`);
   }, []);
 
   const applyWorkspaces = useCallback((list: WorkspaceSummary[]) => {
@@ -41,7 +40,7 @@ export default function useDashboardData() {
     }
     if (!selectedRef.current || !list.some((workspace) => workspace.name === selectedRef.current)) {
       const hash = decodeURIComponent(location.hash.replace(/^#/, ""));
-      const preferred = [urlParam("ws"), hash, bootstrapRef.current.preselect, localStorage.getItem("workspace")]
+      const preferred = [hash, bootstrapRef.current.preselect, localStorage.getItem("workspace")]
         .find((name) => name && list.some((workspace) => workspace.name === name));
       selectWorkspace(preferred || list[0].name);
     }

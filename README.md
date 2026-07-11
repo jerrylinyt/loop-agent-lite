@@ -125,6 +125,13 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 - 工具列「⌕ 全域搜尋」可跨 workspace 搜尋 state 錯誤、計畫任務、issues、完成 commit、history、console 與最近異常 log；後端以 8 MiB 掃描預算及數量／檔案大小上限保持查詢有界。
 - workspace 狀態列的「🧭 時間軸」把歷史輪次、異常與目前 console 的操作紀錄整合成單一時間序；只有時間而沒有日期的 console 紀錄會明確標示為本機時間，避免把推定時間當成精確事實。
 - 階段切換、任務跳轉、Validate、封存、還原與永久刪除等操作，在確認視窗先列出將改變的 state、命令、timeout、workspace 目錄與不受影響的 target repo，讓操作者能在送出前核對影響範圍。
+- 啟動表單的「執行前變更 Diff」會比較既有 repo／workspace 與本次 goal、plan、phase、Agent、Validate、門檻、timeout 及 branch 選擇；有待匯入內容時自動展開。
+- workspace 的「⇄ Run 對比」並排顯示目前與上一個 run 的樣本數、平均、P95、最慢、逾時率、未回 DONE 與異常數；沒有 per-run snapshot 的設定與 commit 不會推測比較。
+- `⌘K`／`Ctrl+K` 可開啟快捷指令，搜尋 workspace 或前往總覽、全域搜尋、問題中心、Incidents、封存與啟動管理。
+- 「⚡ Incidents」將同一 workspace 五分鐘內的 Validate 失敗、逾時、未回 DONE 與 reset／異常事件聚合；只把它標為時間關聯，不宣稱已證明因果。
+- 總覽的批次操作可多選 workspace 並標記 issues 已讀、立即停止或封存；不符合動作前置條件的項目會在確認預覽中列為跳過，符合者仍逐筆使用既有安全 API。
+- 「🔔 通知」集中目前 state 與有界 history 尾段的完成、異常、停滯、復原及 goal 變動；最多顯示 100 則，已讀 ID 最多保留 300 筆且只存在目前瀏覽器。
+- Dashboard 提供跳至主要內容、清楚的 focus outline、Modal focus trap／Esc／焦點回復、reduced-motion 與 forced-colors 支援；首次空畫面則提供 repo、goal/plan、Validate 三步引導與常見失敗原因。
 - 分隔線可拖曳調整欄寬；箭頭可收合，設定會保存在瀏覽器。
 - 狀態列的「🎯 goal」「🕒 輪次紀錄」「📨 prompt」chips 分別顯示目前 goal 內容、history.log 逐輪判定（含每輪 Agent 耗時／逾時／是否未回 phase DONE）、以及最近一輪送給 Agent 的完整 prompt（全部唯讀）；「輪次紀錄」保留最近 100 輪的樣本數、平均、P50、P95、最慢輪、逾時率、未回 DONE 次數與異常率完整分析，Overview 卡片同步提供快速摘要。goal 在停機期間變更時，Goal 視窗會用保存的計畫基準 hash 從 Git 歷史重建並顯示 unified diff。
 - Issues 視窗可「標記已讀」而不刪除稽核紀錄；只有未讀 issues 會讓 fleet 顯示需關注，仍可用「清空全部」永久移除紀錄。
