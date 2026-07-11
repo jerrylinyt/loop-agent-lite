@@ -1368,6 +1368,96 @@ def read_incremental(path: Path, offset: int):
         return {"size": 0, "data": "", "error": f"workspace log 不安全:{e}"}
 
 
+class PlanEditError(ValueError):
+    """結構化 plan 編輯不符合 coordinator 邊界；code 保留衝突與輸入錯誤的差異。"""
+
+    def __init__(self, message: str, code: int = 400):
+        super().__init__(message)
+        self.code = code
+
+
+def locked_plan_task_count(state, plan) -> int:
+    """計算不可移動的連續前綴：已完成任務，加上執行期目前任務。"""
+    locked_orders = {entry["order"] for entry in state.get("completed") or []}
+    if state.get("phase") == "exec" and state.get("current_order"):
+        locked_orders.add(state["current_order"])
+    locked_indexes = [index for index, task in enumerate(plan)
+                      if task["order"] in locked_orders]
+    return max(locked_indexes, default=-1) + 1
+
+
+def normalize_plan_edit(state, tasks, expected_version):
+    """驗證完整 plan 快照並回傳正規化結果、變更摘要與鎖定前綴長度。
+
+    此函式只計算、不寫 state，讓 HTTP adapter 能在所有驗證成功後一次提交，
+    也讓鎖定任務、pending 身分與重新編號規則能脫離 transport 單獨測試。
+    """
+    if not isinstance(tasks, list) or not tasks:
+        raise PlanEditError("plan 必須保留至少一項任務")
+    if (not isinstance(expected_version, int) or isinstance(expected_version, bool) or
+            expected_version != state.get("plan_version")):
+        raise PlanEditError(
+            f"plan 已更新（目前 v{state.get('plan_version', 0)}），請重新載入後再編輯", 409)
+
+    original = state.get("plan") or []
+    locked_count = locked_plan_task_count(state, original)
+    if len(tasks) < locked_count:
+        raise PlanEditError("已完成或目前任務不可刪除")
+    if state.get("phase") == "done" and len(tasks) != len(original):
+        raise PlanEditError("已完成 workspace 沒有可調整的 pending task；請先回規劃期")
+
+    editable_orders = {task["order"] for task in original[locked_count:]}
+    seen_existing = set()
+    normalized = []
+    for index, entry in enumerate(tasks):
+        if not isinstance(entry, dict):
+            raise PlanEditError(f"tasks[{index}] 必須是 object")
+        text = entry.get("task")
+        ref = entry.get("ref")
+        if not isinstance(text, str) or not text.strip():
+            raise PlanEditError(f"tasks[{index}].task 必須是非空字串")
+        if ref is not None and not isinstance(ref, str):
+            raise PlanEditError(f"tasks[{index}].ref 必須是字串或 null")
+
+        source_order = entry.get("order")
+        normalized_ref = ref.strip() if isinstance(ref, str) and ref.strip() else None
+        if index < locked_count:
+            expected_order = original[index]["order"]
+            if source_order != expected_order:
+                raise PlanEditError(f"task-{expected_order} 已完成或正在執行，不可移動或刪除")
+            if (text.strip() != original[index]["task"] or
+                    normalized_ref != (original[index].get("ref") or None)):
+                raise PlanEditError(f"task-{expected_order} 已完成或正在執行，不可修改內容")
+        elif source_order is not None:
+            if (not isinstance(source_order, int) or isinstance(source_order, bool) or
+                    source_order not in editable_orders):
+                raise PlanEditError(f"tasks[{index}].order 不是可編輯的 pending task")
+            if source_order in seen_existing:
+                raise PlanEditError(f"task-{source_order} 重複")
+            seen_existing.add(source_order)
+        normalized.append({"order": index + 1, "task": text.strip(), "ref": normalized_ref})
+
+    # state schema 保證原 order 連續；此判斷明確守住未來 schema 改動時的安全邊界。
+    if any(normalized[index]["order"] != original[index]["order"]
+           for index in range(locked_count)):
+        raise PlanEditError("已完成或目前任務的 order 不可變更")
+
+    old_pending = [task["order"] for task in original[locked_count:]]
+    submitted = [entry.get("order") for entry in tasks[locked_count:]
+                 if entry.get("order") is not None]
+    deleted_count = sum(order not in seen_existing for order in old_pending)
+    inserted_count = sum(entry.get("order") is None for entry in tasks[locked_count:])
+    reordered = submitted != [order for order in old_pending if order in seen_existing]
+    summary = []
+    if inserted_count:
+        summary.append(f"新增 {inserted_count} 項")
+    if deleted_count:
+        summary.append(f"刪除 {deleted_count} 項")
+    if reordered:
+        summary.append("調整順序")
+    return normalized, "、".join(summary) or "更新文字", locked_count
+
+
 class Handler(BaseHTTPRequestHandler):
     """本機 Dashboard 的靜態檔、REST 與 SSE handler；寫入路由可整體切為唯讀。"""
 
@@ -2009,80 +2099,16 @@ class Handler(BaseHTTPRequestHandler):
         changed = []
         tasks = body.get("tasks")
         if tasks is not None and body.get("plan_edit"):
-            # 結構編輯採完整 plan 快照：前端傳期望的 plan_version，後端在同一把
-            # workspace lock 內驗證鎖定前綴、pending 身分與新任務，再一次寫回。
-            # 這可避免拖曳期間 Agent 或另一個 Dashboard 已更新 plan 卻被舊畫面覆蓋。
-            if not isinstance(tasks, list) or not tasks:
-                self._err("plan 必須保留至少一項任務")
+            # normalize_plan_edit 只計算；在同一把 workspace lock 內通過全部驗證後才一次寫回，
+            # 避免拖曳期間另一個 Dashboard 更新 plan 卻被舊畫面部分覆蓋。
+            try:
+                normalized, summary, locked_count = normalize_plan_edit(
+                    st, tasks, body.get("plan_version"))
+            except PlanEditError as e:
+                self._err(str(e), e.code)
                 return
-            expected_version = body.get("plan_version")
-            if (not isinstance(expected_version, int) or isinstance(expected_version, bool) or
-                    expected_version != st.get("plan_version")):
-                self._err(f"plan 已更新（目前 v{st.get('plan_version', 0)}），請重新載入後再編輯", 409)
-                return
-            original = st.get("plan") or []
-            locked_orders = {entry["order"] for entry in st.get("completed") or []}
-            if st.get("phase") == "exec" and st.get("current_order"):
-                locked_orders.add(st["current_order"])
-            locked_indexes = [index for index, task in enumerate(original)
-                              if task["order"] in locked_orders]
-            locked_count = max(locked_indexes, default=-1) + 1
-            if len(tasks) < locked_count:
-                self._err("已完成或目前任務不可刪除")
-                return
-            if st.get("phase") == "done" and len(tasks) != len(original):
-                self._err("已完成 workspace 沒有可調整的 pending task；請先回規劃期")
-                return
-            editable_orders = {task["order"] for task in original[locked_count:]}
-            seen_existing = set()
-            normalized_input = []
-            for index, entry in enumerate(tasks):
-                if not isinstance(entry, dict):
-                    self._err(f"tasks[{index}] 必須是 object")
-                    return
-                text = entry.get("task")
-                ref = entry.get("ref")
-                if not isinstance(text, str) or not text.strip():
-                    self._err(f"tasks[{index}].task 必須是非空字串")
-                    return
-                if ref is not None and not isinstance(ref, str):
-                    self._err(f"tasks[{index}].ref 必須是字串或 null")
-                    return
-                source_order = entry.get("order")
-                if index < locked_count:
-                    expected_order = original[index]["order"]
-                    if source_order != expected_order:
-                        self._err(f"task-{expected_order} 已完成或正在執行，不可移動或刪除")
-                        return
-                    normalized_ref = ref.strip() if isinstance(ref, str) and ref.strip() else None
-                    if (text.strip() != original[index]["task"] or
-                            normalized_ref != (original[index].get("ref") or None)):
-                        self._err(f"task-{expected_order} 已完成或正在執行，不可修改內容")
-                        return
-                elif source_order is not None:
-                    if (not isinstance(source_order, int) or isinstance(source_order, bool) or
-                            source_order not in editable_orders):
-                        self._err(f"tasks[{index}].order 不是可編輯的 pending task")
-                        return
-                    if source_order in seen_existing:
-                        self._err(f"task-{source_order} 重複")
-                        return
-                    seen_existing.add(source_order)
-                normalized_input.append({"order": index + 1, "task": text.strip(),
-                                         "ref": ref.strip() if isinstance(ref, str) and ref.strip() else None})
-            # 鎖定前綴的 canonical order 必須保持不變；state schema 本身保證原 order 連續。
-            if any(normalized_input[index]["order"] != original[index]["order"]
-                   for index in range(locked_count)):
-                self._err("已完成或目前任務的 order 不可變更")
-                return
-            if normalized_input != original:
-                old_pending = [task["order"] for task in original[locked_count:]]
-                submitted = [entry.get("order") for entry in tasks[locked_count:]
-                             if entry.get("order") is not None]
-                deleted = [order for order in old_pending if order not in seen_existing]
-                inserted = sum(1 for entry in tasks[locked_count:] if entry.get("order") is None)
-                reordered = submitted != [order for order in old_pending if order in seen_existing]
-                st["plan"] = normalized_input
+            if normalized != (st.get("plan") or []):
+                st["plan"] = normalized
                 st["plan_version"] = st.get("plan_version", 0) + 1
                 if st.get("phase") == "plan":
                     st["flag"] = 0
@@ -2090,14 +2116,7 @@ class Handler(BaseHTTPRequestHandler):
                     key: value for key, value in (st.get("task_reset_counts") or {}).items()
                     if int(key) <= locked_count
                 }
-                summary = []
-                if inserted:
-                    summary.append(f"新增 {inserted} 項")
-                if deleted:
-                    summary.append(f"刪除 {len(deleted)} 項")
-                if reordered:
-                    summary.append("調整順序")
-                changed.append(f"plan v{st['plan_version']}（{'、'.join(summary) or '更新文字'}）")
+                changed.append(f"plan v{st['plan_version']}（{summary}）")
         elif tasks is not None:
             by_order = {t["order"]: t for t in st.get("plan") or []}
             for e in tasks:
