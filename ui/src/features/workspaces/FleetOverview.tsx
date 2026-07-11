@@ -3,89 +3,15 @@ import { useEffect, useMemo, useState } from "react";
 import type { FleetHistoryEntry, FleetRoundMetrics, WorkspaceSummary } from "../../shared/api/types";
 import AnomalyLogModal from "./AnomalyLogModal";
 import { deriveFleetEvents } from "./fleetEvents";
-import { deriveRoundTiming, useRoundNow } from "./roundTiming";
+import { useRoundNow } from "./roundTiming";
 import { postJson } from "../../shared/api/client";
 import ActionDialog from "../../shared/components/ActionDialog";
-
-const PHASE_NAMES: Record<string, string> = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
-type FleetFilter = "all" | "attention" | "running" | "done";
-type FleetSort = "name" | "attention" | "running" | "progress";
-interface SavedFleetView {
-  id: string;
-  name: string;
-  filter: FleetFilter;
-  search: string;
-  sort: FleetSort;
-  compact: boolean;
-}
-const FLEET_FILTERS: FleetFilter[] = ["all", "attention", "running", "done"];
-const FLEET_SORTS: FleetSort[] = ["name", "attention", "running", "progress"];
-
-function workspaceNeedsAttention(workspace: WorkspaceSummary): boolean {
-  // done workspace 不再因歷史紅燈/停滯誤報；但 state 錯誤、未讀 issue、checkpoint、goal 與 stale PID
-  // 仍是操作者現在需要處理的訊號，所以不受 completed 例外影響。
-  const completed = workspace.phase === "done";
-  return !!(
-    workspace.error ||
-    (workspace.unread_issues ?? workspace.issues ?? 0) > 0 ||
-    workspace.state_recovery_pending ||
-    workspace.goal_changed ||
-    workspace.stale_loop_pid ||
-    (!completed && (
-      (workspace.red_streak ?? 0) > 0 ||
-      (workspace.stall_rounds ?? 0) > 0 ||
-      (workspace.agent_failure_streak ?? 0) > 0 ||
-      workspace.last_round_timed_out ||
-      (workspace.state_recovery_count ?? 0) > 0
-    ))
-  );
-}
-
-function initialFleetFilter(): FleetFilter {
-  // localStorage 可能被人工改壞；只有白名單值才採用。
-  const saved = localStorage.getItem("fleet-filter") as FleetFilter | null;
-  return saved && FLEET_FILTERS.includes(saved) ? saved : "all";
-}
-
-function initialFleetSort(): FleetSort {
-  // 無效或舊版排序值安全退回名稱排序。
-  const saved = localStorage.getItem("fleet-sort") as FleetSort | null;
-  return saved && FLEET_SORTS.includes(saved) ? saved : "name";
-}
-
-function loadSavedViews(): SavedFleetView[] {
-  // 個人視圖不是 coordinator truth；解析失敗直接回空，且最多載入 20 組。
-  try {
-    const value = JSON.parse(localStorage.getItem("fleet-saved-views") ?? "[]") as unknown;
-    if (!Array.isArray(value)) return [];
-    return value.filter((item): item is SavedFleetView => !!item && typeof item === "object" &&
-      typeof (item as SavedFleetView).id === "string" && typeof (item as SavedFleetView).name === "string" &&
-      FLEET_FILTERS.includes((item as SavedFleetView).filter) && FLEET_SORTS.includes((item as SavedFleetView).sort) &&
-      typeof (item as SavedFleetView).search === "string" && typeof (item as SavedFleetView).compact === "boolean").slice(0, 20);
-  } catch {
-    return [];
-  }
-}
-
-function formatMetric(seconds: number | null): string {
-  if (seconds === null) return "—";
-  return `${seconds < 1 ? seconds.toFixed(2) : seconds.toFixed(1)}s`;
-}
-
-function progress(workspace: WorkspaceSummary): { done: number; total: number; pct: number } {
-  // 空 plan 的百分比定義為 0，避免除以零與誤顯示完成。
-  const total = workspace.plan_len ?? 0;
-  const done = workspace.completed ?? 0;
-  return { done, total, pct: total > 0 ? Math.round((done / total) * 100) : 0 };
-}
-
-function currentActivity(workspace: WorkspaceSummary): string {
-  if (workspace.error) return "state 讀取失敗，請檢查 checkpoint 或重新啟動";
-  if (workspace.phase === "done") return "全部任務收斂完成";
-  if (workspace.phase === "plan") return workspace.running ? "規劃收斂中…" : "規劃期（已停止）";
-  if (workspace.current_task) return `task-${workspace.current_order}：${workspace.current_task}`;
-  return "";
-}
+import FleetWorkspaceCard from "./FleetWorkspaceCard";
+import {
+  formatMetric, initialFleetFilter, initialFleetSort, loadSavedViews,
+  visibleFleetWorkspaces, workspaceNeedsAttention,
+} from "./fleetViewModel";
+import type { FleetFilter, FleetSort, SavedFleetView } from "./fleetViewModel";
 
 /** 監控電視牆:聚合統計 + 全 fleet 即時卡片 + 事件推播。
  * 卡片與歷史事件都走同一條 SSE；事件流仍由前端從 history 尾段推導。 */
@@ -220,24 +146,10 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
   const totalTasks = workspaces.reduce((sum, workspace) => sum + (workspace.plan_len ?? 0), 0);
   const doneTasks = workspaces.reduce((sum, workspace) => sum + (workspace.completed ?? 0), 0);
   const alerts = workspaces.filter(workspaceNeedsAttention).length;
-  const visibleWorkspaces = useMemo(() => {
-    let visible = filter === "attention" ? workspaces.filter(workspaceNeedsAttention)
-      : filter === "running" ? workspaces.filter((workspace) => workspace.running)
-        : filter === "done" ? workspaces.filter((workspace) => workspace.phase === "done")
-          : workspaces;
-    const query = search.trim().toLowerCase();
-    if (query) visible = visible.filter((workspace) => workspace.name.toLowerCase().includes(query));
-    return [...visible].sort((left, right) => {
-      if (sort === "attention") return Number(workspaceNeedsAttention(right)) - Number(workspaceNeedsAttention(left)) || left.name.localeCompare(right.name);
-      if (sort === "running") return Number(right.running) - Number(left.running) || left.name.localeCompare(right.name);
-      if (sort === "progress") {
-        const leftProgress = progress(left);
-        const rightProgress = progress(right);
-        return rightProgress.pct - leftProgress.pct || left.name.localeCompare(right.name);
-      }
-      return left.name.localeCompare(right.name);
-    });
-  }, [filter, search, sort, workspaces]);
+  const visibleWorkspaces = useMemo(
+    () => visibleFleetWorkspaces(workspaces, filter, search, sort),
+    [filter, search, sort, workspaces]
+  );
   const filters: Array<{ id: FleetFilter; label: string; count: number }> = [
     { id: "all", label: "全部", count: workspaces.length },
     { id: "attention", label: "需關注", count: alerts },
@@ -315,68 +227,10 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
       </div>}
       <div className="fleet-body">
         <div className="fleet-grid">
-          {visibleWorkspaces.map((workspace) => {
-            const { done: cardDone, total, pct } = progress(workspace);
-            const alert = workspaceNeedsAttention(workspace);
-            const unreadIssues = workspace.unread_issues ?? workspace.issues ?? 0;
-            const activity = currentActivity(workspace);
-            const roundTiming = deriveRoundTiming(workspace, workspace.running, roundNow);
-            const metrics = metricsByWorkspace.get(workspace.name);
-            return (
-              <button key={workspace.name} type="button" className={`fleet-card phase-${workspace.phase ?? "unknown"}${workspace.running ? " running" : ""}`} onClick={() => onSelect(workspace.name)}>
-                <div className="fleet-card-head">
-                  <strong>{workspace.name}</strong>
-                  {workspace.running && <span className="breathing-dot" aria-label="執行中" />}
-                </div>
-                <div className="fleet-card-meta">
-                  <span className={`phase-badge phase-${workspace.phase ?? "unknown"}`}>{PHASE_NAMES[workspace.phase ?? ""] ?? "—"}</span>
-                  <span className="muted">round {workspace.round ?? 0}</span>
-                  {workspace.phase === "plan" && <span className="muted">flag {workspace.flag ?? 0}</span>}
-                  {workspace.phase === "exec" && <span className="muted">done {workspace.done_count ?? 0}</span>}
-                  {roundTiming && <span className={`round-timer${roundTiming.warning || roundTiming.interrupted ? " warning" : ""}`}>{roundTiming.label}</span>}
-                  {(workspace.last_round_seconds ?? 0) > 0 && <span className="muted">⏱ {workspace.last_round_seconds}s</span>}
-                </div>
-                {total > 0 && workspace.phase !== "plan" && (
-                  <div className="fleet-progress" aria-label={`任務 ${cardDone}/${total}`}>
-                    <div className="fleet-progress-fill" style={{ width: `${pct}%` }} />
-                    <span className="fleet-progress-text">{cardDone}/{total}</span>
-                  </div>
-                )}
-                {activity && <div className="fleet-card-task" title={activity}>{workspace.phase === "exec" ? "→ " : ""}{activity}</div>}
-                {metrics && metrics.sample_count > 0 ? (
-                  <div className="fleet-card-analysis" aria-label={`近期 ${metrics.sample_count} 輪效能`}>
-                    <div className="fleet-card-analysis-head"><strong>近期 {metrics.sample_count} 輪</strong><span>效能</span></div>
-                    <div className="fleet-card-analysis-grid">
-                      <span><small>平均</small><strong>{formatMetric(metrics.average_seconds)}</strong></span>
-                      <span><small>P50</small><strong>{formatMetric(metrics.p50_seconds)}</strong></span>
-                      <span><small>P95</small><strong>{formatMetric(metrics.p95_seconds)}</strong></span>
-                      <span><small>最慢</small><strong>{formatMetric(metrics.max_seconds)}</strong></span>
-                      <span className={metrics.timeout_count ? "warning" : ""}><small>逾時</small><strong>{metrics.timeout_rate_pct}%</strong></span>
-                    </div>
-                    <div className="fleet-card-anomaly-grid" title="有 Git 變更但未回報仍算異常；人工中斷輪不計">
-                      <span className={metrics.missing_done_count ? "warning" : ""}><small>未回 DONE</small><strong>{metrics.missing_done_count} 次</strong></span>
-                      <span className={metrics.missing_done_count ? "warning" : ""}><small>異常率</small><strong>{metrics.missing_done_rate_pct}%</strong></span>
-                    </div>
-                  </div>
-                ) : <div className="fleet-card-analysis-empty">尚無輪次效能資料</div>}
-                {alert && (
-                  <div className="fleet-card-alerts">
-                    {workspace.phase !== "done" && (workspace.red_streak ?? 0) > 0 && <span className="chip warning">紅連跳 {workspace.red_streak}</span>}
-                    {workspace.phase !== "done" && (workspace.stall_rounds ?? 0) > 0 && <span className="chip subdued">停滯 {workspace.stall_rounds}</span>}
-                    {unreadIssues > 0 && <span className="chip issue-chip">issues 未讀 {unreadIssues}</span>}
-                    {workspace.phase !== "done" && (workspace.agent_failure_streak ?? 0) > 0 && <span className="chip warning">Agent 異常 {workspace.agent_failure_streak}</span>}
-                    {workspace.phase !== "done" && workspace.last_round_timed_out && <span className="chip warning">⏱ 上輪逾時</span>}
-                    {workspace.phase !== "done" && (workspace.state_recovery_count ?? 0) > 0 && <span className="chip warning">🛟 state 復原 {workspace.state_recovery_count}</span>}
-                    {workspace.state_recovery_pending && <span className="chip warning">🛟 checkpoint</span>}
-                    {workspace.goal_changed && <span className="chip warning">goal 已變更</span>}
-                    {workspace.stale_loop_pid && <span className="chip warning">⚠ PID 殘留</span>}
-                    {workspace.error && <span className="chip warning">❌ state 錯誤</span>}
-                  </div>
-                )}
-                {workspace.repo && <div className="fleet-card-repo" title={workspace.repo}>{workspace.repo}</div>}
-              </button>
-            );
-          })}
+          {visibleWorkspaces.map((workspace) => (
+            <FleetWorkspaceCard key={workspace.name} workspace={workspace}
+              metrics={metricsByWorkspace.get(workspace.name)} roundNow={roundNow} onSelect={onSelect} />
+          ))}
           {!visibleWorkspaces.length && <div className="empty-inline">{search.trim() ? "沒有符合搜尋的 workspace" : filter === "all" ? "尚未建立 workspace" : "沒有符合目前篩選的 workspace"}</div>}
         </div>
         <aside className="fleet-events" aria-label="事件推播">
