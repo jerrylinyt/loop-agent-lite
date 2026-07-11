@@ -1,5 +1,5 @@
 /** Dashboard 根元件：協調全域工具列、workspace/總覽切換、Modal 與鍵盤導覽；業務資料由 useDashboardData 統一提供。 */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import ConsolePane from "../features/console/ConsolePane";
 import Splitter from "../features/layout/Splitter";
 import LauncherModal from "../features/launcher/LauncherModal";
@@ -12,6 +12,7 @@ import CommandPalette from "../features/workspaces/CommandPalette";
 import useDashboardData from "./useDashboardData";
 import useStatusFavicon from "./useStatusFavicon";
 import GettingStarted from "../features/launcher/GettingStarted";
+import useWorkspaceNavigation from "./useWorkspaceNavigation";
 
 export default function App() {
   const dashboard = useDashboardData();
@@ -19,8 +20,6 @@ export default function App() {
   const [archivesOpen, setArchivesOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [overviewOpen, setOverviewOpen] = useState(() => localStorage.getItem("fleet-overview") === "1");
-  const [navigationChord, setNavigationChord] = useState(false);
-  const navigationTimer = useRef<number | null>(null);
   const [attentionRequest, setAttentionRequest] = useState(0);
   const [leftWidth, setLeftWidth] = useState(() => +(localStorage.getItem("left-pane-width") || Math.round(window.innerWidth * 0.44)));
   const [rightCollapsed, setRightCollapsed] = useState(() => localStorage.getItem("agent-console-collapsed") === "1");
@@ -72,47 +71,12 @@ export default function App() {
     setAttentionRequest((value) => value + 1);
     setOverviewOpen(true);
   };
-  useEffect(() => {
-    const listener = (event: KeyboardEvent) => {
-      // ⌘/Ctrl+K 是立即開啟；⌘/Ctrl+G 則進入 1.5 秒的兩段式導覽模式，
-      // 避免單按數字時意外切走 workspace。表單或 Modal 內一律不攔截。
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
-        event.preventDefault(); setPaletteOpen(true);
-        return;
-      }
-      const target = event.target as HTMLElement | null;
-      const editing = !!target?.closest("input, textarea, select, [contenteditable='true']");
-      const modalOpen = !!document.querySelector("[role='dialog']");
-      if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "g") {
-        if (editing || modalOpen) return;
-        event.preventDefault();
-        setNavigationChord(true);
-        if (navigationTimer.current !== null) window.clearTimeout(navigationTimer.current);
-        navigationTimer.current = window.setTimeout(() => setNavigationChord(false), 1500);
-        return;
-      }
-      if (!navigationChord || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey || !/^[0-5]$/.test(event.key)) return;
-      event.preventDefault();
-      setNavigationChord(false);
-      if (navigationTimer.current !== null) window.clearTimeout(navigationTimer.current);
-      if (event.key === "0") {
-        setOverviewOpen(true);
-        localStorage.setItem("fleet-overview", "1");
-        return;
-      }
-      const next = dashboard.workspaces[Number(event.key) - 1];
-      // 超出現有 workspace 數量時維持原畫面，不把空位置當成錯誤。
-      if (!next) return;
-      dashboard.selectWorkspace(next.name);
-      setOverviewOpen(false);
-      localStorage.setItem("fleet-overview", "0");
-    };
-    document.addEventListener("keydown", listener);
-    return () => document.removeEventListener("keydown", listener);
-  }, [dashboard.selectWorkspace, dashboard.workspaces, navigationChord]);
-  useEffect(() => () => {
-    if (navigationTimer.current !== null) window.clearTimeout(navigationTimer.current);
-  }, []);
+  const navigationChord = useWorkspaceNavigation({
+    workspaces: dashboard.workspaces,
+    selectWorkspace: dashboard.selectWorkspace,
+    setOverviewOpen,
+    setPaletteOpen,
+  });
   const paletteCommands = useMemo(() => [
     { id: "overview", label: "開啟 Fleet 總覽", hint: "監控所有 workspace", run: () => { setOverviewOpen(true); localStorage.setItem("fleet-overview", "1"); } },
     { id: "archives", label: "查看已封存", hint: "還原或永久刪除", run: () => setArchivesOpen(true) },
