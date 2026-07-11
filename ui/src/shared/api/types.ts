@@ -136,6 +136,12 @@ export interface PlanTask {
   ref?: string | null;
 }
 
+export interface PlanEditTask {
+  order: number | null;
+  task: string;
+  ref?: string | null;
+}
+
 export interface CompletedTask {
   order: number;
   sha: string;

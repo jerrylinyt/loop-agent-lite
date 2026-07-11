@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { PlanTask, WorkspaceState } from "../../shared/api/types";
+import type { PlanEditTask, WorkspaceState } from "../../shared/api/types";
+import PlanEditorModal from "./PlanEditorModal";
 
 export default function PlanTable({
   state,
@@ -9,15 +10,12 @@ export default function PlanTable({
 }: {
   state: WorkspaceState;
   canEdit: boolean;
-  onSave: (tasks: PlanTask[], doneCount: number) => Promise<string>;
+  onSave: (tasks: PlanEditTask[], doneCount: number) => Promise<string>;
   onGoto: (order: number) => void;
 }) {
   const [showDone, setShowDone] = useState(() => localStorage.getItem("showdone") === "1");
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
-  const [editing, setEditing] = useState(false);
-  const [drafts, setDrafts] = useState<PlanTask[]>([]);
-  const [doneCount, setDoneCount] = useState(0);
-  const [message, setMessage] = useState("");
+  const [editorOpen, setEditorOpen] = useState(false);
   const [currentOffscreen, setCurrentOffscreen] = useState(false);
   const [flashOrders, setFlashOrders] = useState<Set<number>>(new Set());
   const [updatedVersion, setUpdatedVersion] = useState<number | null>(null);
@@ -59,20 +57,6 @@ export default function PlanTable({
     [state.completed]
   );
 
-  const startEditing = () => {
-    setDrafts((state.plan ?? []).map((task) => ({ ...task })));
-    setDoneCount(state.done_count ?? 0);
-    setMessage("");
-    setEditing(true);
-  };
-
-  const save = async () => {
-    setMessage("儲存中…");
-    const result = await onSave(drafts, doneCount);
-    setMessage(result);
-    if (result.startsWith("✅")) setEditing(false);
-  };
-
   const checkCurrentVisibility = () => {
     const wrap = scrollRef.current;
     const row = wrap?.querySelector<HTMLElement>("tr.current");
@@ -82,39 +66,9 @@ export default function PlanTable({
     setCurrentOffscreen(current.bottom < bounds.top || current.top > bounds.bottom);
   };
 
-  if (editing) {
-    return (
-      <section className="plan-pane">
-        <header className="pane-header">
-          <div><strong>編輯計畫</strong><span>停止時才可修改</span></div>
-          <button type="button" className="secondary-button" onClick={() => setEditing(false)}>取消</button>
-        </header>
-        <div className="edit-plan-list">
-          {drafts.map((task, index) => (
-            <label key={task.order}>
-              <span>task-{task.order}</span>
-              <textarea
-                rows={3}
-                value={task.task}
-                onChange={(event) => setDrafts((items) => items.map((item, itemIndex) =>
-                  itemIndex === index ? { ...item, task: event.target.value } : item
-                ))}
-              />
-            </label>
-          ))}
-        </div>
-        <footer className="edit-plan-footer">
-          <label>done 計數<input type="number" min={0} value={doneCount} onChange={(event) => setDoneCount(+event.target.value)} /></label>
-          <button type="button" className="primary-button" onClick={save}>💾 儲存</button>
-          <span className="inline-message" role="status">{message}</span>
-        </footer>
-      </section>
-    );
-  }
-
   const plan = state.plan ?? [];
   const visibleTasks = plan.filter((task) => showDone || !completed.has(task.order));
-  return (
+  return (<>
     <section className="plan-pane">
       <header className={`pane-header plan-header${updatedVersion !== null ? " updated" : ""}`}>
         <div>
@@ -122,7 +76,7 @@ export default function PlanTable({
           <span>{completed.size}/{plan.length} 已完成</span>
           {updatedVersion !== null && <span className="plan-update-badge" role="status" aria-label={`計畫已更新 v${updatedVersion}`}>計畫已更新 v{updatedVersion}</span>}
         </div>
-        {canEdit && plan.length > 0 && <button type="button" className="secondary-button" onClick={startEditing}>✎ 編輯計畫</button>}
+        {canEdit && plan.length > 0 && <button type="button" className="secondary-button" onClick={() => setEditorOpen(true)}>✎ 編輯計畫</button>}
       </header>
       <div className="table-scroll" ref={scrollRef} onScroll={checkCurrentVisibility}>
         <table>
@@ -187,5 +141,6 @@ export default function PlanTable({
         }}>→ 回到執行中</button>
       )}
     </section>
-  );
+    {editorOpen && <PlanEditorModal state={state} onClose={() => setEditorOpen(false)} onSave={onSave} />}
+  </>);
 }

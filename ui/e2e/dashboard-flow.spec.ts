@@ -54,6 +54,7 @@ test("Goal／Plan Prompt 模板可選類型、共用分析規則並下載", asyn
 });
 
 test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、phase 與進度", async ({ page }) => {
+  test.setTimeout(90_000);
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "尚未建立 workspace" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "第一次使用，三步完成" })).toBeVisible();
@@ -146,6 +147,14 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await palette.getByLabel("搜尋快捷指令").fill("e2e-workspace");
   await expect(palette.getByRole("option")).toContainText("e2e-workspace");
   await palette.getByRole("button", { name: "關閉對話框" }).click();
+  await expect(palette).toBeHidden();
+  await page.keyboard.press("ControlOrMeta+KeyG");
+  await expect(page.locator(".navigation-chord")).toContainText("按 0 回總覽");
+  await page.keyboard.press("0");
+  await expect(page.getByRole("main", { name: "工作區總覽" })).toBeVisible();
+  await page.keyboard.press("ControlOrMeta+KeyG");
+  await page.keyboard.press("1");
+  await expect(page.getByRole("heading", { name: "e2e-workspace" })).toBeVisible();
   await expect(page.getByRole("img", { name: /^健康度：紅連跳 \d+\/\d+ · 停滯 \d+\/\d+/ })).toBeVisible();
   await expect(page.getByRole("button", { name: "⏹ 立即停止" })).toBeVisible();
   await expect(page.getByRole("button", { name: "⏸ 本輪後停止" })).toBeVisible();
@@ -421,14 +430,26 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(settings).toBeHidden();
 
   await page.getByRole("button", { name: "✎ 編輯計畫" }).click();
-  await page.getByLabel("task-1").fill("這個變更應該被取消");
-  await page.getByRole("button", { name: "取消", exact: true }).click();
-  await expect(page.getByRole("button", { name: "建立 E2E 第一項功能" })).toBeVisible();
+  let planEditor = page.getByRole("dialog", { name: "Plan 編輯器" });
+  await expect(planEditor.locator(".plan-editor-task").first().getByLabel("任務內容")).toBeDisabled();
+  await planEditor.locator(".plan-editor-task").nth(1).getByLabel("任務內容").fill("這個變更應該被取消");
+  await planEditor.getByRole("button", { name: "取消", exact: true }).click();
+  const discardPlan = page.getByRole("dialog", { name: "放棄未儲存變更？" });
+  await discardPlan.getByRole("button", { name: "放棄變更" }).click();
+  await expect(planEditor).toBeHidden();
+  await expect(page.getByRole("button", { name: "驗證 E2E 第二項功能" })).toBeVisible();
   await page.getByRole("button", { name: "✎ 編輯計畫" }).click();
-  await page.getByLabel("task-1").fill("已由 E2E 更新的第一項功能");
-  await page.getByLabel("done 計數").fill("0");
-  await page.getByRole("button", { name: "💾 儲存" }).click();
-  await expect(page.getByRole("button", { name: "已由 E2E 更新的第一項功能" })).toBeVisible();
+  planEditor = page.getByRole("dialog", { name: "Plan 編輯器" });
+  await planEditor.locator(".plan-editor-task").first().getByRole("button", { name: "＋ 插入在此任務之後" }).click();
+  await planEditor.locator(".plan-editor-task").nth(1).getByLabel("任務內容").fill("插入的 E2E 任務");
+  await planEditor.getByRole("button", { name: "下移 task-2" }).click();
+  await planEditor.locator(".plan-editor-task", { hasText: "驗證 E2E 第二項功能" }).getByRole("button", { name: "刪除" }).click();
+  await expect(planEditor.locator(".plan-editor-summary")).toContainText("新增1 項");
+  await expect(planEditor.locator(".plan-editor-summary")).toContainText("刪除1 項");
+  await planEditor.getByLabel("done 計數").fill("0");
+  await planEditor.getByRole("button", { name: "💾 儲存變更" }).click();
+  await expect(planEditor).toBeHidden();
+  await expect(page.getByRole("button", { name: "插入的 E2E 任務" })).toBeVisible();
 
   await expect(page.getByRole("button", { name: /最近事件/ })).toHaveCount(0);
 
@@ -453,11 +474,11 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page.getByText("規劃期", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "▶ 運行" }).click();
   await expect(page.getByRole("button", { name: "⏹ 立即停止" })).toBeVisible();
-  await expect(page.getByRole("status", { name: "計畫已更新 v2" })).toBeVisible();
+  await expect(page.getByRole("status", { name: "計畫已更新 v3" })).toBeVisible();
   await expect(page.locator('tr[data-order="2"]')).toHaveClass(/flash/);
   await expect(page.getByRole("button", { name: "由 Agent 重新分析的第二項功能" })).toBeVisible();
   await expect(loopConsole).toContainText("📨 Agent 指令｜create-plan");
-  await expect(loopConsole).toContainText("📝 計畫已更新｜v2｜共 2 條任務");
+  await expect(loopConsole).toContainText("📝 計畫已更新｜v3｜共 2 條任務");
   await page.getByRole("button", { name: "⏹ 立即停止" }).click();
   await expect(page.getByRole("button", { name: "▶ 運行" })).toBeVisible();
   await acceptConfirmation(page, () => page.getByRole("button", { name: "⏩ 進執行期" }).click());

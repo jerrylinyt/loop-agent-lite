@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { postJson, waitForJobStartup } from "../../shared/api/client";
 import ActionDialog, { type ActionPreviewItem } from "../../shared/components/ActionDialog";
-import type { PlanTask, StartupResponse, WorkspaceState, WorkspaceSummary } from "../../shared/api/types";
+import type { PlanEditTask, StartupResponse, WorkspaceState, WorkspaceSummary } from "../../shared/api/types";
 import ConsolePane from "../console/ConsolePane";
 import HorizontalSplitter from "../layout/HorizontalSplitter";
 import ConfigModal from "./ConfigModal";
@@ -136,8 +136,8 @@ export default function WorkspaceView({
       }
     });
   };
-  const savePlan = async (tasks: PlanTask[], doneCount: number) => {
-    const response = await postJson<{ changed?: string[] }>("/api/edit-state", { name: workspace?.name, tasks, done_count: doneCount });
+  const savePlan = async (tasks: PlanEditTask[], doneCount: number) => {
+    const response = await postJson<{ changed?: string[] }>("/api/edit-state", { name: workspace?.name, tasks, done_count: doneCount, plan_edit: true, plan_version: state.plan_version });
     if (response.error) return `❌ ${response.error}`;
     onRefresh();
     return `✅ 已儲存 ${response.changed?.join(", ") || "（無變更）"}`;
