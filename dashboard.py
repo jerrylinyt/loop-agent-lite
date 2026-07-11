@@ -1953,6 +1953,9 @@ class Handler(BaseHTTPRequestHandler):
         changed = []
         tasks = body.get("tasks")
         if tasks is not None and body.get("plan_edit"):
+            # 結構編輯採完整 plan 快照：前端傳期望的 plan_version，後端在同一把
+            # workspace lock 內驗證鎖定前綴、pending 身分與新任務，再一次寫回。
+            # 這可避免拖曳期間 Agent 或另一個 Dashboard 已更新 plan 卻被舊畫面覆蓋。
             if not isinstance(tasks, list) or not tasks:
                 self._err("plan 必須保留至少一項任務")
                 return
@@ -1994,6 +1997,11 @@ class Handler(BaseHTTPRequestHandler):
                     expected_order = original[index]["order"]
                     if source_order != expected_order:
                         self._err(f"task-{expected_order} 已完成或正在執行，不可移動或刪除")
+                        return
+                    normalized_ref = ref.strip() if isinstance(ref, str) and ref.strip() else None
+                    if (text.strip() != original[index]["task"] or
+                            normalized_ref != (original[index].get("ref") or None)):
+                        self._err(f"task-{expected_order} 已完成或正在執行，不可修改內容")
                         return
                 elif source_order is not None:
                     if (not isinstance(source_order, int) or isinstance(source_order, bool) or

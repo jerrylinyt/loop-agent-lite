@@ -2089,6 +2089,15 @@ class TestPendingPlanEditing(unittest.TestCase):
         self.assertEqual(stale[0], 409)
         self.assertIn("請重新載入", stale[1]["error"])
 
+        modified = self.call([
+            {"order": 1, "task": "改寫已完成任務", "ref": None},
+            {"order": 2, "task": "task 2", "ref": None},
+            {"order": 3, "task": "task 3", "ref": None},
+            {"order": 4, "task": "task 4", "ref": None},
+        ])
+        self.assertEqual(modified[0], 400)
+        self.assertIn("不可修改內容", modified[1]["error"])
+
 
 class TestStopIdempotency(unittest.TestCase):
     """fleet 狀態稍舊時重複 stop 不應報「沒有在執行中」。"""
