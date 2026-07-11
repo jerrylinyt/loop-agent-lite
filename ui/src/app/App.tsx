@@ -9,7 +9,6 @@ import WorkspaceTabs from "../features/workspaces/WorkspaceTabs";
 import WorkspaceView from "../features/workspaces/WorkspaceView";
 import WorkspaceDoctorModal from "../features/workspaces/WorkspaceDoctorModal";
 import CommandPalette from "../features/workspaces/CommandPalette";
-import IncidentCenterModal from "../features/workspaces/IncidentCenterModal";
 import useDashboardData from "./useDashboardData";
 import useStatusFavicon from "./useStatusFavicon";
 import GettingStarted from "../features/launcher/GettingStarted";
@@ -20,7 +19,6 @@ export default function App() {
   const [archivesOpen, setArchivesOpen] = useState(false);
   const [doctorOpen, setDoctorOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [incidentsOpen, setIncidentsOpen] = useState(false);
   const [overviewOpen, setOverviewOpen] = useState(() => localStorage.getItem("fleet-overview") === "1");
   const [attentionRequest, setAttentionRequest] = useState(0);
   const [leftWidth, setLeftWidth] = useState(() => +(localStorage.getItem("left-pane-width") || Math.round(window.innerWidth * 0.44)));
@@ -91,7 +89,6 @@ export default function App() {
   const paletteCommands = useMemo(() => [
     { id: "overview", label: "開啟 Fleet 總覽", hint: "監控所有 workspace", run: () => { setOverviewOpen(true); localStorage.setItem("fleet-overview", "1"); } },
     { id: "doctor", label: "開啟問題中心", hint: "診斷需處理訊號", run: () => setDoctorOpen(true) },
-    { id: "incidents", label: "開啟 Incident 中心", hint: "查看關聯異常", run: () => setIncidentsOpen(true) },
     { id: "archives", label: "查看已封存", hint: "還原或永久刪除", run: () => setArchivesOpen(true) },
     ...(!dashboard.bootstrap.readonly ? [{ id: "launch", label: "啟動／管理", hint: "建立或重新啟動 loop", run: () => setLauncherOpen(true) }] : [])
   ], [dashboard.bootstrap.readonly]);
@@ -113,7 +110,6 @@ export default function App() {
             <ThemePicker />
             <button type="button" className="secondary-button command-palette-trigger" aria-keyshortcuts="Meta+K Control+K" onClick={() => setPaletteOpen(true)}>⌘K</button>
             <button type="button" className="secondary-button" onClick={() => setDoctorOpen(true)}>🩺 問題中心</button>
-            <button type="button" className="secondary-button" onClick={() => setIncidentsOpen(true)}>⚡ Incidents</button>
             <button type="button" className={`secondary-button${overviewOpen ? " active-toggle" : ""}`} aria-pressed={overviewOpen} onClick={toggleOverview}>📺 總覽</button>
             <button type="button" className="secondary-button" onClick={() => setArchivesOpen(true)}>🗃 已封存</button>
             {!dashboard.bootstrap.readonly && <button type="button" className="success-button" onClick={() => setLauncherOpen(true)}>＋ 啟動／管理</button>}
@@ -146,7 +142,6 @@ export default function App() {
       {archivesOpen && <ArchivesModal readonly={dashboard.bootstrap.readonly} onClose={() => setArchivesOpen(false)} onRestored={restored} />}
       {doctorOpen && <WorkspaceDoctorModal workspaces={dashboard.workspaces} onClose={() => setDoctorOpen(false)} onSelect={selectFromDoctor} />}
       {paletteOpen && <CommandPalette workspaces={dashboard.workspaces} commands={paletteCommands} onClose={() => setPaletteOpen(false)} onSelectWorkspace={(name) => { dashboard.selectWorkspace(name); setOverviewOpen(false); }} />}
-      {incidentsOpen && <IncidentCenterModal workspaces={dashboard.workspaces} history={dashboard.fleetHistory} onClose={() => setIncidentsOpen(false)} onSelect={selectFromOverview} />}
     </>
   );
 }

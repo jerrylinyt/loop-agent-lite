@@ -297,12 +297,6 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await doctor.getByRole("button", { name: "前往處理" }).click();
   await expect(doctor).toBeHidden();
 
-  await page.getByRole("button", { name: "⚡ Incidents" }).click();
-  const incidents = page.getByRole("dialog", { name: "Incident 中心" });
-  await expect(incidents).toContainText("現行事件");
-  await expect(incidents).toContainText("e2e-workspace");
-  await incidents.getByRole("button", { name: "關閉對話框" }).click();
-
   const attentionButton = page.getByRole("button", { name: /工作區需處理/ });
   await expect(attentionButton).toBeVisible();
   await attentionButton.click();
