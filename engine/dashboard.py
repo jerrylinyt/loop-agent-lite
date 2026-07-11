@@ -705,6 +705,15 @@ def write_state(name, st):
     loop_mod.write_checkpointed_state(safe_workspace_dir(name) / "state.json", data)
 
 
+def _load_state_or_err(handler, name, *, repair=True):
+    """讀 workspace state；失敗時透過 handler 送出 _err JSON 並回傳 None（同 _ws_dir 慣例）。"""
+    st, err = read_state(name, repair=repair)
+    if err:
+        handler._err(err)
+        return None
+    return st
+
+
 def read_report(name):
     """REPORT.md 唯讀投影:只在全部任務收斂完成後由 loop 產生,不存在回明確 error。"""
     if not loop_mod.valid_workspace_name(name):
@@ -2005,9 +2014,8 @@ class Handler(BaseHTTPRequestHandler):
     def api_run(self, body):
         """一鍵重跑既有 workspace:設定全部從 state.json 拿,agent 命令先過 config 白名單。"""
         name = str(body.get("name") or "")
-        st, err = read_state(name)
-        if err:
-            self._err(err)
+        st = _load_state_or_err(self, name)
+        if st is None:
             return
         c = st.get("config") or {}
         repo, agent_cmd, validate_cmd = c.get("repo"), c.get("agent_cmd"), c.get("validate_cmd")
@@ -2083,9 +2091,8 @@ class Handler(BaseHTTPRequestHandler):
     def api_edit_state(self, body):
         """停止狀態下的人工編輯:plan、done 計數與 issue 已讀/清除；執行中全部鎖死。"""
         name = str(body.get("name") or "")
-        st, err = read_state(name)
-        if err:
-            self._err(err)
+        st = _load_state_or_err(self, name)
+        if st is None:
             return
         if ws_running(name, st):
             self._err(f"{name} 執行中,全部鎖死——先停止才能編輯")
@@ -2158,9 +2165,8 @@ class Handler(BaseHTTPRequestHandler):
     def api_edit_config(self, body):
         """停止狀態下編輯 workspace 設定(agent/validate/五顆旋鈕),存回 state.config,▶ 運行時生效。執行中鎖死。"""
         name = str(body.get("name") or "")
-        st, err = read_state(name)
-        if err:
-            self._err(err)
+        st = _load_state_or_err(self, name)
+        if st is None:
             return
         if ws_running(name, st):
             self._err(f"{name} 執行中,全部鎖死——先停止才能改設定")
@@ -2220,9 +2226,8 @@ class Handler(BaseHTTPRequestHandler):
         name = str(body.get("name") or "")
         st = None
         if name:
-            st, err = read_state(name)
-            if err:
-                self._err(err)
+            st = _load_state_or_err(self, name)
+            if st is None:
                 return
             if ws_running(name, st):
                 self._err(f"{name} 執行中——先停止才能單獨確認 Validate 命令")
@@ -2330,9 +2335,8 @@ class Handler(BaseHTTPRequestHandler):
         name = str(body.get("name") or "")
         st = None
         if name:
-            st, err = read_state(name)
-            if err:
-                self._err(err)
+            st = _load_state_or_err(self, name)
+            if st is None:
                 return
             if ws_running(name, st):
                 self._err(f"{name} 執行中——先停止才能單獨確認 Agent CLI")
@@ -2392,9 +2396,8 @@ class Handler(BaseHTTPRequestHandler):
         """CLI 管理器測試尚未儲存的 command/PATH 草稿；固定 prompt=test。"""
         name = str(body.get("name") or "")
         if name:
-            st, err = read_state(name)
-            if err:
-                self._err(err)
+            st = _load_state_or_err(self, name)
+            if st is None:
                 return
             if ws_running(name, st):
                 self._err(f"{name} 執行中——先停止才能測試 Agent CLI")
@@ -2568,9 +2571,8 @@ class Handler(BaseHTTPRequestHandler):
     def api_phase(self, body):
         """停止狀態下切換 phase:exec/done → plan(執行進度歸零,計畫保留);plan → exec(直接開做)。"""
         name = str(body.get("name") or "")
-        st, err = read_state(name)
-        if err:
-            self._err(err)
+        st = _load_state_or_err(self, name)
+        if st is None:
             return
         if ws_running(name, st):
             self._err(f"{name} 執行中,全部鎖死——先停止才能切換 phase")
@@ -2603,9 +2605,8 @@ class Handler(BaseHTTPRequestHandler):
     def api_set_task(self, body):
         """停止狀態下的進度管理:退回重做,或往前跳(validate 綠才放行,被跳過的標人工完成)。"""
         name = str(body.get("name") or "")
-        st, err = read_state(name)
-        if err:
-            self._err(err)
+        st = _load_state_or_err(self, name)
+        if st is None:
             return
         if ws_running(name, st):
             self._err(f"{name} 執行中,全部鎖死——先停止才能調整進度")
@@ -2675,9 +2676,8 @@ class Handler(BaseHTTPRequestHandler):
     def api_archive_workspace(self, body):
         """停止狀態下以原子 rename 軟刪除 workspace；不動 target repo 或覆寫既有 archive。"""
         name = str(body.get("name") or "")
-        st, err = read_state(name, repair=False)
-        if err:
-            self._err(err)
+        st = _load_state_or_err(self, name, repair=False)
+        if st is None:
             return
         if ws_running(name, st):
             self._err(f"{name} 執行中,不能封存——先停止")
@@ -2807,9 +2807,8 @@ class Handler(BaseHTTPRequestHandler):
     def api_drain(self, body):
         """要求目前 session 在完整處理本輪後停止；只寫旁路控制檔，不競寫 loop state。"""
         name = str(body.get("name") or "")
-        st, err = read_state(name)
-        if err:
-            self._err(err)
+        st = _load_state_or_err(self, name)
+        if st is None:
             return
         loop_state = st.get("loop") or {}
         pid = loop_state.get("pid")
@@ -2854,9 +2853,8 @@ class Handler(BaseHTTPRequestHandler):
     def api_cancel_drain(self, body):
         """撤銷尚未被 loop 取走的本輪後停止請求；claim 競態輸家必須明確回報太晚。"""
         name = str(body.get("name") or "")
-        st, err = read_state(name)
-        if err:
-            self._err(err)
+        st = _load_state_or_err(self, name)
+        if st is None:
             return
         loop_state = st.get("loop") or {}
         pid = loop_state.get("pid")
