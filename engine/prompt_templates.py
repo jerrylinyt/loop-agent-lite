@@ -116,8 +116,8 @@ BUILTIN_PROMPT_TEMPLATES = [
     {
         "id": "java-generic",
         "label": "泛用 Java 工作",
-        "category": "既有模板",
-        "description": "對應 templates/java-generic.md，適用新功能、重構與批次修 Bug。",
+        "category": "開發",
+        "description": "在既有 Java 專案規劃新功能、重構或批次修 Bug，行為條目逐條對應測試證據。",
         "requirement_placeholder": "例：在既有 Java 專案新增批次匯入，沿用目前分層與 ApiResponse 規格。",
         "instructions": """- 逐條列出輸入 → 輸出／副作用與需求依據；重構先列不可變行為，Bug 先列重現測試。
 - 從 codebase 讀出分層、命名、Mapper、回應包裝與例外處理慣例，讓後續執行者不必猜。
@@ -127,8 +127,8 @@ BUILTIN_PROMPT_TEMPLATES = [
     {
         "id": "ejb-springboot-migration",
         "label": "EJB → Spring Boot 搬移",
-        "category": "既有模板",
-        "description": "對應 templates/ejb-to-springboot.md，強調交易、容器服務與平台跳版。",
+        "category": "遷移",
+        "description": "把 WildFly／EJB 舊系統搬到 Spring Boot 3／Java 17，重點在交易語意、容器服務與平台跳版。",
         "requirement_placeholder": "例：把舊專案全部 EJB 與對外 API 搬到 Spring Boot 3／Java 17，維持行為等價。",
         "instructions": """- 完整盤點 EJB、descriptor 覆寫、JNDI、timer、interceptor、security、端點、JMS／MDB 與平台 API。
 - 逐 business method 確認 EJB CMT 有效交易屬性，對應 Spring `@Transactional`、rollback、timeout 與測試。
@@ -138,13 +138,48 @@ BUILTIN_PROMPT_TEMPLATES = [
     {
         "id": "jsp-react-migration",
         "label": "JSP → React 搬移",
-        "category": "既有模板",
-        "description": "對應 templates/jsp-to-react.md，以逐頁盤點與三層驗證確保完整。",
+        "category": "遷移",
+        "description": "把 JSP 頁面逐頁搬到 React，以完整盤點與三層機器驗證守住行為等價。",
         "requirement_placeholder": "例：把舊系統指定目錄下全部 JSP 搬到 React，保持頁面與權限行為等價。",
         "instructions": """- 每支 JSP 與共用 fragment 都要列入 inventory，包含 URL、include、taglib、scriptlet、JSTL、表單、session 與 i18n。
 - 逐頁整理輸入、輸出、驗證、錯誤訊息與跳轉；碰 DB／session 的邏輯移到後端 API，純呈現留前端。
 - 規劃 build、元件測試、Playwright e2e 三層機器驗證；視覺還原與真後端煙測列人工驗收。
 - 每個盤點列必須能追到完成任務與測試證據，未列入 inventory 的頁面不得視為已搬完。""",
+    },
+    {
+        "id": "db-migration",
+        "label": "資料庫平台搬移",
+        "category": "遷移",
+        "description": "把系統從一種資料庫搬到另一種（如 Oracle → MariaDB），以逐條 SQL 盤點守住行為等價。",
+        "requirement_placeholder": "例：把訂單模組從 Oracle 搬到 MariaDB，SQL 與交易行為維持等價。",
+        "instructions": """- 盤點所有 SQL 使用點：ORM 對映、XML／annotation Mapper、native query、view、stored procedure、trigger、sequence 與排程 job，一條不漏。
+- 逐條標出方言差異：函式、分頁語法、日期／數值型別與隱式轉型、NULL 與空字串語意、大小寫與 collation、鎖與隔離等級行為。
+- 盤點 schema／DDL 對映（型別、索引、約束、預設值）與資料搬移、比對、回滾策略；無法自動驗證的資料正確性列人工驗收。
+- 規劃以真實目標資料庫（如 Testcontainers）執行的 characterization 測試：先釘住現有行為再切換，每個差異點都要有測試證據。""",
+    },
+    {
+        "id": "dependency-upgrade",
+        "label": "框架／依賴跳版",
+        "category": "遷移",
+        "description": "升級 JDK、框架或關鍵程式庫的大版本，把 breaking changes 展開成可枚舉、可驗證的搬移清單。",
+        "requirement_placeholder": "例：把服務從 Spring Boot 2.7 升到 3.3（Java 17），列出全部 breaking changes 與修正任務。",
+        "instructions": """- 先確認目前與目標版本、傳遞依賴與相容矩陣；可取得官方 migration guide／changelog 時逐條對照，不可臆造變更項目。
+- 在 codebase 枚舉每個受影響 API、設定檔、annotation 與行為變更的實際使用點，附 `檔案:行號`；沒有使用點的變更明確標記為不適用。
+- 區分編譯期可攔截與執行期才爆發的變更（預設值、序列化、日期時區、反射、classpath）；後者必須各安排測試證據。
+- 規劃可分段驗證的升級順序（先測試骨架與相容層，再逐模組），每一步保持建置與測試全綠，無法直接等價的能力列為 human gate。""",
+    },
+    {
+        "id": "k8s-deployment-config",
+        "label": "K8s 部署設置文件",
+        "category": "部署",
+        "description": "參考既有範本為來源專案完成 Kubernetes 部署設置，每個環境都能 build 出通過檢查的 YAML。",
+        "requirement_placeholder": "例：參考 payment-service 的 Helm chart，為 order-service 完成 base／sit／prod 部署設置，需通過 helm lint 與 helm template。",
+        "instructions": """- 產出格式（pure YAML／Kustomize 或 Helm chart）必須由需求指定；未指定時列為待確認並分別列出兩種格式的影響，不得自行選定。
+- 盤點參考目標的完整結構：資源清單（Deployment、Service、Ingress、ConfigMap、Secret、HPA、PDB 等）、環境分層方式、命名與 label 慣例、image 與 tag 注入點。
+- 從來源專案讀出實際部署需求：埠號、健康檢查端點、資源限制、環境變數、掛載與依賴服務，證據附 `檔案:行號`；不得未經查證沿用參考專案的值。
+- 環境設置（base／dev／sit／prod 等）分開維護：共用部分進 base 或 chart 預設值，環境差異只進 overlay 或各環境 values，並逐環境列出差異項。
+- Secret 只留佔位或外部引用（如 ExternalSecret、SealedSecret、CSI），不得把真實憑證寫進 YAML；需要人工提供的值列為 human gate。
+- 機器 DoD：每個環境都能 build 且通過檢查——Kustomize 用 `kustomize build <overlay>`，Helm 用 `helm lint` 加 `helm template -f <環境 values>`；能取得 schema 時再加 kubeconform 之類的驗證。""",
     },
 ]
 
