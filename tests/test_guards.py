@@ -2017,6 +2017,79 @@ class TestIssueAcknowledgement(unittest.TestCase):
                 D.ROOT, L.WORKSPACE_ROOT = old_roots
 
 
+class TestPendingPlanEditing(unittest.TestCase):
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "workspace"
+        (self.root / "demo").mkdir(parents=True)
+        self.old_roots = D.ROOT, L.WORKSPACE_ROOT
+        D.ROOT = L.WORKSPACE_ROOT = self.root
+        state = L.Workspace.__new__(L.Workspace).fresh_state()
+        state.update(
+            phase="exec", plan_version=7, current_order=2,
+            plan=[{"order": order, "task": f"task {order}", "ref": None}
+                  for order in range(1, 5)],
+            completed=[{"order": 1, "sha": "a" * 40, "round": 2}],
+            task_reset_counts={"1": 1, "3": 4},
+        )
+        D.write_state("demo", state)
+
+    def tearDown(self):
+        D.ROOT, L.WORKSPACE_ROOT = self.old_roots
+        self.temp.cleanup()
+
+    def call(self, tasks, version=7):
+        handler = self.ResponseCapture()
+        D.Handler.api_edit_state(handler, {
+            "name": "demo", "plan_edit": True, "plan_version": version, "tasks": tasks,
+        })
+        return handler.response
+
+    def test_reorders_deletes_and_inserts_only_after_current_task(self):
+        response = self.call([
+            {"order": 1, "task": "task 1", "ref": None},
+            {"order": 2, "task": "task 2", "ref": None},
+            {"order": 4, "task": "task 4 moved", "ref": None},
+            {"order": None, "task": "inserted task", "ref": "spec.md"},
+        ])
+        self.assertEqual(response[0], 200, response)
+        saved, error = D.read_state("demo", repair=False)
+        self.assertIsNone(error)
+        self.assertEqual(saved["plan_version"], 8)
+        self.assertEqual([task["order"] for task in saved["plan"]], [1, 2, 3, 4])
+        self.assertEqual([task["task"] for task in saved["plan"]],
+                         ["task 1", "task 2", "task 4 moved", "inserted task"])
+        self.assertEqual(saved["plan"][3]["ref"], "spec.md")
+        self.assertEqual(saved["completed"][0]["order"], 1)
+        self.assertEqual(saved["current_order"], 2)
+        self.assertEqual(saved["task_reset_counts"], {"1": 1})
+
+    def test_rejects_locked_task_move_and_stale_plan_version(self):
+        moved = self.call([
+            {"order": 2, "task": "task 2", "ref": None},
+            {"order": 1, "task": "task 1", "ref": None},
+            {"order": 3, "task": "task 3", "ref": None},
+            {"order": 4, "task": "task 4", "ref": None},
+        ])
+        self.assertEqual(moved[0], 400)
+        self.assertIn("不可移動", moved[1]["error"])
+        stale = self.call([
+            {"order": order, "task": f"task {order}", "ref": None}
+            for order in range(1, 5)
+        ], version=6)
+        self.assertEqual(stale[0], 409)
+        self.assertIn("請重新載入", stale[1]["error"])
+
+
 class TestStopIdempotency(unittest.TestCase):
     """fleet 狀態稍舊時重複 stop 不應報「沒有在執行中」。"""
 
