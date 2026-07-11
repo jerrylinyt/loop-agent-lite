@@ -20,6 +20,15 @@ import useStatusPulse from "./useStatusPulse";
 
 const PHASE_NAMES = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
 type WorkspaceModal = "config" | "goal" | "history" | "issues" | "report" | "prompt" | "timeline" | "runCompare";
+const WORKSPACE_MUTATIONS = {
+  run: { url: "/api/run", busy: "run" },
+  drain: { url: "/api/drain", busy: "drain" },
+  cancelDrain: { url: "/api/cancel-drain", busy: "cancelDrain" },
+  stop: { url: "/api/stop", busy: "stop" },
+  phase: { url: "/api/phase", busy: null },
+  setTask: { url: "/api/set-task", busy: null },
+} as const;
+type WorkspaceMutation = keyof typeof WORKSPACE_MUTATIONS;
 
 export default function WorkspaceView({
   workspace,
@@ -65,11 +74,12 @@ export default function WorkspaceView({
   if (!state) return <section className="workspace-pane"><div className="loading-state">載入 workspace…</div></section>;
   if (state.error) return <section className="workspace-pane"><div className="loading-state error">{state.error === "busy" ? "state 更新中…" : state.error}</div></section>;
 
-  const mutate = async (url: string, body: unknown) => {
+  const mutate = async (action: WorkspaceMutation, body: unknown) => {
     // run/stop/drain 共用 startup/error 處理；若是啟動操作，不能只看 POST 成功，還要等 ready marker。
-    setBusyAction(url === "/api/stop" ? "stop" : url === "/api/drain" ? "drain" : url === "/api/cancel-drain" ? "cancelDrain" : url === "/api/run" ? "run" : null);
+    const mutation = WORKSPACE_MUTATIONS[action];
+    setBusyAction(mutation.busy);
     try {
-      const response = await postJson<StartupResponse>(url, body);
+      const response = await postJson<StartupResponse>(mutation.url, body);
       if (response.error) {
         setDialog({ title: "操作失敗", message: response.error });
         return;
@@ -107,7 +117,7 @@ export default function WorkspaceView({
       ],
       onConfirm: () => {
         setDialog(null);
-        void mutate("/api/phase", { name: workspace?.name, phase });
+        void mutate("phase", { name: workspace?.name, phase });
       }
     });
   };
@@ -132,7 +142,7 @@ export default function WorkspaceView({
       ],
       onConfirm: () => {
         setDialog(null);
-        void mutate("/api/set-task", { name: workspace?.name, order });
+        void mutate("setTask", { name: workspace?.name, order });
       }
     });
   };
@@ -190,9 +200,9 @@ export default function WorkspaceView({
             {workspace.running && (workspace.draining
               ? workspace.drain_claimed
                 ? <button type="button" className="secondary-button" disabled title="loop 已接手停止請求，會在本輪完整收尾後停止">⏳ 本輪收尾中</button>
-                : <button type="button" className="secondary-button" disabled={busyAction !== null} onClick={() => void mutate("/api/cancel-drain", { name: workspace.name })}>{busyAction === "cancelDrain" ? "撤銷中…" : "↩ 繼續運行"}</button>
-              : <button type="button" className="secondary-button" disabled={busyAction !== null} onClick={() => void mutate("/api/drain", { name: workspace.name })}>{busyAction === "drain" ? "要求中…" : "⏸ 本輪後停止"}</button>)}
-            <button type="button" className={workspace.running ? "danger-button" : "success-button"} disabled={busyAction !== null} onClick={() => void mutate(workspace.running ? "/api/stop" : "/api/run", { name: workspace.name })}>{busyAction === "stop" ? "停止中…" : busyAction === "run" ? "啟動中…" : workspace.running ? "⏹ 立即停止" : "▶ 運行"}</button>
+                : <button type="button" className="secondary-button" disabled={busyAction !== null} onClick={() => void mutate("cancelDrain", { name: workspace.name })}>{busyAction === "cancelDrain" ? "撤銷中…" : "↩ 繼續運行"}</button>
+              : <button type="button" className="secondary-button" disabled={busyAction !== null} onClick={() => void mutate("drain", { name: workspace.name })}>{busyAction === "drain" ? "要求中…" : "⏸ 本輪後停止"}</button>)}
+            <button type="button" className={workspace.running ? "danger-button" : "success-button"} disabled={busyAction !== null} onClick={() => void mutate(workspace.running ? "stop" : "run", { name: workspace.name })}>{busyAction === "stop" ? "停止中…" : busyAction === "run" ? "啟動中…" : workspace.running ? "⏹ 立即停止" : "▶ 運行"}</button>
             {canChange && state.phase === "plan" && total > 0 && <button type="button" className="secondary-button" onClick={() => changePhase("exec")}>⏩ 進執行期</button>}
             {canChange && (state.phase === "exec" || state.phase === "done") && <button type="button" className="secondary-button" onClick={() => changePhase("plan")}>⏪ 回規劃期</button>}
             {canChange && <button type="button" className="secondary-button" onClick={() => setActiveModal("config")}>⚙ 設定</button>}
