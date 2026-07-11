@@ -588,3 +588,9 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .launch-diff-row span { padding: 5px 7px; border-radius: 6px; overflow-wrap: anywhere; }
 .diff-before { color: var(--muted); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 .diff-after { color: var(--text); background: color-mix(in srgb, var(--success) 10%, transparent); }
+.run-compare-table { display: grid; border: 1px solid var(--border-soft); border-radius: 9px; overflow: hidden; }
+.run-compare-head, .run-compare-row { display: grid; grid-template-columns: 1.2fr repeat(3, 1fr); gap: 8px; padding: 9px 11px; align-items: center; }
+.run-compare-head { background: var(--surface-subtle); }
+.run-compare-row { border-top: 1px solid var(--border-soft); font-variant-numeric: tabular-nums; }
+.run-compare-row .improved { color: var(--success); }
+.run-compare-row .regressed { color: var(--danger); }

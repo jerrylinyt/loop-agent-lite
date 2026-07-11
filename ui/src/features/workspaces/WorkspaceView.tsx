@@ -12,6 +12,7 @@ import PlanTable from "./PlanTable";
 import PromptModal from "./PromptModal";
 import ReportModal from "./ReportModal";
 import RoundSparkline from "./RoundSparkline";
+import RunCompareModal from "./RunCompareModal";
 import TimelineModal from "./TimelineModal";
 import { deriveRoundTiming, useRoundNow } from "./roundTiming";
 import useStatusPulse from "./useStatusPulse";
@@ -40,6 +41,7 @@ export default function WorkspaceView({
   const [reportOpen, setReportOpen] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
   const [timelineOpen, setTimelineOpen] = useState(false);
+  const [runCompareOpen, setRunCompareOpen] = useState(false);
   const [statusHeight, setStatusHeight] = useState(() => +(localStorage.getItem("status-console-height") || 220));
   const [statusCollapsed, setStatusCollapsed] = useState(() => localStorage.getItem("status-console-collapsed") === "1");
   const [busyAction, setBusyAction] = useState<"run" | "drain" | "cancelDrain" | "stop" | null>(null);
@@ -218,6 +220,7 @@ export default function WorkspaceView({
             {!!issues.length && <button type="button" className={`chip ${unreadIssues > 0 ? "issue-chip" : "subdued"}`} onClick={() => setIssuesOpen(true)}>{unreadIssues > 0 ? `⚠ issues ${unreadIssues}/${issues.length}` : `✓ issues ${issues.length}（已讀）`}</button>}
             {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setHistoryOpen(true)}>🕒 輪次紀錄</button>}
             {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setTimelineOpen(true)}>🧭 時間軸</button>}
+            {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setRunCompareOpen(true)}>⇄ Run 對比</button>}
             {state.round > 0 && <button type="button" className="chip subdued" onClick={() => setPromptOpen(true)}>📨 prompt</button>}
           </div>
         </div>
@@ -244,6 +247,7 @@ export default function WorkspaceView({
       {issuesOpen && workspace && <IssuesModal workspace={workspace.name} issues={issues} unreadIssues={unreadIssues} readonly={readonly || workspace.running} onClose={() => setIssuesOpen(false)} onChanged={onRefresh} />}
       {historyOpen && workspace && <HistoryModal workspace={workspace.name} onClose={() => setHistoryOpen(false)} />}
       {timelineOpen && workspace && <TimelineModal workspace={workspace.name} consoleText={consoleText} onClose={() => setTimelineOpen(false)} />}
+      {runCompareOpen && workspace && <RunCompareModal workspace={workspace.name} onClose={() => setRunCompareOpen(false)} />}
       {goalOpen && workspace && <GoalModal workspace={workspace.name} onClose={() => setGoalOpen(false)} />}
       {promptOpen && workspace && <PromptModal workspace={workspace.name} onClose={() => setPromptOpen(false)} />}
       {reportOpen && workspace && <ReportModal workspace={workspace.name} onClose={() => setReportOpen(false)} />}
