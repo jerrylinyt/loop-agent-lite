@@ -40,6 +40,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -1290,89 +1291,103 @@ def agent_failure_backoff(streak, maximum_seconds) -> float:
     return min(float(maximum_seconds), float(2 ** min(streak - 1, 30)))
 
 
-def main():
-    """解析 CLI、執行 preflight，然後進入規劃/執行雙階段 coordinator loop。"""
-    ap = argparse.ArgumentParser(description="loop-agent-lite:規劃/執行雙段共識迴圈")
-    ap.add_argument("--repo", required=True, help="target code repo(git、乾淨、validate 綠)")
-    ap.add_argument("--name", default=None,
-                    help="workspace 名稱(預設=repo 目錄名;不可 . / .. 或以 . 開頭)")
-    ap.add_argument("--goal", default="goal.md", help="goal 檔(相對 repo,須已 commit)")
-    ap.add_argument("--plan-doc", default="", help="選配:參考分析文件(相對 repo);提供的話須已 commit 且受保護")
-    ap.add_argument("--agent-cmd", default=None, help="agent CLI 命令(整串;prompt 走 stdin)")
-    ap.add_argument("--validate-cmd", default=None, help="驗證命令(預設 mvn -q compile)")
-    ap.add_argument("--flag-threshold", type=int, default=FLAG_THRESHOLD)
-    ap.add_argument("--done-threshold", type=int, default=DONE_THRESHOLD)
-    ap.add_argument("--red-limit", type=int, default=RED_LIMIT)
-    ap.add_argument("--stall-limit", type=int, default=STALL_LIMIT)
-    ap.add_argument("--stuck-stop", action="store_true", help="同一任務 reset 達上限即停機(預設關)")
-    ap.add_argument("--stuck-stop-count", type=int, default=STUCK_STOP_COUNT)
-    ap.add_argument("--round-timeout", type=float, default=ROUND_TIMEOUT_MIN,
-                    help="單輪 agent 上限(分鐘;0=不限,預設 30)")
-    ap.add_argument("--agent-backoff-max", type=float, default=AGENT_BACKOFF_MAX_SEC,
-                    help="Agent CLI 連續異常退出的指數退避上限(秒;0=關閉,預設 60)")
-    ap.add_argument("--validate-timeout", type=float, default=VALIDATE_TIMEOUT_SEC,
-                    help="啟動前與每輪 Validate 上限(秒;必須 >0,預設 120)")
-    ap.add_argument("--notify-cmd", default="", help="終態通知命令,佔位符 {status} {name}(空=不通知)")
-    ap.add_argument("--import-plan", default="", help="匯入 plan.json(重置 state;等同 dashboard 貼上匯入)")
-    ap.add_argument("--consume-import-plan", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--start-phase", choices=("plan", "exec"), default="plan",
-                    help="搭配 --import-plan:從規劃期(讓 agent 補完)或直接執行期開跑")
-    ap.add_argument("--max-rounds", type=int, default=0, help="總輪數上限;0=不限(測試用)")
-    ap.add_argument("--reset-state", action="store_true", help="清掉 workspace state 從頭跑")
-    ap.add_argument("--preflight-only", action="store_true",
-                    help="只跑啟動前健檢(git/鎖/乾淨樹/goal 已 commit/validate)就退出;"
-                         "不建 state、不動 snapshots、不啟動 agent")
-    args = ap.parse_args()
-    # CLI 也必須和 Dashboard 一樣 fail-closed：這些值直接控制共識/timeout，0、負數或 NaN
-    # 不能被解讀成「立刻收斂」或讓 subprocess.wait() 在 preflight 之後才崩潰。
+@dataclass(frozen=True)
+class RuntimeOptions:
+    """已通過 CLI 邊界驗證、可直接交給 coordinator 的啟動參數。"""
+
+    args: argparse.Namespace
+    repo: Path
+    workspace_name: str
+    agent_cmd: list
+    validate_cmd: list
+    protected: list
+    plan_doc_display: str
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    """宣告 CLI 契約；解析後的跨欄位與路徑驗證由 parse_runtime_options 負責。"""
+    parser = argparse.ArgumentParser(description="loop-agent-lite:規劃/執行雙段共識迴圈")
+    parser.add_argument("--repo", required=True, help="target code repo(git、乾淨、validate 綠)")
+    parser.add_argument("--name", default=None,
+                        help="workspace 名稱(預設=repo 目錄名;不可 . / .. 或以 . 開頭)")
+    parser.add_argument("--goal", default="goal.md", help="goal 檔(相對 repo,須已 commit)")
+    parser.add_argument("--plan-doc", default="", help="選配:參考分析文件(相對 repo);提供的話須已 commit 且受保護")
+    parser.add_argument("--agent-cmd", default=None, help="agent CLI 命令(整串;prompt 走 stdin)")
+    parser.add_argument("--validate-cmd", default=None, help="驗證命令(預設 mvn -q compile)")
+    parser.add_argument("--flag-threshold", type=int, default=FLAG_THRESHOLD)
+    parser.add_argument("--done-threshold", type=int, default=DONE_THRESHOLD)
+    parser.add_argument("--red-limit", type=int, default=RED_LIMIT)
+    parser.add_argument("--stall-limit", type=int, default=STALL_LIMIT)
+    parser.add_argument("--stuck-stop", action="store_true", help="同一任務 reset 達上限即停機(預設關)")
+    parser.add_argument("--stuck-stop-count", type=int, default=STUCK_STOP_COUNT)
+    parser.add_argument("--round-timeout", type=float, default=ROUND_TIMEOUT_MIN,
+                        help="單輪 agent 上限(分鐘;0=不限,預設 30)")
+    parser.add_argument("--agent-backoff-max", type=float, default=AGENT_BACKOFF_MAX_SEC,
+                        help="Agent CLI 連續異常退出的指數退避上限(秒;0=關閉,預設 60)")
+    parser.add_argument("--validate-timeout", type=float, default=VALIDATE_TIMEOUT_SEC,
+                        help="啟動前與每輪 Validate 上限(秒;必須 >0,預設 120)")
+    parser.add_argument("--notify-cmd", default="", help="終態通知命令,佔位符 {status} {name}(空=不通知)")
+    parser.add_argument("--import-plan", default="", help="匯入 plan.json(重置 state;等同 dashboard 貼上匯入)")
+    parser.add_argument("--consume-import-plan", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--start-phase", choices=("plan", "exec"), default="plan",
+                        help="搭配 --import-plan:從規劃期(讓 agent 補完)或直接執行期開跑")
+    parser.add_argument("--max-rounds", type=int, default=0, help="總輪數上限;0=不限(測試用)")
+    parser.add_argument("--reset-state", action="store_true", help="清掉 workspace state 從頭跑")
+    parser.add_argument("--preflight-only", action="store_true",
+                        help="只跑啟動前健檢(git/鎖/乾淨樹/goal 已 commit/validate)就退出;"
+                             "不建 state、不動 snapshots、不啟動 agent")
+    return parser
+
+
+def parse_runtime_options(argv=None) -> RuntimeOptions:
+    """解析並驗證所有不需存取 Git/state 的啟動參數，回傳 coordinator 所需衍生值。"""
+    parser = build_argument_parser()
+    args = parser.parse_args(argv)
+    # 這些值直接控制共識/timeout；0、負數或 NaN 不可被解讀成「立刻收斂」。
     for attr, option in (("flag_threshold", "--flag-threshold"),
                          ("done_threshold", "--done-threshold"),
                          ("red_limit", "--red-limit"),
                          ("stall_limit", "--stall-limit"),
                          ("stuck_stop_count", "--stuck-stop-count")):
         if getattr(args, attr) < 1:
-            ap.error(f"{option} 必須 ≥ 1")
+            parser.error(f"{option} 必須 ≥ 1")
     if args.max_rounds < 0:
-        ap.error("--max-rounds 必須 ≥ 0")
+        parser.error("--max-rounds 必須 ≥ 0")
     for attr, option, positive in (("round_timeout", "--round-timeout", False),
                                    ("agent_backoff_max", "--agent-backoff-max", False),
                                    ("validate_timeout", "--validate-timeout", True)):
         value = getattr(args, attr)
         if not math.isfinite(value) or value < 0 or (positive and value == 0):
-            ap.error(f"{option} 必須是{' > 0' if positive else ' ≥ 0'} 的有限數字")
+            parser.error(f"{option} 必須是{' > 0' if positive else ' ≥ 0'} 的有限數字")
 
     repo = Path(args.repo).resolve()
     workspace_name = args.name or repo.name
     try:
         require_workspace_name(workspace_name)
     except ValueError as e:
-        ap.error(f"--name {e}")
-    agent_cmd = shlex.split(args.agent_cmd) if args.agent_cmd else AGENT_CMD
-    validate_cmd = shlex.split(args.validate_cmd) if args.validate_cmd else VALIDATE_CMD
+        parser.error(f"--name {e}")
     protected = [args.goal] + ([args.plan_doc] if args.plan_doc else [])
-    for option, rel in (("--goal", args.goal), ("--plan-doc", args.plan_doc)):
-        if not rel:
+    for option, relative_path in (("--goal", args.goal), ("--plan-doc", args.plan_doc)):
+        if not relative_path:
             continue
         try:
-            repo_relative_path(repo, rel)
+            repo_relative_path(repo, relative_path)
         except ValueError as e:
-            ap.error(f"{option} {e}")
-    plan_doc_display = (str(repo_relative_path(repo, args.plan_doc)) if args.plan_doc
-                        else "(未提供——以 goal、現有計畫與實際程式碼為準)")
+            parser.error(f"{option} {e}")
+    return RuntimeOptions(
+        args=args,
+        repo=repo,
+        workspace_name=workspace_name,
+        agent_cmd=shlex.split(args.agent_cmd) if args.agent_cmd else AGENT_CMD,
+        validate_cmd=shlex.split(args.validate_cmd) if args.validate_cmd else VALIDATE_CMD,
+        protected=protected,
+        plan_doc_display=(str(repo_relative_path(repo, args.plan_doc)) if args.plan_doc
+                          else "(未提供——以 goal、現有計畫與實際程式碼為準)"),
+    )
 
-    # preflight 失敗也必須出現在 dashboard 的完整 console。舊流程直到所有 git
-    # 檢查通過後才設定 console，導致「pid 出現後立刻停止」卻完全看不到原因。
-    try:
-        ws = Workspace(workspace_name)
-    except ValueError as e:
-        ap.error(f"--name {e}")
-    configure_console(ws.dir / "console.log")
-    acquire_run_lock(ws.dir / ".run.lock", f"workspace '{ws.dir.name}'")
-    startup_ready = ws.dir / "startup_ready.json"
-    if not args.preflight_only:  # 健檢模式不得動到既有啟動 handshake 檔
-        startup_ready.unlink(missing_ok=True)
 
-    # ===== preflight:第一行就擋,不合格不進迴圈 =====
+def guard_repository_baseline(repo: Path, protected) -> None:
+    """取得 worktree 單 writer 鎖，並確認 Git、乾淨樹與受保護檔案可作為起點。"""
     if git(repo, "rev-parse", "--is-inside-work-tree", check=False).returncode != 0:
         fail(f"preflight：{repo} 不是 git repo")
     if git(repo, "rev-parse", "HEAD", check=False).returncode != 0:
@@ -1383,23 +1398,82 @@ def main():
     acquire_run_lock(git_dir / "loop-agent-lite.run.lock", f"Git worktree {repo}")
     if is_dirty(repo):
         fail("preflight：工作樹不乾淨。之後的 reset --hard 會吃掉你的 WIP，先 commit 或 stash 再來")
-    for rel in protected:
-        if not tracked_in_head(repo, rel):
-            fail(f"preflight：{rel} 不在 HEAD 裡。流程是：模板產初版 → 你審 → commit → 才 run loop")
+    for relative_path in protected:
+        if not tracked_in_head(repo, relative_path):
+            fail(f"preflight：{relative_path} 不在 HEAD 裡。流程是：模板產初版 → 你審 → commit → 才 run loop")
 
+
+def run_preflight_check(repo: Path, validate_cmd, timeout_seconds: float) -> None:
+    """執行不建立 state 的完整啟動健檢；失敗時以既有 fail-closed 路徑終止。"""
+    log(f"🔎 Preflight 健檢（--preflight-only,不啟動 loop）｜驗證:{shlex.join(validate_cmd)}")
+    ok, tail, timed_out = run_validate(validate_cmd, repo, timeout_seconds)
+    if is_dirty(repo):
+        fail(f"preflight-only:validate `{shlex.join(validate_cmd)}` 執行後弄髒工作樹——"
+             "validate 必須只產生 ignored build artifacts。輸出尾段:\n" + tail)
+    if not ok:
+        timeout_note = f"（逾時 {timeout_seconds:g} 秒）" if timed_out else ""
+        fail(f"preflight-only:驗證失敗{timeout_note}——全新啟動會被擋"
+             f"(既有 workspace 若有合法綠點,resume 仍可能放行)。輸出尾段:\n{tail}")
+    log("✅ preflight-only 全部通過｜repo 乾淨、goal/plan-doc 已 commit、validate 綠、無其他 loop 佔用")
+
+
+def establish_startup_green_anchor(repo: Path, workspace, state, protected,
+                                   validate_cmd, timeout_seconds: float) -> None:
+    """驗證目前 HEAD，或在紅燈時確認既有 last-green 仍是合法、安全的錨點。"""
+    log(f"🔎 啟動前檢查｜執行驗證：{shlex.join(validate_cmd)}")
+    ok, tail, timed_out = run_validate(validate_cmd, repo, timeout_seconds)
+    # validator 若修改原始碼，就算 exit 0 也不能讓副作用混成下一輪 agent 變更。
+    if is_dirty(repo):
+        fail(f"啟動前驗證 `{shlex.join(validate_cmd)}` 執行後弄髒工作樹——"
+             "validate 必須只產生 ignored build artifacts,不能修改 tracked/untracked 原始碼。"
+             f"輸出尾段:\n{tail}")
+    if ok:
+        state["last_green_sha"] = head_sha(repo)
+        log(f"✅ 啟動前檢查完成｜驗證通過｜綠點 {state['last_green_sha'][:8]}")
+        return
+
+    green = state["last_green_sha"]
+    if green_anchor_valid(repo, green, workspace.dir / "snapshots", protected):
+        log(f"⚠️ 啟動驗證失敗｜沿用已確認綠點 {green[:8]} 繼續修復")
+        if tail:
+            log(f"驗證錯誤尾段：\n{tail}")
+        state["notes"].append(f"❌ 啟動時 `{' '.join(validate_cmd)}` 就是紅的,"
+                              f"先把它修綠再繼續往下做。輸出尾段:\n```\n{tail}\n```")
+        return
+
+    why = ("沒有綠點可錨定" if not green else
+           f"綠點 {green[:8]} 未通過驗證(不存在/非 HEAD 祖先/protected 與現況分歧)")
+    timeout_note = f"（逾時 {timeout_seconds:g} 秒）" if timed_out else ""
+    fail(f"啟動驗證 `{shlex.join(validate_cmd)}` 失敗{timeout_note}，{why}——"
+         f"起點必須是可信綠點。先把工作樹修到 validate 綠再 resume。輸出尾段:\n{tail}")
+
+
+def main():
+    """解析 CLI、執行 preflight，然後進入規劃/執行雙階段 coordinator loop。"""
+    options = parse_runtime_options()
+    args = options.args
+    repo = options.repo
+    workspace_name = options.workspace_name
+    agent_cmd = options.agent_cmd
+    validate_cmd = options.validate_cmd
+    protected = options.protected
+    plan_doc_display = options.plan_doc_display
+
+    # preflight 失敗也必須出現在 dashboard 的完整 console。舊流程直到所有 git
+    # 檢查通過後才設定 console，導致「pid 出現後立刻停止」卻完全看不到原因。
+    try:
+        ws = Workspace(workspace_name)
+    except ValueError as e:
+        build_argument_parser().error(f"--name {e}")
+    configure_console(ws.dir / "console.log")
+    acquire_run_lock(ws.dir / ".run.lock", f"workspace '{ws.dir.name}'")
+    startup_ready = ws.dir / "startup_ready.json"
+    if not args.preflight_only:  # 健檢模式不得動到既有啟動 handshake 檔
+        startup_ready.unlink(missing_ok=True)
+
+    guard_repository_baseline(repo, protected)
     if args.preflight_only:
-        # 健檢=全新啟動的可行性:validate 必須綠且不弄髒工作樹。resume 沿用舊綠點的
-        # 放行路徑不在此模擬(那需要既有 snapshots),紅燈時訊息會說明差異。
-        log(f"🔎 Preflight 健檢（--preflight-only,不啟動 loop）｜驗證:{shlex.join(validate_cmd)}")
-        ok, vtail, validate_timed_out = run_validate(validate_cmd, repo, args.validate_timeout)
-        if is_dirty(repo):
-            fail(f"preflight-only:validate `{shlex.join(validate_cmd)}` 執行後弄髒工作樹——"
-                 "validate 必須只產生 ignored build artifacts。輸出尾段:\n" + vtail)
-        if not ok:
-            timeout_note = f"（逾時 {args.validate_timeout:g} 秒）" if validate_timed_out else ""
-            fail(f"preflight-only:驗證失敗{timeout_note}——全新啟動會被擋"
-                 f"(既有 workspace 若有合法綠點,resume 仍可能放行)。輸出尾段:\n{vtail}")
-        log("✅ preflight-only 全部通過｜repo 乾淨、goal/plan-doc 已 commit、validate 綠、無其他 loop 佔用")
+        run_preflight_check(repo, validate_cmd, args.validate_timeout)
         return
 
     log(f"🚀 Loop 啟動｜workspace={ws.dir.name}｜repo={repo}")
@@ -1451,37 +1525,8 @@ def main():
     if not fresh_start:
         ws.snapshot_protected(repo, protected)
 
-    # preflight:validate。綠點錨定 fail-closed(#1)——resume 不能只看 last_green_sha 非空,
-    # 否則舊 green 若已不存在/非 HEAD 祖先/protected 已分歧,reset 回去會製造髒工作樹或錯版 goal。
-    log(f"🔎 啟動前檢查｜執行驗證：{shlex.join(validate_cmd)}")
-    ok, vtail, validate_timed_out = run_validate(validate_cmd, repo, args.validate_timeout)
-    # validate 本身若修改 tracked/untracked(non-ignored)檔案,不論 rc 綠紅都不能放行。否則 rc=0
-    # 會落出下列分支直接續跑;rc!=0 + 舊 green 合法也會帶髒工作樹進 loop,把 validator 的副作用
-    # 誤判成 agent 異動。preflight 起點必須在 validate 前後都乾淨。
-    if is_dirty(repo):
-        fail(f"啟動前驗證 `{shlex.join(validate_cmd)}` 執行後弄髒工作樹——"
-             "validate 必須只產生 ignored build artifacts,不能修改 tracked/untracked 原始碼。"
-             f"輸出尾段:\n{vtail}")
-    if ok:
-        # 當前 HEAD 綠且乾淨:它就是最新、protected 必然與啟動快照一致的錨點,直接錨在這。
-        # 同時修掉「停機期間人改 goal、舊 green 已分歧」——丟棄舊 green,不沿用過時錨點。
-        state["last_green_sha"] = head_sha(repo)
-        log(f"✅ 啟動前檢查完成｜驗證通過｜綠點 {state['last_green_sha'][:8]}")
-    elif not ok:
-        # 當前 HEAD 紅:必須有「通過驗證」的舊綠點才放行,否則沒有可信起點,fail-closed 停機。
-        green = state["last_green_sha"]
-        if green_anchor_valid(repo, green, ws.dir / "snapshots", protected):
-            log(f"⚠️ 啟動驗證失敗｜沿用已確認綠點 {green[:8]} 繼續修復")
-            if vtail:
-                log(f"驗證錯誤尾段：\n{vtail}")
-            state["notes"].append(f"❌ 啟動時 `{' '.join(validate_cmd)}` 就是紅的,"
-                                  f"先把它修綠再繼續往下做。輸出尾段:\n```\n{vtail}\n```")
-        else:
-            why = ("沒有綠點可錨定" if not green else
-                   f"綠點 {green[:8]} 未通過驗證(不存在/非 HEAD 祖先/protected 與現況分歧)")
-            timeout_note = f"（逾時 {args.validate_timeout:g} 秒）" if validate_timed_out else ""
-            fail(f"啟動驗證 `{shlex.join(validate_cmd)}` 失敗{timeout_note}，{why}——"
-                 f"起點必須是可信綠點。先把工作樹修到 validate 綠再 resume。輸出尾段:\n{vtail}")
+    establish_startup_green_anchor(
+        repo, ws, state, protected, validate_cmd, args.validate_timeout)
 
     if fresh_start:
         ws.snapshot_protected(repo, protected)
