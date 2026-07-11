@@ -594,3 +594,10 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .run-compare-row { border-top: 1px solid var(--border-soft); font-variant-numeric: tabular-nums; }
 .run-compare-row .improved { color: var(--success); }
 .run-compare-row .regressed { color: var(--danger); }
+.command-palette-trigger { min-width: 42px; font-variant-numeric: tabular-nums; }
+.command-palette-search { width: 100%; margin-bottom: 8px; }
+.command-palette-list { display: grid; gap: 3px; max-height: min(55vh, 430px); overflow: auto; }
+.command-palette-list button { display: flex; justify-content: space-between; align-items: center; gap: 12px; width: 100%; padding: 8px 10px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+.command-palette-list button:hover, .command-palette-list button:focus-visible { border-color: var(--accent); background: var(--accent-soft); }
+.command-palette-list button span { display: grid; }
+.command-palette-list small, .command-palette-list em { color: var(--muted); font-size: 11px; font-style: normal; }
