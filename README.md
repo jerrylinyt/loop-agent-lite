@@ -13,7 +13,7 @@
   └─ goal.md + PLAN.md 已審核並 commit
           │
           ▼
-Dashboard 啟動 loop（或直接執行 loop.py）
+`loop dashboard` 啟動本機服務與 engine coordinator
           │
           ├─ preflight：validate、工作樹、goal/PLAN commit 檢查
           │       └─ 失敗：保留舊 state，不啟動新工作
@@ -33,16 +33,28 @@ Dashboard 啟動若同時要求匯入 goal 與新 branch，會先完成 goal 路
 
 Loop 另以 OS 鎖維持單 writer：同一 workspace 或同一 Git worktree 不能同時跑兩個 loop（即使來自不同 Dashboard／終端機）。不同 Git worktree 可各自運行，保留日後有限並行的隔離邊界；目前不會自動拆任務、合併分支或建立多份協調 state。
 
-## 快速開始
+## 安裝與啟動
+
+專案參考 v3 的 Python package／console-script 方式安裝；lite 版只公開 Dashboard：
+
+```bash
+python3 -m pip install -e .
+loop dashboard
+```
+
+開啟終端顯示的本機網址（預設從 <http://127.0.0.1:8765/> 開始；port 被占用會自動往上找）。
+安裝後不需要直接操作任何 Python 檔案；`loop` 目前唯一公開子命令就是 `dashboard`。
 
 ### 1. 準備 target repo
 
 在 target repo 建立並 commit `goal.md`、`PLAN.md`，確認驗證命令可在該 repo 執行。
 
-### 2. 啟動 Dashboard（推薦）
+### 啟動選項
 
 ```bash
-python3 dashboard.py --port 8766
+loop dashboard --port 8766
+loop dashboard --name <workspace>
+loop dashboard --read-only
 ```
 
 開啟 <http://127.0.0.1:8766/>，在「啟動／管理」設定：
@@ -53,37 +65,7 @@ python3 dashboard.py --port 8766
 
 找不到 CLI 時，點 Agent CLI 旁的齒輪，設定 CLI 命令及其 PATH 目錄；也可以直接填可執行檔的絕對路徑，再按「測試」。
 
-### 3. 直接執行 loop（可選）
-
-```bash
-python3 loop.py \
-  --repo /path/to/repo \
-  --agent-cmd "claude -p" \
-  --validate-cmd "python3 -m unittest discover -s tests -t . -q"
-```
-
-Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace log。每輪都有獨立 token，舊輪殘留命令不會被下一輪誤收；CLI 主程序退出時也會清理同 process-group 的背景子行程。中斷後重新執行相同命令即可從 `state.json` 繼續。
-
-不開 Dashboard 也可以用唯讀 CLI 查詢同一份 coordinator truth：
-
-```bash
-python3 status.py --name <workspace>
-python3 status.py --name <workspace> --json   # 供 shell/CI 解析
-python3 status.py --name <workspace> --watch --interval 2
-python3 status.py --name <workspace> --watch --on-change --interval 2
-python3 status.py --all --json                # 一次列出整個 workspace fleet
-python3 status.py --all --json --check        # 需關注或 state 錯誤時 exit 1
-python3 status.py --all --json --sort attention  # 將需關注項目排前
-python3 status.py --all --json --filter attention # 只輸出需關注／錯誤 workspace
-python3 status.py --name <workspace> --metrics 100 # 聚合近期輪次效能
-```
-
-`status.py` 不啟動 loop、不修復檔案；`--all` 與 `--name` 擇一，`--watch` 只重複唯讀輪詢，`--on-change` 可抑制未變更 projection 的重複輸出，Ctrl-C 以 exit code 130 結束。輸出也包含進行中輪次的 elapsed／timeout remaining，以及最近一輪 Agent 耗時與逾時狀態；primary state 不可讀時只投影 checkpoint，找不到 workspace 或兩份 state 都損壞會以 exit code 1 結束。
-JSON 輸出包含 `schema_version: 1`；單 workspace 直接帶狀態欄位，`--all --json` 另外輸出 `workspaces` 與 `summary`。摘要包含執行中、規劃／執行／完成數、需關注 workspace、issues 總數與未讀數、Agent 異常、最近一輪逾時、state 復原、goal 變更、stale loop PID、任務完成率，以及 state 錯誤數，方便 shell／CI 直接判斷 fleet 健康度。
-`--check` 是一次性 gate：projection 仍照常輸出，但只要有 state 錯誤或需關注 workspace 就以 exit code 1 結束；不可與 `--watch` 同時使用。
-`--sort` 只作用於 `--all`，可選 `name`、`attention`、`running`、`phase`、`round`；預設 `name` 維持穩定的相容輸出。
-`--filter` 也只作用於 `--all`，可選 `all`、`attention`、`running`、`stopped`、`done`、`error`。篩選時 `workspaces` 只包含符合項目，另帶 `filter`／`matched_count`；`summary` 與 `--check` 始終涵蓋完整 fleet，避免篩選掩蓋其他 workspace 的異常。
-`--metrics N` 可搭配單一或全部 workspace，唯讀掃描每份 `history.log` 尾端最多 2 MiB，聚合最近 N 輪（上限 500）的平均、P50、P95、最慢輪與逾時率；未指定時完全不掃 history。
+Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace log。每輪都有獨立 token，舊輪殘留命令不會被下一輪誤收；engine 主程序退出時也會清理同 process-group 的背景子行程。中斷後可直接在 Dashboard 按「▶ 運行」從 `state.json` 續跑。
 
 Dashboard 也提供唯讀 `GET /api/health`，回傳 `schema_version: 1`、`status`（`ok`／`degraded`／`error`）與 workspace、執行中、需關注、state 錯誤、issues、Agent 異常、最近一輪逾時、state 復原、goal 變更及 stale PID 摘要；適合本機探針或外部監控。加上 `?strict=1` 時，`degraded`／`error` 會以 HTTP 503 回應，方便 readiness probe 直接判斷；預設仍維持 HTTP 200 並讓呼叫端讀取 status。瀏覽器頁首與即時 SSE 的 `health` event 使用同一份 projection，不會修復或改寫任何 workspace。
 `GET /api/round-metrics?ws=<name>&run=current&limit=100` 使用同一套 bounded/safe history reader，供 Dashboard 與外部觀測工具取得近期效能摘要、逐輪樣本，以及 Agent 結束但未送出 phase 完成回報的異常次數／異常率；Plan 以 `create-plan`／`plan-ok`、Exec 以 `done` 作為完成回報，即使本輪有 Git 變更，沒有回報仍算異常。人工立即中斷的未完成輪不寫入 history，因此不進入異常分子或總輪數；`run=previous` 可分析保留的上一個 run。
@@ -93,25 +75,18 @@ Dashboard 也提供唯讀 `GET /api/health`，回傳 `schema_version: 1`、`stat
 常用選項：
 
 ```text
---name <workspace>       指定 workspace 名稱
---reset-state             清除舊進度後重新開始（驗證成功才套用）
---import-plan <file>      匯入 plan JSON 並建立新 state
---start-phase exec        搭配匯入 plan，直接進入執行期
---round-timeout <分鐘>    單輪上限，0 表示不限
---agent-backoff-max <秒>   CLI 連續異常時 1,2,4…秒退避上限，0 表示關閉
---validate-timeout <秒>   驗證命令上限
---stuck-stop              同一任務反覆 reset 達上限時停機
---preflight-only          只跑啟動前健檢（git／鎖／乾淨樹／validate）就退出，不動任何進度
+loop dashboard --name <workspace>  預選 workspace
+loop dashboard --port <port>       指定起始 port
+loop dashboard --read-only         啟動唯讀看板
 ```
 
-所有數值參數都會在建立 workspace 或啟動 Agent 前驗證；收斂／reset 門檻必須至少為 1，
-round timeout、退避與測試輪數不可為負，所有秒數／分鐘數都必須是有限數字。
+Agent、Validate、收斂門檻、timeout、plan 匯入、state 重置與新 branch 都在 Dashboard
+啟動表單設定。所有數值會在建立 workspace 或啟動 Agent 前由前後端重新驗證。
 workspace 名稱只允許英數、`.`、`_`、`-`，且不可為 `.`、`..` 或以 `.` 開頭；若 repo
 目錄本身是 hidden 目錄，請明確以 `--name` 指定一個符合規則的名稱。
-`--goal` 與 `--plan-doc` 也必須是 target repo 內的相對 regular file；不得使用 `..`、絕對路徑或 symlink。
 workspace 的 `state`、console/history、prompt、round log、REPORT 與其 `logs/`、`prompts/`、`snapshots/` 父目錄也會以 `O_NOFOLLOW`／regular-file 檢查；若被替換成 symlink、FIFO 或其他非預期類型，loop 與 Dashboard 會拒絕讀寫。
-Agent 使用的 `work.py` marker、plan proposal、issue 與 loop 的單 writer lock 也沿用同一套檢查；不安全的協調檔會直接拒絕該命令，不會跟隨連結寫到 workspace 外。
-`work.py issue` 單筆最多 2000 字、每輪最多 100 條；state 最多保留最新 200 條 issue，避免異常 Agent 輸出無限膨脹 coordinator state。人員可在 Dashboard 將目前 issues 標記已讀：只寫入 round watermark、保留原始紀錄；後續新 round 回報的 issue 會再次成為未讀並觸發 fleet health。
+Agent 使用的 `engine.work` marker、plan proposal、issue 與 loop 的單 writer lock 也沿用同一套檢查；不安全的協調檔會直接拒絕該命令，不會跟隨連結寫到 workspace 外。
+單筆 issue 最多 2000 字、每輪最多 100 條；state 最多保留最新 200 條 issue，避免異常 Agent 輸出無限膨脹 coordinator state。人員可在 Dashboard 將目前 issues 標記已讀：只寫入 round watermark、保留原始紀錄；後續新 round 回報的 issue 會再次成為未讀並觸發 fleet health。
 Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會拒絕 symlink、FIFO 或非 JSON object，避免 UI 操作意外觸碰檔案邊界外。
 
 ## Dashboard 操作
@@ -150,8 +125,9 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 
 ## 團隊設定與個人設定
 
-- `dashboard.config.shared.json`：團隊共用、應提交到 Git 的預設值。
-- `dashboard.config.local.json`：個人 CLI、PATH、repo roots 與通知設定，已加入 `.gitignore`，不應提交。
+- `engine/dashboard.config.shared.json`：隨 package 安裝的團隊預設值；可用 `LOOP_AGENT_DASHBOARD_PROJECT_CONFIG` 指向另一份 shared config。
+- `dashboard.config.local.json`：editable checkout 的個人 CLI、PATH、repo roots 與通知設定，已加入 `.gitignore`。
+- 一般 wheel 安裝的個人設定與 workspace 預設放在 `~/.local/share/loop-agent-lite/`；可用 `LOOP_AGENT_HOME` 或既有環境變數覆寫。
 
 第一次使用請在 Dashboard 的設定頁完成個人 CLI／PATH／repo roots 設定；不同電腦只需各自建立 local 設定，不會改動團隊檔案。
 
@@ -217,4 +193,4 @@ npm install
 npm run check
 ```
 
-`ui/dist/` 已包含 production 靜態檔，只有 Python 的環境也能直接執行 Dashboard。
+`engine/ui/` 已包含 production 靜態檔並隨 wheel 安裝，只有 Python 的環境也能執行 `loop dashboard`。
