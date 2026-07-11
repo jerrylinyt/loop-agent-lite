@@ -10,7 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def run(*args, cwd):
@@ -37,7 +37,6 @@ def prepare_fixture():
     run("git", "commit", "-qm", "e2e fixture", cwd=repo)
 
     fake_agent = fixture / "fake_agent.py"
-    work_py = PROJECT_ROOT / "work.py"
     fake_agent.write_text(
         "import json, os, subprocess, sys, time\n"
         "from pathlib import Path\n"
@@ -50,7 +49,7 @@ def prepare_fixture():
         "task = (ws / 'current_task').read_text().strip()\n"
         "print(f'E2E fake agent started phase={phase} task={task}', flush=True)\n"
         "print('\\x1b[32mE2E-ANSI-GREEN\\x1b[0m plain-tail', flush=True)\n"
-        f"subprocess.run([sys.executable, {str(work_py)!r}, 'issue', 'E2E structured issue'], env=os.environ, check=True)\n"
+        "subprocess.run([sys.executable, '-m', 'engine.work', 'issue', 'E2E structured issue'], env=os.environ, check=True)\n"
         "if phase == 'plan':\n"
         "    marker = ws / '.e2e-plan-updated'\n"
         "    if not marker.exists():\n"
@@ -58,12 +57,12 @@ def prepare_fixture():
         "            {'order': 1, 'task': '已由 E2E 更新的第一項功能', 'ref': 'README.md'},\n"
         "            {'order': 2, 'task': '由 Agent 重新分析的第二項功能'},\n"
         "        ]\n"
-        f"        subprocess.run([sys.executable, {str(work_py)!r}, 'create-plan'], input=json.dumps(plan, ensure_ascii=False), text=True, env=os.environ, check=True)\n"
+        "        subprocess.run([sys.executable, '-m', 'engine.work', 'create-plan'], input=json.dumps(plan, ensure_ascii=False), text=True, env=os.environ, check=True)\n"
         "        marker.write_text('done')\n"
         "    else:\n"
-        f"        subprocess.run([sys.executable, {str(work_py)!r}, 'plan-ok'], env=os.environ, check=True)\n"
+        "        subprocess.run([sys.executable, '-m', 'engine.work', 'plan-ok'], env=os.environ, check=True)\n"
         "elif task:\n"
-        f"    subprocess.run([sys.executable, {str(work_py)!r}, 'done', task], env=os.environ, check=True)\n"
+        "    subprocess.run([sys.executable, '-m', 'engine.work', 'done', task], env=os.environ, check=True)\n"
         "counter = ws / '.e2e-agent-count'\n"
         "count = int(counter.read_text()) + 1 if counter.exists() else 1\n"
         "counter.write_text(str(count))\n"
@@ -114,9 +113,8 @@ def main():
     os.environ["LOOP_AGENT_DASHBOARD_CONFIG"] = str(config_path)
     sys.path.insert(0, str(PROJECT_ROOT))
     try:
-        import dashboard
-        sys.argv = ["dashboard.py", "--port", str(args.port)] + (["--read-only"] if args.read_only else [])
-        dashboard.main()
+        from engine import dashboard
+        dashboard.run_dashboard(port=args.port, read_only=args.read_only)
     finally:
         shutil.rmtree(fixture, ignore_errors=True)
 

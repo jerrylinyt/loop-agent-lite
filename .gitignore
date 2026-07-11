@@ -1,7 +1,7 @@
 # 執行期狀態與產物(每個 workspace 的 state/log/prompt/snapshot)——不是原始碼
 workspace/
 
-# dashboard 舊版與個人設定；團隊版 dashboard.config.shared.json 刻意進版控
+# dashboard 舊版與個人設定；團隊版 engine/dashboard.config.shared.json 刻意進版控
 dashboard.config.json
 dashboard.config.local.json
 
@@ -16,13 +16,14 @@ examples/
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
 .pytest_cache/
 .mypy_cache/
 .venv/
 venv/
 .DS_Store
 
-# React dashboard 開發依賴；ui/dist 是 production 產物，刻意進版控供 Python 離線提供
+# React dashboard 開發依賴；engine/ui 是 production 產物，會隨 Python package 安裝
 ui/node_modules/
 ui/test-results/
 ui/playwright-report/

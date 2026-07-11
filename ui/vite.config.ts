@@ -5,7 +5,8 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   build: {
-    outDir: "dist",
+    // Production assets 跟著 engine package 安裝，`loop dashboard` 不依賴 checkout 的 ui/ 路徑。
+    outDir: "../engine/ui",
     emptyOutDir: true
   },
   server: {

@@ -26,14 +26,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-import loop as L  # noqa: E402
-import dashboard as D  # noqa: E402
-import status as S  # noqa: E402
-import work as W  # noqa: E402
+from engine import dashboard as D  # noqa: E402
+from engine import loop as L  # noqa: E402
+from engine import status as S  # noqa: E402
+from engine import work as W  # noqa: E402
 
-WORK_PY = str(REPO_ROOT / "work.py")
-LOOP_PY = str(REPO_ROOT / "loop.py")
-STATUS_PY = str(REPO_ROOT / "status.py")
+WORK_CMD = [sys.executable, "-m", "engine.work"]
+LOOP_CMD = [sys.executable, "-m", "engine.loop"]
+STATUS_CMD = [sys.executable, "-m", "engine.status"]
 WS_ROOT = REPO_ROOT / "workspace"
 
 
@@ -226,7 +226,7 @@ class TestStateCheckpointRecovery(unittest.TestCase):
             root = Path(d)
             repo = make_repo(root)
             workspace_root = root / "workspace"
-            common = [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "resume-recover",
+            common = [*LOOP_CMD, "--repo", str(repo), "--name", "resume-recover",
                       "--agent-cmd", "true", "--validate-cmd", "true"]
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             seeded = subprocess.run(common + ["--max-rounds", "1"], capture_output=True, text=True, env=env)
@@ -256,7 +256,7 @@ class TestRoundIsolation(unittest.TestCase):
             ws.write_dispatch("exec", "task-1", current)
             env = {**os.environ, "LOOP_WS": str(ws_dir), "LOOP_ROUND_TOKEN": stale}
 
-            result = subprocess.run([sys.executable, WORK_PY, "done", "task-1"],
+            result = subprocess.run([*WORK_CMD, "done", "task-1"],
                                     capture_output=True, text=True, env=env)
 
             self.assertNotEqual(result.returncode, 0)
@@ -326,7 +326,7 @@ class TestRoundTelemetry(unittest.TestCase):
         agent.write_text(agent_body)
         env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
         result = subprocess.run(
-            [sys.executable, LOOP_PY, "--repo", str(repo), "--name", name,
+            [*LOOP_CMD, "--repo", str(repo), "--name", name,
              "--agent-cmd", shlex.join([sys.executable, str(agent)]),
              "--validate-cmd", "true", "--agent-backoff-max", "0",
              "--max-rounds", "1", *extra],
@@ -378,7 +378,7 @@ class TestRoundTelemetry(unittest.TestCase):
             )
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             result = subprocess.run(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "normal-progress",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "normal-progress",
                  "--agent-cmd", shlex.join([sys.executable, str(agent)]),
                  "--validate-cmd", "true", "--import-plan", str(plan),
                  "--start-phase", "exec", "--max-rounds", "1"],
@@ -489,7 +489,7 @@ class TestLiveRoundTiming(unittest.TestCase):
             agent.write_text("import time\ntime.sleep(10)\n")
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             process = subprocess.Popen(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "live-round",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "live-round",
                  "--agent-cmd", shlex.join([sys.executable, str(agent)]),
                  "--validate-cmd", "true", "--round-timeout", "1",
                  "--agent-backoff-max", "0", "--max-rounds", "1"],
@@ -514,7 +514,7 @@ class TestLiveRoundTiming(unittest.TestCase):
                 self.assertGreaterEqual((deadline_at - started_at).total_seconds(), 59)
 
                 live = subprocess.run(
-                    [sys.executable, STATUS_PY, "--name", "live-round", "--json"],
+                    [*STATUS_CMD, "--name", "live-round", "--json"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(live.returncode, 0, live.stdout + live.stderr)
                 live_projection = json.loads(live.stdout)
@@ -539,7 +539,7 @@ class TestLiveRoundTiming(unittest.TestCase):
                 self.assertFalse((workspace_root / "live-round" / "logs" / "anomalies").exists())
 
                 stopped_status = subprocess.run(
-                    [sys.executable, STATUS_PY, "--name", "live-round"],
+                    [*STATUS_CMD, "--name", "live-round"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(stopped_status.returncode, 0, stopped_status.stdout + stopped_status.stderr)
                 self.assertIn("round 1 中斷", stopped_status.stdout)
@@ -673,13 +673,13 @@ class TestAbnormalRoundVoided(unittest.TestCase):
             agent.write_text(
                 "import os, subprocess, sys\n"
                 "sys.stdin.read()\n"
-                f"subprocess.run([sys.executable, {WORK_PY!r}, 'plan-ok'], env=dict(os.environ))\n"
+                "subprocess.run([sys.executable, '-m', 'engine.work', 'plan-ok'], env=dict(os.environ))\n"
                 "raise SystemExit(7)\n"
             )
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
 
             result = subprocess.run(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "abnormal-vote",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "abnormal-vote",
                  "--agent-cmd", shlex.join([sys.executable, str(agent)]),
                  "--validate-cmd", "true", "--import-plan", str(plan),
                  "--start-phase", "plan", "--max-rounds", "1"],
@@ -717,7 +717,7 @@ class TestAgentFailureBackoff(unittest.TestCase):
             started = time.monotonic()
 
             result = subprocess.run(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "flaky-backoff",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "flaky-backoff",
                  "--agent-cmd", shlex.join([sys.executable, str(agent)]),
                  "--validate-cmd", "true", "--agent-backoff-max", "0.05", "--max-rounds", "2"],
                 capture_output=True, text=True, env=env,
@@ -740,7 +740,7 @@ class TestAgentFailureBackoff(unittest.TestCase):
             state_path = workspace_root / "visible-backoff" / "state.json"
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             process = subprocess.Popen(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "visible-backoff",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "visible-backoff",
                  "--agent-cmd", "false", "--validate-cmd", "true",
                  "--agent-backoff-max", "2", "--max-rounds", "2"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
@@ -1049,7 +1049,7 @@ class TestWorkCliArtifactGuards(unittest.TestCase):
 
     def run_work(self, workspace, token, command, *args):
         env = {**os.environ, "LOOP_WS": str(workspace), "LOOP_ROUND_TOKEN": token}
-        return subprocess.run([sys.executable, WORK_PY, command, *args],
+        return subprocess.run([*WORK_CMD, command, *args],
                               capture_output=True, text=True, env=env)
 
     def test_dispatch_symlink_is_rejected_without_reading_outside(self):
@@ -1124,7 +1124,7 @@ class TestStatusCli(unittest.TestCase):
                 before = ws.state_path.read_bytes()
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 result = subprocess.run(
-                    [sys.executable, STATUS_PY, "--name", "cli-status", "--json"],
+                    [*STATUS_CMD, "--name", "cli-status", "--json"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 payload = json.loads(result.stdout)
@@ -1143,7 +1143,7 @@ class TestStatusCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
             result = subprocess.run(
-                [sys.executable, STATUS_PY, "--name", "missing", "--json"],
+                [*STATUS_CMD, "--name", "missing", "--json"],
                 capture_output=True, text=True, env=env)
             self.assertEqual(result.returncode, 1)
             payload = json.loads(result.stdout)
@@ -1159,7 +1159,7 @@ class TestStatusCli(unittest.TestCase):
                 ws.save_state(ws.fresh_state())
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 process = subprocess.Popen(
-                    [sys.executable, STATUS_PY, "--name", "watch-status", "--json",
+                    [*STATUS_CMD, "--name", "watch-status", "--json",
                      "--watch", "--interval", "0.01"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
                 captured = []
@@ -1198,7 +1198,7 @@ class TestStatusCli(unittest.TestCase):
                 ws.save_state(state)
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 process = subprocess.Popen(
-                    [sys.executable, STATUS_PY, "--name", "watch-change", "--json",
+                    [*STATUS_CMD, "--name", "watch-change", "--json",
                      "--watch", "--on-change", "--interval", "0.01"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
                 captured = []
@@ -1238,7 +1238,7 @@ class TestStatusCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
             result = subprocess.run(
-                [sys.executable, STATUS_PY, "--name", "missing", "--on-change"],
+                [*STATUS_CMD, "--name", "missing", "--on-change"],
                 capture_output=True, text=True, env=env)
             self.assertEqual(result.returncode, 2)
             self.assertIn("必須搭配 --watch", result.stderr)
@@ -1257,7 +1257,7 @@ class TestStatusCli(unittest.TestCase):
                 ws.save_state(state)
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 result = subprocess.run(
-                    [sys.executable, STATUS_PY, "--all", "--json", "--check"],
+                    [*STATUS_CMD, "--all", "--json", "--check"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 payload = json.loads(result.stdout)
@@ -1282,7 +1282,7 @@ class TestStatusCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
             result = subprocess.run(
-                [sys.executable, STATUS_PY, "--name", "missing", "--check", "--watch"],
+                [*STATUS_CMD, "--name", "missing", "--check", "--watch"],
                 capture_output=True, text=True, env=env)
             self.assertEqual(result.returncode, 2)
             self.assertIn("不可搭配 --watch", result.stderr)
@@ -1299,7 +1299,7 @@ class TestStatusCli(unittest.TestCase):
                 ws.save_state(state)
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 result = subprocess.run(
-                    [sys.executable, STATUS_PY, "--all", "--json", "--check"],
+                    [*STATUS_CMD, "--all", "--json", "--check"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 payload = json.loads(result.stdout)
@@ -1313,7 +1313,7 @@ class TestStatusCli(unittest.TestCase):
                 state["issues"].append({"round": 4, "text": "new issue"})
                 ws.save_state(state)
                 result = subprocess.run(
-                    [sys.executable, STATUS_PY, "--all", "--json", "--check"],
+                    [*STATUS_CMD, "--all", "--json", "--check"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 payload = json.loads(result.stdout)
@@ -1335,7 +1335,7 @@ class TestStatusCli(unittest.TestCase):
                     ws.save_state(state)
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 result = subprocess.run(
-                    [sys.executable, STATUS_PY, "--all", "--json", "--sort", "attention"],
+                    [*STATUS_CMD, "--all", "--json", "--sort", "attention"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 payload = json.loads(result.stdout)
@@ -1357,7 +1357,7 @@ class TestStatusCli(unittest.TestCase):
                 ws.save_state(state)
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 result = subprocess.run(
-                    [sys.executable, STATUS_PY, "--name", "human-status"],
+                    [*STATUS_CMD, "--name", "human-status"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("Agent 異常 2", result.stdout)
@@ -1380,7 +1380,7 @@ class TestStatusCli(unittest.TestCase):
                     "2026-07-10T10:02:00 round=3 phase=exec task=- secs=2.000 timeout=False\n")
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 result = subprocess.run(
-                    [sys.executable, STATUS_PY, "--name", "metrics-status", "--metrics", "2", "--json"],
+                    [*STATUS_CMD, "--name", "metrics-status", "--metrics", "2", "--json"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 metrics = json.loads(result.stdout)["round_metrics"]
@@ -1390,7 +1390,7 @@ class TestStatusCli(unittest.TestCase):
                 self.assertEqual(metrics["timeout_rate_pct"], 50)
 
                 human = subprocess.run(
-                    [sys.executable, STATUS_PY, "--name", "metrics-status", "--metrics", "2"],
+                    [*STATUS_CMD, "--name", "metrics-status", "--metrics", "2"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(human.returncode, 0, human.stdout + human.stderr)
                 self.assertIn("效能 2 輪", human.stdout)
@@ -1404,7 +1404,7 @@ class TestStatusCli(unittest.TestCase):
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
             for value in ("-1", str(L.ROUND_METRICS_MAX_SAMPLES + 1), "bad"):
                 result = subprocess.run(
-                    [sys.executable, STATUS_PY, "--name", "missing", "--metrics", value],
+                    [*STATUS_CMD, "--name", "missing", "--metrics", value],
                     capture_output=True, text=True, env=env)
                 with self.subTest(value=value):
                     self.assertEqual(result.returncode, 2)
@@ -1414,7 +1414,7 @@ class TestStatusCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
             result = subprocess.run(
-                [sys.executable, STATUS_PY, "--name", "missing", "--sort", "round"],
+                [*STATUS_CMD, "--name", "missing", "--sort", "round"],
                 capture_output=True, text=True, env=env)
             self.assertEqual(result.returncode, 2)
             self.assertIn("只有搭配 --all", result.stderr)
@@ -1453,7 +1453,7 @@ class TestStatusCli(unittest.TestCase):
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
 
                 result = subprocess.run(
-                    [sys.executable, STATUS_PY, "--all", "--json", "--filter", "done", "--check"],
+                    [*STATUS_CMD, "--all", "--json", "--filter", "done", "--check"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 payload = json.loads(result.stdout)
@@ -1465,7 +1465,7 @@ class TestStatusCli(unittest.TestCase):
                 self.assertEqual(payload["summary"]["error_count"], 1)
 
                 result = subprocess.run(
-                    [sys.executable, STATUS_PY, "--all", "--json", "--filter", "attention"],
+                    [*STATUS_CMD, "--all", "--json", "--filter", "attention"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 payload = json.loads(result.stdout)
@@ -1478,7 +1478,7 @@ class TestStatusCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(Path(d) / "workspace")}
             result = subprocess.run(
-                [sys.executable, STATUS_PY, "--name", "missing", "--filter", "attention"],
+                [*STATUS_CMD, "--name", "missing", "--filter", "attention"],
                 capture_output=True, text=True, env=env)
             self.assertEqual(result.returncode, 2)
             self.assertIn("--filter 只有搭配 --all", result.stderr)
@@ -1499,7 +1499,7 @@ class TestStatusCli(unittest.TestCase):
                 broken.state_path.write_text("{broken", encoding="utf-8")
                 env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
                 result = subprocess.run(
-                    [sys.executable, STATUS_PY, "--all", "--json"],
+                    [*STATUS_CMD, "--all", "--json"],
                     capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 payload = json.loads(result.stdout)
@@ -1565,7 +1565,7 @@ class TestPreflightConsole(unittest.TestCase):
             workspace_root = Path(d) / "workspace"
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             result = subprocess.run(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "preflight-console",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "preflight-console",
                  "--agent-cmd", "true", "--validate-cmd", "true", "--max-rounds", "1"],
                 capture_output=True, text=True, env=env,
             )
@@ -1601,7 +1601,7 @@ class TestTransactionalReset(unittest.TestCase):
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
 
             result = subprocess.run(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "reset-safe",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "reset-safe",
                  "--agent-cmd", "true", "--validate-cmd", "false", "--reset-state", "--max-rounds", "1"],
                 capture_output=True, text=True, env=env,
             )
@@ -1634,7 +1634,7 @@ class TestTransactionalReset(unittest.TestCase):
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
 
             result = subprocess.run(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "reset-success",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "reset-success",
                  "--agent-cmd", "true", "--validate-cmd", "true", "--reset-state", "--max-rounds", "1"],
                 capture_output=True, text=True, env=env,
             )
@@ -1666,7 +1666,7 @@ class TestValidateTimeout(unittest.TestCase):
             slow = shlex.join([sys.executable, "-c", "import time; time.sleep(10)"])
             started = time.monotonic()
             result = subprocess.run(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "validate-timeout",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "validate-timeout",
                  "--agent-cmd", "true", "--validate-cmd", slow,
                  "--validate-timeout", "0.1", "--max-rounds", "1"],
                 capture_output=True, text=True, env=env, timeout=3,
@@ -2168,7 +2168,7 @@ class TestGracefulRoundStop(unittest.TestCase):
             )
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             process = subprocess.Popen(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "graceful-stop",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "graceful-stop",
                  "--agent-cmd", shlex.join([sys.executable, str(agent)]),
                  "--validate-cmd", "true", "--max-rounds", "5"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
@@ -2227,7 +2227,7 @@ class TestGracefulRoundStop(unittest.TestCase):
             )
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             result = subprocess.run(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "stale-stop",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "stale-stop",
                  "--agent-cmd", "true", "--validate-cmd", "true", "--max-rounds", "1"],
                 capture_output=True, text=True, env=env,
             )
@@ -2269,7 +2269,7 @@ class TestGracefulRoundStop(unittest.TestCase):
             )
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             process = subprocess.Popen(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "cancel-drain",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "cancel-drain",
                  "--agent-cmd", shlex.join([sys.executable, str(agent)]),
                  "--validate-cmd", "true", "--max-rounds", "2"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
@@ -2516,7 +2516,7 @@ class TestValidateMustStayClean(unittest.TestCase):
             wsd = WS_ROOT / name
             shutil.rmtree(wsd, ignore_errors=True)
             try:
-                common = [sys.executable, LOOP_PY, "--repo", str(repo), "--name", name,
+                common = [*LOOP_CMD, "--repo", str(repo), "--name", name,
                           "--goal", "goal.md", "--agent-cmd", "true", "--max-rounds", "1"]
                 if rc:
                     # 先建立一個可信 last_green_sha；舊行為會因 green 合法而放行紅色 dirty validator。
@@ -2547,12 +2547,12 @@ class TestValidateMustStayClean(unittest.TestCase):
 _AGENT_TAMPER = f'''import os, subprocess, sys
 sys.stdin.read()
 open("goal.md", "a").write("\\nTAMPERED BY AGENT\\n")   # 竄改受保護檔
-subprocess.run([sys.executable, {WORK_PY!r}, "create-plan"],
+subprocess.run([sys.executable, "-m", "engine.work", "create-plan"],
                input='[{{"order":1,"task":"stolen dirty task"}}]', text=True, env=dict(os.environ))
 '''
 _AGENT_CLEAN = f'''import os, subprocess, sys
 sys.stdin.read()
-subprocess.run([sys.executable, {WORK_PY!r}, "create-plan"],
+subprocess.run([sys.executable, "-m", "engine.work", "create-plan"],
                input='[{{"order":1,"task":"legit planned task"}}]', text=True, env=dict(os.environ))
 '''
 
@@ -2569,7 +2569,7 @@ class TestTamperRoundVoided(unittest.TestCase):
             agent = Path(d) / "agent.py"
             agent.write_text(agent_body)
             subprocess.run(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", name,
+                [*LOOP_CMD, "--repo", str(repo), "--name", name,
                  "--goal", "goal.md", "--agent-cmd", f"{sys.executable} {agent}",
                  "--validate-cmd", "true", "--max-rounds", "1"],
                 capture_output=True, text=True)
@@ -2945,7 +2945,7 @@ class TestPreflightOnly(unittest.TestCase):
     def _run(self, repo, workspace_root, validate_cmd, name):
         env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
         return subprocess.run(
-            [sys.executable, LOOP_PY, "--repo", str(repo), "--name", name,
+            [*LOOP_CMD, "--repo", str(repo), "--name", name,
              "--validate-cmd", validate_cmd, "--preflight-only"],
             capture_output=True, text=True, env=env)
 
@@ -3002,7 +3002,7 @@ class TestCliArgumentGuards(unittest.TestCase):
             for index, (option, value) in enumerate(cases):
                 name = f"bad-number-{index}"
                 result = subprocess.run(
-                    [sys.executable, LOOP_PY, "--repo", str(repo), "--name", name,
+                    [*LOOP_CMD, "--repo", str(repo), "--name", name,
                      "--agent-cmd", shlex.join([sys.executable, str(agent)]),
                      "--validate-cmd", "true", option, value],
                     capture_output=True, text=True, env=env,
@@ -3025,7 +3025,7 @@ class TestCliArgumentGuards(unittest.TestCase):
             agent.write_text(f"from pathlib import Path\nPath({str(marker)!r}).write_text('started')\n")
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             result = subprocess.run(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "zero-done",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "zero-done",
                  "--agent-cmd", shlex.join([sys.executable, str(agent)]), "--validate-cmd", "true",
                  "--import-plan", str(plan), "--start-phase", "exec", "--done-threshold", "0"],
                 capture_output=True, text=True, env=env,
@@ -3174,7 +3174,7 @@ class TestWorkspaceNameGuards(unittest.TestCase):
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             for name in (".", "..", ".archive", ".hidden"):
                 result = subprocess.run(
-                    [sys.executable, LOOP_PY, "--repo", str(repo), "--name", name,
+                    [*LOOP_CMD, "--repo", str(repo), "--name", name,
                      "--agent-cmd", shlex.join([sys.executable, str(agent)]),
                      "--validate-cmd", "true", "--preflight-only"],
                     capture_output=True, text=True, env=env,
@@ -3189,7 +3189,7 @@ class TestWorkspaceNameGuards(unittest.TestCase):
             outside.mkdir()
             (workspace_root / "linked").symlink_to(outside, target_is_directory=True)
             result = subprocess.run(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "linked",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "linked",
                  "--agent-cmd", shlex.join([sys.executable, str(agent)]),
                  "--validate-cmd", "true", "--preflight-only"],
                 capture_output=True, text=True, env=env,
@@ -3280,7 +3280,7 @@ class TestProtectedPathGuards(unittest.TestCase):
             ]
             for index, (option, value) in enumerate(cases):
                 result = subprocess.run(
-                    [sys.executable, LOOP_PY, "--repo", str(repo), "--name", f"protected-{index}",
+                    [*LOOP_CMD, "--repo", str(repo), "--name", f"protected-{index}",
                      "--agent-cmd", "true", "--validate-cmd", "true", "--preflight-only",
                      option, value],
                     capture_output=True, text=True, env=env,
@@ -3384,7 +3384,7 @@ class TestGoalProjection(unittest.TestCase):
             git(repo, "commit", "-qm", "update goal")
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             result = subprocess.run(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "goal-diff",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "goal-diff",
                  "--agent-cmd", "true", "--validate-cmd", "true", "--max-rounds", "1"],
                 capture_output=True, text=True, env=env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -3411,7 +3411,7 @@ class TestGoalProjection(unittest.TestCase):
             git(repo, "add", "goal.md")
             git(repo, "commit", "-qm", "update goal again")
             result = subprocess.run(
-                [sys.executable, LOOP_PY, "--repo", str(repo), "--name", "goal-diff",
+                [*LOOP_CMD, "--repo", str(repo), "--name", "goal-diff",
                  "--agent-cmd", "true", "--validate-cmd", "true", "--max-rounds", "1"],
                 capture_output=True, text=True, env=env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -3738,7 +3738,7 @@ class TestFreshStartClearsRoundArtifacts(unittest.TestCase):
         env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
         agent = f"{sys.executable} -c pass"
         return subprocess.run(
-            [sys.executable, LOOP_PY, "--repo", str(repo), "--name", name,
+            [*LOOP_CMD, "--repo", str(repo), "--name", name,
              "--agent-cmd", agent, "--validate-cmd", validate_cmd,
              "--reset-state", "--max-rounds", "1"],
             capture_output=True, text=True, env=env)

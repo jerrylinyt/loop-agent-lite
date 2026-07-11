@@ -5,8 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import dashboard as D
-import prompt_templates as P
+from engine import dashboard as D
+from engine import prompt_templates as P
 
 
 def team_template(template_id="team-flow", **overrides):

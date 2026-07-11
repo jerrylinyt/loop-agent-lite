@@ -2,7 +2,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
-const dist = new URL("../dist/", import.meta.url);
+const dist = new URL("../../engine/ui/", import.meta.url);
 const index = await readFile(new URL("index.html", dist), "utf8");
 const assetNames = await readdir(new URL("assets/", dist));
 const cssFiles = await Promise.all(

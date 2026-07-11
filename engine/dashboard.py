@@ -37,18 +37,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-import loop as loop_mod          # 共用 Workspace/fresh_state,匯入計畫時建 state 不自己發明 schema
-from prompt_templates import prompt_template_projection
-from work import validate_plan  # 計畫校驗單一來源(create-plan / 匯入共用)
+from engine import loop as loop_mod  # 共用 Workspace/fresh_state,匯入計畫時建 state 不自己發明 schema
+from engine.paths import (default_personal_config, default_workspace_root, expose_checkout_package,
+                          legacy_config_path)
+from engine.prompt_templates import prompt_template_projection
+from engine.work import validate_plan  # 計畫校驗單一來源(create-plan / 匯入共用)
 
 HERE = Path(__file__).resolve().parent
-ROOT = Path(os.environ.get("LOOP_AGENT_WORKSPACE_ROOT", HERE / "workspace")).expanduser().resolve()
+ROOT = default_workspace_root()
 CONFIG_OVERRIDE = os.environ.get("LOOP_AGENT_DASHBOARD_CONFIG")
 PROJECT_CONFIG_PATH = Path(os.environ.get(
     "LOOP_AGENT_DASHBOARD_PROJECT_CONFIG", HERE / "dashboard.config.shared.json"
 )).expanduser().resolve()
-PERSONAL_CONFIG_PATH = Path(CONFIG_OVERRIDE or HERE / "dashboard.config.local.json").expanduser().resolve()
-LEGACY_CONFIG_PATH = (HERE / "dashboard.config.json").resolve()
+PERSONAL_CONFIG_PATH = default_personal_config()
+LEGACY_CONFIG_PATH = legacy_config_path()
 CONFIG_PATH = PERSONAL_CONFIG_PATH  # 舊程式/錯誤訊息相容名稱；UI 會分別顯示團隊版與個人版
 MAX_CHUNK = 512 * 1024  # 單次 tail 最多回傳量
 MAX_REQUEST_BYTES = 8 * 1024 * 1024  # POST JSON 上限，避免 goal/plan 或惡意 body 吃光 dashboard 記憶體
@@ -117,7 +119,7 @@ def command_env(cfg):
     _, extra = configured_path_dirs(cfg)
     existing = [value for value in env.get("PATH", "").split(os.pathsep) if value]
     env["PATH"] = os.pathsep.join(dict.fromkeys(extra + existing))
-    return env
+    return expose_checkout_package(env)
 
 
 def command_not_found(label, executable, cfg):
@@ -517,14 +519,14 @@ class Job:
 
 
 def loop_pid_alive(pid):
-    """state.json 記的 pid 是否還是活著的 loop.py(pid 重用靠 ps 命令內容兜底)。"""
+    """state.json 記的 pid 是否仍是 coordinator；同時支援舊檔案入口與 package module。"""
     try:
         pid = int(pid)
         os.kill(pid, 0)
     except (TypeError, ValueError, ProcessLookupError, PermissionError):
         return False
     r = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
-    return "loop.py" in r.stdout
+    return "loop.py" in r.stdout or "engine.loop" in r.stdout
 
 
 def norm_cmd(s):
@@ -593,7 +595,7 @@ def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout
     """spawn loop.py 並登記進 JOBS(呼叫方需持 JOBS_LOCK)。"""
     loop_mod.require_workspace_name(name)
     workspace_dir = safe_workspace_dir(name)
-    cmd = [sys.executable, str(HERE / "loop.py"), "--repo", str(repo), "--name", name,
+    cmd = [sys.executable, "-m", "engine.loop", "--repo", str(repo), "--name", name,
            "--agent-cmd", agent_cmd, "--validate-cmd", validate_cmd,
            "--flag-threshold", str(ft), "--done-threshold", str(dt), "--round-timeout", str(rt),
            "--agent-backoff-max", str(agent_backoff_max),
@@ -1068,6 +1070,11 @@ def stop_all_jobs():
 
 def load_config():
     """讀取團隊版 + 個人版；個人版只允許覆蓋 PERSONAL_CONFIG_KEYS。"""
+    try:
+        PERSONAL_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return {"error": f"個人設定目錄無法建立:{e}"}
+
     def read_json(path, label):
         """安全讀取單一設定 JSON object；缺檔與格式錯誤分開回報。"""
         try:
@@ -1193,7 +1200,7 @@ def scan_repos(cfg):
     return found
 
 
-UI_DIST = HERE / "ui" / "dist"
+UI_DIST = HERE / "ui"
 
 MIME_OVERRIDES = {
     ".js": "text/javascript; charset=utf-8",
@@ -2305,7 +2312,7 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             self._err("validate_timeout 必須 > 0 秒")
             return
-        command = [sys.executable, str(HERE / "loop.py"), "--repo", str(repo), "--name", name,
+        command = [sys.executable, "-m", "engine.loop", "--repo", str(repo), "--name", name,
                    "--validate-cmd", validate_cmd, "--validate-timeout", str(timeout), "--preflight-only"]
         # loop.py 會自行以 validate_timeout 終止 validator；外層多留緩衝，只在意外卡住時清整群組。
         rc, output, timed_out = run_command_check(command, repo, timeout=timeout + 15, env=command_env(cfg))
@@ -2932,32 +2939,25 @@ class Handler(BaseHTTPRequestHandler):
         self._out(200, json.dumps({"ok": True, "name": name, "already_stopped": True}, ensure_ascii=False))
 
 
-def main():
-    """啟動只監聽 localhost 的 Dashboard，處理 port fallback 與優雅關閉。"""
-    ap = argparse.ArgumentParser(description="loop-agent-lite dashboard(fleet + 直播 + launcher)")
-    ap.add_argument("--name", default="", help="預選 workspace(可省;頁面內隨時可切)")
-    ap.add_argument("--port", type=int, default=8765, help="被占用會自動往上找(最多 +20)")
-    ap.add_argument("--read-only", action="store_true", help="唯讀實例:擋所有 POST,UI 隱藏操作鈕(分享看板用)")
-    args = ap.parse_args()
-    Handler.readonly = args.read_only
-
+def run_dashboard(*, name="", port=8765, read_only=False) -> int:
+    """啟動 localhost Dashboard；供安裝後的 `loop dashboard` 與測試共用。"""
+    Handler.readonly = read_only
     load_config()  # 不存在就先建預設檔,讓人有得改
-    if args.name:
-        if not loop_mod.valid_workspace_name(args.name):
+    if name:
+        if not loop_mod.valid_workspace_name(name):
             sys.exit(f"❌ workspace 名稱不合法：{loop_mod.WORKSPACE_NAME_RULE}")
         names = ({d.name for d in ROOT.iterdir()
                   if loop_mod.valid_workspace_name(d.name) and not d.is_symlink() and d.is_dir()}
                  if ROOT.is_dir() else set())
-        if args.name not in names:
-            sys.exit(f"❌ workspace {args.name} 不存在,可用:{sorted(names) or '(無)'}")
-    Handler.preselect = args.name
+        if name not in names:
+            sys.exit(f"❌ workspace {name} 不存在,可用:{sorted(names) or '(無)'}")
+    Handler.preselect = name
 
     def _sigterm(*_):
         """將服務管理器 SIGTERM 轉成既有 KeyboardInterrupt 關閉流程。"""
         raise KeyboardInterrupt  # 走與 Ctrl-C 相同的優雅關閉路徑(stop_all_jobs)
     signal.signal(signal.SIGTERM, _sigterm)
 
-    port = args.port
     srv = None
     for _ in range(20):
         try:
@@ -2979,7 +2979,18 @@ def main():
         srv.server_close()
         stop_all_jobs()
         print("dashboard 已關閉。", flush=True)
+    return 0
+
+
+def main(argv=None) -> int:
+    """保留 `python -m engine.dashboard` 開發入口；正式使用建議 `loop dashboard`。"""
+    parser = argparse.ArgumentParser(description="loop-agent-lite dashboard(fleet + 直播 + launcher)")
+    parser.add_argument("--name", default="", help="預選 workspace(可省;頁面內隨時可切)")
+    parser.add_argument("--port", type=int, default=8765, help="被占用會自動往上找(最多 +20)")
+    parser.add_argument("--read-only", action="store_true", help="唯讀實例:擋所有 POST,UI 隱藏操作鈕")
+    args = parser.parse_args(argv)
+    return run_dashboard(name=args.name, port=args.port, read_only=args.read_only)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

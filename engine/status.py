@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import loop
+from engine import loop
 
 STATUS_SCHEMA_VERSION = 1
 
@@ -56,7 +56,7 @@ def format_clock(seconds):
 
 
 def pid_is_loop_alive(pid) -> bool:
-    """確認 state 記錄的 pid 仍是 loop.py，避免 pid reuse 誤報執行中。"""
+    """確認 state 記錄的 pid 仍是 coordinator，兼容舊檔案入口與新 module 入口。"""
     try:
         pid = int(pid)
         os.kill(pid, 0)
@@ -67,7 +67,7 @@ def pid_is_loop_alive(pid) -> bool:
                                  capture_output=True, text=True, check=False).stdout
     except OSError:
         return True
-    return "loop.py" in command
+    return "loop.py" in command or "engine.loop" in command
 
 
 def project_status(name: str, metrics_limit=0):

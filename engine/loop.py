@@ -44,8 +44,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from engine.paths import default_workspace_root, expose_checkout_package
+
 HERE = Path(__file__).resolve().parent
-WORKSPACE_ROOT = Path(os.environ.get("LOOP_AGENT_WORKSPACE_ROOT", HERE / "workspace")).expanduser().resolve()
+WORKSPACE_ROOT = default_workspace_root()
 WORKSPACE_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 WORKSPACE_NAME_RULE = "只允許英數、.、_、-，且不可 . / .. 或以 . 開頭"
 
@@ -1693,7 +1695,7 @@ def main():
 
     # 選配:CLI 匯入 plan.json(重置 state,選起跑階段)——dashboard 匯入的 CLI 等價
     if args.import_plan:
-        from work import validate_plan
+        from engine.work import validate_plan
         try:
             plan_obj = json.loads(Path(args.import_plan).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
@@ -1801,14 +1803,14 @@ def main():
         startup_marked = True
         log("🟢 啟動完成｜preflight、Validate 與 Agent spawn 均成功")
 
-    work_py = HERE / "work.py"
     # Prompt 中的 coordinator 命令會交給另一個 CLI agent 執行；使用絕對路徑，
     # 避免不同使用者、IDE 或非互動 shell 的 PATH 指到另一套 Python。
     py = shlex.quote(str(Path(sys.executable).expanduser().resolve()))
-    create_cmd = f"{py} {shlex.quote(str(work_py))} create-plan"
-    planok_cmd = f"{py} {shlex.quote(str(work_py))} plan-ok"
-    issue_cmd = f"{py} {shlex.quote(str(work_py))} issue"
-    base_env = {**os.environ, "LOOP_WS": str(ws.dir)}
+    work_module = f"{py} -m engine.work"
+    create_cmd = f"{work_module} create-plan"
+    planok_cmd = f"{work_module} plan-ok"
+    issue_cmd = f"{work_module} issue"
+    base_env = expose_checkout_package({**os.environ, "LOOP_WS": str(ws.dir)})
 
     phase_name = "規劃期" if state["phase"] == "plan" else "執行期"
     log(f"📍 恢復進度｜階段：{phase_name}｜已完成 round {state['round']}")
@@ -1882,7 +1884,7 @@ def main():
                 "NOTES": notes_text,
             })
         else:
-            done_cmd = f"{py} {shlex.quote(str(work_py))} done {task_id}"
+            done_cmd = f"{work_module} done {task_id}"
             prompt = build_prompt(HERE / "prompts" / "exec.md", {
                 "GOAL": goal_text.strip(),
                 "PLAN_DOC": plan_doc_display,

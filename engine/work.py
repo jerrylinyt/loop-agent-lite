@@ -9,7 +9,7 @@ import os
 import sys
 from pathlib import Path
 
-import loop as loop_mod
+from engine import loop as loop_mod
 
 EXAMPLE = '[{"order": 1, "task": "描述", "ref": "PLAN.md#段落"}, {"order": 2, "task": "ref 可省略"}]'
 
