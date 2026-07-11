@@ -83,12 +83,13 @@ export default function Modal({ title, description, onClose, children, footer, w
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
+        aria-describedby={description ? `${titleId}-description` : undefined}
         onMouseDown={stop}
       >
         <header className="modal-header">
           <div>
             <h2 id={titleId}>{title}</h2>
-            {description && <p>{description}</p>}
+            {description && <p id={`${titleId}-description`}>{description}</p>}
           </div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="關閉對話框">✕</button>
         </header>

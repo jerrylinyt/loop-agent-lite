@@ -122,6 +122,7 @@ export default function App() {
 
   return (
     <>
+      <a className="skip-link" href="#main-content">跳到主要內容</a>
       <div id="app-shell">
         <header className="app-toolbar">
           <WorkspaceTabs workspaces={dashboard.workspaces} selected={dashboard.selected} onSelect={dashboard.selectWorkspace} />
@@ -147,12 +148,12 @@ export default function App() {
           </div>
         </header>
         {!dashboard.initialized ? (
-          <main className="empty-state" aria-busy="true">
+          <main id="main-content" tabIndex={-1} className="empty-state" aria-busy="true">
             <div className="empty-icon" aria-hidden="true">⌁</div>
             <h1>載入 dashboard…</h1>
           </main>
         ) : !dashboard.workspaces.length ? (
-          <main className="empty-state">
+          <main id="main-content" tabIndex={-1} className="empty-state">
             <div className="empty-icon" aria-hidden="true">⌁</div>
             <h1>尚未建立 workspace</h1>
             <p>啟動第一個 loop 後，任務計畫、執行狀態與完整流程紀錄會顯示在這裡。</p>
@@ -161,7 +162,7 @@ export default function App() {
         ) : overviewOpen ? (
           <FleetOverview workspaces={dashboard.workspaces} fleetHistory={dashboard.fleetHistory} fleetMetrics={dashboard.fleetMetrics} attentionRequest={attentionRequest} readonly={dashboard.bootstrap.readonly} onSelect={selectFromOverview} onChanged={dashboard.refreshWorkspaces} />
         ) : (
-          <main className="dashboard-grid" style={{ gridTemplateColumns: `${leftWidth}px 6px ${rightCollapsed ? "42px" : "minmax(0, 1fr)"}` }}>
+          <main id="main-content" tabIndex={-1} className="dashboard-grid" style={{ gridTemplateColumns: `${leftWidth}px 6px ${rightCollapsed ? "42px" : "minmax(0, 1fr)"}` }}>
             <WorkspaceView key={dashboard.selected} workspace={workspace} state={dashboard.state} consoleText={dashboard.consoleText} readonly={dashboard.bootstrap.readonly} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} />
             <Splitter onResize={resize} />
             <ConsolePane text={dashboard.consoleText} round={dashboard.state?.round ?? 0} running={workspace?.running ?? false} hasWorkspace={!!dashboard.selected} collapsed={rightCollapsed} onToggleCollapse={toggleRight} />

@@ -225,7 +225,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
   const taskPct = totalTasks > 0 ? Math.round((doneTasks / totalTasks) * 100) : 0;
 
   return (
-    <main className={`fleet-overview${compact ? " compact-cards" : ""}`} aria-label="工作區總覽">
+    <main id="main-content" tabIndex={-1} className={`fleet-overview${compact ? " compact-cards" : ""}`} aria-label="工作區總覽">
       <div className="fleet-stats" role="list" aria-label="工作區統計">
         <div className="fleet-stat" role="listitem"><strong>{workspaces.length}</strong><span>workspaces</span></div>
         <div className="fleet-stat running" role="listitem"><strong>{running}</strong><span>執行中</span></div>

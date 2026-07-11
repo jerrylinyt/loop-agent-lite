@@ -621,3 +621,13 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .notification-item.read { opacity: .65; }
 .notification-item > span { display: flex; justify-content: space-between; gap: 8px; }
 .notification-item small, .notification-item p { margin: 0; color: var(--muted); }
+.skip-link { position: fixed; z-index: 10000; top: 8px; left: 8px; padding: 8px 11px; border-radius: 7px; background: var(--accent); color: white; transform: translateY(-150%); }
+.skip-link:focus { transform: translateY(0); }
+:where(button, input, select, textarea, a, [tabindex]):focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 75%, white); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+@media (forced-colors: active) {
+  .health-strip-fill, .fleet-progress-fill { forced-color-adjust: none; background: Highlight !important; }
+  .phase-badge, .chip, .notification-trigger b { border: 1px solid ButtonText; }
+}
