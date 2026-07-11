@@ -9,7 +9,8 @@ export default function CommandPalette({ workspaces, commands, onSelectWorkspace
   const [query, setQuery] = useState("");
   const entries = useMemo(() => {
     const common = commands.map((command) => ({ ...command, group: "操作" }));
-    const workspaceEntries = workspaces.map((workspace) => ({ id: `ws:${workspace.name}`, label: workspace.name, hint: `${workspace.phase ?? "—"} · ${workspace.running ? "執行中" : "已停止"}`, group: "Workspace", run: () => onSelectWorkspace(workspace.name) }));
+    const modifier = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘G" : "Ctrl+G";
+    const workspaceEntries = workspaces.map((workspace, index) => ({ id: `ws:${workspace.name}`, label: workspace.name, hint: `${workspace.phase ?? "—"} · ${workspace.running ? "執行中" : "已停止"}${index < 5 ? ` · ${modifier} → ${index + 1}` : ""}`, group: "Workspace", run: () => onSelectWorkspace(workspace.name) }));
     const needle = query.trim().toLowerCase();
     return [...common, ...workspaceEntries].filter((entry) => !needle || `${entry.label} ${entry.hint}`.toLowerCase().includes(needle)).slice(0, 30);
   }, [commands, onSelectWorkspace, query, workspaces]);

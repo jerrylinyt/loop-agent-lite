@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ConsolePane from "../features/console/ConsolePane";
 import Splitter from "../features/layout/Splitter";
 import LauncherModal from "../features/launcher/LauncherModal";
@@ -18,6 +18,8 @@ export default function App() {
   const [archivesOpen, setArchivesOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [overviewOpen, setOverviewOpen] = useState(() => localStorage.getItem("fleet-overview") === "1");
+  const [navigationChord, setNavigationChord] = useState(false);
+  const navigationTimer = useRef<number | null>(null);
   const [attentionRequest, setAttentionRequest] = useState(0);
   const [leftWidth, setLeftWidth] = useState(() => +(localStorage.getItem("left-pane-width") || Math.round(window.innerWidth * 0.44)));
   const [rightCollapsed, setRightCollapsed] = useState(() => localStorage.getItem("agent-console-collapsed") === "1");
@@ -73,10 +75,39 @@ export default function App() {
     const listener = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault(); setPaletteOpen(true);
+        return;
       }
+      const target = event.target as HTMLElement | null;
+      const editing = !!target?.closest("input, textarea, select, [contenteditable='true']");
+      const modalOpen = !!document.querySelector("[role='dialog']");
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "g") {
+        if (editing || modalOpen) return;
+        event.preventDefault();
+        setNavigationChord(true);
+        if (navigationTimer.current !== null) window.clearTimeout(navigationTimer.current);
+        navigationTimer.current = window.setTimeout(() => setNavigationChord(false), 1500);
+        return;
+      }
+      if (!navigationChord || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey || !/^[0-5]$/.test(event.key)) return;
+      event.preventDefault();
+      setNavigationChord(false);
+      if (navigationTimer.current !== null) window.clearTimeout(navigationTimer.current);
+      if (event.key === "0") {
+        setOverviewOpen(true);
+        localStorage.setItem("fleet-overview", "1");
+        return;
+      }
+      const next = dashboard.workspaces[Number(event.key) - 1];
+      if (!next) return;
+      dashboard.selectWorkspace(next.name);
+      setOverviewOpen(false);
+      localStorage.setItem("fleet-overview", "0");
     };
     document.addEventListener("keydown", listener);
     return () => document.removeEventListener("keydown", listener);
+  }, [dashboard.selectWorkspace, dashboard.workspaces, navigationChord]);
+  useEffect(() => () => {
+    if (navigationTimer.current !== null) window.clearTimeout(navigationTimer.current);
   }, []);
   const paletteCommands = useMemo(() => [
     { id: "overview", label: "開啟 Fleet 總覽", hint: "監控所有 workspace", run: () => { setOverviewOpen(true); localStorage.setItem("fleet-overview", "1"); } },
@@ -128,6 +159,7 @@ export default function App() {
           </main>
         )}
       </div>
+      {navigationChord && <div className="navigation-chord" role="status">導覽：按 0 回總覽，1～5 切換 workspace</div>}
       {launcherOpen && <LauncherModal workspaces={dashboard.workspaces} onClose={() => setLauncherOpen(false)} onLaunched={launched} />}
       {archivesOpen && <ArchivesModal readonly={dashboard.bootstrap.readonly} onClose={() => setArchivesOpen(false)} onRestored={restored} />}
       {paletteOpen && <CommandPalette workspaces={dashboard.workspaces} commands={paletteCommands} onClose={() => setPaletteOpen(false)} onSelectWorkspace={(name) => { dashboard.selectWorkspace(name); setOverviewOpen(false); }} />}
