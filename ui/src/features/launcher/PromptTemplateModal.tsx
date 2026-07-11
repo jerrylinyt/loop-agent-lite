@@ -1,7 +1,7 @@
 /** 外部 Agent prompt 產生器：在瀏覽器組合、預覽與下載文字，不接觸 repo 或 workspace。 */
 import { useMemo, useState } from "react";
 import Modal from "../../shared/components/Modal";
-import type { PromptTemplate } from "../../shared/api/types";
+import type { PromptTemplate, PromptTemplateBundle } from "../../shared/api/types";
 import {
   buildExternalAgentPrompt,
   downloadPromptFile,
@@ -9,27 +9,16 @@ import {
   type PromptTemplateMode
 } from "./promptTemplateBuilder";
 
-const TEAM_TEMPLATE_EXAMPLE = `{
-  "prompt_templates": [
-    {
-      "id": "team-payment-flow",
-      "label": "分析團隊付款流程",
-      "category": "團隊",
-      "description": "追蹤付款狀態、補償與通知。",
-      "requirement_placeholder": "例：分析退款失敗後的補償流程。",
-      "instructions": "- 盤點付款狀態機與真相來源。\\n- 追蹤重試、冪等、補償與通知邊界。"
-    }
-  ]
-}`;
-
 export default function PromptTemplateModal({
   templates,
+  bundle,
   warnings,
   projectConfigPath,
   initialMode,
   onClose
 }: {
   templates: PromptTemplate[];
+  bundle: PromptTemplateBundle;
   warnings?: string[];
   projectConfigPath?: string;
   initialMode: PromptTemplateMode;
@@ -51,8 +40,9 @@ export default function PromptTemplateModal({
     return [...grouped.entries()];
   }, [templates]);
   const prompt = template
-    ? buildExternalAgentPrompt({ template, mode, requirement, projectContext })
+    ? buildExternalAgentPrompt({ template, bundle, mode, requirement, projectContext })
     : "";
+  const hasRequirement = !!requirement.trim();
   const outputName = mode === "goal" ? "goal.md" : "plan.json";
 
   const copyPrompt = async () => {
@@ -73,8 +63,8 @@ export default function PromptTemplateModal({
   const footer = (
     <>
       <button type="button" className="secondary-button" onClick={onClose}>關閉</button>
-      <button type="button" className="secondary-button" disabled={!prompt} onClick={() => void copyPrompt()}>複製 Prompt</button>
-      <button type="button" className="primary-button" disabled={!template} onClick={downloadPrompt}>下載 .md</button>
+      <button type="button" className="secondary-button" disabled={!template || !hasRequirement || !prompt} onClick={() => void copyPrompt()}>複製 Prompt</button>
+      <button type="button" className="primary-button" disabled={!template || !hasRequirement || !prompt} onClick={downloadPrompt}>下載 .md</button>
       <span className="inline-message" role="status" aria-live="polite">{message}</span>
     </>
   );
@@ -141,10 +131,11 @@ export default function PromptTemplateModal({
           ) : <div className="loading-state error">沒有可用的 Prompt 模板</div>}
 
           <label htmlFor="prompt-requirement">
-            原始需求
+            原始需求 <span className="label-help">必填；範例不會自動當成需求</span>
             <textarea
               id="prompt-requirement"
               rows={8}
+              required
               value={requirement}
               onChange={(event) => setRequirement(event.target.value)}
               placeholder={template?.requirement_placeholder}
@@ -164,7 +155,7 @@ export default function PromptTemplateModal({
           <details className="team-template-help">
             <summary>團隊成員如何新增模板</summary>
             <p>將下列結構加入 Git 共用設定 <code>{projectConfigPath || "dashboard.config.shared.json"}</code>。重新開啟啟動視窗後就會出現在任務類型清單。</p>
-            <pre>{TEAM_TEMPLATE_EXAMPLE}</pre>
+            <pre>{bundle.team_template_example}</pre>
             <p>團隊只維護任務專屬指引；共用分析規則及 Goal／Plan 輸出契約由系統統一套用。</p>
           </details>
         </section>

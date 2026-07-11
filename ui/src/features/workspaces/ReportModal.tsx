@@ -3,6 +3,11 @@ import { useEffect, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import Modal from "../../shared/components/Modal";
 
+interface ReportResponse {
+  content?: string;
+  error?: string;
+}
+
 export default function ReportModal({ workspace, onClose }: { workspace: string; onClose: () => void }) {
   const [content, setContent] = useState("");
   const [error, setError] = useState("");
@@ -10,7 +15,7 @@ export default function ReportModal({ workspace, onClose }: { workspace: string;
 
   useEffect(() => {
     void (async () => {
-      const response = await getJson<{ content?: string; error?: string }>(`/api/report?ws=${encodeURIComponent(workspace)}`);
+      const response = await getJson<ReportResponse>(`/api/report?ws=${encodeURIComponent(workspace)}`);
       setLoading(false);
       if (!response || response.error) setError(response?.error ?? "讀取 REPORT.md 失敗");
       else setContent(response.content ?? "");

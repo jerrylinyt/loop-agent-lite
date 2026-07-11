@@ -134,7 +134,7 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 
 第一次使用請在 Dashboard 的設定頁完成個人 CLI／PATH／repo roots 設定；不同電腦只需各自建立 local 設定，不會改動團隊檔案。
 
-Prompt 模板的共用核心與 Goal／Plan 輸出契約由系統固定；團隊只在 shared 設定的 `prompt_templates` 新增任務專屬指引。`id` 必須是唯一的小寫英數／`.`／`_`／`-`，單一 Dashboard 最多載入 50 筆團隊模板；不合法或和內建模板重複的項目會略過並在模板視窗提示，不會讓 Dashboard 失效。例：
+Prompt 模板的共用核心與 Goal／Plan 輸出契約由 `engine/prompts/external-agent-*.md` 資源載入，UI 只負責替換經驗證的 placeholder，不再內嵌 prompt 長字串；修改資源後需重新啟動 Dashboard。任一固定資源缺失、過大或 placeholder 漂移時只會停用 Prompt 產生器並顯示原因，不影響其他 Dashboard 功能。團隊只在 shared 設定的 `prompt_templates` 新增任務專屬指引。`id` 必須是唯一的小寫英數／`.`／`_`／`-`，單一 Dashboard 最多載入 50 筆團隊模板；不合法或和內建模板重複的項目會略過並在模板視窗提示。例：
 
 ```json
 {

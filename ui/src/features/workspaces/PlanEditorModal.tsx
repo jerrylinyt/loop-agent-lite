@@ -11,7 +11,7 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
   onClose: () => void;
   onSave: (tasks: PlanEditTask[], doneCount: number) => Promise<string>;
 }) {
-  const original = state.plan ?? [];
+  const original = useMemo(() => state.plan ?? [], [state.plan]);
   const completed = useMemo(() => new Set((state.completed ?? []).map((entry) => entry.order)), [state.completed]);
   const lockedCount = useMemo(() => {
     // 鎖定區採「前綴」而不是零散列：完成任務或目前任務之前的順序都屬既有執行歷史，

@@ -1,13 +1,40 @@
 """Dashboard 設定投影使用的外部 Agent prompt 模板目錄。
 
-共用分析核心與 Goal/Plan 輸出契約固定在 UI builder；團隊設定只能追加任務指引，
-不能取代系統契約。無效的團隊模板會略過並轉成 warning，不讓整個 Dashboard 失效。
+共用分析核心與 Goal/Plan 輸出契約放在 package prompt 資源，由 UI builder 只做安全替換；
+團隊設定只能追加任務指引，不能取代系統契約。無效模板或資源會 fail-closed，
+但不讓整個 Dashboard 失效。
 """
+from functools import lru_cache
+from importlib import resources
 import re
 
 
 MAX_TEAM_PROMPT_TEMPLATES = 50
 TEMPLATE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+PROMPT_PLACEHOLDER_RE = re.compile(r"<<[A-Z][A-Z0-9_]*>>")
+PROMPT_MARKER_RE = re.compile(r"<<[^\r\n]*?>>")
+MAX_PROMPT_RESOURCE_CHARS = 100_000
+PROMPT_TEMPLATE_BUNDLE_SCHEMA_VERSION = 1
+PROMPT_RESOURCE_SPECS = {
+    "base": (
+        "external-agent-base.md",
+        {
+            "<<OUTPUT_NAME>>": 1,
+            "<<ORIGINAL_REQUIREMENT_JSON>>": 1,
+            "<<PROJECT_CONTEXT_JSON>>": 1,
+            "<<TEMPLATE_LABEL_JSON>>": 1,
+            "<<TEMPLATE_DESCRIPTION_JSON>>": 1,
+            "<<TEMPLATE_INSTRUCTIONS_JSON>>": 1,
+            "<<MODE_CONTRACT>>": 1,
+        },
+        True,
+    ),
+    "goal": ("external-agent-goal.md", {}, False),
+    "plan": ("external-agent-plan.md", {}, False),
+    "missing_requirement": ("external-agent-missing.md", {"<<OUTPUT_NAME>>": 2}, False),
+    "default_context": ("external-agent-default-context.md", {}, False),
+    "team_template_example": ("external-agent-team-template-example.md", {}, False),
+}
 TEAM_TEMPLATE_KEYS = {
     "id", "label", "category", "description", "instructions", "requirement_placeholder",
 }
@@ -21,8 +48,8 @@ BUILTIN_PROMPT_TEMPLATES = [
         "description": "把產品需求轉成有邊界、可驗證且能逐步交付的目標或任務。",
         "requirement_placeholder": "例：新增可依狀態篩選 workspace 的功能，並保留重新整理後的選擇。",
         "instructions": """- 先找出既有使用流程、相鄰功能、資料來源與可重用元件，不要另造平行架構。
-- 明列使用者入口、正常流程、空狀態、錯誤狀態、權限或唯讀邊界及相容性影響。
-- 將 UI、資料契約、持久化與測試需求互相對應；若需求跨層，說清楚每層責任。
+- 將驗收條件編成穩定 ID，明列使用者入口、正常流程、空狀態、錯誤狀態、權限或唯讀邊界及相容性影響。
+- 建立「驗收條件 → 適用層 → 驗證」對照；只列實際涉及的 UI、資料契約、持久化等層，不適用者以證據標 N/A。
 - 優先切出可獨立驗證的垂直功能片段，避免只按檔案或技術層拆任務。""",
     },
     {
@@ -31,9 +58,9 @@ BUILTIN_PROMPT_TEMPLATES = [
         "category": "開發",
         "description": "從可重現證據定位根因，建立回歸測試後修復。",
         "requirement_placeholder": "例：完成的 workspace 仍顯示需關注，請找出原因並修正。",
-        "instructions": """- 先定義最小重現條件、預期結果與實際結果；沒有重現證據時要標為待確認。
+        "instructions": """- 先定義最小重現條件、預期與實際結果，包含版本、資料、權限、時間或競態等必要前提；沒有重現證據時要標為待確認。
 - 沿資料流追到第一個錯誤狀態的產生點，區分根因、放大因素與表面症狀。
-- 修復前先規劃會失敗的回歸測試，並涵蓋造成問題的邊界條件。
+- 同一任務內先建立會失敗的回歸測試再修到全綠；若無法穩定自動重現，規劃 instrumentation／replay 證據並說明限制，不得虛構紅燈測試。
 - 檢查同一規則是否在其他入口重複實作，避免只補畫面上的症狀。""",
     },
     {
@@ -42,8 +69,8 @@ BUILTIN_PROMPT_TEMPLATES = [
         "category": "開發",
         "description": "先釘住既有行為，再安全調整結構、責任或可維護性。",
         "requirement_placeholder": "例：整理 Dashboard 的統計投影邏輯，降低重複但不改變 API 行為。",
-        "instructions": """- 先列出不可改變的外部行為、公開介面、資料格式、錯誤語意與副作用。
-- 找出目前能證明行為的測試；不足處先補 characterization tests，再開始搬動程式。
+        "instructions": """- 先寫清楚重構動機與可量測的改善目標，再列出不可改變的外部行為、公開介面、資料格式、錯誤語意與副作用。
+- 找出目前能證明行為且不綁內部實作的測試；不足處先補 characterization tests，並要求同一套測試在改動前後通過。
 - 說明新的責任邊界、依賴方向與遷移順序，避免一次性大改造成不可定位的回歸。
 - 將純結構改善與任何可觀察行為變更分開；後者必須明列為需求決策。""",
     },
@@ -51,10 +78,11 @@ BUILTIN_PROMPT_TEMPLATES = [
         "id": "project-logic-analysis",
         "label": "分析專案架構／邏輯",
         "category": "分析",
-        "description": "盤點模組、入口、依賴、主要流程與狀態真相來源。",
+        "description": "先做全局模組地圖，再深追需求指定流程的依賴與狀態真相來源。",
         "requirement_placeholder": "例：分析整個專案如何從 Dashboard 啟動 loop，以及狀態如何回到 Overview。",
-        "instructions": """- 從目錄、建置檔、啟動入口與設定檔建立模組清單，說明每個模組責任及依賴方向。
-- 追蹤主要使用流程的入口 → 核心邏輯 → 持久化／外部程序 → UI 投影，標出真相來源。
+        "instructions": """- 先界定要回答的架構問題、深追流程與排除項；repo-wide 部分只做淺層模組盤點，避免無界展開。
+- 從目錄、建置檔、啟動入口與設定檔建立模組清單，說明每個模組責任及依賴方向。
+- 對需求指定流程追蹤入口 → 核心邏輯 → 持久化／外部程序 → 消費端投影，標出狀態真相來源。
 - 盤點跨模組契約、生命週期、錯誤處理、並行或鎖定邊界，以及測試覆蓋位置。
 - 將直接從程式讀到的事實與推論分開；推論要附理由並列出仍需驗證的證據。""",
     },
@@ -62,11 +90,12 @@ BUILTIN_PROMPT_TEMPLATES = [
         "id": "code-logic-analysis",
         "label": "分析指定程式／呼叫鏈",
         "category": "分析",
-        "description": "針對檔案、函式、API 或事件追出完整控制流與資料流。",
+        "description": "針對明確符號或事件，在界定範圍內追出 inbound callers、outbound callees、控制流與資料流。",
         "requirement_placeholder": "例：分析 dashboard.py 的 fleet_health_projection，包含所有呼叫端與需關注判定。",
-        "instructions": """- 明確鎖定指定符號與所有直接／間接呼叫端，追出輸入來源、轉換步驟、輸出與副作用。
+        "instructions": """- 以檔案、完整符號／signature 或事件名稱鎖定目標，列出同名或 overload 歧義及選定依據。
+- 在需求範圍內同時追 inbound callers 與 outbound callees，整理輸入來源、轉換步驟、輸出與副作用。
 - 列出分支條件、預設值、例外路徑、早退、狀態變更、檔案／網路 I/O 與並行邊界。
-- 對每個重要結論附 `檔案:行號`；若動態呼叫無法靜態確認，要明確標記。
+- 對每個重要結論附 `檔案:行號`；外部套件、generated code、reflection、事件訂閱或動態 dispatch 要標出停止邊界與未確認路徑。
 - 說明既有測試如何覆蓋這條呼叫鏈，以及哪些邊界目前沒有證據。""",
     },
     {
@@ -75,8 +104,9 @@ BUILTIN_PROMPT_TEMPLATES = [
         "category": "品質",
         "description": "把需求、風險分支與既有測試做可追蹤的覆蓋對照。",
         "requirement_placeholder": "例：分析 workspace 封存／還原流程的測試缺口，優先找資料遺失風險。",
-        "instructions": """- 先枚舉可觀察行為、風險分支與失敗模式，再對照現有 unit／integration／e2e 測試。
-- 建立需求或分支 → 測試檔與案例 → 缺口的追蹤關係，不以單純 coverage 百分比代替分析。
+        "instructions": """- 先枚舉可觀察行為、風險分支與失敗模式，再對照現有 unit／integration／e2e 測試及 CI 實際執行路徑。
+- 將缺口分類為完全缺少、斷言過弱、flaky、skipped、只證明 mock 或未被 CI 執行；不以單純 coverage 百分比代替分析。
+- 建立需求或分支 → 測試檔與案例 → 缺口的追蹤關係，為每項選擇最低但足以可靠攔截回歸的測試層。
 - 優先處理資料損壞、安全邊界、競態、錯誤恢復與曾發生的回歸。
 - 說清楚 fixture、mock 與真實整合環境的界線，避免測試只證明 mock 本身。""",
     },
@@ -86,10 +116,10 @@ BUILTIN_PROMPT_TEMPLATES = [
         "category": "品質",
         "description": "用可量測基準定位時間、記憶體或 I/O 熱點並規劃驗證。",
         "requirement_placeholder": "例：分析 Overview 載入 500 輪資料時的瓶頸並提出可驗證改善。",
-        "instructions": """- 先定義工作負載、資料規模、環境、目前基準與目標，缺少量測時不可直接宣稱瓶頸。
+        "instructions": """- 先定義具代表性的工作負載、資料規模、環境、warmup、重複次數、percentile／throughput／error rate 基準與目標；缺少量測時不可直接宣稱瓶頸。
 - 沿熱路徑盤點演算法複雜度、重複 I/O、序列化、快取、鎖競爭與前端重繪。
-- 將觀測到的瓶頸、合理假設與待量測項目分開，規劃可重複的 benchmark 或 profiling 證據。
-- 每個改善都要列出正確性風險、資源交換與前後基準比較方式。""",
+- 將觀測到的瓶頸、合理假設與待量測項目分開；先安排 baseline／profiling 任務，只有證實熱點後才規劃最佳化。
+- 每個改善只改一組可歸因變因，並列出正確性風險、資源交換與相同環境下的前後比較方式。""",
     },
     {
         "id": "api-data-flow-analysis",
@@ -97,10 +127,21 @@ BUILTIN_PROMPT_TEMPLATES = [
         "category": "分析",
         "description": "追蹤跨前後端或服務邊界的資料契約、轉換與錯誤語意。",
         "requirement_placeholder": "例：分析異常紀錄從 loop 寫入、Dashboard API 到前端展開 log 的完整資料流。",
-        "instructions": """- 從生產者到消費者列出每一段 schema、欄位語意、預設值、驗證與相容策略。
-- 追蹤成功、空資料、部分失敗、逾時、重試、取消與權限拒絕的端到端行為。
+        "instructions": """- 確認 authoritative contract、版本與所有 producer／consumer；從生產者到消費者列出每段 schema、欄位語意、預設值、驗證與相容策略。
+- 分開追蹤同步與非同步路徑的成功、空資料、部分失敗、逾時、重試、取消、權限拒絕、重複／亂序投遞及 idempotency 行為。
 - 標出資料真相來源、衍生投影、快取與失效時機，避免兩套狀態各自演進。
-- 對跨層變更安排 contract test 與至少一條端到端驗證路徑。""",
+- 說明 auth context、版本相容窗口與 producer／consumer 部署先後；安排 contract test 與至少一條端到端驗證路徑。""",
+    },
+    {
+        "id": "change-impact-analysis",
+        "label": "分析變更影響／相容性",
+        "category": "分析",
+        "description": "從一項預定變更追出直接與間接受影響面，形成有證據的相容、部署與驗證方案。",
+        "requirement_placeholder": "例：評估把 workspace status 欄位改成 enum 對 API、歷史 state、前端與既有 workspace 的影響。",
+        "instructions": """- 先固定變更前基線、預定變更與不變條件，再盤點 callers／callees、schema、持久資料、事件、設定、批次 job、外部 consumer 與操作文件。
+- 將每個候選影響面分類為需修改、相容但需驗證、不受影響或待確認；文字命中不等於語意受影響，每項都要附判定證據。
+- 分析舊／新版本共存窗口、資料遷移或 backfill、feature flag、部署順序、監控訊號與回滾條件，不得只列編譯期影響。
+- 建立「變更 → 受影響面 → 驗證」對照，讓每個確認受影響項都能追到 task／DoD，N/A 也需證據。""",
     },
     {
         "id": "security-boundary-analysis",
@@ -111,51 +152,67 @@ BUILTIN_PROMPT_TEMPLATES = [
         "instructions": """- 先畫出信任邊界、資產、攻擊者可控輸入與高權限副作用，不把一般錯誤直接稱為漏洞。
 - 逐入口檢查驗證、正規化、授權、symlink／路徑邊界、命令參數、資源上限與敏感資料輸出。
 - 每個風險附可定位的程式證據、可利用前提、影響與現有緩解；不確定時標示待驗證。
-- 修復任務要含負向測試，並確認 fail-closed 行為不破壞合法流程。""",
+- 依 impact × exploitability 排序，驗證方式必須安全且非破壞性；若原需求包含修復，任務才需加入負向測試並確認 fail-closed 不破壞合法流程。""",
     },
     {
         "id": "java-generic",
-        "label": "泛用 Java 工作",
+        "label": "Java 專案通用工作",
         "category": "開發",
         "description": "在既有 Java 專案規劃新功能、重構或批次修 Bug，行為條目逐條對應測試證據。",
         "requirement_placeholder": "例：在既有 Java 專案新增批次匯入，沿用目前分層與 ApiResponse 規格。",
-        "instructions": """- 逐條列出輸入 → 輸出／副作用與需求依據；重構先列不可變行為，Bug 先列重現測試。
-- 從 codebase 讀出分層、命名、Mapper、回應包裝與例外處理慣例，讓後續執行者不必猜。
+        "instructions": """- 此模板只補充 Java 技術慣例；新功能、Bug、重構的行為分析仍依原始需求，不要把三者混成無界工作。
+- 逐條列出輸入 → 輸出／副作用與需求依據；重構先列不可變行為，Bug 在同一任務走 red → green。
+- 從 codebase 讀出實際分層、命名、Mapper／序列化、回應包裝與例外處理慣例；不存在的常見模式標 N/A，不要假設一定有 Mapper 或 ApiResponse。
 - 優先建立測試骨架；每個行為條目都要能對到任務與測試證據。
-- 預設機器 DoD 為 `mvn -q test`，若專案實際命令不同，必須以 repo 證據修正。""",
+- 從 repo wrapper、multi-module 設定與 CI 判定實際 DoD（如 `./mvnw test` 或 `./gradlew test`）及執行目錄，不得預設 Maven。""",
     },
     {
         "id": "ejb-springboot-migration",
         "label": "EJB → Spring Boot 搬移",
         "category": "遷移",
-        "description": "把 WildFly／EJB 舊系統搬到 Spring Boot 3／Java 17，重點在交易語意、容器服務與平台跳版。",
+        "description": "把 EJB／應用伺服器舊系統搬到需求指定的 Spring Boot／JDK 版本，守住交易、生命週期與容器服務語意。",
         "requirement_placeholder": "例：把舊專案全部 EJB 與對外 API 搬到 Spring Boot 3／Java 17，維持行為等價。",
-        "instructions": """- 完整盤點 EJB、descriptor 覆寫、JNDI、timer、interceptor、security、端點、JMS／MDB 與平台 API。
-- 逐 business method 確認 EJB CMT 有效交易屬性，對應 Spring `@Transactional`、rollback、timeout 與測試。
+        "instructions": """- 固定來源應用伺服器／Java EE 與目標 Spring Boot／JDK 的確切版本，再盤點 Stateless／Stateful／Singleton／MDB、JNDI、timer、interceptor、security、端點與平台 API。
+- 依 descriptor → method → class → 預設值的實際優先序，逐 business method 確認有效 CMT 屬性，再對應 Spring `@Transactional`、rollback、timeout 與測試。
+- 盤點 Stateful session、Singleton concurrency／lock、pooling、lifecycle callback、async 與 local／remote 呼叫語意，不得只處理可編譯的 annotation。
 - 將 XA、持久 timer、BMT 與無法直接等價的容器能力列為明確 human gate，不自行替團隊決策。
-- 規劃 characterization／Testcontainers 證據，並涵蓋 `javax`→`jakarta`、Hibernate 與 JDK 移除模組。""",
+- 規劃 characterization／真實整合環境證據；`javax`→`jakarta`、Hibernate 與 JDK 移除模組只依目標版本的官方相容資訊判定。""",
     },
     {
         "id": "jsp-react-migration",
         "label": "JSP → React 搬移",
         "category": "遷移",
-        "description": "把 JSP 頁面逐頁搬到 React，以完整盤點與三層機器驗證守住行為等價。",
+        "description": "把 JSP 頁面與其伺服器端互動逐頁搬到 React，以完整盤點及 repo 可用的多層驗證守住等價性。",
         "requirement_placeholder": "例：把舊系統指定目錄下全部 JSP 搬到 React，保持頁面與權限行為等價。",
-        "instructions": """- 每支 JSP 與共用 fragment 都要列入 inventory，包含 URL、include、taglib、scriptlet、JSTL、表單、session 與 i18n。
+        "instructions": """- 每支 JSP／fragment 及相鄰 controller、filter、custom tag、靜態資源、內嵌 Ajax、upload／download 都要列入 inventory，包含 URL、表單、session、權限與 i18n。
 - 逐頁整理輸入、輸出、驗證、錯誤訊息與跳轉；碰 DB／session 的邏輯移到後端 API，純呈現留前端。
-- 規劃 build、元件測試、Playwright e2e 三層機器驗證；視覺還原與真後端煙測列人工驗收。
+- 優先沿用目標 repo 的 build、元件與 e2e 測試棧；有穩定環境時自動化真後端 contract／smoke，否則才列 human gate，不得固定假設一定用 Playwright。
 - 每個盤點列必須能追到完成任務與測試證據，未列入 inventory 的頁面不得視為已搬完。""",
     },
     {
         "id": "db-migration",
         "label": "資料庫平台搬移",
         "category": "遷移",
-        "description": "把系統從一種資料庫搬到另一種（如 Oracle → MariaDB），以逐條 SQL 盤點守住行為等價。",
+        "description": "在明確的來源／目標版本下搬移 schema、資料、查詢與交易行為，以差異驗證及可演練的切換方案守住等價性。",
         "requirement_placeholder": "例：把訂單模組從 Oracle 搬到 MariaDB，SQL 與交易行為維持等價。",
-        "instructions": """- 盤點所有 SQL 使用點：ORM 對映、XML／annotation Mapper、native query、view、stored procedure、trigger、sequence 與排程 job，一條不漏。
-- 逐條標出方言差異：函式、分頁語法、日期／數值型別與隱式轉型、NULL 與空字串語意、大小寫與 collation、鎖與隔離等級行為。
-- 盤點 schema／DDL 對映（型別、索引、約束、預設值）與資料搬移、比對、回滾策略；無法自動驗證的資料正確性列人工驗收。
-- 規劃以真實目標資料庫（如 Testcontainers）執行的 characterization 測試：先釘住現有行為再切換，每個差異點都要有測試證據。""",
+        "instructions": """- 固定來源／目標資料庫、driver／ORM dialect 的確切版本，以及範圍、資料量、允許停機、RPO／RTO；缺少者列為會阻擋切換設計的待確認事項。
+- 盤點 repo 自有 SQL、ORM／Mapper、動態 SQL、DDL、view、procedure、trigger、sequence／identity、外部 job、連線池與交易設定；記錄搜尋方法，無法靜態枚舉者明列邊界。
+- 建立相容矩陣：型別／轉型、函式、分頁、日期時區、NULL／空字串、encoding／collation、識別碼大小寫、鎖、隔離與錯誤語意；repo 使用點與官方版本證據分開引用。
+- 規劃可重跑／續跑且有版本紀錄的 schema／資料搬移與切換演練；用筆數、checksum、業務 invariant、孤兒資料及 sequence 等機器比對，只有不可機器化的業務簽核才列人工驗收。
+- 同一套 characterization／contract 測試要分別在來源與目標資料庫執行並比較結果、副作用及關鍵 query plan／效能門檻。
+- 明列停止舊寫入、切換、驗證與回滾條件；切換後新寫入若讓回滾不再安全，必須標成 human gate，不得只寫 restore backup。""",
+    },
+    {
+        "id": "schema-data-rollout",
+        "label": "Schema／資料回填上線",
+        "category": "遷移",
+        "description": "在同一資料平台安全變更 schema 或回填資料，涵蓋混合版本相容窗、可續跑 backfill、切換與移除舊結構。",
+        "requirement_placeholder": "例：把 orders.status 由字串拆成 status code 與 history table，需不停機上線並回填既有資料。",
+        "instructions": """- 固定資料量、寫入速率、允許停機、部署拓撲與 rollback 窗口，定義變更前後 schema、資料 invariant 及舊／新應用混跑期間的不變條件。
+- 依 expand → migrate/backfill → switch reads/writes → contract 拆階段；只有證據顯示需要時才加入 dual-write／dual-read，並定義一致性與修復策略。
+- Backfill 必須可分批、冪等、可重跑／續跑、限流且可觀測；說明 checkpoint、失敗重試、線上寫入競態及鎖／交易邊界。
+- 每階段列出向前／向後相容驗證、筆數／checksum／業務 invariant 對帳、監控與停止條件；資料或 schema destructive step 必須晚於相容窗及人工確認 gate。
+- 回滾方案要區分程式 rollback 與資料 rollback；若新寫入無法無損轉回舊格式，明確標示 point of no return 與替代恢復方式。""",
     },
     {
         "id": "dependency-upgrade",
@@ -163,25 +220,92 @@ BUILTIN_PROMPT_TEMPLATES = [
         "category": "遷移",
         "description": "升級 JDK、框架或關鍵程式庫的大版本，把 breaking changes 展開成可枚舉、可驗證的搬移清單。",
         "requirement_placeholder": "例：把服務從 Spring Boot 2.7 升到 3.3（Java 17），列出全部 breaking changes 與修正任務。",
-        "instructions": """- 先確認目前與目標版本、傳遞依賴與相容矩陣；可取得官方 migration guide／changelog 時逐條對照，不可臆造變更項目。
-- 在 codebase 枚舉每個受影響 API、設定檔、annotation 與行為變更的實際使用點，附 `檔案:行號`；沒有使用點的變更明確標記為不適用。
-- 區分編譯期可攔截與執行期才爆發的變更（預設值、序列化、日期時區、反射、classpath）；後者必須各安排測試證據。
-- 規劃可分段驗證的升級順序（先測試骨架與相容層，再逐模組），每一步保持建置與測試全綠，無法直接等價的能力列為 human gate。""",
+        "instructions": """- 固定目前與目標的精確版本，包含 runtime／JDK、build tool／plugin、直接依賴、lockfile 與實際解析的傳遞依賴；限定本次範圍，避免順手升級無關套件。
+- 逐條對照適用版本的官方 migration guide／release notes／相容矩陣；外部變更附 URL、版本與章節，repo 使用點附 `檔案:行號`。
+- 找不到直接使用點時先標「未找到」；還要核對 autoconfiguration、傳遞啟用、設定／預設值、啟動 log 與整合測試，具備證據後才能判 N/A。
+- 區分編譯期、啟動期與特定流量才出現的差異，涵蓋序列化、日期時區、反射、classpath、資料格式與對外契約，逐項安排測試或 runtime smoke。
+- 依必須一起升級的相依群組切成連貫 checkpoint，每個 checkpoint 結束時 build／test／smoke 全綠；相容層只在確有跨版本共存需求時加入。
+- 每個 checkpoint 使用 repo 實際命令並列出回退方式；無法維持相容或不可逆的能力列為 human gate。""",
     },
     {
         "id": "k8s-deployment-config",
-        "label": "K8s 部署設置文件",
+        "label": "Kubernetes 部署設定",
         "category": "部署",
-        "description": "參考既有範本為來源專案完成 Kubernetes 部署設置，每個環境都能 build 出通過檢查的 YAML。",
+        "description": "依待部署服務的實際需求與參考專案慣例，建立可逐環境 render、schema 驗證且不含明文憑證的 Kubernetes 設定。",
         "requirement_placeholder": "例：參考 payment-service 的 Helm chart，為 order-service 完成 base／sit／prod 部署設置，需通過 helm lint 與 helm template。",
-        "instructions": """- 產出格式（pure YAML／Kustomize 或 Helm chart）必須由需求指定；未指定時列為待確認並分別列出兩種格式的影響，不得自行選定。
-- 盤點參考目標的完整結構：資源清單（Deployment、Service、Ingress、ConfigMap、Secret、HPA、PDB 等）、環境分層方式、命名與 label 慣例、image 與 tag 注入點。
-- 從來源專案讀出實際部署需求：埠號、健康檢查端點、資源限制、環境變數、掛載與依賴服務，證據附 `檔案:行號`；不得未經查證沿用參考專案的值。
-- 環境設置（base／dev／sit／prod 等）分開維護：共用部分進 base 或 chart 預設值，環境差異只進 overlay 或各環境 values，並逐環境列出差異項。
-- Secret 只留佔位或外部引用（如 ExternalSecret、SealedSecret、CSI），不得把真實憑證寫進 YAML；需要人工提供的值列為 human gate。
-- 機器 DoD：每個環境都能 build 且通過檢查——Kustomize 用 `kustomize build <overlay>`，Helm 用 `helm lint` 加 `helm template -f <環境 values>`；能取得 schema 時再加 kubeconform 之類的驗證。""",
+        "instructions": """- 明確區分待部署服務與參考專案，固定目標 Kubernetes／API 版本、namespace、環境清單、可用 CRD 與政策限制；服務值只從待部署服務取證，參考專案只提供結構慣例。
+- 產出格式依原始需求 → 待部署 repo 既有慣例 → 參考 repo 依序判定；仍衝突時比較 pure YAML、Kustomize、Helm 三種方案並列 human gate，不得自行選定。
+- 盤點 workload、Service、Ingress、ServiceAccount／RBAC、ConfigMap、Secret 外部引用、volume／PVC、HPA、PDB、NetworkPolicy、securityContext、probe、rollout、affinity／toleration 與 image 注入點；N/A 項附證據。
+- 從待部署服務確認 image、command／args、port、健康檢查、資源、環境變數、掛載與外部依賴，附 `檔案:行號`；不得複製參考服務的識別碼或專屬值。
+- 共用內容放 base／chart defaults，環境差異只放 overlay／values 並逐環境列出；Secret 僅用佔位或受控外部引用，不得輸出明文憑證。
+- 每個環境都以 repo 實際路徑驗證：pure YAML 做版本相符的 schema validation／dry-run；Kustomize 執行 `kustomize build <overlay-dir>` 後驗 schema；Helm 執行 `helm lint <chart-dir> -f <values-file>` 與 `helm template <release> <chart-dir> -f <values-file>` 後驗 schema。最終 DoD 不得保留 `<...>` 佔位符。""",
     },
 ]
+
+
+def _read_prompt_resource(filename):
+    """透過 importlib.resources 讀 package data，讓 wheel／editable install 使用同一路徑。"""
+    return (
+        resources.files("engine").joinpath("prompts").joinpath(filename)
+        .read_text(encoding="utf-8").strip()
+    )
+
+
+@lru_cache(maxsize=1)
+def prompt_template_bundle():
+    """載入 package 內的固定 prompt 資源；缺檔或 placeholder 漂移時整包 fail-closed。"""
+    bundle = {}
+    errors = []
+    for key, (filename, expected_counts, contract_last) in PROMPT_RESOURCE_SPECS.items():
+        try:
+            value = _read_prompt_resource(filename)
+        except (OSError, UnicodeError) as error:
+            errors.append(f"固定 Prompt 資源 {filename} 無法讀取：{error}")
+            continue
+        if not value:
+            errors.append(f"固定 Prompt 資源 {filename} 不可為空")
+            continue
+        if len(value) > MAX_PROMPT_RESOURCE_CHARS:
+            errors.append(
+                f"固定 Prompt 資源 {filename} 超過 {MAX_PROMPT_RESOURCE_CHARS} 字"
+            )
+            continue
+        valid_markers = PROMPT_PLACEHOLDER_RE.findall(value)
+        all_markers = PROMPT_MARKER_RE.findall(value)
+        malformed = (
+            len(all_markers) != len(valid_markers)
+            or value.count("<<") != len(all_markers)
+            or value.count(">>") != len(all_markers)
+        )
+        wrong_counts = {
+            placeholder: (expected, valid_markers.count(placeholder))
+            for placeholder, expected in expected_counts.items()
+            if valid_markers.count(placeholder) != expected
+        }
+        unknown = sorted(set(valid_markers) - set(expected_counts))
+        if malformed or wrong_counts or unknown:
+            details = []
+            if malformed:
+                details.append("含格式錯誤的 <<...>> marker")
+            if wrong_counts:
+                details.append(
+                    "次數錯誤 " + ", ".join(
+                        f"{placeholder} 應為 {expected}、實際 {actual}"
+                        for placeholder, (expected, actual) in sorted(wrong_counts.items())
+                    )
+                )
+            if unknown:
+                details.append(f"未知 {', '.join(unknown)}")
+            errors.append(f"固定 Prompt 資源 {filename} placeholder 不合法：{'；'.join(details)}")
+            continue
+        if contract_last and not value.endswith("<<MODE_CONTRACT>>"):
+            errors.append(f"固定 Prompt 資源 {filename} 必須以 <<MODE_CONTRACT>> 結尾")
+            continue
+        bundle[key] = value
+    if errors or len(bundle) != len(PROMPT_RESOURCE_SPECS):
+        return None, "；".join(errors) or "固定 Prompt 資源不完整"
+    bundle["schema_version"] = PROMPT_TEMPLATE_BUNDLE_SCHEMA_VERSION
+    return bundle, None
 
 
 def _read_text(item, key, index, warnings, *, required=False, maximum=400):

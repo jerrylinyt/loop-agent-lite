@@ -40,7 +40,7 @@ from urllib.parse import urlparse, parse_qs
 from engine import loop as loop_mod  # 共用 Workspace/fresh_state,匯入計畫時建 state 不自己發明 schema
 from engine.paths import (default_personal_config, default_workspace_root, expose_checkout_package,
                           legacy_config_path)
-from engine.prompt_templates import prompt_template_projection
+from engine.prompt_templates import prompt_template_bundle, prompt_template_projection
 from engine.work import validate_plan  # 計畫校驗單一來源(create-plan / 匯入共用)
 
 HERE = Path(__file__).resolve().parent
@@ -1153,6 +1153,7 @@ def config_projection(cfg):
     """移除後端內部設定，只投影 Launcher/設定頁需要的安全欄位。"""
     raw_paths, resolved_paths = configured_path_dirs(cfg)
     prompt_templates, prompt_template_warnings = prompt_template_projection(cfg)
+    prompt_bundle, prompt_bundle_error = prompt_template_bundle()
     return {"agent_cmds": cfg.get("agent_cmds", []),
             "validate_cmds": cfg.get("validate_cmds", []),
             "defaults": cfg.get("defaults") or {},
@@ -1166,6 +1167,8 @@ def config_projection(cfg):
             "repo_roots": cfg.get("repo_roots", DEFAULT_CONFIG["repo_roots"]),
             "repos": scan_repos(cfg),
             "prompt_templates": prompt_templates,
+            "prompt_template_bundle": prompt_bundle,
+            "prompt_template_bundle_error": prompt_bundle_error,
             "prompt_template_warnings": prompt_template_warnings}
 
 

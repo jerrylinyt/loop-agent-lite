@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from engine import dashboard as D
 from engine import prompt_templates as P
@@ -22,6 +23,74 @@ def team_template(template_id="team-flow", **overrides):
     return value
 
 
+class TestPromptTemplateResources(unittest.TestCase):
+    def tearDown(self):
+        P.prompt_template_bundle.cache_clear()
+
+    def test_packaged_bundle_is_versioned_complete_and_contract_last(self):
+        P.prompt_template_bundle.cache_clear()
+        bundle, error = P.prompt_template_bundle()
+        self.assertIsNone(error)
+        self.assertEqual(bundle["schema_version"], P.PROMPT_TEMPLATE_BUNDLE_SCHEMA_VERSION)
+        self.assertEqual(
+            set(bundle),
+            {
+                "schema_version", "base", "goal", "plan", "missing_requirement",
+                "default_context", "team_template_example",
+            },
+        )
+        self.assertTrue(bundle["base"].endswith("<<MODE_CONTRACT>>"))
+        self.assertIn("最終輸出契約：goal.md", bundle["goal"])
+        self.assertIn("最終輸出契約：plan.json", bundle["plan"])
+
+    def test_invalid_resource_makes_entire_bundle_unavailable(self):
+        originals = {
+            filename: P._read_prompt_resource(filename)
+            for filename, _, _ in P.PROMPT_RESOURCE_SPECS.values()
+        }
+        base_name = P.PROMPT_RESOURCE_SPECS["base"][0]
+        cases = {
+            "duplicate": (
+                {base_name: originals[base_name].replace(
+                    "<<OUTPUT_NAME>>", "<<OUTPUT_NAME>><<OUTPUT_NAME>>", 1
+                )},
+                "次數錯誤",
+            ),
+            "unknown": ({base_name: originals[base_name] + "\n<<UNKNOWN>>"}, "未知"),
+            "malformed": (
+                {base_name: originals[base_name].replace(
+                    "<<OUTPUT_NAME>>", "<<output_name>>", 1
+                )},
+                "marker",
+            ),
+            "contract-not-last": ({base_name: originals[base_name] + "\n後置文字"}, "結尾"),
+        }
+        for label, (overrides, expected) in cases.items():
+            with self.subTest(case=label), mock.patch.object(
+                P,
+                "_read_prompt_resource",
+                side_effect=lambda filename, values={**originals, **overrides}: values[filename],
+            ):
+                P.prompt_template_bundle.cache_clear()
+                bundle, error = P.prompt_template_bundle()
+                self.assertIsNone(bundle)
+                self.assertIn(expected, error)
+
+    def test_unreadable_resource_makes_entire_bundle_unavailable(self):
+        original = P._read_prompt_resource
+
+        def fail_plan(filename):
+            if filename == P.PROMPT_RESOURCE_SPECS["plan"][0]:
+                raise OSError("missing")
+            return original(filename)
+
+        with mock.patch.object(P, "_read_prompt_resource", side_effect=fail_plan):
+            P.prompt_template_bundle.cache_clear()
+            bundle, error = P.prompt_template_bundle()
+        self.assertIsNone(bundle)
+        self.assertIn("無法讀取", error)
+
+
 class TestPromptTemplateCatalog(unittest.TestCase):
     def test_builtin_catalog_contains_existing_and_analysis_templates(self):
         templates, warnings = P.prompt_template_projection({})
@@ -30,8 +99,34 @@ class TestPromptTemplateCatalog(unittest.TestCase):
         self.assertTrue({
             "java-generic", "ejb-springboot-migration", "jsp-react-migration",
             "project-logic-analysis", "code-logic-analysis",
+            "change-impact-analysis", "db-migration", "schema-data-rollout",
+            "dependency-upgrade", "k8s-deployment-config",
         }.issubset(ids))
         self.assertTrue(all(item["source"] == "builtin" for item in templates))
+
+    def test_builtin_catalog_has_unique_complete_prompt_guidance(self):
+        templates, warnings = P.prompt_template_projection({})
+        self.assertFalse(warnings)
+        ids = [item["id"] for item in templates]
+        self.assertEqual(len(ids), len(set(ids)))
+        for item in templates:
+            with self.subTest(template=item["id"]):
+                self.assertRegex(item["id"], P.TEMPLATE_ID_RE)
+                self.assertTrue(item["label"].strip())
+                self.assertTrue(item["category"].strip())
+                self.assertTrue(item["description"].strip())
+                self.assertTrue(item["requirement_placeholder"].strip())
+                self.assertGreaterEqual(item["instructions"].count("- "), 4)
+
+    def test_high_risk_migration_templates_require_versioned_evidence_and_real_validation(self):
+        catalog = {item["id"]: item for item in P.BUILTIN_PROMPT_TEMPLATES}
+        self.assertIn("來源／目標資料庫", catalog["db-migration"]["instructions"])
+        self.assertIn("分別在來源與目標資料庫執行", catalog["db-migration"]["instructions"])
+        self.assertIn("autoconfiguration", catalog["dependency-upgrade"]["instructions"])
+        self.assertIn("具備證據後才能判 N/A", catalog["dependency-upgrade"]["instructions"])
+        self.assertIn("pure YAML、Kustomize、Helm 三種", catalog["k8s-deployment-config"]["instructions"])
+        self.assertIn("helm lint <chart-dir> -f <values-file>", catalog["k8s-deployment-config"]["instructions"])
+        self.assertIn("helm template <release> <chart-dir> -f <values-file>", catalog["k8s-deployment-config"]["instructions"])
 
     def test_valid_team_template_is_appended_without_replacing_contracts(self):
         templates, warnings = P.prompt_template_projection({
@@ -73,6 +168,16 @@ class TestPromptTemplateCatalog(unittest.TestCase):
         })
         self.assertEqual(len(projected["prompt_templates"]), len(P.BUILTIN_PROMPT_TEMPLATES))
         self.assertTrue(projected["prompt_template_warnings"])
+        self.assertEqual(projected["prompt_template_bundle"]["schema_version"], 1)
+        self.assertIsNone(projected["prompt_template_bundle_error"])
+
+    def test_config_projection_keeps_dashboard_usable_when_fixed_bundle_fails(self):
+        with mock.patch.object(D, "prompt_template_bundle", return_value=(None, "resource broken")):
+            projected = D.config_projection({"repo_roots": []})
+        self.assertIsNone(projected["prompt_template_bundle"])
+        self.assertEqual(projected["prompt_template_bundle_error"], "resource broken")
+        self.assertEqual(len(projected["prompt_templates"]), len(P.BUILTIN_PROMPT_TEMPLATES))
+        self.assertIn("repos", projected)
 
 
 class TestTeamTemplateConfigBoundary(unittest.TestCase):

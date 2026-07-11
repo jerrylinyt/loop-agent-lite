@@ -223,6 +223,16 @@ export interface PromptTemplate {
   source: "builtin" | "team";
 }
 
+export interface PromptTemplateBundle {
+  schema_version: 1;
+  base: string;
+  goal: string;
+  plan: string;
+  missing_requirement: string;
+  default_context: string;
+  team_template_example: string;
+}
+
 export interface ConfigResponse {
   error?: string;
   agent_cmds: SelectCommand[];
@@ -238,6 +248,8 @@ export interface ConfigResponse {
   notify_cmd?: string;
   repo_roots?: string[];
   prompt_templates?: PromptTemplate[];
+  prompt_template_bundle?: PromptTemplateBundle | null;
+  prompt_template_bundle_error?: string | null;
   prompt_template_warnings?: string[];
 }
 

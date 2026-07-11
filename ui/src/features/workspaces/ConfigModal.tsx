@@ -42,7 +42,7 @@ export default function ConfigModal({
     validateGuard.cancelPending();
     setValidating(false);
     setValidateResult(null);
-  }, [draft.validate_cmd, draft.validate_timeout]);
+  }, [draft.validate_cmd, draft.validate_timeout, validateGuard]);
 
   const save = async () => {
     setMessage("儲存中…");

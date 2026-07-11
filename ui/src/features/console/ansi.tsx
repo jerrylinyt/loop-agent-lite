@@ -2,6 +2,7 @@
 import type { CSSProperties, ReactNode } from "react";
 
 // SGR(...m)拆出來著色;其他 CSI(游標移動/清行)與 OSC(改標題)序列直接剝除。
+// eslint-disable-next-line no-control-regex -- ANSI parser 必須明確比對 ESC 與 BEL 控制字元。
 const ANSI_RE = /\x1b(?:\[([0-9;]*)m|\[[0-9;?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\x1b\\)?)/g;
 
 const COLOR_NAMES = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"] as const;

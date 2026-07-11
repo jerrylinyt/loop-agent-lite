@@ -10,7 +10,7 @@ import NotifyModal from "./NotifyModal";
 import PromptTemplateModal from "./PromptTemplateModal";
 import RepoRootsModal from "./RepoRootsModal";
 import { validatePlan } from "./planValidation";
-import type { PromptTemplateMode } from "./promptTemplateBuilder";
+import { isPromptTemplateBundleSupported, type PromptTemplateMode } from "./promptTemplateBuilder";
 import LauncherJobs from "./LauncherJobs";
 
 interface RepoStatus { goal: "committed" | "modified" | "untracked" | "missing"; tree_clean: boolean; branch?: string; suggested_validate_cmd?: string | null; error?: string }
@@ -85,6 +85,11 @@ export default function LauncherModal({
 
   const repo = repoChoice === "__custom__" ? customRepo.trim() : repoChoice;
   const matchingWorkspace = useMemo(() => workspaces.find((workspace) => workspace.repo === repo), [repo, workspaces]);
+  const promptTemplateAvailable = !!config?.prompt_templates?.length
+    && isPromptTemplateBundleSupported(config.prompt_template_bundle);
+  const promptTemplateUnavailableReason = config?.prompt_templates?.length && !promptTemplateAvailable
+    ? config.prompt_template_bundle_error || "固定 Prompt 資源未載入或版本不相容，請重新啟動 Dashboard 後再試。"
+    : "";
 
   useEffect(() => {
     void getJson<ConfigResponse>("/api/config").then((response) => {
@@ -160,13 +165,13 @@ export default function LauncherModal({
     validateGuard.cancelPending();
     setValidating(false);
     setValidateResult(null);
-  }, [customValidate, repo, validateChoice, settings.validateTimeout]);
+  }, [customValidate, repo, settings.validateTimeout, validateChoice, validateGuard]);
 
   useEffect(() => {
     preflightGuard.cancelPending();
     setPreflighting(false);
     setPreflightResult(null);
-  }, [repo, name, validateChoice, settings.validateTimeout, goalFile, planJson, resetState, newBranch]);
+  }, [goalFile, name, newBranch, planJson, preflightGuard, repo, resetState, settings.validateTimeout, validateChoice]);
 
   const launch = async () => {
     // 前端先擋明顯格式錯誤以提供即時回饋；後端仍會重新校驗 plan、路徑、Git 與數值。
@@ -299,10 +304,11 @@ export default function LauncherModal({
             {repoStatus.error ? `❌ ${repoStatus.error}` : <>goal.md {repoMark(repoStatus.goal)} · 工作樹 {repoStatus.tree_clean ? "✅ 乾淨" : "❌ 髒（preflight 會擋）"}{matchingWorkspace && ` · workspace「${matchingWorkspace.name}」已存在`}</>}
           </div>}
           <div className="form-field">
-            <div className="field-label-row"><label htmlFor="goal-file">goal.md <span className="label-help">留空＝沿用 repo 已 commit 的版本</span></label><button type="button" className="text-button" disabled={!config?.prompt_templates?.length} onClick={() => setPromptTemplateMode("goal")}>產生 Goal Prompt</button></div>
+            <div className="field-label-row"><label htmlFor="goal-file">goal.md <span className="label-help">留空＝沿用 repo 已 commit 的版本</span></label><button type="button" className="text-button" title={promptTemplateUnavailableReason || undefined} disabled={!promptTemplateAvailable} onClick={() => setPromptTemplateMode("goal")}>產生 Goal Prompt</button></div>
             <input id="goal-file" type="file" accept=".md,.markdown,.txt" onChange={(event) => setGoalFile(event.target.files?.[0] ?? null)} />
           </div>
-          <PlanImportField value={planJson} onChange={setPlanJson} startPhase={startPhase} onStartPhaseChange={setStartPhase} onOpenPromptTemplate={() => setPromptTemplateMode("plan")} promptTemplateAvailable={!!config?.prompt_templates?.length} />
+          <PlanImportField value={planJson} onChange={setPlanJson} startPhase={startPhase} onStartPhaseChange={setStartPhase} onOpenPromptTemplate={() => setPromptTemplateMode("plan")} promptTemplateAvailable={promptTemplateAvailable} />
+          {promptTemplateUnavailableReason && <p className="field-error" role="alert">Prompt 模板停用：{promptTemplateUnavailableReason}</p>}
           <label>Workspace 名稱 <span className="label-help">留空＝repo 目錄名</span><input value={name} onChange={(event) => setName(event.target.value)} /></label>
           <div className="form-columns command-columns">
             <div className="form-field agent-command-field"><span className="field-label-row"><span>Agent 命令</span></span><div className="command-select-row"><select aria-label="Agent 命令" value={agentIndex} onChange={(event) => setAgentIndex(event.target.value)}>{(config?.agent_cmds ?? []).map((agent, index) => <option key={agent.cmd} value={index}>{agent.label} — {agent.cmd}</option>)}</select><button type="button" className="icon-button cli-gear-button" aria-label="管理 Agent CLI" disabled={!config || !repo || !!repoStatus?.error} onClick={() => setManagerModal("cli")}>⚙</button></div></div>
@@ -340,8 +346,9 @@ export default function LauncherModal({
         if (repo !== "" && next.repos.includes(repo)) return;
         setRepoChoice(next.repos[0] ?? "__custom__");
       }} />}
-      {promptTemplateMode && config?.prompt_templates?.length && <PromptTemplateModal
+      {promptTemplateMode && config?.prompt_templates?.length && isPromptTemplateBundleSupported(config.prompt_template_bundle) && <PromptTemplateModal
         templates={config.prompt_templates}
+        bundle={config.prompt_template_bundle}
         warnings={config.prompt_template_warnings}
         projectConfigPath={config.project_config_path}
         initialMode={promptTemplateMode}

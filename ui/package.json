@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
+    "lint": "eslint . --max-warnings 0",
     "check:offline": "node scripts/check-offline-assets.mjs",
-    "check": "npm run build && npm run check:offline",
+    "check": "npm run lint && npm run build && npm run check:offline",
     "test:e2e": "npm run build && playwright test",
     "test:e2e:headed": "npm run build && playwright test --headed",
     "check:all": "npm run check && playwright test"
@@ -17,10 +18,18 @@
     "react-dom": "^19.2.7"
   },
   "devDependencies": {
+    "@babel/core": "^7.29.7",
+    "@babel/eslint-parser": "^7.29.7",
+    "@babel/preset-typescript": "^7.29.7",
+    "@eslint/js": "^9.39.5",
     "@playwright/test": "^1.61.1",
-    "@vitejs/plugin-react": "^6.0.3",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.3",
+    "globals": "^17.7.0",
     "typescript": "^7.0.2",
     "vite": "^8.1.4"
   }

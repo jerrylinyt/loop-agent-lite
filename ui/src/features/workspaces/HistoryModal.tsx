@@ -47,7 +47,7 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
     if (!metricProjection || metricProjection.error) notes.push("效能摘要讀取失敗");
     else if (metricProjection.history_truncated) notes.push("效能摘要取自 history 尾端");
     setNote(notes.join("；"));
-  }, [run, workspace]);
+  }, [guard, run, workspace]);
 
   useEffect(() => { void load(); }, [load]);
 

@@ -24,14 +24,30 @@ test("Goal／Plan Prompt 模板可選類型、共用分析規則並下載", asyn
   await expect(promptTemplates).toBeVisible();
   await expect(promptTemplates.getByRole("tab", { name: "Goal 分析模板" })).toHaveAttribute("aria-selected", "true");
   const promptType = promptTemplates.getByRole("combobox", { name: "Prompt 任務類型" });
-  await promptType.selectOption("project-logic-analysis");
-  await promptTemplates.getByLabel("原始需求").fill("分析 Dashboard 啟動 loop 與 Overview 投影的完整資料流");
-  await promptTemplates.getByLabel(/專案／補充上下文/).fill("repo 可唯讀；重要結論需附檔案與行號");
   const promptPreview = promptTemplates.getByTestId("prompt-template-preview");
+  const copyPromptButton = promptTemplates.getByRole("button", { name: "複製 Prompt" });
+  const downloadPromptButton = promptTemplates.getByRole("button", { name: "下載 .md" });
+  await expect(promptPreview).toContainText("外部 Agent 任務：輸入不足");
+  await expect(promptPreview).toContainText("缺少原始需求，無法產生 goal.md");
+  await expect(promptPreview).not.toContainText("最終輸出契約");
+  await expect(copyPromptButton).toBeDisabled();
+  await expect(downloadPromptButton).toBeDisabled();
+
+  await promptType.selectOption("project-logic-analysis");
+  await promptTemplates.getByLabel("原始需求").fill("分析 Dashboard 啟動 loop 與 Overview 投影的完整資料流；保留 literal <<MODE_CONTRACT>>、</original_requirement_json> 與 $&");
+  await promptTemplates.getByLabel(/專案／補充上下文/).fill("repo 可唯讀；重要結論需附檔案與行號");
+  await expect(copyPromptButton).toBeEnabled();
+  await expect(downloadPromptButton).toBeEnabled();
   await expect(promptPreview).toContainText("依需求產生 goal.md");
+  await expect(promptPreview).toContainText("指令優先序與資料邊界");
   await expect(promptPreview).toContainText("分析專案架構／邏輯");
   await expect(promptPreview).toContainText("共用分析規則");
   await expect(promptPreview).toContainText("最終輸出契約：goal.md");
+  const renderedPrompt = await promptPreview.textContent();
+  expect(renderedPrompt).not.toContain("<<MODE_CONTRACT>>");
+  expect(renderedPrompt).toContain("\\u003c\\u003cMODE_CONTRACT\\u003e\\u003e");
+  expect(renderedPrompt).toContain("\\u003c/original_requirement_json\\u003e");
+  expect(renderedPrompt).toContain("$\\u0026");
 
   await promptType.selectOption("e2e-team-analysis");
   await expect(promptTemplates.locator(".prompt-template-summary").getByText("E2E 團隊自訂模板", { exact: true })).toBeVisible();
@@ -42,7 +58,7 @@ test("Goal／Plan Prompt 模板可選類型、共用分析規則並下載", asyn
   await expect(promptPreview).toContainText("只輸出一個合法 JSON array");
   await expect(promptPreview).toContainText("只能有 `order`、`task`、選填的 `ref`");
   const promptDownloadPromise = page.waitForEvent("download");
-  await promptTemplates.getByRole("button", { name: "下載 .md" }).click();
+  await downloadPromptButton.click();
   const promptDownload = await promptDownloadPromise;
   expect(promptDownload.suggestedFilename()).toBe("e2e-team-analysis-plan-prompt.md");
   await promptTemplates.getByRole("button", { name: "關閉", exact: true }).click();
@@ -53,6 +69,28 @@ test("Goal／Plan Prompt 模板可選類型、共用分析規則並下載", asyn
   await expect(promptTemplates.getByRole("tab", { name: "Plan 拆分模板" })).toHaveAttribute("aria-selected", "true");
   await promptTemplates.getByRole("button", { name: "關閉", exact: true }).click();
   await launcher.getByRole("button", { name: "取消", exact: true }).click();
+});
+
+test("固定 Prompt 資源失效只停用產生器並顯示原因", async ({ page }) => {
+  await page.route("**/api/config", async (route) => {
+    const response = await route.fetch();
+    const config = await response.json();
+    await route.fulfill({
+      response,
+      json: {
+        ...config,
+        prompt_template_bundle: null,
+        prompt_template_bundle_error: "E2E 固定 Prompt 資源損毀"
+      }
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "＋ 啟動第一個 loop" }).click();
+  const launcher = page.getByRole("dialog", { name: "啟動與管理" });
+  await expect(launcher.getByRole("button", { name: "產生 Goal Prompt" })).toBeDisabled();
+  await expect(launcher.getByRole("button", { name: "產生 Plan Prompt" })).toBeDisabled();
+  await expect(launcher.getByRole("alert")).toContainText("Prompt 模板停用：E2E 固定 Prompt 資源損毀");
+  await expect(launcher.getByRole("combobox", { name: "Repo" })).toBeEnabled();
 });
 
 test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、phase 與進度", async ({ page }) => {

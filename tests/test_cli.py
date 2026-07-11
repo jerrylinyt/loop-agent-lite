@@ -25,6 +25,12 @@ class TestInstalledCli(unittest.TestCase):
             "dashboard.config.shared.json",
             "prompts/plan.md",
             "prompts/exec.md",
+            "prompts/external-agent-base.md",
+            "prompts/external-agent-goal.md",
+            "prompts/external-agent-plan.md",
+            "prompts/external-agent-missing.md",
+            "prompts/external-agent-default-context.md",
+            "prompts/external-agent-team-template-example.md",
             "ui/index.html",
         ):
             with self.subTest(relative=relative):
