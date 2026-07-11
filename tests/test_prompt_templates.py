@@ -99,8 +99,8 @@ class TestPromptTemplateCatalog(unittest.TestCase):
         self.assertTrue({
             "java-generic", "ejb-springboot-migration", "jsp-react-migration",
             "project-logic-analysis", "code-logic-analysis",
-            "change-impact-analysis", "db-migration", "schema-data-rollout",
-            "dependency-upgrade", "k8s-deployment-config",
+            "change-impact-analysis", "db-migration", "oracle-mariadb-migration",
+            "schema-data-rollout", "dependency-upgrade", "k8s-deployment-config",
             "incident-root-cause", "security-scan-remediation",
         }.issubset(ids))
         self.assertTrue(all(item["source"] == "builtin" for item in templates))
@@ -123,6 +123,22 @@ class TestPromptTemplateCatalog(unittest.TestCase):
         catalog = {item["id"]: item for item in P.BUILTIN_PROMPT_TEMPLATES}
         self.assertIn("來源／目標資料庫", catalog["db-migration"]["instructions"])
         self.assertIn("分別在來源與目標資料庫執行", catalog["db-migration"]["instructions"])
+        self.assertIn("不得以「MySQL 相容」概括", catalog["oracle-mariadb-migration"]["instructions"])
+        self.assertIn("空字串與 NULL", catalog["oracle-mariadb-migration"]["instructions"])
+        self.assertIn(
+            "分別在 Oracle 與 MariaDB 執行", catalog["oracle-mariadb-migration"]["instructions"]
+        )
+        self.assertIn("CONNECT BY", catalog["oracle-mariadb-migration"]["instructions"])
+        self.assertIn(
+            "sequence.NEXTVAL／CURRVAL", catalog["oracle-mariadb-migration"]["instructions"]
+        )
+        self.assertIn("LAST_INSERT_ID()", catalog["oracle-mariadb-migration"]["instructions"])
+        self.assertIn(
+            "procedure／function／trigger／event", catalog["oracle-mariadb-migration"]["instructions"]
+        )
+        self.assertIn(
+            "human gate，不自行替團隊決策", catalog["oracle-mariadb-migration"]["instructions"]
+        )
         self.assertIn("autoconfiguration", catalog["dependency-upgrade"]["instructions"])
         self.assertIn("具備證據後才能判 N/A", catalog["dependency-upgrade"]["instructions"])
         self.assertIn("pure YAML、Kustomize、Helm 三種", catalog["k8s-deployment-config"]["instructions"])

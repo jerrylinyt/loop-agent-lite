@@ -227,6 +227,19 @@ BUILTIN_PROMPT_TEMPLATES = [
 - 明列停止舊寫入、切換、驗證與回滾條件；切換後新寫入若讓回滾不再安全，必須標成 human gate，不得只寫 restore backup。""",
     },
     {
+        "id": "oracle-mariadb-migration",
+        "label": "Oracle → MariaDB 搬移",
+        "category": "遷移",
+        "description": "把 Oracle 專屬 SQL、語意差異與 PL/SQL 展開成可枚舉的必查清單，以雙庫對照測試守住行為等價。",
+        "requirement_placeholder": "例：把帳務模組從 Oracle 19c 搬到 MariaDB 10.11，MyBatis XML 內全部 SQL 需行為等價。",
+        "instructions": """- 固定來源 Oracle 與目標 MariaDB 的確切版本及 driver／ORM dialect；等價物依 MariaDB 版本判定（如 SEQUENCE、window function、recursive CTE 支援度），不得以「MySQL 相容」概括，版本能力引官方文件證據。
+- 逐檔盤點 SQL 使用點（含 ORM／Mapper 動態 SQL、DDL、view、排程 job），對照 Oracle 專屬語法必查清單：DUAL、(+) 外連接、ROWNUM 分頁、CONNECT BY、MERGE、NVL／NVL2／DECODE、SYSDATE 與日期算術、TO_DATE／TO_CHAR 格式、sequence.NEXTVAL／CURRVAL 取號（對應 AUTO_INCREMENT／SEQUENCE 與 LAST_INSERT_ID()／ORM generated-key 取值路徑）、ROWID、隱含型別轉換；每個命中附 `檔案:行號` 與改寫方案，無法靜態枚舉的動態拼接明列邊界。
+- 語意差異逐項驗證而非假設：空字串與 NULL（Oracle 視為同一、MariaDB 區分）、預設交易隔離級別與鎖行為、識別碼大小寫與 collation、VARCHAR2 的 byte／char 長度語意、NUMBER 對 DECIMAL 精度、DATE 含時間成分的型別對應；受影響的讀寫路徑要有測試證據，不得只改到語法可執行。
+- PL/SQL（package、procedure、function、trigger、scheduler job）逐支判定改寫成對應的 MariaDB stored program（procedure／function／trigger／event）、搬到應用層或棄用；交易邊界與例外語意改寫後需測試證明，無法等價的能力（如 autonomous transaction）列 human gate，不自行替團隊決策。
+- 同一套 characterization 測試分別在 Oracle 與 MariaDB 執行並比對結果、副作用與錯誤語意，優先沿用 repo 既有測試棧的真實資料庫環境；資料搬移以筆數、checksum 與業務 invariant 對帳。
+- 明列停止舊寫入、驗證、切換與回滾條件；切換後新寫入若讓回滾不再安全，必須標成 human gate，不得只寫 restore backup。""",
+    },
+    {
         "id": "schema-data-rollout",
         "label": "Schema／資料回填上線",
         "category": "遷移",
