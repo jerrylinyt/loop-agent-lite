@@ -32,6 +32,7 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
   const moved = drafts.slice(lockedCount).filter((task, index) => task.order !== null && task.order !== lockedCount + index + 1);
   const changedText = drafts.filter((task) => task.order !== null && original[task.order - 1] &&
     (task.task !== original[task.order - 1].task || (task.ref ?? null) !== (original[task.order - 1].ref ?? null)));
+  const emptyTaskCount = drafts.filter((task) => !task.task.trim()).length;
   const dirty = JSON.stringify(drafts.map(({ order, task, ref }) => ({ order, task, ref: ref ?? null }))) !==
     JSON.stringify(original.map(({ order, task, ref }) => ({ order, task, ref: ref ?? null }))) || doneCount !== (state.done_count ?? 0);
   const canInsert = state.phase !== "done";
@@ -74,7 +75,7 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
   return <>
     <Modal title="Plan 編輯器" description={`plan v${state.plan_version} · 只有停止狀態下、尚未執行的任務可排序、刪除或插入`} onClose={requestClose} fullScreen footer={<>
       <button type="button" className="secondary-button" disabled={saving} onClick={requestClose}>取消</button>
-      <button type="button" className="primary-button" disabled={saving || !dirty} onClick={() => void save()}>{saving ? "儲存中…" : "💾 儲存變更"}</button>
+      <button type="button" className="primary-button" disabled={saving || !dirty || emptyTaskCount > 0} onClick={() => void save()}>{saving ? "儲存中…" : "💾 儲存變更"}</button>
       <span className="inline-message" role="status">{message}</span>
     </>}>
       <div className="plan-editor-layout">
@@ -91,9 +92,9 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
                 <button type="button" className="icon-button" aria-label={`下移 task-${index + 1}`} disabled={locked || index === drafts.length - 1} onClick={() => move(index, 1)}>↓</button>
                 <button type="button" className="danger-button compact-button" disabled={locked} onClick={() => remove(index)}>刪除</button>
               </span></header>
-              <label>任務內容<textarea rows={3} disabled={locked} value={task.task} onChange={(event) => update(index, { task: event.target.value })} /></label>
+              <label>任務內容<textarea rows={3} disabled={locked} aria-invalid={!task.task.trim()} value={task.task} onChange={(event) => update(index, { task: event.target.value })} /></label>
               <label>Ref（選填）<input disabled={locked} value={task.ref ?? ""} onChange={(event) => update(index, { ref: event.target.value })} /></label>
-              {canInsert && index >= lockedCount - 1 && <button type="button" className="insert-task-button" onClick={() => insertAfter(index)}>＋ 插入在此任務之後</button>}
+              {canInsert && index >= lockedCount - 1 && <button type="button" className="insert-task-button" aria-label={`插入在 task-${index + 1} 之後`} title={`插入在 task-${index + 1} 之後`} onClick={() => insertAfter(index)}>＋</button>}
             </div>;
           })}
           {draggingId && <div className={`plan-drop-tail${dropIndex === drafts.length ? " active" : ""}`}
@@ -105,6 +106,7 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
           <dl><div><dt>鎖定</dt><dd>{lockedCount} 項</dd></div><div><dt>新增</dt><dd>{inserted.length} 項</dd></div><div><dt>刪除</dt><dd>{deleted.length} 項</dd></div><div><dt>移動</dt><dd>{moved.length} 項</dd></div><div><dt>文字／Ref</dt><dd>{changedText.length} 項</dd></div></dl>
           {deleted.length > 0 && <div className="plan-editor-diff"><strong>將刪除</strong>{deleted.map((task) => <span key={task.order}>− task-{task.order}：{task.task}</span>)}</div>}
           {inserted.length > 0 && <div className="plan-editor-diff safe"><strong>將新增</strong>{inserted.map((task) => <span key={task.id}>＋ {task.task || "（尚未填寫）"}</span>)}</div>}
+          {emptyTaskCount > 0 && <p className="plan-editor-validation" role="alert">尚有 {emptyTaskCount} 項任務未填寫，完成前不可儲存。</p>}
           <label>done 計數<input type="number" min={0} value={doneCount} onChange={(event) => setDoneCount(+event.target.value)} /></label>
           <p>儲存後 pending tasks 會依畫面順序重新編號；歷史紀錄、完成 commit 與目前任務不改寫。</p>
         </aside>

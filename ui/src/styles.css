@@ -610,7 +610,10 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .plan-editor-task label { display: grid; grid-template-columns: 100px minmax(0, 1fr); align-items: start; gap: 8px; color: var(--muted); font-size: 12px; }
 .plan-editor-task textarea { min-height: 68px; resize: vertical; }
 .plan-editor-task textarea, .plan-editor-task input, .plan-editor-summary input { width: 100%; min-height: 32px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 13px; }
-.insert-task-button { justify-self: center; margin-bottom: -25px; z-index: 1; padding: 4px 10px; border: 1px dashed var(--accent); border-radius: 999px; background: var(--surface-raised); color: var(--accent); cursor: pointer; }
+.plan-editor-task textarea[aria-invalid="true"] { border-color: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
+.insert-task-button { display: inline-grid; z-index: 1; width: 28px; height: 28px; margin-bottom: -25px; justify-self: center; place-items: center; padding: 0; border: 1px solid var(--accent); border-radius: 50%; background: var(--surface-raised); color: var(--accent); font-size: 18px; line-height: 1; cursor: pointer; }
+.insert-task-button:hover { background: var(--accent-soft); }
+.plan-editor-validation { color: var(--danger) !important; font-weight: 650; }
 .plan-editor-summary { align-self: start; display: grid; gap: 12px; padding: 13px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-subtle); }
 .plan-editor-summary h3 { margin: 0; }
 .plan-editor-summary dl { display: grid; gap: 5px; margin: 0; }

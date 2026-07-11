@@ -440,7 +440,9 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page.getByRole("button", { name: "驗證 E2E 第二項功能" })).toBeVisible();
   await page.getByRole("button", { name: "✎ 編輯計畫" }).click();
   planEditor = page.getByRole("dialog", { name: "Plan 編輯器" });
-  await planEditor.locator(".plan-editor-task").first().getByRole("button", { name: "＋ 插入在此任務之後" }).click();
+  await planEditor.locator(".plan-editor-task").first().getByRole("button", { name: "插入在 task-1 之後" }).click();
+  await expect(planEditor.getByRole("button", { name: "💾 儲存變更" })).toBeDisabled();
+  await expect(planEditor.getByRole("alert")).toContainText("1 項任務未填寫");
   await planEditor.locator(".plan-editor-task").nth(1).getByLabel("任務內容").fill("插入的 E2E 任務");
   const originalPendingTask = planEditor.locator(".plan-editor-task", { hasText: "驗證 E2E 第二項功能" });
   const originalPendingBounds = await originalPendingTask.boundingBox();
