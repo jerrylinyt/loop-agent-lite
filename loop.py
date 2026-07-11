@@ -1496,6 +1496,148 @@ def write_run_report(repo: Path, workspace, state) -> Path:
     return report_path
 
 
+def process_plan_round(state, workspace, round_token: str, *, tampered, changed,
+                       agent_failed: bool, flag_threshold: int) -> str:
+    """套用規劃期訊號與共識規則，必要時切換到執行期，回傳本輪事件摘要。"""
+    event = ""
+    if workspace.signal("called_create_plan", round_token):
+        log("📨 Agent 指令｜create-plan（提交新計畫）")
+        state["flag"] = 0
+        pending = workspace.take_pending_plan(round_token)
+        if pending is not None:
+            state["plan"] = pending
+            state["plan_version"] += 1
+            event = f"📝 計畫已更新｜v{state['plan_version']}｜共 {len(pending)} 條任務"
+            log(event)
+        else:
+            event = "❌ create-plan 校驗未通過｜保留原計畫"
+            log(event)
+    elif tampered or changed or agent_failed:
+        state["flag"] = 0
+    elif workspace.signal("signal_plan_ok", round_token):
+        log("📨 Agent 指令｜plan-ok（確認目前計畫）")
+        if state["plan"]:
+            state["flag"] += 1
+            log(f"✅ 規劃共識累計｜flag={state['flag']}｜門檻 > {flag_threshold}")
+        else:
+            state["notes"].append("plan 仍為空,plan-ok 不計數。請先 create-plan。")
+            log("⚠️ plan-ok 未計數｜目前計畫為空，請先 create-plan")
+    elif not tampered:
+        log("ℹ️ Agent 本輪未送出 create-plan 或 plan-ok｜規劃共識不增加")
+
+    if state["flag"] > flag_threshold:
+        state["phase"] = "exec"
+        state["flag"] = 0
+        state["current_order"] = 1
+        state["done_count"] = 0
+        # 規劃期的停滯/紅燈計數不具執行期語意，不可帶入 reset 判斷。
+        state["stall_rounds"] = 0
+        state["red_streak"] = 0
+        state["goal_changed"] = False
+        state.pop("goal_previous_hash", None)
+        event = f"✅ 規劃收斂(plan v{state['plan_version']},{len(state['plan'])} 條)→ 執行期"
+        log(event)
+    return event
+
+
+def process_exec_round(state, workspace, round_token: str, *, task_id: str,
+                       round_number: int, repo: Path, protected, validate_cmd,
+                       args, head_after: str, dirty: bool, tampered, changed,
+                       agent_failed: bool):
+    """套用執行期 done/Validate/reset 狀態機，回傳事件摘要與驗證結果。"""
+    event = ""
+    done_signaled = workspace.signal("signal_done", round_token)
+    create_signaled = workspace.signal("called_create_plan", round_token)
+    log(f"📨 Agent 指令｜done {task_id}（回報任務完成）" if done_signaled
+        else f"ℹ️ Agent 本輪未送出 done {task_id}")
+    if create_signaled:
+        log("📨 Agent 指令｜create-plan｜執行期計畫已凍結，將忽略此指令")
+
+    log(f"🧪 執行驗證｜命令：{shlex.join(validate_cmd)}")
+    ok, tail, validate_timed_out = run_validate(validate_cmd, repo, args.validate_timeout)
+    validate_note = "PASS" if ok else "FAIL"
+    if ok:
+        log("✅ 驗證通過")
+        state["red_streak"] = 0
+        if not dirty:
+            state["last_green_sha"] = head_after
+    else:
+        timeout_note = f"｜逾時 {args.validate_timeout:g} 秒" if validate_timed_out else ""
+        log(f"❌ 驗證失敗{timeout_note}｜紅燈連續 {state['red_streak'] + 1} 輪")
+        if tail:
+            log(f"驗證錯誤尾段：\n{tail}")
+        state["red_streak"] += 1
+        state["done_count"] = 0
+        state["notes"].append(
+            f"❌ 上一輪結束後 `{' '.join(validate_cmd)}` 失敗。先判斷是前一個 commit 沒做好、"
+            f"還是前一個 agent 沒做完,把它修好讓驗證過了再繼續。輸出尾段:\n```\n{tail}\n```")
+    if create_signaled:
+        state["notes"].append("執行期計畫已凍結,create-plan 被忽略。任務本身有問題請在 log/commit 說明,交人處理。")
+    if tampered or changed or agent_failed or create_signaled:
+        state["done_count"] = 0
+        reason = ("本輪被判定作廢" if tampered else
+                  "Agent round 未正常結束" if agent_failed else
+                  "執行期誤打 create-plan，不能同時算完成票" if create_signaled else
+                  "偵測到程式碼或 commit 變更，等待下一輪確認")
+        log(f"↩️ done 共識歸零｜{reason}")
+    elif done_signaled and ok:
+        state["done_count"] += 1
+        log(f"✅ done 共識累計｜{state['done_count']} / {args.done_threshold}")
+
+    if state["done_count"] >= args.done_threshold:
+        state["completed"].append({"order": state["current_order"], "sha": head_after,
+                                   "round": round_number})
+        event = f"✅ {task_id} 完成(sha {head_after[:8]},{state['done_count']} 輪共識)"
+        log(event)
+        state["done_count"] = 0
+        next_order = next((task["order"] for task in state["plan"]
+                           if task["order"] > state["current_order"]), None)
+        if next_order is None:
+            state["phase"] = "done"
+            state["red_streak"] = 0
+            state["stall_rounds"] = 0
+        else:
+            state["current_order"] = next_order
+
+    reset_reason = ""
+    if state["phase"] == "exec":
+        if state["red_streak"] >= args.red_limit:
+            reset_reason = f"驗證連紅 {state['red_streak']} 輪"
+        elif state["stall_rounds"] >= args.stall_limit:
+            reset_reason = f"HEAD 停滯 {state['stall_rounds']} 輪"
+    if not reset_reason:
+        return event, validate_note
+
+    green = state["last_green_sha"]
+    git(repo, "reset", "--hard", green)
+    git(repo, "clean", "-fd")
+    workspace.restore_protected(repo, protected)
+    if head_sha(repo) != green or is_dirty(repo):
+        workspace.save_state(state)
+        notify(args.notify_cmd, "reset_broken", workspace.dir.name)
+        fail(f"reset 回綠點 {green[:8]} 後工作樹不符預期"
+             f"（HEAD={head_sha(repo)[:8]}、dirty={is_dirty(repo)}）——"
+             f"綠點錨定不可信，停機交由人員確認。詳見 {workspace.history}")
+    state["completed"] = [entry for entry in state["completed"]
+                          if is_ancestor(repo, entry["sha"], green)]
+    state["current_order"] = ((state["completed"][-1]["order"] + 1) if state["completed"] else
+                              (state["plan"][0]["order"] if state["plan"] else 1))
+    key = str(state["current_order"])
+    state["task_reset_counts"][key] = state["task_reset_counts"].get(key, 0) + 1
+    state["done_count"] = state["red_streak"] = state["stall_rounds"] = 0
+    event = (f"🔄 RESET({reset_reason})→ 回到綠點 {green[:8]},任務指標退回 "
+             f"task-{state['current_order']}(該任務第 {state['task_reset_counts'][key]} 次 reset)")
+    log(event)
+    state["notes"].append(f"🔄 迴圈已 reset --hard 回最後綠點 {green[:8]}({reset_reason})。"
+                          "之前未收斂的工作已捨棄,請照當前任務重做。")
+    if args.stuck_stop and state["task_reset_counts"][key] >= args.stuck_stop_count:
+        workspace.save_state(state)
+        notify(args.notify_cmd, "stuck_stop", workspace.dir.name)
+        fail(f"stuck-stop：task-{state['current_order']} 已 reset {state['task_reset_counts'][key]} 次，"
+             f"停機交由人員確認。詳見 {workspace.history}")
+    return event, validate_note
+
+
 def main():
     """解析 CLI、執行 preflight，然後進入規劃/執行雙階段 coordinator loop。"""
     options = parse_runtime_options()
@@ -1850,140 +1992,17 @@ def main():
         changed = dirty or (head_after != head_before)
         state["stall_rounds"] = 0 if head_after != head_before else state["stall_rounds"] + 1
 
-        event = ""
         if phase == "plan":
-            # create-plan 只要被 call(不論成敗)就歸零 —— fail-closed
-            if ws.signal("called_create_plan", round_token):
-                log("📨 Agent 指令｜create-plan（提交新計畫）")
-                state["flag"] = 0
-                pending = ws.take_pending_plan(round_token)
-                if pending is not None:
-                    state["plan"] = pending
-                    state["plan_version"] += 1
-                    event = f"📝 計畫已更新｜v{state['plan_version']}｜共 {len(pending)} 條任務"
-                    log(event)
-                else:
-                    event = "❌ create-plan 校驗未通過｜保留原計畫"
-                    log(event)
-            elif tampered or changed or agent_failed:
-                state["flag"] = 0
-            elif ws.signal("signal_plan_ok", round_token):
-                log("📨 Agent 指令｜plan-ok（確認目前計畫）")
-                if state["plan"]:
-                    state["flag"] += 1
-                    log(f"✅ 規劃共識累計｜flag={state['flag']}｜門檻 > {args.flag_threshold}")
-                else:
-                    state["notes"].append("plan 仍為空,plan-ok 不計數。請先 create-plan。")
-                    log("⚠️ plan-ok 未計數｜目前計畫為空，請先 create-plan")
-            elif not tampered:
-                log("ℹ️ Agent 本輪未送出 create-plan 或 plan-ok｜規劃共識不增加")
+            event = process_plan_round(
+                state, ws, round_token, tampered=tampered, changed=changed,
+                agent_failed=agent_failed, flag_threshold=args.flag_threshold)
             validate_note = "-"
-            if state["flag"] > args.flag_threshold:
-                state["phase"] = "exec"
-                state["flag"] = 0
-                state["current_order"] = 1
-                state["done_count"] = 0
-                # 規劃期 HEAD 幾乎不動,停滯/紅燈計數是髒的,不歸零會把殘值帶進執行期誤觸 reset
-                state["stall_rounds"] = 0
-                state["red_streak"] = 0
-                state["goal_changed"] = False  # 計畫已在(可能更新過的)goal 下重新收斂
-                state.pop("goal_previous_hash", None)
-                event = f"✅ 規劃收斂(plan v{state['plan_version']},{len(state['plan'])} 條)→ 執行期"
-                log(event)
         else:
-            if ws.signal("signal_done", round_token):
-                log(f"📨 Agent 指令｜done {task_id}（回報任務完成）")
-            else:
-                log(f"ℹ️ Agent 本輪未送出 done {task_id}")
-            if ws.signal("called_create_plan", round_token):
-                log("📨 Agent 指令｜create-plan｜執行期計畫已凍結，將忽略此指令")
-            log(f"🧪 執行驗證｜命令：{shlex.join(validate_cmd)}")
-            ok, vtail, validate_timed_out = run_validate(validate_cmd, repo, args.validate_timeout)
-            validate_note = "PASS" if ok else "FAIL"
-            if ok:
-                log("✅ 驗證通過")
-                state["red_streak"] = 0
-                if not dirty:
-                    state["last_green_sha"] = head_after
-            else:
-                timeout_note = f"｜逾時 {args.validate_timeout:g} 秒" if validate_timed_out else ""
-                log(f"❌ 驗證失敗{timeout_note}｜紅燈連續 {state['red_streak'] + 1} 輪")
-                if vtail:
-                    log(f"驗證錯誤尾段：\n{vtail}")
-                state["red_streak"] += 1
-                state["done_count"] = 0
-                state["notes"].append(
-                    f"❌ 上一輪結束後 `{' '.join(validate_cmd)}` 失敗。先判斷是前一個 commit 沒做好、"
-                    f"還是前一個 agent 沒做完,把它修好讓驗證過了再繼續。輸出尾段:\n```\n{vtail}\n```")
-            if ws.signal("called_create_plan", round_token):
-                state["notes"].append("執行期計畫已凍結,create-plan 被忽略。任務本身有問題請在 log/commit 說明,交人處理。")
-            if tampered or changed or agent_failed or ws.signal("called_create_plan", round_token):
-                state["done_count"] = 0
-                reason = ("本輪被判定作廢" if tampered else
-                          "Agent round 未正常結束" if agent_failed else
-                          "執行期誤打 create-plan，不能同時算完成票" if ws.signal("called_create_plan", round_token) else
-                          "偵測到程式碼或 commit 變更，等待下一輪確認")
-                log(f"↩️ done 共識歸零｜{reason}")
-            elif ws.signal("signal_done", round_token) and ok:
-                state["done_count"] += 1
-                log(f"✅ done 共識累計｜{state['done_count']} / {args.done_threshold}")
-
-            # ---- 任務完成判定 ----
-            if state["done_count"] >= args.done_threshold:
-                state["completed"].append({"order": state["current_order"], "sha": head_after, "round": rnd})
-                event = f"✅ {task_id} 完成(sha {head_after[:8]},{state['done_count']} 輪共識)"
-                log(event)
-                state["done_count"] = 0
-                nxt = next((t["order"] for t in state["plan"]
-                            if t["order"] > state["current_order"]), None)
-                if nxt is None:
-                    state["phase"] = "done"
-                    # 最後一個任務通常需要數輪無變更的 done 共識，stall_rounds
-                    # 會自然大於零；完成後清掉暫態健康計數，避免成功收斂被誤報。
-                    state["red_streak"] = 0
-                    state["stall_rounds"] = 0
-                else:
-                    state["current_order"] = nxt
-
-            # ---- reset 防線 ----
-            reset_reason = ""
-            if state["phase"] == "exec":
-                if state["red_streak"] >= args.red_limit:
-                    reset_reason = f"驗證連紅 {state['red_streak']} 輪"
-                elif state["stall_rounds"] >= args.stall_limit:
-                    reset_reason = f"HEAD 停滯 {state['stall_rounds']} 輪"
-            if reset_reason:
-                green = state["last_green_sha"]
-                git(repo, "reset", "--hard", green)
-                git(repo, "clean", "-fd")
-                ws.restore_protected(repo, protected)
-                # reset 後 post-condition(#1):必須回到乾淨綠點,否則綠點錨定不可信,不靠寫回
-                # 快照硬撐,fail-closed 停機交人。
-                if head_sha(repo) != green or is_dirty(repo):
-                    ws.save_state(state)
-                    notify(args.notify_cmd, "reset_broken", ws.dir.name)
-                    fail(f"reset 回綠點 {green[:8]} 後工作樹不符預期"
-                         f"（HEAD={head_sha(repo)[:8]}、dirty={is_dirty(repo)}）——"
-                         f"綠點錨定不可信，停機交由人員確認。詳見 {ws.history}")
-                # 依完成 sha 回退任務指標,不用一個一個退
-                state["completed"] = [e for e in state["completed"] if is_ancestor(repo, e["sha"], green)]
-                state["current_order"] = (state["completed"][-1]["order"] + 1) if state["completed"] else \
-                    (state["plan"][0]["order"] if state["plan"] else 1)
-                key = str(state["current_order"])
-                state["task_reset_counts"][key] = state["task_reset_counts"].get(key, 0) + 1
-                state["done_count"] = 0
-                state["red_streak"] = 0
-                state["stall_rounds"] = 0
-                event = (f"🔄 RESET({reset_reason})→ 回到綠點 {green[:8]},任務指標退回 "
-                         f"task-{state['current_order']}(該任務第 {state['task_reset_counts'][key]} 次 reset)")
-                log(event)
-                state["notes"].append(f"🔄 迴圈已 reset --hard 回最後綠點 {green[:8]}({reset_reason})。"
-                                      "之前未收斂的工作已捨棄,請照當前任務重做。")
-                if args.stuck_stop and state["task_reset_counts"][key] >= args.stuck_stop_count:
-                    ws.save_state(state)
-                    notify(args.notify_cmd, "stuck_stop", ws.dir.name)
-                    fail(f"stuck-stop：task-{state['current_order']} 已 reset {state['task_reset_counts'][key]} 次，"
-                         f"停機交由人員確認。詳見 {ws.history}")
+            event, validate_note = process_exec_round(
+                state, ws, round_token, task_id=task_id, round_number=rnd, repo=repo,
+                protected=protected, validate_cmd=validate_cmd, args=args,
+                head_after=head_after, dirty=dirty, tampered=tampered, changed=changed,
+                agent_failed=agent_failed)
 
         ingest_pending_issues(ws, state, round_token, rnd, task_id, phase)
 
