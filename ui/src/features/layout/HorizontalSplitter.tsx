@@ -1,13 +1,13 @@
 /** 水平分隔線：支援滑鼠拖曳與方向鍵微調，尺寸範圍由元件內限制避免面板消失。 */
-import { useRef } from "react";
+import usePointerDrag from "./usePointerDrag";
 
 export default function HorizontalSplitter({ onResize }: { onResize: (pixels: number) => void }) {
-  const dragging = useRef(false);
   const resize = (clientY: number) => {
     const minimum = 120;
     const maximum = Math.max(minimum, window.innerHeight - 280);
     onResize(Math.min(maximum, Math.max(minimum, window.innerHeight - clientY)));
   };
+  const dragHandlers = usePointerDrag("resizing-row", (event) => resize(event.clientY));
 
   return (
     <div
@@ -16,13 +16,7 @@ export default function HorizontalSplitter({ onResize }: { onResize: (pixels: nu
       aria-label="調整任務與狀態紀錄高度"
       aria-orientation="horizontal"
       tabIndex={0}
-      onPointerDown={(event) => {
-        dragging.current = true;
-        event.currentTarget.setPointerCapture(event.pointerId);
-        document.body.classList.add("resizing-row");
-      }}
-      onPointerMove={(event) => { if (dragging.current) resize(event.clientY); }}
-      onPointerUp={() => { dragging.current = false; document.body.classList.remove("resizing-row"); }}
+      {...dragHandlers}
       onKeyDown={(event) => {
         if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
         event.preventDefault();

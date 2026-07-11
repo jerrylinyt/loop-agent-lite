@@ -1,13 +1,13 @@
 /** 垂直分隔線：調整任務與 Agent console 寬度，並提供鍵盤等價操作。 */
-import { useRef } from "react";
+import usePointerDrag from "./usePointerDrag";
 
 export default function Splitter({ onResize }: { onResize: (pixels: number) => void }) {
-  const dragging = useRef(false);
   const resize = (clientX: number) => {
     const minimum = 400;
     const maximum = Math.max(minimum, window.innerWidth - 440);
     onResize(Math.min(maximum, Math.max(minimum, clientX)));
   };
+  const dragHandlers = usePointerDrag("resizing", (event) => resize(event.clientX));
   return (
     <div
       className="splitter"
@@ -15,13 +15,7 @@ export default function Splitter({ onResize }: { onResize: (pixels: number) => v
       aria-label="調整任務與 console 欄寬"
       aria-orientation="vertical"
       tabIndex={0}
-      onPointerDown={(event) => {
-        dragging.current = true;
-        event.currentTarget.setPointerCapture(event.pointerId);
-        document.body.classList.add("resizing");
-      }}
-      onPointerMove={(event) => { if (dragging.current) resize(event.clientX); }}
-      onPointerUp={() => { dragging.current = false; document.body.classList.remove("resizing"); }}
+      {...dragHandlers}
       onKeyDown={(event) => {
         if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
         event.preventDefault();
