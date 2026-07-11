@@ -8,6 +8,7 @@ import FleetOverview from "../features/workspaces/FleetOverview";
 import WorkspaceTabs from "../features/workspaces/WorkspaceTabs";
 import WorkspaceView from "../features/workspaces/WorkspaceView";
 import WorkspaceDoctorModal from "../features/workspaces/WorkspaceDoctorModal";
+import GlobalSearchModal from "../features/workspaces/GlobalSearchModal";
 import useDashboardData from "./useDashboardData";
 import useStatusFavicon from "./useStatusFavicon";
 
@@ -16,6 +17,7 @@ export default function App() {
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [archivesOpen, setArchivesOpen] = useState(false);
   const [doctorOpen, setDoctorOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [overviewOpen, setOverviewOpen] = useState(() => localStorage.getItem("fleet-overview") === "1");
   const [attentionRequest, setAttentionRequest] = useState(0);
   const [leftWidth, setLeftWidth] = useState(() => +(localStorage.getItem("left-pane-width") || Math.round(window.innerWidth * 0.44)));
@@ -67,6 +69,12 @@ export default function App() {
     setOverviewOpen(false);
     localStorage.setItem("fleet-overview", "0");
   };
+  const selectFromSearch = (name: string) => {
+    setSearchOpen(false);
+    dashboard.selectWorkspace(name);
+    setOverviewOpen(false);
+    localStorage.setItem("fleet-overview", "0");
+  };
   const showAttention = () => {
     localStorage.setItem("fleet-filter", "attention");
     localStorage.setItem("fleet-search", "");
@@ -89,6 +97,7 @@ export default function App() {
               <span aria-hidden="true">●</span>{healthText}{health.attention > 0 ? ` · ${health.attention}` : ""}
             </button>}
             <ThemePicker />
+            <button type="button" className="secondary-button" onClick={() => setSearchOpen(true)}>⌕ 全域搜尋</button>
             <button type="button" className="secondary-button" onClick={() => setDoctorOpen(true)}>🩺 問題中心</button>
             <button type="button" className={`secondary-button${overviewOpen ? " active-toggle" : ""}`} aria-pressed={overviewOpen} onClick={toggleOverview}>📺 總覽</button>
             <button type="button" className="secondary-button" onClick={() => setArchivesOpen(true)}>🗃 已封存</button>
@@ -120,6 +129,7 @@ export default function App() {
       {launcherOpen && <LauncherModal workspaces={dashboard.workspaces} onClose={() => setLauncherOpen(false)} onLaunched={launched} />}
       {archivesOpen && <ArchivesModal readonly={dashboard.bootstrap.readonly} onClose={() => setArchivesOpen(false)} onRestored={restored} />}
       {doctorOpen && <WorkspaceDoctorModal workspaces={dashboard.workspaces} onClose={() => setDoctorOpen(false)} onSelect={selectFromDoctor} />}
+      {searchOpen && <GlobalSearchModal onClose={() => setSearchOpen(false)} onSelect={selectFromSearch} />}
     </>
   );
 }
