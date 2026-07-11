@@ -522,3 +522,18 @@ tr.flash td { animation: flash 2.4s ease-out; }
 /* Health strip:紅連跳/停滯逼近 reset 防線時由綠轉紅 */
 .health-strip { height: 4px; margin: -10px -14px 8px; overflow: hidden; }
 .health-strip-fill { width: 100%; height: 100%; transition: background .5s, opacity .5s; }
+.doctor-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+.doctor-toolbar input { flex: 1; }
+.doctor-list { display: grid; gap: 14px; max-height: min(68vh, 760px); overflow: auto; padding-right: 4px; }
+.doctor-workspace { border: 1px solid var(--border); border-radius: 12px; background: var(--surface-subtle); overflow: hidden; }
+.doctor-workspace > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+.doctor-workspace > header > div { display: flex; align-items: center; gap: 10px; }
+.doctor-diagnostics { display: grid; gap: 8px; padding: 10px; }
+.doctor-diagnostic { border-left: 4px solid var(--muted); border-radius: 8px; background: var(--surface); padding: 10px 12px; }
+.doctor-diagnostic.error { border-left-color: var(--danger); }
+.doctor-diagnostic.warning { border-left-color: var(--warning); }
+.doctor-diagnostic.info { border-left-color: var(--accent); }
+.doctor-diagnostic > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.doctor-diagnostic > div span { color: var(--muted); font-size: 11px; }
+.doctor-diagnostic p { margin: 6px 0; }
+.doctor-diagnostic small { color: var(--muted); line-height: 1.5; }

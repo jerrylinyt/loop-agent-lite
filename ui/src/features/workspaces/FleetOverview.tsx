@@ -3,6 +3,7 @@ import type { FleetHistoryEntry, FleetRoundMetrics, WorkspaceSummary } from "../
 import AnomalyLogModal from "./AnomalyLogModal";
 import { deriveFleetEvents } from "./fleetEvents";
 import { deriveRoundTiming, useRoundNow } from "./roundTiming";
+import { workspaceNeedsAttention } from "./workspaceDiagnostics";
 
 const PHASE_NAMES: Record<string, string> = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
 type FleetFilter = "all" | "attention" | "running" | "done";
@@ -11,24 +12,6 @@ const FLEET_FILTERS: FleetFilter[] = ["all", "attention", "running", "done"];
 function initialFleetFilter(): FleetFilter {
   const saved = localStorage.getItem("fleet-filter") as FleetFilter | null;
   return saved && FLEET_FILTERS.includes(saved) ? saved : "all";
-}
-
-function needsAttention(workspace: WorkspaceSummary): boolean {
-  const completed = workspace.phase === "done";
-  return !!(
-    workspace.error ||
-    (workspace.unread_issues ?? workspace.issues ?? 0) > 0 ||
-    workspace.state_recovery_pending ||
-    workspace.goal_changed ||
-    workspace.stale_loop_pid ||
-    (!completed && (
-      (workspace.red_streak ?? 0) > 0 ||
-      (workspace.stall_rounds ?? 0) > 0 ||
-      (workspace.agent_failure_streak ?? 0) > 0 ||
-      workspace.last_round_timed_out ||
-      (workspace.state_recovery_count ?? 0) > 0
-    ))
-  );
 }
 
 function formatMetric(seconds: number | null): string {
@@ -94,9 +77,9 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
   const executing = workspaces.filter((workspace) => workspace.phase === "exec").length;
   const totalTasks = workspaces.reduce((sum, workspace) => sum + (workspace.plan_len ?? 0), 0);
   const doneTasks = workspaces.reduce((sum, workspace) => sum + (workspace.completed ?? 0), 0);
-  const alerts = workspaces.filter(needsAttention).length;
+  const alerts = workspaces.filter(workspaceNeedsAttention).length;
   const visibleWorkspaces = useMemo(() => {
-    let visible = filter === "attention" ? workspaces.filter(needsAttention)
+    let visible = filter === "attention" ? workspaces.filter(workspaceNeedsAttention)
       : filter === "running" ? workspaces.filter((workspace) => workspace.running)
         : filter === "done" ? workspaces.filter((workspace) => workspace.phase === "done")
           : workspaces;
@@ -161,7 +144,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
         <div className="fleet-grid">
           {visibleWorkspaces.map((workspace) => {
             const { done: cardDone, total, pct } = progress(workspace);
-            const alert = needsAttention(workspace);
+            const alert = workspaceNeedsAttention(workspace);
             const unreadIssues = workspace.unread_issues ?? workspace.issues ?? 0;
             const activity = currentActivity(workspace);
             const roundTiming = deriveRoundTiming(workspace, workspace.running, roundNow);
