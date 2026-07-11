@@ -3,7 +3,6 @@ import type { FleetHistoryEntry, FleetRoundMetrics, WorkspaceSummary } from "../
 import AnomalyLogModal from "./AnomalyLogModal";
 import { deriveFleetEvents } from "./fleetEvents";
 import { deriveRoundTiming, useRoundNow } from "./roundTiming";
-import { workspaceNeedsAttention } from "./workspaceDiagnostics";
 import { postJson } from "../../shared/api/client";
 import ActionDialog from "../../shared/components/ActionDialog";
 
@@ -20,6 +19,24 @@ interface SavedFleetView {
 }
 const FLEET_FILTERS: FleetFilter[] = ["all", "attention", "running", "done"];
 const FLEET_SORTS: FleetSort[] = ["name", "attention", "running", "progress"];
+
+function workspaceNeedsAttention(workspace: WorkspaceSummary): boolean {
+  const completed = workspace.phase === "done";
+  return !!(
+    workspace.error ||
+    (workspace.unread_issues ?? workspace.issues ?? 0) > 0 ||
+    workspace.state_recovery_pending ||
+    workspace.goal_changed ||
+    workspace.stale_loop_pid ||
+    (!completed && (
+      (workspace.red_streak ?? 0) > 0 ||
+      (workspace.stall_rounds ?? 0) > 0 ||
+      (workspace.agent_failure_streak ?? 0) > 0 ||
+      workspace.last_round_timed_out ||
+      (workspace.state_recovery_count ?? 0) > 0
+    ))
+  );
+}
 
 function initialFleetFilter(): FleetFilter {
   const saved = localStorage.getItem("fleet-filter") as FleetFilter | null;
