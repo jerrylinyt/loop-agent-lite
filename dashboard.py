@@ -535,6 +535,57 @@ def norm_cmd(s):
         return None
 
 
+def repo_file_status(repo: Path, relative_path: str) -> str:
+    """回傳 repo 檔案相對 HEAD 的狀態，供啟動器用一致語意顯示。"""
+    in_head = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", f"HEAD:{relative_path}"],
+        capture_output=True,
+    ).returncode == 0
+    dirty = bool(subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain", "--", relative_path],
+        capture_output=True,
+        text=True,
+    ).stdout.strip())
+    if in_head and not dirty:
+        return "committed"
+    if in_head:
+        return "modified"
+    return "untracked" if (repo / relative_path).exists() else "missing"
+
+
+def suggested_validate_command(repo: Path):
+    """依專案入口檔提供保守的預設驗證命令；無法辨識時交由使用者選擇。"""
+    if (repo / "pom.xml").is_file():
+        return "mvn -q compile"
+    if (repo / "package.json").is_file():
+        return "sh -c 'npm run build && npm test -- --run && npx playwright test'"
+    if (repo / "tests").is_dir():
+        return "python3 -m unittest discover -s tests -t . -q"
+    return None
+
+
+def repo_status_projection(repo: Path):
+    """集中組裝 repo 啟動前投影，避免 HTTP handler 同時負責 Git 細節與回應格式。"""
+    if not (repo / ".git").exists():
+        return {"error": f"{repo} 不是 git repo"}
+    clean = not subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    branch_result = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--show-current"],
+        capture_output=True,
+        text=True,
+    )
+    return {
+        "goal": repo_file_status(repo, "goal.md"),
+        "tree_clean": clean,
+        "branch": branch_result.stdout.strip() if branch_result.returncode == 0 else "",
+        "suggested_validate_cmd": suggested_validate_command(repo),
+    }
+
+
 def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout=120,
                reset=False, import_plan=None, start_phase="plan", notify_cmd="",
                red_limit=20, stall_limit=300, stuck_stop=False, stuck_count=100,
@@ -1531,39 +1582,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._out(200, json.dumps(job_startup_status(name, pid), ensure_ascii=False))
             elif u.path == "/api/repo-status":
                 repo = Path(q.get("repo", [""])[0]).expanduser()
-                if not (repo / ".git").exists():
-                    self._out(200, json.dumps({"error": f"{repo} 不是 git repo"}, ensure_ascii=False))
-                    return
-
-                def fstat(rel):
-                    """區分 repo 檔案已 commit、已修改、未追蹤或缺少。"""
-                    in_head = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"HEAD:{rel}"],
-                                             capture_output=True).returncode == 0
-                    dirty = bool(subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--", rel],
-                                                capture_output=True, text=True).stdout.strip())
-                    if in_head and not dirty:
-                        return "committed"
-                    if in_head:
-                        return "modified"
-                    return "untracked" if (repo / rel).exists() else "missing"
-
-                clean = not subprocess.run(["git", "-C", str(repo), "status", "--porcelain"],
-                                           capture_output=True, text=True).stdout.strip()
-                branch_result = subprocess.run(["git", "-C", str(repo), "branch", "--show-current"],
-                                               capture_output=True, text=True)
-                branch = branch_result.stdout.strip() if branch_result.returncode == 0 else ""
-                if (repo / "pom.xml").is_file():
-                    suggested_validate = "mvn -q compile"
-                elif (repo / "package.json").is_file():
-                    suggested_validate = "sh -c 'npm run build && npm test -- --run && npx playwright test'"
-                elif (repo / "tests").is_dir():
-                    suggested_validate = "python3 -m unittest discover -s tests -t . -q"
-                else:
-                    suggested_validate = None
-                self._out(200, json.dumps({"goal": fstat("goal.md"),
-                                           "tree_clean": clean,
-                                           "branch": branch,
-                                           "suggested_validate_cmd": suggested_validate}, ensure_ascii=False))
+                self._out(200, json.dumps(repo_status_projection(repo), ensure_ascii=False))
             elif u.path == "/api/state":
                 d = self._ws_dir(q)
                 if d is None:
