@@ -4,7 +4,7 @@ import CliManagerModal from "../cli/CliManagerModal";
 import Modal from "../../shared/components/Modal";
 import { getJson, postJson, waitForJobStartup } from "../../shared/api/client";
 import useStaleGuard from "../../shared/hooks/useStaleGuard";
-import type { ConfigResponse, StartupResponse, WorkspaceState, WorkspaceSummary } from "../../shared/api/types";
+import type { ConfigResponse, DashboardConfig, StartupResponse, WorkspaceState, WorkspaceSummary } from "../../shared/api/types";
 import PlanImportField from "./PlanImportField";
 import NotifyModal from "./NotifyModal";
 import PromptTemplateModal from "./PromptTemplateModal";
@@ -48,10 +48,13 @@ function ExecutionSettingsFields({ value, onChange }: {
 
 export default function LauncherModal({
   workspaces,
+  templateConfig,
   onClose,
   onLaunched
 }: {
   workspaces: WorkspaceSummary[];
+  /** 「以此為範本啟動」帶入的來源 workspace config；只預填表單，不影響既有驗證與啟動路徑。 */
+  templateConfig?: DashboardConfig | null;
   onClose: () => void;
   onLaunched: (name: string) => void;
 }) {
@@ -80,6 +83,7 @@ export default function LauncherModal({
   const [managerModal, setManagerModal] = useState<"cli" | "repoRoots" | "notify" | null>(null);
   const [promptTemplateMode, setPromptTemplateMode] = useState<PromptTemplateMode | null>(null);
   const hydratedRepo = useRef("");
+  const appliedTemplate = useRef(false);
   const validateGuard = useStaleGuard();
   const preflightGuard = useStaleGuard();
 
@@ -96,7 +100,8 @@ export default function LauncherModal({
       setConfig(response);
       if (!response) return setMessage("❌ 設定載入失敗");
       if (response.error) return setMessage(`❌ ${response.error}`);
-      setRepoChoice(response.repos[0] ?? "__custom__");
+      // 範本模式 fail-closed：repo 只由範本 hydration 決定；範本缺 repo 就留空，不落回預設 repo。
+      if (!templateConfig) setRepoChoice(response.repos[0] ?? "__custom__");
       setSettings({
         flagThreshold: response.defaults.flag_threshold ?? 10,
         doneThreshold: response.defaults.done_threshold ?? 3,
@@ -105,7 +110,48 @@ export default function LauncherModal({
         validateTimeout: response.defaults.validate_timeout ?? 120,
       });
     });
-  }, []);
+  }, [templateConfig]);
+
+  useEffect(() => {
+    // 以範本 workspace 的 config 預填欄位；只跑一次，workspace 名稱刻意留給使用者填新的。
+    if (!config || !templateConfig || appliedTemplate.current) return;
+    appliedTemplate.current = true;
+    const repoValue = (templateConfig.repo ?? "").trim();
+    if (repoValue) {
+      if (config.repos.includes(repoValue)) {
+        setRepoChoice(repoValue);
+        setCustomRepo("");
+      } else {
+        setRepoChoice("__custom__");
+        setCustomRepo(repoValue);
+      }
+    } else {
+      // fail-closed：範本缺 repo 就讓欄位留空給使用者自己填，不落回 /api/config 的預設 repo。
+      setRepoChoice("__custom__");
+      setCustomRepo("");
+    }
+    if (templateConfig.agent_cmd) {
+      const agentMatch = config.agent_cmds.findIndex((item) => item.cmd === templateConfig.agent_cmd);
+      if (agentMatch >= 0) setAgentIndex(String(agentMatch));
+    }
+    if (templateConfig.validate_cmd) {
+      const validateMatch = config.validate_cmds.findIndex((item) => item.cmd === templateConfig.validate_cmd);
+      if (validateMatch >= 0) {
+        setValidateChoice(String(validateMatch));
+        setCustomValidate("");
+      } else {
+        setValidateChoice("__custom__");
+        setCustomValidate(templateConfig.validate_cmd);
+      }
+    }
+    setSettings((value) => ({
+      flagThreshold: templateConfig.flag_threshold ?? value.flagThreshold,
+      doneThreshold: templateConfig.done_threshold ?? value.doneThreshold,
+      roundTimeout: templateConfig.round_timeout ?? value.roundTimeout,
+      agentBackoffMax: templateConfig.agent_backoff_max ?? value.agentBackoffMax,
+      validateTimeout: templateConfig.validate_timeout ?? value.validateTimeout,
+    }));
+  }, [config, templateConfig]);
 
   useEffect(() => {
     if (!repo) return setRepoStatus(null);
@@ -117,6 +163,9 @@ export default function LauncherModal({
   }, [repo]);
 
   useEffect(() => {
+    // 範本模式無條件停用自動回填：欄位一律以範本 config 為準（含使用者後續手動改動），
+    // 不讓同 repo 既有 workspace 的保存設定或 Validate 建議覆寫範本值。
+    if (templateConfig) return;
     if (!config || !repo || !repoStatus || hydratedRepo.current === repo) return;
     // 同 repo 已有 workspace 時以保存設定回填；否則只套用 repo 偵測出的 Validate 建議。
     // hydratedRepo 防止 SSE/狀態重繪覆蓋使用者正在修改的表單。
@@ -159,7 +208,7 @@ export default function LauncherModal({
       selectValidate(repoStatus.suggested_validate_cmd);
     })();
     return () => { active = false; };
-  }, [config, matchingWorkspace, repo, repoStatus]);
+  }, [config, matchingWorkspace, repo, repoStatus, templateConfig]);
 
   useEffect(() => {
     validateGuard.cancelPending();

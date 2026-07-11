@@ -2,7 +2,7 @@
 import { useState } from "react";
 import { postJson, waitForJobStartup } from "../../shared/api/client";
 import ActionDialog, { type ActionPreviewItem } from "../../shared/components/ActionDialog";
-import type { PlanEditTask, StartupResponse, WorkspaceState, WorkspaceSummary } from "../../shared/api/types";
+import type { DashboardConfig, PlanEditTask, StartupResponse, WorkspaceState, WorkspaceSummary } from "../../shared/api/types";
 import ConsolePane from "../console/ConsolePane";
 import HorizontalSplitter from "../layout/HorizontalSplitter";
 import ConfigModal from "./ConfigModal";
@@ -36,7 +36,8 @@ export default function WorkspaceView({
   consoleText,
   readonly,
   onRefresh,
-  onRefreshWorkspaces
+  onRefreshWorkspaces,
+  onLaunchFromTemplate
 }: {
   workspace?: WorkspaceSummary;
   state: WorkspaceState | null;
@@ -44,6 +45,8 @@ export default function WorkspaceView({
   readonly: boolean;
   onRefresh: () => void;
   onRefreshWorkspaces: () => void | Promise<void>;
+  /** 以目前 workspace 的 config 為範本開啟啟動表單；執行中／停止／完成都可當範本。 */
+  onLaunchFromTemplate: (config: DashboardConfig) => void;
 }) {
   // 這些 Modal 在操作流程上互斥；用 union 讓「同時開兩個」成為不可表示的狀態。
   const [activeModal, setActiveModal] = useState<WorkspaceModal | null>(null);
@@ -207,6 +210,7 @@ export default function WorkspaceView({
             {canChange && (state.phase === "exec" || state.phase === "done") && <button type="button" className="secondary-button" onClick={() => changePhase("plan")}>⏪ 回規劃期</button>}
             {canChange && <button type="button" className="secondary-button" onClick={() => setActiveModal("config")}>⚙ 設定</button>}
             {canChange && <button type="button" className="secondary-button" onClick={archiveWorkspace}>🗄 封存</button>}
+            <button type="button" className="secondary-button" disabled={!state.config} title={state.config ? "以這個 workspace 的設定預填啟動表單" : "state 缺少 config 區塊，無法以此為範本"} onClick={() => state.config && onLaunchFromTemplate(state.config)}>📋 以此為範本啟動</button>
           </div>}
         </div>
         <div className="workspace-status-row">

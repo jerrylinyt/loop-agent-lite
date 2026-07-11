@@ -116,7 +116,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
 
   await launcher.getByRole("button", { name: "管理 Agent CLI" }).click();
   let cliManager = page.getByRole("dialog", { name: "Agent CLI 管理" });
-  await cliManager.getByRole("button", { name: "執行測試" }).click();
+  await cliManager.getByRole("button", { name: "執行測試" }).first().click();
   const launchAgentCheck = page.getByRole("dialog", { name: "Agent CLI 執行確認" });
   await expect(launchAgentCheck.getByRole("status")).toContainText("E2E Agent CLI test result");
   await launchAgentCheck.getByRole("button", { name: "關閉", exact: true }).click();
@@ -144,6 +144,10 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await launcher.locator(".validate-command-field").getByRole("button", { name: "完整健檢" }).click();
   await expect(launcher.getByRole("status").filter({ hasText: "完整啟動前健檢通過" })).toBeVisible();
 
+  // 選第二個 Agent／Validate（index 1）啟動：讓稍後的範本預填斷言可與表單初始值（index 0）區分。
+  await launcher.getByRole("combobox", { name: "Agent 命令" }).selectOption("1");
+  await launcher.getByRole("combobox", { name: "Validate 命令" }).selectOption("1");
+
   const plan = launcher.getByLabel("匯入 plan.json 選填");
   await plan.fill("not-json");
   await expect(launcher.getByRole("alert")).toContainText("JSON 解析失敗");
@@ -157,9 +161,12 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
     buffer: Buffer.from("E2E goal imported through UI\n")
   });
   await launcher.getByText("進階設定").click();
-  await launcher.getByLabel("done 收斂（≥）").fill("999");
-  await launcher.getByLabel("單輪上限（分）").fill("1");
+  // 五個門檻全部改成與 fixture 預設（10/999/1/60/10）不同的值：範本預填斷言才不會撞上表單預設而假陽性。
+  await launcher.getByLabel("flag 收斂（>）").fill("12");
+  await launcher.getByLabel("done 收斂（≥）").fill("998");
+  await launcher.getByLabel("單輪上限（分）").fill("2");
   await launcher.getByLabel("Agent 異常退避上限（秒）").fill("5");
+  await launcher.getByLabel("Validate 上限（秒）").fill("11");
   await launcher.getByLabel("在新 branch 跑（loop/<workspace 名>）").check();
   const launchDiff = launcher.locator(".launch-diff");
   await expect(launchDiff).toContainText("執行前變更 Diff");
@@ -209,6 +216,41 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page).toHaveTitle(/^🟢 e2e-workspace · r\d+/);
   const faviconHref = await page.evaluate(() => document.querySelector('link[rel="icon"]')?.getAttribute("href") ?? "");
   expect(faviconHref.startsWith("data:image/png")).toBeTruthy();
+
+  // 以此為範本啟動：帶入這個（執行中）workspace 的 config；先等 Agent 欄位命中儲存值，代表 hydration 完成。
+  await page.getByRole("button", { name: "📋 以此為範本啟動" }).click();
+  const templateLauncher = page.getByRole("dialog", { name: "啟動與管理" });
+  await expect(templateLauncher).toBeVisible();
+  // Agent／Validate 都應命中儲存的第二個選項（index 1），與表單初始值（index 0）可區分。
+  await expect(templateLauncher.getByRole("combobox", { name: "Agent 命令" })).toHaveValue("1");
+  await expect(templateLauncher.getByRole("combobox", { name: "Validate 命令" })).toHaveValue("1");
+  // workspace 名稱刻意留空讓使用者填新的。
+  await expect(templateLauncher.getByLabel("Workspace 名稱 留空＝repo 目錄名")).toHaveValue("");
+  const templateRepoValue = await templateLauncher.getByRole("combobox", { name: "Repo" }).inputValue();
+  if (templateRepoValue === "__custom__") {
+    // state.config.repo 是 loop.py resolve() 過的絕對路徑；本機 /tmp 若走 symlink（如 macOS）
+    // 可能與 config.repos 掃到的未 resolve 字串不同，此時預填會落到手動輸入欄，仍指向同一個 repo。
+    await expect(templateLauncher.getByLabel("Repo 路徑")).toHaveValue(/\/demo-repo$/);
+  } else {
+    expect(templateRepoValue).toBe(originalRepo);
+  }
+  await templateLauncher.getByText("進階設定").click();
+  await expect(templateLauncher.getByLabel("flag 收斂（>）")).toHaveValue("12");
+  await expect(templateLauncher.getByLabel("done 收斂（≥）")).toHaveValue("998");
+  await expect(templateLauncher.getByLabel("單輪上限（分）")).toHaveValue("2");
+  await expect(templateLauncher.getByLabel("Agent 異常退避上限（秒）")).toHaveValue("5");
+  await expect(templateLauncher.getByLabel("Validate 上限（秒）")).toHaveValue("11");
+  await templateLauncher.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(templateLauncher).toBeHidden();
+
+  // 關閉後重開一般啟動表單：範本值不得殘留——repo 回到預設選項、不顯示範本落下的手動輸入欄。
+  await page.getByRole("button", { name: "＋ 啟動／管理" }).click();
+  const reopenedLauncher = page.getByRole("dialog", { name: "啟動與管理" });
+  await expect(reopenedLauncher).toBeVisible();
+  await expect(reopenedLauncher.getByRole("combobox", { name: "Repo" })).toHaveValue(originalRepo);
+  await expect(reopenedLauncher.getByLabel("Repo 路徑")).toHaveCount(0);
+  await reopenedLauncher.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(reopenedLauncher).toBeHidden();
 
   await page.getByRole("button", { name: "📺 總覽" }).click();
   const overview = page.getByRole("main", { name: "工作區總覽" });

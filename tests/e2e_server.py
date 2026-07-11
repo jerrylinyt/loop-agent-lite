@@ -73,8 +73,15 @@ def prepare_fixture():
     )
 
     config = {
-        "agent_cmds": [{"label": "fake agent", "cmd": shlex.join([sys.executable, str(fake_agent)])}],
-        "validate_cmds": [{"label": "always green", "cmd": "true"}],
+        # 各留兩個選項：讓 E2E 能以「非第一項」啟動，驗證範本預填不是表單初始值的假陽性。
+        "agent_cmds": [
+            {"label": "fake agent", "cmd": shlex.join([sys.executable, str(fake_agent)])},
+            {"label": "fake agent alt", "cmd": shlex.join([sys.executable, str(fake_agent), "--alt"])},
+        ],
+        "validate_cmds": [
+            {"label": "always green", "cmd": "true"},
+            {"label": "always green alt", "cmd": "sh -c true"},
+        ],
         "repo_roots": [str(repos)],
         "notify_cmd": "",
         "prompt_templates": [{

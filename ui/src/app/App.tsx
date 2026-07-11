@@ -13,10 +13,12 @@ import useDashboardData from "./useDashboardData";
 import useStatusFavicon from "./useStatusFavicon";
 import GettingStarted from "../features/launcher/GettingStarted";
 import useWorkspaceNavigation from "./useWorkspaceNavigation";
+import type { DashboardConfig } from "../shared/api/types";
 
 export default function App() {
   const dashboard = useDashboardData();
   const [launcherOpen, setLauncherOpen] = useState(false);
+  const [launcherTemplate, setLauncherTemplate] = useState<DashboardConfig | null>(null);
   const [archivesOpen, setArchivesOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [overviewOpen, setOverviewOpen] = useState(() => localStorage.getItem("fleet-overview") === "1");
@@ -37,8 +39,20 @@ export default function App() {
     setLeftWidth(pixels);
     localStorage.setItem("left-pane-width", String(pixels));
   };
-  const launched = (name: string) => {
+  const openLauncher = () => {
+    setLauncherTemplate(null);
+    setLauncherOpen(true);
+  };
+  const openLauncherFromTemplate = (config: DashboardConfig) => {
+    setLauncherTemplate(config);
+    setLauncherOpen(true);
+  };
+  const closeLauncher = () => {
     setLauncherOpen(false);
+    setLauncherTemplate(null);
+  };
+  const launched = (name: string) => {
+    closeLauncher();
     dashboard.selectWorkspace(name);
     void dashboard.refreshWorkspaces();
   };
@@ -80,7 +94,7 @@ export default function App() {
   const paletteCommands = useMemo(() => [
     { id: "overview", label: "開啟 Fleet 總覽", hint: "監控所有 workspace", run: () => { setOverviewOpen(true); localStorage.setItem("fleet-overview", "1"); } },
     { id: "archives", label: "查看已封存", hint: "還原或永久刪除", run: () => setArchivesOpen(true) },
-    ...(!dashboard.bootstrap.readonly ? [{ id: "launch", label: "啟動／管理", hint: "建立或重新啟動 loop", run: () => setLauncherOpen(true) }] : [])
+    ...(!dashboard.bootstrap.readonly ? [{ id: "launch", label: "啟動／管理", hint: "建立或重新啟動 loop", run: () => openLauncher() }] : [])
   ], [dashboard.bootstrap.readonly]);
 
   return (
@@ -101,7 +115,7 @@ export default function App() {
             <button type="button" className="secondary-button command-palette-trigger" aria-keyshortcuts="Meta+K Control+K" onClick={() => setPaletteOpen(true)}>⌘K</button>
             <button type="button" className={`secondary-button${overviewOpen ? " active-toggle" : ""}`} aria-pressed={overviewOpen} onClick={toggleOverview}>📺 總覽</button>
             <button type="button" className="secondary-button" onClick={() => setArchivesOpen(true)}>🗃 已封存</button>
-            {!dashboard.bootstrap.readonly && <button type="button" className="success-button" onClick={() => setLauncherOpen(true)}>＋ 啟動／管理</button>}
+            {!dashboard.bootstrap.readonly && <button type="button" className="success-button" onClick={() => openLauncher()}>＋ 啟動／管理</button>}
           </div>
         </header>
         {!dashboard.initialized ? (
@@ -114,21 +128,21 @@ export default function App() {
             <div className="empty-icon" aria-hidden="true">⌁</div>
             <h1>尚未建立 workspace</h1>
             <p>啟動第一個 loop 後，任務計畫、執行狀態與完整流程紀錄會顯示在這裡。</p>
-            {!dashboard.bootstrap.readonly && <button type="button" className="primary-button" onClick={() => setLauncherOpen(true)}>＋ 啟動第一個 loop</button>}
-            <GettingStarted readonly={dashboard.bootstrap.readonly} onLaunch={() => setLauncherOpen(true)} />
+            {!dashboard.bootstrap.readonly && <button type="button" className="primary-button" onClick={() => openLauncher()}>＋ 啟動第一個 loop</button>}
+            <GettingStarted readonly={dashboard.bootstrap.readonly} onLaunch={() => openLauncher()} />
           </main>
         ) : overviewOpen ? (
           <FleetOverview workspaces={dashboard.workspaces} fleetHistory={dashboard.fleetHistory} fleetMetrics={dashboard.fleetMetrics} attentionRequest={attentionRequest} readonly={dashboard.bootstrap.readonly} onSelect={selectFromOverview} onChanged={dashboard.refreshWorkspaces} />
         ) : (
           <main id="main-content" tabIndex={-1} className="dashboard-grid" style={{ gridTemplateColumns: `${leftWidth}px 6px ${rightCollapsed ? "42px" : "minmax(0, 1fr)"}` }}>
-            <WorkspaceView key={dashboard.selected} workspace={workspace} state={dashboard.state} consoleText={dashboard.consoleText} readonly={dashboard.bootstrap.readonly} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} />
+            <WorkspaceView key={dashboard.selected} workspace={workspace} state={dashboard.state} consoleText={dashboard.consoleText} readonly={dashboard.bootstrap.readonly} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} onLaunchFromTemplate={openLauncherFromTemplate} />
             <Splitter onResize={resize} />
             <ConsolePane text={dashboard.consoleText} round={dashboard.state?.round ?? 0} running={workspace?.running ?? false} hasWorkspace={!!dashboard.selected} collapsed={rightCollapsed} onToggleCollapse={toggleRight} />
           </main>
         )}
       </div>
       {navigationChord && <div className="navigation-chord" role="status">導覽：按 0 回總覽，1～5 切換 workspace</div>}
-      {launcherOpen && <LauncherModal workspaces={dashboard.workspaces} onClose={() => setLauncherOpen(false)} onLaunched={launched} />}
+      {launcherOpen && <LauncherModal workspaces={dashboard.workspaces} templateConfig={launcherTemplate} onClose={closeLauncher} onLaunched={launched} />}
       {archivesOpen && <ArchivesModal readonly={dashboard.bootstrap.readonly} onClose={() => setArchivesOpen(false)} onRestored={restored} />}
       {paletteOpen && <CommandPalette workspaces={dashboard.workspaces} commands={paletteCommands} onClose={() => setPaletteOpen(false)} onSelectWorkspace={(name) => { dashboard.selectWorkspace(name); setOverviewOpen(false); }} />}
     </>
