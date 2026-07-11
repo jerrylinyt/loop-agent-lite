@@ -15,6 +15,7 @@ import NotificationCenterModal, { notificationItems, readNotificationSeen } from
 import useDashboardData from "./useDashboardData";
 import useStatusFavicon from "./useStatusFavicon";
 import { updateUrlState, urlParam } from "../shared/urlState";
+import GettingStarted from "../features/launcher/GettingStarted";
 
 export default function App() {
   const dashboard = useDashboardData();
@@ -158,6 +159,7 @@ export default function App() {
             <h1>尚未建立 workspace</h1>
             <p>啟動第一個 loop 後，任務計畫、執行狀態與完整流程紀錄會顯示在這裡。</p>
             {!dashboard.bootstrap.readonly && <button type="button" className="primary-button" onClick={() => setLauncherOpen(true)}>＋ 啟動第一個 loop</button>}
+            <GettingStarted readonly={dashboard.bootstrap.readonly} onLaunch={() => setLauncherOpen(true)} />
           </main>
         ) : overviewOpen ? (
           <FleetOverview workspaces={dashboard.workspaces} fleetHistory={dashboard.fleetHistory} fleetMetrics={dashboard.fleetMetrics} attentionRequest={attentionRequest} readonly={dashboard.bootstrap.readonly} onSelect={selectFromOverview} onChanged={dashboard.refreshWorkspaces} />

@@ -631,3 +631,14 @@ tr.flash td { animation: flash 2.4s ease-out; }
   .health-strip-fill, .fleet-progress-fill { forced-color-adjust: none; background: Highlight !important; }
   .phase-badge, .chip, .notification-trigger b { border: 1px solid ButtonText; }
 }
+.getting-started { width: min(760px, calc(100vw - 40px)); margin-top: 20px; padding: 16px; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--surface-subtle); text-align: left; }
+.getting-started-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+.getting-started h2 { margin: 0 0 3px; font-size: 17px; }
+.getting-started p { margin: 0; color: var(--muted); }
+.getting-started ol { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 14px 0; padding: 0; list-style: none; }
+.getting-started li { display: flex; gap: 9px; padding: 10px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--surface); }
+.getting-started li > span { display: grid; flex: 0 0 25px; height: 25px; place-items: center; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-weight: 700; }
+.getting-started li p { margin-top: 4px; font-size: 11px; line-height: 1.45; }
+.getting-started summary { cursor: pointer; font-weight: 650; }
+.getting-started ul { margin-bottom: 0; color: var(--muted); }
+@media (max-width: 760px) { .getting-started ol { grid-template-columns: 1fr; } }
