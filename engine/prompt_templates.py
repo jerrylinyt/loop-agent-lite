@@ -48,7 +48,7 @@ BUILTIN_PROMPT_TEMPLATES = [
         "description": "把產品需求轉成有邊界、可驗證且能逐步交付的目標或任務。",
         "requirement_placeholder": "例：新增可依狀態篩選 workspace 的功能，並保留重新整理後的選擇。",
         "instructions": """- 先找出既有使用流程、相鄰功能、資料來源與可重用元件，不要另造平行架構。
-- 將驗收條件編成穩定 ID，明列使用者入口、正常流程、空狀態、錯誤狀態、權限或唯讀邊界及相容性影響。
+- 將驗收條件逐條編成穩定 ID（AC-1、AC-2…），明列使用者入口、正常流程、空狀態、錯誤狀態、權限或唯讀邊界及相容性影響。
 - 建立「驗收條件 → 適用層 → 驗證」對照；只列實際涉及的 UI、資料契約、持久化等層，不適用者以證據標 N/A。
 - 優先切出可獨立驗證的垂直功能片段，避免只按檔案或技術層拆任務。""",
     },
@@ -80,7 +80,7 @@ BUILTIN_PROMPT_TEMPLATES = [
         "category": "分析",
         "description": "先做全局模組地圖，再深追需求指定流程的依賴與狀態真相來源。",
         "requirement_placeholder": "例：分析整個專案如何從 Dashboard 啟動 loop，以及狀態如何回到 Overview。",
-        "instructions": """- 先界定要回答的架構問題、深追流程與排除項；repo-wide 部分只做淺層模組盤點，避免無界展開。
+        "instructions": """- 先界定要回答的架構問題、深追流程與排除項；repo-wide 部分只做淺層模組盤點（淺層＝僅模組清單、每模組一句責任與依賴方向，不深入函式層），避免無界展開。
 - 從目錄、建置檔、啟動入口與設定檔建立模組清單，說明每個模組責任及依賴方向。
 - 對需求指定流程追蹤入口 → 核心邏輯 → 持久化／外部程序 → 消費端投影，標出狀態真相來源。
 - 盤點跨模組契約、生命週期、錯誤處理、並行或鎖定邊界，以及測試覆蓋位置。
@@ -95,7 +95,7 @@ BUILTIN_PROMPT_TEMPLATES = [
         "instructions": """- 以檔案、完整符號／signature 或事件名稱鎖定目標，列出同名或 overload 歧義及選定依據。
 - 在需求範圍內同時追 inbound callers 與 outbound callees，整理輸入來源、轉換步驟、輸出與副作用。
 - 列出分支條件、預設值、例外路徑、早退、狀態變更、檔案／網路 I/O 與並行邊界。
-- 對每個重要結論附 `檔案:行號`；外部套件、generated code、reflection、事件訂閱或動態 dispatch 要標出停止邊界與未確認路徑。
+- 對每個結論附 `檔案:行號`，無法定位者標為待確認；外部套件、generated code、reflection、事件訂閱或動態 dispatch 要標出停止邊界與未確認路徑。
 - 說明既有測試如何覆蓋這條呼叫鏈，以及哪些邊界目前沒有證據。""",
     },
     {
@@ -134,7 +134,7 @@ BUILTIN_PROMPT_TEMPLATES = [
 - mock 資料策略集中管理：用 Playwright network interception（route／fulfill）或 repo 既有 mock server 固定 API 回應；mock 形狀必須以真實 API 契約為依據並附契約來源（型別定義、schema 或後端程式 `檔案:行號`），不得自創欄位。
 - 斷言使用者可見行為（文字、可及性角色、URL、可互動狀態）；selector 優先 role／label／testid，不綁 CSS 結構，不斷言元件內部 state 或實作細節。
 - 等待一律用 Playwright 自動等待與明確條件，禁止固定 sleep；時間、隨機與動畫來源在測試內固定；每條測試先確認會因對應行為破壞而變紅。
-- DoD：流程條目全數對應到測試與檔案位置，以 repo 實際 Playwright 命令全綠為準；mock 與真實契約的漂移風險明列，必要時規劃最小 smoke 對真後端驗證或列 human gate。""",
+- DoD：流程條目全數對應到測試與檔案位置，以 repo 實際 Playwright 命令全綠為準；mock 與真實契約的漂移風險明列，且逐項二選一：規劃最小 smoke 對真後端驗證，或在無法對真後端驗證時列 human gate，不得兩者皆無。""",
     },
     {
         "id": "characterization-test",
@@ -155,8 +155,14 @@ BUILTIN_PROMPT_TEMPLATES = [
         "category": "品質",
         "description": "把對外 API 的請求／回應契約（狀態碼、錯誤格式、欄位語意、相容規則）鎖成可重跑的測試，作為重構與遷移的等價防線。",
         "requirement_placeholder": "例：為訂單服務全部對外 REST API 補契約測試，鎖住狀態碼、統一錯誤格式與分頁行為，作為搬移到 Spring Boot 3 的等價基準。",
-        "instructions": """- 先盤點範圍內全部對外端點（路徑、方法、版本），逐端點枚舉成功、驗證失敗、授權失敗、資源不存在、衝突與伺服器錯誤的實際回應。契約權威性先判定：已有權威契約（OpenAPI、CDC 契約）時，實作與契約不一致即為測試失敗或明確的治理決策，需 fail／escalate 不得靜默放行；沒有權威契約時以實際行為為基準建立相容防線，文件與實際行為的不一致列為發現。
-- 逐端點鎖定請求側與回應側：請求側含接受的 Content-Type、path／query／header／body 的必填與選填參數、request body schema 與驗證語意；回應側含狀態碼、回應 schema（欄位名、型別、必填性、null 語意）、錯誤 body 格式與錯誤碼、預設值與分頁／排序行為、Content-Type 與編碼；repo 有統一回應包裝時其形狀在共用測試工具集中斷言，不在每條測試重複，沒有則以證據標 N/A。
+        "instructions": """- 先盤點範圍內全部對外端點（路徑、方法、版本），逐端點枚舉成功、驗證失敗、授權失敗、資源不存在、衝突與伺服器錯誤的實際回應。
+- 契約權威性先判定，逐項只有兩種情形：
+  - 已有權威契約（OpenAPI、CDC 契約）時，實作與契約不一致即為測試失敗或明確的治理決策，需 fail／escalate 不得靜默放行。
+  - 沒有權威契約時以實際行為為基準建立相容防線，文件與實際行為的不一致列為發現。
+- 逐端點鎖定請求側與回應側：
+  - 請求側含接受的 Content-Type、path／query／header／body 的必填與選填參數、request body schema 與驗證語意。
+  - 回應側含狀態碼、回應 schema（欄位名、型別、必填性、null 語意）、錯誤 body 格式與錯誤碼、預設值與分頁／排序行為、Content-Type 與編碼。
+  - repo 有統一回應包裝時其形狀在共用測試工具集中斷言，不在每條測試重複，沒有則以證據標 N/A。
 - 斷言「對外可觀察的形狀與語意」，不斷言內部實作；欄位比較用結構化比對並明列忽略欄位（時間戳、trace id 等），不得整包字串 snapshot，避免雜訊改動造成全紅。
 - 測試環境優先沿用 repo 既有整合測試棧（如 MockMvc／WebTestClient 或真實服務加真實資料庫）；依賴外部系統的端點以受控替身固定，替身形狀附真實契約來源，不得自創欄位。
 - 相容規則明確化：新增欄位是否破壞消費端、未知欄位如何處理、enum 擴充語意，逐項寫成測試或明列為未定義行為交人裁決；版本共存窗口的行為差異分開鎖定。
@@ -239,7 +245,7 @@ BUILTIN_PROMPT_TEMPLATES = [
         "instructions": """- 此模板只補充 Java 技術慣例；新功能、Bug、重構的行為分析仍依原始需求，不要把三者混成無界工作。
 - 逐條列出輸入 → 輸出／副作用與需求依據；重構先列不可變行為，Bug 在同一任務走 red → green。
 - 從 codebase 讀出實際分層、命名、Mapper／序列化、回應包裝與例外處理慣例；不存在的常見模式標 N/A，不要假設一定有 Mapper 或 ApiResponse。
-- 優先建立測試骨架；每個行為條目都要能對到任務與測試證據。
+- 測試骨架只有在可重用且本身能綠燈驗收時才獨立成前置任務（與固定契約一致），否則測試與實作放同一任務；每個行為條目都要能對到任務與測試證據。
 - 從 repo wrapper、multi-module 設定與 CI 判定實際 DoD（如 `./mvnw test` 或 `./gradlew test`）及執行目錄，不得預設 Maven。""",
     },
     {
@@ -285,7 +291,11 @@ BUILTIN_PROMPT_TEMPLATES = [
         "description": "把 Oracle 專屬 SQL、語意差異與 PL/SQL 展開成可枚舉的必查清單，以雙庫對照測試守住行為等價。",
         "requirement_placeholder": "例：把帳務模組從 Oracle 19c 搬到 MariaDB 10.11，MyBatis XML 內全部 SQL 需行為等價。",
         "instructions": """- 固定來源 Oracle 與目標 MariaDB 的確切版本及 driver／ORM dialect；等價物依 MariaDB 版本判定（如 SEQUENCE、window function、recursive CTE 支援度），不得以「MySQL 相容」概括，版本能力引官方文件證據。
-- 逐檔盤點 SQL 使用點（含 ORM／Mapper 動態 SQL、DDL、view、排程 job），對照 Oracle 專屬語法必查清單：DUAL、(+) 外連接、ROWNUM 分頁、CONNECT BY、MERGE、NVL／NVL2／DECODE、SYSDATE 與日期算術、TO_DATE／TO_CHAR 格式、sequence.NEXTVAL／CURRVAL 取號（對應 AUTO_INCREMENT／SEQUENCE 與 LAST_INSERT_ID()／ORM generated-key 取值路徑）、ROWID、隱含型別轉換；每個命中附 `檔案:行號` 與改寫方案，無法靜態枚舉的動態拼接明列邊界。
+- 逐檔盤點 SQL 使用點（含 ORM／Mapper 動態 SQL、DDL、view、排程 job），逐項對照 Oracle 專屬語法必查清單：
+  - 結構與語法：DUAL、(+) 外連接、ROWNUM 分頁、CONNECT BY、MERGE、ROWID、隱含型別轉換。
+  - 函式與日期：NVL／NVL2／DECODE、SYSDATE 與日期算術、TO_DATE／TO_CHAR 格式。
+  - 取號：sequence.NEXTVAL／CURRVAL，對應 AUTO_INCREMENT／SEQUENCE 與 LAST_INSERT_ID()／ORM generated-key 取值路徑。
+  - 清單每一項都要有結論：命中者附 `檔案:行號` 與改寫方案，未命中者附搜尋方法標 N/A；無法靜態枚舉的動態拼接明列邊界。
 - 語意差異逐項驗證而非假設：空字串與 NULL（Oracle 視為同一、MariaDB 區分）、預設交易隔離級別與鎖行為、識別碼大小寫與 collation、VARCHAR2 的 byte／char 長度語意、NUMBER 對 DECIMAL 精度、DATE 含時間成分的型別對應；受影響的讀寫路徑要有測試證據，不得只改到語法可執行。
 - PL/SQL（package、procedure、function、trigger、scheduler job）逐支判定改寫成對應的 MariaDB stored program（procedure／function／trigger／event）、搬到應用層或棄用；交易邊界與例外語意改寫後需測試證明，無法等價的能力（如 autonomous transaction）列 human gate，不自行替團隊決策。
 - 同一套 characterization 測試分別在 Oracle 與 MariaDB 執行並比對結果、副作用與錯誤語意，優先沿用 repo 既有測試棧的真實資料庫環境；資料搬移以筆數、checksum 與業務 invariant 對帳。
