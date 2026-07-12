@@ -103,6 +103,7 @@ class TestPromptTemplateCatalog(unittest.TestCase):
             "schema-data-rollout", "dependency-upgrade", "k8s-deployment-config",
             "incident-root-cause", "security-scan-remediation",
             "java-test-completion", "react-playwright-testing",
+            "characterization-test", "api-contract-testing",
         }.issubset(ids))
         self.assertTrue(all(item["source"] == "builtin" for item in templates))
 
@@ -150,6 +151,34 @@ class TestPromptTemplateCatalog(unittest.TestCase):
         self.assertIn("route／fulfill", catalog["react-playwright-testing"]["instructions"])
         self.assertIn("不得自創欄位", catalog["react-playwright-testing"]["instructions"])
         self.assertIn("禁止固定 sleep", catalog["react-playwright-testing"]["instructions"])
+        self.assertIn(
+            "只記錄現況、不判斷對錯", catalog["characterization-test"]["instructions"]
+        )
+        self.assertIn(
+            "疑似 bug 另列清單交人裁決", catalog["characterization-test"]["instructions"]
+        )
+        self.assertIn("不得順手修", catalog["characterization-test"]["instructions"])
+        self.assertIn(
+            "優先斷言輸出與持久化結果", catalog["characterization-test"]["instructions"]
+        )
+        self.assertIn(
+            "不斷言內部呼叫順序或私有狀態", catalog["characterization-test"]["instructions"]
+        )
+        self.assertIn(
+            "fail／escalate 不得靜默放行", catalog["api-contract-testing"]["instructions"]
+        )
+        self.assertIn("請求側與回應側", catalog["api-contract-testing"]["instructions"])
+        self.assertIn("結構化比對", catalog["api-contract-testing"]["instructions"])
+        self.assertIn(
+            "不得整包字串 snapshot", catalog["api-contract-testing"]["instructions"]
+        )
+        self.assertIn(
+            "新增欄位是否破壞消費端", catalog["api-contract-testing"]["instructions"]
+        )
+        self.assertIn("端點×情境矩陣", catalog["api-contract-testing"]["instructions"])
+        self.assertIn(
+            "沒有則以證據標 N/A", catalog["api-contract-testing"]["instructions"]
+        )
         self.assertIn("autoconfiguration", catalog["dependency-upgrade"]["instructions"])
         self.assertIn("具備證據後才能判 N/A", catalog["dependency-upgrade"]["instructions"])
         self.assertIn("pure YAML、Kustomize、Helm 三種", catalog["k8s-deployment-config"]["instructions"])
