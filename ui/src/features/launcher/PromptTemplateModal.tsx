@@ -9,10 +9,12 @@ import {
   type PromptTemplateMode
 } from "./promptTemplateBuilder";
 
-/** 範例預填值：拿掉「例：」前綴，因為預填內容會直接進入產生的 prompt。 */
+/** 範例預填值：只有「例：」開頭的 placeholder 才視為可預填的範例（去前綴，因為預填內容會
+ * 直接進入產生的 prompt）；「請貼上…」之類的指示語不是範例，回空字串、不預填。 */
 function placeholderSeed(item?: PromptTemplate): string {
   const text = item?.requirement_placeholder?.trim() ?? "";
-  return text.replace(/^例[:：]\s*/, "");
+  const match = /^例[:：]\s*/.exec(text);
+  return match ? text.slice(match[0].length) : "";
 }
 
 export default function PromptTemplateModal({
@@ -33,14 +35,16 @@ export default function PromptTemplateModal({
   const [mode, setMode] = useState<PromptTemplateMode>(initialMode);
   const [templateId, setTemplateId] = useState(templates[0]?.id ?? "");
   const [requirement, setRequirement] = useState(() => placeholderSeed(templates[0]));
+  // 只要使用者親手改過需求欄就不再被切換模板覆蓋；用旗標而非字串比較，避免「手動輸入剛好
+  // 等於範例文字」被誤判成未修改。
+  const [requirementTouched, setRequirementTouched] = useState(false);
   const [projectContext, setProjectContext] = useState("");
   const [message, setMessage] = useState("");
   const template = templates.find((item) => item.id === templateId) ?? templates[0];
 
   const selectTemplate = (id: string) => {
     const next = templates.find((item) => item.id === id);
-    // 使用者尚未輸入（空白）或內容仍是目前模板的預填範例時，跟著換成新模板的範例；改過就不覆蓋。
-    if (!requirement.trim() || requirement === placeholderSeed(template)) {
+    if (!requirement.trim() || !requirementTouched) {
       setRequirement(placeholderSeed(next));
     }
     setTemplateId(id);
@@ -58,6 +62,7 @@ export default function PromptTemplateModal({
     ? buildExternalAgentPrompt({ template, bundle, mode, requirement, projectContext })
     : "";
   const hasRequirement = !!requirement.trim();
+  const requirementIsUntouchedSeed = hasRequirement && !requirementTouched;
   const outputName = mode === "goal" ? "goal.md" : "plan.json";
 
   const copyPrompt = async () => {
@@ -80,7 +85,9 @@ export default function PromptTemplateModal({
       <button type="button" className="secondary-button" onClick={onClose}>關閉</button>
       <button type="button" className="secondary-button" disabled={!template || !hasRequirement || !prompt} onClick={() => void copyPrompt()}>複製 Prompt</button>
       <button type="button" className="primary-button" disabled={!template || !hasRequirement || !prompt} onClick={downloadPrompt}>下載 .md</button>
-      <span className="inline-message" role="status" aria-live="polite">{message}</span>
+      <span className="inline-message" role="status" aria-live="polite">
+        {message || (requirementIsUntouchedSeed ? "⚠ 需求仍是模板範例，下載前請改成實際需求" : "")}
+      </span>
     </>
   );
 
@@ -152,7 +159,7 @@ export default function PromptTemplateModal({
               rows={8}
               required
               value={requirement}
-              onChange={(event) => setRequirement(event.target.value)}
+              onChange={(event) => { setRequirement(event.target.value); setRequirementTouched(true); }}
               placeholder={template?.requirement_placeholder}
             />
           </label>

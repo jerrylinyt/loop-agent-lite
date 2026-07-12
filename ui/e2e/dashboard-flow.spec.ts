@@ -28,10 +28,11 @@ test("Goal／Plan Prompt 模板可選類型、共用分析規則並下載", asyn
   const copyPromptButton = promptTemplates.getByRole("button", { name: "複製 Prompt" });
   const downloadPromptButton = promptTemplates.getByRole("button", { name: "下載 .md" });
   const promptRequirement = promptTemplates.getByLabel("原始需求");
-  // 開啟即以第一個模板的範例預填（去掉「例：」前綴），預覽直接可用
+  // 開啟即以第一個模板的範例預填（去掉「例：」前綴），預覽直接可用，並提示仍是範例
   await expect(promptRequirement).toHaveValue(/^新增可依狀態篩選 workspace/);
   await expect(copyPromptButton).toBeEnabled();
   await expect(promptPreview).toContainText("最終輸出契約：goal.md");
+  await expect(promptTemplates.getByText("需求仍是模板範例", { exact: false })).toBeVisible();
   // 清空後仍維持輸入不足的 fail-closed 契約
   await promptRequirement.fill("");
   await expect(promptPreview).toContainText("外部 Agent 任務：輸入不足");
@@ -41,6 +42,13 @@ test("Goal／Plan Prompt 模板可選類型、共用分析規則並下載", asyn
   await expect(downloadPromptButton).toBeDisabled();
 
   // 空白狀態下切換模板 → 預填跟著換成新模板的範例
+  await promptType.selectOption("project-logic-analysis");
+  await expect(promptRequirement).toHaveValue(/^分析整個專案如何從 Dashboard 啟動 loop/);
+  // 無「例：」前綴的 placeholder 是指示語不是範例：blank 切換不預填，維持輸入不足
+  await promptRequirement.fill("");
+  await promptType.selectOption("e2e-team-analysis");
+  await expect(promptRequirement).toHaveValue("");
+  await expect(promptPreview).toContainText("外部 Agent 任務：輸入不足");
   await promptType.selectOption("project-logic-analysis");
   await expect(promptRequirement).toHaveValue(/^分析整個專案如何從 Dashboard 啟動 loop/);
   await promptTemplates.getByLabel("原始需求").fill("分析 Dashboard 啟動 loop 與 Overview 投影的完整資料流；保留 literal <<MODE_CONTRACT>>、</original_requirement_json> 與 $&");
