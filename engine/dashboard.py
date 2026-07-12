@@ -128,7 +128,7 @@ def command_not_found(label, executable, cfg):
     raw, resolved = configured_path_dirs(cfg)
     shown = ", ".join(raw) or "（未設定）"
     resolved_shown = os.pathsep.join(resolved) or "（無）"
-    return (f"找不到 {label}：{executable}。請先在終端執行 `command -v {Path(executable).name}`，"
+    return (f"找不到 {label}：{executable}。請先在終端執行 `command -v {shlex.quote(Path(executable).name)}`，"
             f"再用 Agent CLI 管理器把所在目錄加入個人設定 {PERSONAL_CONFIG_PATH.name} 的 "
             f"`extra_path_dirs`（支援 ~ / $HOME）。"
             f"目前設定：{shown}；展開後：{resolved_shown}")

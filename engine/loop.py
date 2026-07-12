@@ -1292,6 +1292,13 @@ def build_prompt(tpl_path, mapping):
     return text
 
 
+def fenced_block(text):
+    """以動態長度反引號圍欄包住不可信輸出；內容含 ``` 時圍欄不會被提前關閉。"""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}\n{text}\n{fence}"
+
+
 def agent_failure_backoff(streak, maximum_seconds) -> float:
     """CLI 連續異常的機械退避：1,2,4...秒並封頂；0 表示關閉。"""
     if streak <= 0 or maximum_seconds <= 0:
@@ -1449,7 +1456,7 @@ def establish_startup_green_anchor(repo: Path, workspace, state, protected,
         if tail:
             log(f"驗證錯誤尾段：\n{tail}")
         state["notes"].append(f"❌ 啟動時 `{shlex.join(validate_cmd)}` 就是紅的,"
-                              f"先把它修綠再繼續往下做。輸出尾段:\n```\n{tail}\n```")
+                              f"先把它修綠再繼續往下做。輸出尾段:\n{fenced_block(tail)}")
         return
 
     why = ("沒有綠點可錨定" if not green else
@@ -1581,7 +1588,7 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
         state["done_count"] = 0
         state["notes"].append(
             f"❌ 上一輪結束後 `{shlex.join(validate_cmd)}` 失敗。先判斷是前一個 commit 沒做好、"
-            f"還是前一個 agent 沒做完,把它修好讓驗證過了再繼續。輸出尾段:\n```\n{tail}\n```")
+            f"還是前一個 agent 沒做完,把它修好讓驗證過了再繼續。輸出尾段:\n{fenced_block(tail)}")
     if create_signaled:
         state["notes"].append("執行期計畫已凍結,create-plan 被忽略。任務本身有問題請在 log/commit 說明,交人處理。")
     if tampered or changed or agent_failed or create_signaled:
