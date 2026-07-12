@@ -9,6 +9,12 @@ import {
   type PromptTemplateMode
 } from "./promptTemplateBuilder";
 
+/** 範例預填值：拿掉「例：」前綴，因為預填內容會直接進入產生的 prompt。 */
+function placeholderSeed(item?: PromptTemplate): string {
+  const text = item?.requirement_placeholder?.trim() ?? "";
+  return text.replace(/^例[:：]\s*/, "");
+}
+
 export default function PromptTemplateModal({
   templates,
   bundle,
@@ -26,10 +32,19 @@ export default function PromptTemplateModal({
 }) {
   const [mode, setMode] = useState<PromptTemplateMode>(initialMode);
   const [templateId, setTemplateId] = useState(templates[0]?.id ?? "");
-  const [requirement, setRequirement] = useState("");
+  const [requirement, setRequirement] = useState(() => placeholderSeed(templates[0]));
   const [projectContext, setProjectContext] = useState("");
   const [message, setMessage] = useState("");
   const template = templates.find((item) => item.id === templateId) ?? templates[0];
+
+  const selectTemplate = (id: string) => {
+    const next = templates.find((item) => item.id === id);
+    // 使用者尚未輸入（空白）或內容仍是目前模板的預填範例時，跟著換成新模板的範例；改過就不覆蓋。
+    if (!requirement.trim() || requirement === placeholderSeed(template)) {
+      setRequirement(placeholderSeed(next));
+    }
+    setTemplateId(id);
+  };
   const groups = useMemo(() => {
     const grouped = new Map<string, PromptTemplate[]>();
     for (const item of templates) {
@@ -101,7 +116,7 @@ export default function PromptTemplateModal({
         </div>
         <label>
           任務類型
-          <select aria-label="Prompt 任務類型" value={template?.id ?? ""} onChange={(event) => setTemplateId(event.target.value)}>
+          <select aria-label="Prompt 任務類型" value={template?.id ?? ""} onChange={(event) => selectTemplate(event.target.value)}>
             {groups.map(([category, items]) => (
               <optgroup key={category} label={category}>
                 {items.map((item) => <option key={item.id} value={item.id}>{item.label}{item.source === "team" ? "（團隊）" : ""}</option>)}
@@ -131,7 +146,7 @@ export default function PromptTemplateModal({
           ) : <div className="loading-state error">沒有可用的 Prompt 模板</div>}
 
           <label htmlFor="prompt-requirement">
-            原始需求 <span className="label-help">必填；範例不會自動當成需求</span>
+            原始需求 <span className="label-help">必填；已預填範例，請改成實際需求再產生</span>
             <textarea
               id="prompt-requirement"
               rows={8}
