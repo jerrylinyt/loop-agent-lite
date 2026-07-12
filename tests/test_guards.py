@@ -692,6 +692,143 @@ class TestAbnormalRoundVoided(unittest.TestCase):
             self.assertIn("coordinator 訊號已全部作廢", result.stdout)
 
 
+class TestPauseAfterPlan(unittest.TestCase):
+    """規劃收斂後暫停:loop 停在執行期起點,人工按「▶ 運行」才開始執行輪。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_loop_pauses_at_exec_start_and_resumes_into_exec(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            plan = root / "plan.json"
+            plan.write_text('[{"order": 1, "task": "only task"}]')
+            agent = root / "agent.py"
+            agent.write_text(
+                "import os, subprocess, sys\n"
+                "sys.stdin.read()\n"
+                "subprocess.run([sys.executable, '-m', 'engine.work', 'plan-ok'], env=dict(os.environ))\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+
+            converged = subprocess.run(
+                [*LOOP_CMD, "--repo", str(repo), "--name", "pause-after-plan",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--import-plan", str(plan),
+                 "--start-phase", "plan", "--flag-threshold", "1",
+                 "--pause-after-plan", "--max-rounds", "10"],
+                capture_output=True, text=True, env=env,
+            )
+
+            self.assertEqual(converged.returncode, 0, converged.stdout + converged.stderr)
+            state_path = workspace_root / "pause-after-plan" / "state.json"
+            state = json.loads(state_path.read_text())
+            self.assertEqual(state["phase"], "exec", "收斂後 state 應停在執行期起點")
+            self.assertEqual(state["current_order"], 1)
+            self.assertEqual(state["round"], 2, "收斂輪之後不得再啟動執行輪")
+            self.assertIsNone(state["loop"]["pid"])
+            self.assertTrue(state["config"]["pause_after_plan"])
+            self.assertIn("規劃已收斂", converged.stdout)
+            self.assertIn("依「規劃後暫停」設定停止", converged.stdout)
+
+            # ▶ 運行等價:同 workspace 續跑(api_run 會再帶同一 flag),必須直接進執行輪,不得再次暫停。
+            resumed = subprocess.run(
+                [*LOOP_CMD, "--repo", str(repo), "--name", "pause-after-plan",
+                 "--agent-cmd", "true", "--validate-cmd", "true",
+                 "--pause-after-plan", "--max-rounds", "3"],
+                capture_output=True, text=True, env=env,
+            )
+
+            self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+            state = json.loads(state_path.read_text())
+            self.assertEqual(state["phase"], "exec")
+            self.assertEqual(state["round"], 3, "續跑必須實際執行執行輪")
+            self.assertIn("階段：執行期", resumed.stdout)
+            self.assertNotIn("依「規劃後暫停」設定停止", resumed.stdout)
+
+    def test_dashboard_launch_run_and_edit_config_propagate_pause_flag(self):
+        self.assertFalse(D.DEFAULT_CONFIG["defaults"]["pause_after_plan"])
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            config = {
+                "agent_cmds": [{"label": "true", "cmd": "true"}],
+                "validate_cmds": [{"label": "true", "cmd": "true"}],
+                "extra_path_dirs": [], "notify_cmd": "",
+                "defaults": {"pause_after_plan": True},
+            }
+            captured = {}
+
+            def fake_spawn(name, *args, **kwargs):
+                captured.clear()
+                captured.update(kwargs, name=name)
+
+                class FakePopen:
+                    pid = 4321
+                return FakePopen()
+
+            old_values = D.ROOT, L.WORKSPACE_ROOT, D.load_config, D.spawn_loop
+            D.ROOT, L.WORKSPACE_ROOT = workspace_root, workspace_root
+            D.load_config = lambda: config
+            D.spawn_loop = fake_spawn
+            try:
+                # launch:表單值優先於團隊 defaults
+                handler = self.ResponseCapture()
+                D.Handler.api_launch(handler, {
+                    "repo": str(repo), "name": "pause-flag", "agent_idx": 0,
+                    "validate_idx": 0, "pause_after_plan": False,
+                })
+                self.assertEqual(handler.response[0], 200, handler.response)
+                self.assertFalse(captured["pause_after_plan"])
+                # launch:表單未指定時落回團隊 defaults
+                handler = self.ResponseCapture()
+                D.Handler.api_launch(handler, {
+                    "repo": str(repo), "name": "pause-flag", "agent_idx": 0,
+                    "validate_idx": 0,
+                })
+                self.assertEqual(handler.response[0], 200, handler.response)
+                self.assertTrue(captured["pause_after_plan"])
+
+                # run:從 state.config 帶回同一開關
+                ws = L.Workspace("pause-flag")
+                state = ws.fresh_state()
+                state["config"] = {
+                    "repo": str(repo), "agent_cmd": "true", "validate_cmd": "true",
+                    "pause_after_plan": True,
+                }
+                ws.save_state(state)
+                handler = self.ResponseCapture()
+                D.Handler.api_run(handler, {"name": "pause-flag"})
+                self.assertEqual(handler.response[0], 200, handler.response)
+                self.assertTrue(captured["pause_after_plan"])
+
+                # edit-config:停止狀態可切換,下一次運行生效
+                handler = self.ResponseCapture()
+                D.Handler.api_edit_config(handler, {
+                    "name": "pause-flag", "pause_after_plan": False,
+                })
+                self.assertEqual(handler.response[0], 200, handler.response)
+                self.assertIn("pause_after_plan=off", handler.response[1]["changed"])
+                saved = json.loads(ws.state_path.read_text(encoding="utf-8"))
+                self.assertFalse(saved["config"]["pause_after_plan"])
+                handler = self.ResponseCapture()
+                D.Handler.api_run(handler, {"name": "pause-flag"})
+                self.assertEqual(handler.response[0], 200, handler.response)
+                self.assertFalse(captured["pause_after_plan"])
+            finally:
+                D.JOBS.pop("pause-flag", None)
+                D.ROOT, L.WORKSPACE_ROOT, D.load_config, D.spawn_loop = old_values
+
+
 class TestAgentFailureBackoff(unittest.TestCase):
     """Agent CLI 秒退時要節流；成功後 failure streak 立即復原。"""
 

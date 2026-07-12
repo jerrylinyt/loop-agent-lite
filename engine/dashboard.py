@@ -81,6 +81,7 @@ DEFAULT_CONFIG = {
         "flag_threshold": 10, "done_threshold": 3, "round_timeout": 30, "agent_backoff_max": 60,
         "validate_timeout": 120,
         "red_limit": 20, "stall_limit": 300, "stuck_stop": False, "stuck_stop_count": 100,
+        "pause_after_plan": False,
     },
 }
 
@@ -591,7 +592,7 @@ def repo_status_projection(repo: Path):
 def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout=120,
                reset=False, import_plan=None, start_phase="plan", notify_cmd="",
                red_limit=20, stall_limit=300, stuck_stop=False, stuck_count=100,
-               agent_backoff_max=60, env=None):
+               agent_backoff_max=60, pause_after_plan=False, env=None):
     """spawn loop.py 並登記進 JOBS(呼叫方需持 JOBS_LOCK)。"""
     loop_mod.require_workspace_name(name)
     workspace_dir = safe_workspace_dir(name)
@@ -603,6 +604,8 @@ def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout
            "--red-limit", str(red_limit), "--stall-limit", str(stall_limit)]
     if stuck_stop:
         cmd += ["--stuck-stop", "--stuck-stop-count", str(stuck_count)]
+    if pause_after_plan:
+        cmd.append("--pause-after-plan")
     if reset:
         cmd.append("--reset-state")
     if import_plan:
@@ -1910,6 +1913,10 @@ class Handler(BaseHTTPRequestHandler):
             self._err("flag/done/red/stall 必須 ≥1，round_timeout/agent_backoff_max 必須 ≥0，"
                       "validate_timeout 必須 >0 秒")
             return
+        # 規劃後暫停:表單值優先,未指定時落回團隊 defaults;非布林輸入以 truthiness 收斂。
+        pause_requested = body.get("pause_after_plan")
+        pause_after_plan = (bool(d.get("pause_after_plan")) if pause_requested is None
+                            else bool(pause_requested))
         # 貼了 plan.json → 建全新 state(等同重置),由使用者決定從 plan 或 exec 開跑
         plan_raw = (body.get("plan_json") or "").strip()
         normalized = None
@@ -2008,6 +2015,7 @@ class Handler(BaseHTTPRequestHandler):
                            agent_backoff_max=ab,
                            stuck_stop=bool(d.get("stuck_stop")),
                            stuck_count=int(d.get("stuck_stop_count", 100)),
+                           pause_after_plan=pause_after_plan,
                            env=command_env(cfg))
         workspace_console_log(name, f"啟動 loop｜pid={p.pid}｜repo={repo}")
         self._out(200, json.dumps({"ok": True, "starting": True, "name": name, "pid": p.pid,
@@ -2084,6 +2092,7 @@ class Handler(BaseHTTPRequestHandler):
                            agent_backoff_max=ab,
                            stuck_stop=bool(d.get("stuck_stop")),
                            stuck_count=int(d.get("stuck_stop_count", 100)),
+                           pause_after_plan=bool(c.get("pause_after_plan")),
                            env=command_env(cfg))
         workspace_console_log(name, f"繼續運行 loop｜pid={p.pid}")
         startup_timeout = vt + 15
@@ -2218,6 +2227,12 @@ class Handler(BaseHTTPRequestHandler):
             if c.get("validate_cmd") != vc:
                 c["validate_cmd"] = vc
                 changed.append("validate_cmd")
+        # 規劃後暫停:布林開關,下一次 ▶ 運行生效
+        if body.get("pause_after_plan") is not None:
+            pause = bool(body["pause_after_plan"])
+            if bool(c.get("pause_after_plan")) != pause:
+                c["pause_after_plan"] = pause
+                changed.append(f"pause_after_plan={'on' if pause else 'off'}")
         st["config"] = c
         write_state(name, st)
         workspace_console_log(name, f"更新 Workspace 設定｜{', '.join(changed) or '無變更'}")

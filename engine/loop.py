@@ -1340,6 +1340,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--consume-import-plan", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--start-phase", choices=("plan", "exec"), default="plan",
                         help="搭配 --import-plan:從規劃期(讓 agent 補完)或直接執行期開跑")
+    parser.add_argument("--pause-after-plan", action="store_true",
+                        help="規劃收斂後暫停:不自動進入執行期,人工按「▶ 運行」才開始執行輪")
     parser.add_argument("--max-rounds", type=int, default=0, help="總輪數上限;0=不限(測試用)")
     parser.add_argument("--reset-state", action="store_true", help="清掉 workspace state 從頭跑")
     parser.add_argument("--preflight-only", action="store_true",
@@ -1758,6 +1760,7 @@ def main():
                        "round_timeout": args.round_timeout,
                        "agent_backoff_max": args.agent_backoff_max,
                        "validate_timeout": args.validate_timeout,
+                       "pause_after_plan": bool(args.pause_after_plan),
                        "repo": str(repo), "agent_cmd": shlex.join(agent_cmd),
                        "validate_cmd": shlex.join(validate_cmd),
                        "goal": args.goal, "plan_doc": args.plan_doc}
@@ -1825,7 +1828,8 @@ def main():
     log(f"⚙️ 收斂門檻｜flag>{args.flag_threshold}｜done≥{args.done_threshold}｜red-limit={args.red_limit}｜"
         f"stall-limit={args.stall_limit}  stuck-stop={'on(' + str(args.stuck_stop_count) + ')' if args.stuck_stop else 'off'}  "
         f"round-timeout={args.round_timeout:g}min  agent-backoff≤{args.agent_backoff_max:g}s  "
-        f"validate-timeout={args.validate_timeout:g}s")
+        f"validate-timeout={args.validate_timeout:g}s  "
+        f"pause-after-plan={'on' if args.pause_after_plan else 'off'}")
 
     goal_text = goal_path.read_text(encoding="utf-8")
 
@@ -2075,6 +2079,13 @@ def main():
             state["agent_backoff_until"] = None
             ws.save_state(state)
             log(f"⏸ 已依要求停止｜round {rnd} 已完整處理並落盤，未啟動下一輪")
+            break
+        # 規劃剛收斂(本輪 phase=plan、state 已切到 exec)且啟用「規劃後暫停」:
+        # 停在執行期起點,不 spawn 執行輪;人工核對計畫後按「▶ 運行」直接從 exec 續跑。
+        if phase == "plan" and state["phase"] == "exec" and args.pause_after_plan:
+            log("⏸ 規劃已收斂｜依「規劃後暫停」設定停止，未啟動執行輪；"
+                "核對計畫後按「▶ 運行」開始執行期")
+            notify(args.notify_cmd, "plan_paused", ws.dir.name)
             break
 
     if state["phase"] == "done":

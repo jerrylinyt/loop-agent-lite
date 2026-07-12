@@ -219,6 +219,7 @@ export default function WorkspaceView({
             <span className="chip">round {state.round}</span>
             {state.phase !== "plan" && total > 0 && <span key={`${completed}-${state.current_order}`} className={`chip${pulse.has("task") ? " status-pulse" : ""}`}>任務 {completed}/{total}</span>}
             {state.phase === "plan" && <span key={state.flag} className={`chip${pulse.has("flag") ? " status-pulse" : ""}`}>flag {state.flag} / &gt;{state.config?.flag_threshold ?? 10}</span>}
+            {state.phase === "plan" && state.config?.pause_after_plan && <span className="chip subdued" title="規劃收斂後 loop 會停止，需按「▶ 運行」開始執行期">⏸ 規劃後暫停</span>}
             {state.phase === "exec" && <span key={state.done_count} className={`chip${pulse.has("done") ? " status-pulse" : ""}`}>done {state.done_count} / ≥{state.config?.done_threshold ?? 3}</span>}
             {state.phase === "done" && <button type="button" className="chip report-chip" onClick={() => setActiveModal("report")}>📄 完成報告</button>}
           </div>

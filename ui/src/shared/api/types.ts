@@ -159,6 +159,8 @@ export interface DashboardConfig {
   validate_timeout?: number;
   red_limit?: number;
   stall_limit?: number;
+  /** 規劃收斂後暫停：不自動進入執行期，需人工按「▶ 運行」。 */
+  pause_after_plan?: boolean;
 }
 
 export interface StartupResponse {

@@ -22,6 +22,7 @@ interface ExecutionSettings {
   roundTimeout: number;
   agentBackoffMax: number;
   validateTimeout: number;
+  pauseAfterPlan: boolean;
 }
 const DEFAULT_EXECUTION_SETTINGS: ExecutionSettings = {
   flagThreshold: 10,
@@ -29,6 +30,7 @@ const DEFAULT_EXECUTION_SETTINGS: ExecutionSettings = {
   roundTimeout: 30,
   agentBackoffMax: 60,
   validateTimeout: 120,
+  pauseAfterPlan: false,
 };
 
 function ExecutionSettingsFields({ value, onChange }: {
@@ -108,6 +110,7 @@ export default function LauncherModal({
         roundTimeout: response.defaults.round_timeout ?? 30,
         agentBackoffMax: response.defaults.agent_backoff_max ?? 60,
         validateTimeout: response.defaults.validate_timeout ?? 120,
+        pauseAfterPlan: response.defaults.pause_after_plan ?? false,
       });
     });
   }, [templateConfig]);
@@ -150,6 +153,7 @@ export default function LauncherModal({
       roundTimeout: templateConfig.round_timeout ?? value.roundTimeout,
       agentBackoffMax: templateConfig.agent_backoff_max ?? value.agentBackoffMax,
       validateTimeout: templateConfig.validate_timeout ?? value.validateTimeout,
+      pauseAfterPlan: templateConfig.pause_after_plan ?? value.pauseAfterPlan,
     }));
   }, [config, templateConfig]);
 
@@ -201,6 +205,7 @@ export default function LauncherModal({
             roundTimeout: saved.round_timeout ?? config.defaults.round_timeout ?? 30,
             agentBackoffMax: saved.agent_backoff_max ?? config.defaults.agent_backoff_max ?? 60,
             validateTimeout: saved.validate_timeout ?? config.defaults.validate_timeout ?? 120,
+            pauseAfterPlan: saved.pause_after_plan ?? config.defaults.pause_after_plan ?? false,
           });
           return;
         }
@@ -237,6 +242,7 @@ export default function LauncherModal({
       round_timeout: settings.roundTimeout,
       agent_backoff_max: settings.agentBackoffMax,
       validate_timeout: settings.validateTimeout,
+      pause_after_plan: settings.pauseAfterPlan,
       reset_state: resetState,
       new_branch: newBranch,
       plan_json: planJson,
@@ -325,7 +331,7 @@ export default function LauncherModal({
     { label: "plan / phase", before: matchingWorkspace ? `${matchingWorkspace.plan_len ?? 0} tasks · ${matchingWorkspace.phase ?? "—"}` : "新 workspace", after: planJson.trim() ? `${importedPlanCount} tasks · ${startPhase}` : resetState ? "重建 state" : "沿用" },
     { label: "Agent", before: matchingWorkspace ? "已儲存設定" : "預設設定", after: selectedAgent || "—" },
     { label: "Validate", before: matchingWorkspace ? "已儲存設定" : "預設設定", after: `${selectedValidate || "—"} · ${settings.validateTimeout}s` },
-    { label: "收斂 / timeout", before: matchingWorkspace ? "現有 workspace 設定" : "預設設定", after: `flag>${settings.flagThreshold} · done≥${settings.doneThreshold} · round ${settings.roundTimeout}m · backoff ${settings.agentBackoffMax}s` },
+    { label: "收斂 / timeout", before: matchingWorkspace ? "現有 workspace 設定" : "預設設定", after: `flag>${settings.flagThreshold} · done≥${settings.doneThreshold} · round ${settings.roundTimeout}m · backoff ${settings.agentBackoffMax}s${settings.pauseAfterPlan ? " · 規劃後暫停" : ""}` },
     { label: "Git branch", before: repoStatus?.branch || "detached / unknown", after: newBranch ? `建立 loop/${name.trim() || repo.split("/").filter(Boolean).slice(-1)[0] || "workspace"}` : "不切換" },
   ];
   const footer = tab === "launch" ? (
@@ -371,6 +377,7 @@ export default function LauncherModal({
             <summary>進階設定</summary>
             <ExecutionSettingsFields value={settings}
               onChange={(patch) => setSettings((value) => ({ ...value, ...patch }))} />
+            <label className="checkbox-row"><input type="checkbox" checked={settings.pauseAfterPlan} onChange={(event) => setSettings((value) => ({ ...value, pauseAfterPlan: event.target.checked }))} />規劃收斂後暫停：不自動進入執行期，需回 Dashboard 按「▶ 運行」開始執行</label>
             <label className="checkbox-row"><input type="checkbox" checked={resetState} onChange={(event) => setResetState(event.target.checked)} />重置 workspace state（清除舊進度）</label>
             <label className="checkbox-row"><input type="checkbox" checked={newBranch} onChange={(event) => setNewBranch(event.target.checked)} />在新 branch 跑（loop/&lt;workspace 名&gt;）</label>
             <div className="notify-entry-row"><button type="button" className="secondary-button" disabled={!config} onClick={() => setManagerModal("notify")}>🔔 管理終態通知</button><span className="label-help">{config?.notify_cmd ? `目前：${config.notify_cmd}` : "目前未設定通知"}</span></div>

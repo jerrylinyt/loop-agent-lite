@@ -101,7 +101,8 @@ def prepare_fixture():
             "red_limit": 20,
             "stall_limit": 300,
             "stuck_stop": False,
-            "stuck_stop_count": 100
+            "stuck_stop_count": 100,
+            "pause_after_plan": False
         }
     }
     config_path = fixture / "dashboard.config.json"

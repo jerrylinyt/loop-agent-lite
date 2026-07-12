@@ -31,6 +31,8 @@ export default function ConfigModal({
     red_limit: config.red_limit ?? 20,
     stall_limit: config.stall_limit ?? 300
   });
+  // 布林開關與數字欄位分開保存，numberField 的 draft 型別維持 string|number。
+  const [pauseAfterPlan, setPauseAfterPlan] = useState(config.pause_after_plan ?? false);
   const [message, setMessage] = useState("");
   const [validating, setValidating] = useState(false);
   const [validateResult, setValidateResult] = useState<{ ok: boolean; text: string; tail: string } | null>(null);
@@ -46,7 +48,7 @@ export default function ConfigModal({
 
   const save = async () => {
     setMessage("儲存中…");
-    const body: Record<string, string | number> = { name: workspace, ...draft };
+    const body: Record<string, string | number | boolean> = { name: workspace, ...draft, pause_after_plan: pauseAfterPlan };
     if (agentIndex !== "") body.agent_idx = +agentIndex;
     const response = await postJson<{ changed?: string[] }>("/api/edit-config", body);
     if (response.error) return setMessage(`❌ ${response.error}`);
@@ -111,6 +113,7 @@ export default function ConfigModal({
           {numberField("red_limit", "紅燈連跳 reset", 1)}
           {numberField("stall_limit", "HEAD 停滯 reset", 1)}
         </div>
+        <label className="checkbox-row"><input type="checkbox" checked={pauseAfterPlan} onChange={(event) => setPauseAfterPlan(event.target.checked)} />規劃收斂後暫停：不自動進入執行期，需按「▶ 運行」開始執行</label>
       </div>
       {cliManagerOpen && available && <CliManagerModal config={available} repo={config.repo ?? ""} workspace={workspace} onClose={() => setCliManagerOpen(false)} onSaved={(next) => {
         setAvailable(next);
