@@ -8,7 +8,7 @@
 
 - 每個元素只能有 `order`、`task`、選填的 `ref`，不得出現其他欄位。
 - `order` 必須是 integer，從 1 開始且依陣列順序連續遞增，不得重複或跳號。
-- `task` 必須是非空字串，寫到 fresh-context Agent 不需依賴聊天紀錄或未輸出的內部分析就能動工；依序交代目的／範圍、repo 證據或 `ref`、前置條件／human gate、交付物及可驗證 DoD。每個 `task` 內文都必須包含「DoD：」字樣並在其後寫出驗證方式；沒有前置條件或 human gate 時省略該段即可，其餘元素一律不得省略。
+- `task` 必須是非空字串，寫到 fresh-context Agent 不需依賴聊天紀錄或未輸出的內部分析就能動工；依序交代目的／範圍、repo 證據或 `ref`、前置條件／human gate、交付物及可驗證 DoD。每個 `task` 內文都必須包含「DoD：」字樣並在其後寫出驗證方式；沒有前置條件或 human gate 時省略該段即可，其餘元素一律不得省略。執行 Agent 只看得到自己那條 task 的全文，因此驗證命令、執行目錄、檔案路徑與通過判準必須逐 task 寫全，不得以「同上」「同一命令」「前一任務的測試」等字樣指代其他 task 的內容；只有依賴順序（如「前置：order 1 完成」）可以引用 order 編號。
 - `ref` 只在已有真實分析文件路徑或段落時填字串；無可用來源時整個省略，不得發明檔案。
 - 使用合法 JSON 雙引號、正確跳脫，不得有 trailing comma。
 
@@ -23,4 +23,4 @@
 - 輸出前在內部以 JSON parser 與上述 schema 自檢；不得留下 TODO、`<placeholder>`、虛構路徑或未從 repo 證實的命令。
 - 除非原需求指定其他語言，task 內文使用繁體中文；程式碼、命令、路徑與識別碼維持原文。
 
-合法形狀示意（內容必須改成實際分析結果，不得照抄；注意每個 task 都含目的、證據、交付物與「DoD：」）：`[{"order":1,"task":"目的：為訂單查詢 API 建立測試骨架，涵蓋 AC-1、AC-2。證據：現有端點定義於 src/api/orders.py:42。交付物：tests/test_orders_api.py 與可重跑 fixture。DoD：在 repo 根目錄執行 python3 -m unittest tests.test_orders_api -q 通過","ref":"docs/analysis.md#訂單查詢"},{"order":2,"task":"目的：實作訂單查詢的狀態篩選，涵蓋 AC-3。證據：篩選參數契約見 src/api/orders.py:57 與 order 1 的測試。前置：order 1 完成。交付物：src/api/orders.py 的篩選實作。DoD：執行同一測試命令全綠"}]`
+合法形狀示意（內容必須改成實際分析結果，不得照抄；注意每個 task 都含目的、證據、交付物與「DoD：」，且驗證命令逐 task 寫全、不指代其他 task）：`[{"order":1,"task":"目的：為訂單查詢 API 建立測試骨架，涵蓋 AC-1、AC-2。證據：現有端點定義於 src/api/orders.py:42。交付物：tests/test_orders_api.py 與可重跑 fixture。DoD：在 repo 根目錄執行 python3 -m unittest tests.test_orders_api -q 通過","ref":"docs/analysis.md#訂單查詢"},{"order":2,"task":"目的：實作訂單查詢的狀態篩選，涵蓋 AC-3。證據：篩選參數契約見 src/api/orders.py:57，既有測試位於 tests/test_orders_api.py。前置：order 1 完成。交付物：src/api/orders.py 的篩選實作。DoD：在 repo 根目錄執行 python3 -m unittest tests.test_orders_api -q 全綠"}]`

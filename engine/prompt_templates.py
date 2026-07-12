@@ -156,9 +156,10 @@ BUILTIN_PROMPT_TEMPLATES = [
         "description": "把對外 API 的請求／回應契約（狀態碼、錯誤格式、欄位語意、相容規則）鎖成可重跑的測試，作為重構與遷移的等價防線。",
         "requirement_placeholder": "例：為訂單服務全部對外 REST API 補契約測試，鎖住狀態碼、統一錯誤格式與分頁行為，作為搬移到 Spring Boot 3 的等價基準。",
         "instructions": """- 先盤點範圍內全部對外端點（路徑、方法、版本），逐端點枚舉成功、驗證失敗、授權失敗、資源不存在、衝突與伺服器錯誤的實際回應。
-- 契約權威性先判定，逐項只有兩種情形：
+- 契約權威性逐項判定並記錄依據：
   - 已有權威契約（OpenAPI、CDC 契約）時，實作與契約不一致即為測試失敗或明確的治理決策，需 fail／escalate 不得靜默放行。
   - 沒有權威契約時以實際行為為基準建立相容防線，文件與實際行為的不一致列為發現。
+  - 同一端點存在多份契約（多版 OpenAPI、CDC、文件）互相衝突或權威不明時，不得自行選定權威：列出衝突各方與 `檔案:行號`，先以實際行為鎖相容基線，權威判定依共用規則升級——Goal 列入待確認事項，Plan 在第一個受影響 task 標 human gate。
 - 逐端點鎖定請求側與回應側：
   - 請求側含接受的 Content-Type、path／query／header／body 的必填與選填參數、request body schema 與驗證語意。
   - 回應側含狀態碼、回應 schema（欄位名、型別、必填性、null 語意）、錯誤 body 格式與錯誤碼、預設值與分頁／排序行為、Content-Type 與編碼。
@@ -295,7 +296,7 @@ BUILTIN_PROMPT_TEMPLATES = [
   - 結構與語法：DUAL、(+) 外連接、ROWNUM 分頁、CONNECT BY、MERGE、ROWID、隱含型別轉換。
   - 函式與日期：NVL／NVL2／DECODE、SYSDATE 與日期算術、TO_DATE／TO_CHAR 格式。
   - 取號：sequence.NEXTVAL／CURRVAL，對應 AUTO_INCREMENT／SEQUENCE 與 LAST_INSERT_ID()／ORM generated-key 取值路徑。
-  - 清單每一項都要有結論：命中者附 `檔案:行號` 與改寫方案，未命中者附搜尋方法標 N/A；無法靜態枚舉的動態拼接明列邊界。
+  - 清單每一項都要有結論：命中者附 `檔案:行號` 與改寫方案，未命中者附搜尋方法標 N/A。以搜尋方法標 N/A 僅適用於有明確字面 token 的項目；隱含型別轉換、日期算術等無法靠字面搜尋排除的語意項不得以未命中判 N/A，必須依下一條語意差異規則以 schema 型別、比較述詞與雙庫測試證據下結論。無法靜態枚舉的動態拼接明列邊界。
 - 語意差異逐項驗證而非假設：空字串與 NULL（Oracle 視為同一、MariaDB 區分）、預設交易隔離級別與鎖行為、識別碼大小寫與 collation、VARCHAR2 的 byte／char 長度語意、NUMBER 對 DECIMAL 精度、DATE 含時間成分的型別對應；受影響的讀寫路徑要有測試證據，不得只改到語法可執行。
 - PL/SQL（package、procedure、function、trigger、scheduler job）逐支判定改寫成對應的 MariaDB stored program（procedure／function／trigger／event）、搬到應用層或棄用；交易邊界與例外語意改寫後需測試證明，無法等價的能力（如 autonomous transaction）列 human gate，不自行替團隊決策。
 - 同一套 characterization 測試分別在 Oracle 與 MariaDB 執行並比對結果、副作用與錯誤語意，優先沿用 repo 既有測試棧的真實資料庫環境；資料搬移以筆數、checksum 與業務 invariant 對帳。
