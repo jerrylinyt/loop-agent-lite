@@ -102,6 +102,7 @@ class TestPromptTemplateCatalog(unittest.TestCase):
             "change-impact-analysis", "db-migration", "oracle-mariadb-migration",
             "schema-data-rollout", "dependency-upgrade", "k8s-deployment-config",
             "incident-root-cause", "security-scan-remediation",
+            "java-test-completion", "react-playwright-testing",
         }.issubset(ids))
         self.assertTrue(all(item["source"] == "builtin" for item in templates))
 
@@ -139,6 +140,16 @@ class TestPromptTemplateCatalog(unittest.TestCase):
         self.assertIn(
             "human gate，不自行替團隊決策", catalog["oracle-mariadb-migration"]["instructions"]
         )
+        self.assertIn("不得交付恆綠測試", catalog["java-test-completion"]["instructions"])
+        self.assertIn(
+            "不得假設存在", catalog["java-test-completion"]["instructions"]
+        )
+        self.assertIn(
+            "避免測試只證明 mock 本身", catalog["java-test-completion"]["instructions"]
+        )
+        self.assertIn("route／fulfill", catalog["react-playwright-testing"]["instructions"])
+        self.assertIn("不得自創欄位", catalog["react-playwright-testing"]["instructions"])
+        self.assertIn("禁止固定 sleep", catalog["react-playwright-testing"]["instructions"])
         self.assertIn("autoconfiguration", catalog["dependency-upgrade"]["instructions"])
         self.assertIn("具備證據後才能判 N/A", catalog["dependency-upgrade"]["instructions"])
         self.assertIn("pure YAML、Kustomize、Helm 三種", catalog["k8s-deployment-config"]["instructions"])

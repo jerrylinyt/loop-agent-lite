@@ -111,6 +111,32 @@ BUILTIN_PROMPT_TEMPLATES = [
 - 說清楚 fixture、mock 與真實整合環境的界線，避免測試只證明 mock 本身。""",
     },
     {
+        "id": "java-test-completion",
+        "label": "補齊 Java 測試案例",
+        "category": "品質",
+        "description": "為既有 Java 專案的指定範圍補齊測試；unit／integration 層級依需求選擇，測試釘行為而非實作。",
+        "requirement_placeholder": "例：為訂單服務的付款流程補齊測試，integration 用真實資料庫驗證交易行為，unit 覆蓋金額計算邊界。",
+        "instructions": """- 先枚舉範圍內的可觀察行為與風險分支（正常、邊界、錯誤處理、並行），對照既有測試找出真缺口；已覆蓋的行為不重寫，缺口逐條對應到任務。
+- 測試層級以需求指定為準（unit／integration 擇一或並用）；需求未指定時選擇「最低但足以可靠攔截回歸的層級」並附理由，不得全部堆到最上層。
+- 從 repo 讀出實際測試棧與慣例（JUnit 版本、assertion 庫、命名、目錄結構、真實資料庫或內嵌替身、CI 實跑範圍），沿用不另創；repo 沒有的測試設施先列前置任務或 human gate，不得假設存在。
+- unit 測試釘行為不釘實作：斷言輸入→輸出與副作用，不 mock 被測邏輯自身；integration 測試優先用真實依賴（資料庫、訊息、交易邊界），mock 只用於不可控外部系統並標明邊界，避免測試只證明 mock 本身。
+- 每個新測試需先確認會因對應行為破壞而變紅（暫時破壞或 mutation 驗證），不得交付恆綠測試；時間、隨機、順序等 flaky 來源在測試內固定。
+- DoD：範圍內行為條目全數對應到測試與 `檔案:行號`，以 repo 實際測試命令全綠為準；無法自動化的行為明列原因與替代驗證。""",
+    },
+    {
+        "id": "react-playwright-testing",
+        "label": "React Playwright 測試（mock 資料）",
+        "category": "品質",
+        "description": "用 Playwright 與受控 mock 資料為 React 前端補齊流程測試，斷言使用者可見行為而非內部實作。",
+        "requirement_placeholder": "例：為訂單查詢頁補 Playwright 測試，API 一律用 mock 資料，涵蓋篩選、分頁、空資料與錯誤狀態。",
+        "instructions": """- 先枚舉範圍內的使用者流程與狀態（載入、空資料、錯誤、權限、互動回饋），對照既有測試找缺口；未列入清單的流程不得視為已覆蓋。
+- 從 repo 讀出實際 Playwright 設定與慣例（config、fixture、selector 策略、CI 實跑範圍）沿用之；repo 尚無 Playwright 時把初始化列為獨立前置任務，不與測試撰寫混在同一任務。
+- mock 資料策略集中管理：用 Playwright network interception（route／fulfill）或 repo 既有 mock server 固定 API 回應；mock 形狀必須以真實 API 契約為依據並附契約來源（型別定義、schema 或後端程式 `檔案:行號`），不得自創欄位。
+- 斷言使用者可見行為（文字、可及性角色、URL、可互動狀態）；selector 優先 role／label／testid，不綁 CSS 結構，不斷言元件內部 state 或實作細節。
+- 等待一律用 Playwright 自動等待與明確條件，禁止固定 sleep；時間、隨機與動畫來源在測試內固定；每條測試先確認會因對應行為破壞而變紅。
+- DoD：流程條目全數對應到測試與檔案位置，以 repo 實際 Playwright 命令全綠為準；mock 與真實契約的漂移風險明列，必要時規劃最小 smoke 對真後端驗證或列 human gate。""",
+    },
+    {
         "id": "performance-analysis",
         "label": "分析效能瓶頸",
         "category": "品質",
