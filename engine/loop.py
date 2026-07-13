@@ -77,11 +77,39 @@ ISSUES_MAX_PENDING = 100              # 單一 round 最多 ingest 的 issue 行
 ISSUES_MAX_COUNT = 200                # state 保留最新 issue 數量
 STOP_AFTER_ROUND_FILE = "stop-after-round.json"
 STOP_AFTER_ROUND_CLAIMED_FILE = "stop-after-round.claimed.json"
+ACTIVE_RUNTIME_FILE = "active-runtime.json"
+COORDINATOR_RUNTIME_FILE = "coordinator-runtime.json"
+PENDING_RUNTIME_SUFFIX = ".pending-runtime.json"
+ACTIVE_RUNTIME_SCHEMA_VERSION = 1
+ACTIVE_RUNTIME_MAX_BYTES = 16 * 1024
 WORKSPACE_OPS_DIR = ".ops"
+STATE_SCHEMA_VERSION = 2
+WORKSPACE_KINDS = {"standalone", "fleet-parent", "fleet-child"}
+FINAL_TRACK_SAFE_NAME = "_final"
 
 _CONSOLE_PATH = None
 _CONSOLE_LOCK = threading.Lock()
 _RUN_LOCKS = []
+_RUNTIME_IDENTITY_CONTEXT = None
+
+# The actual agent/validator must not run until its durable identity is fsynced.  This
+# tiny group leader waits on a close-on-exec pipe, then starts the real command in its
+# existing process group and remains alive until that command exits.  If the
+# coordinator is SIGKILLed before releasing the gate, the pipe reaches EOF and the
+# target command is never started.
+_RUNTIME_GATE_WRAPPER = r"""
+import json, os, subprocess, sys
+gate = int(sys.argv[1])
+try:
+    released = os.read(gate, 1)
+finally:
+    os.close(gate)
+if released != b"1":
+    raise SystemExit(125)
+argv = json.loads(os.environ.pop("LOOP_AGENT_RUNTIME_ARGV"))
+process = subprocess.Popen(argv)
+raise SystemExit(process.wait())
+"""
 
 
 def valid_workspace_name(name) -> bool:
@@ -94,6 +122,11 @@ def require_workspace_name(name: str) -> str:
     if not valid_workspace_name(name):
         raise ValueError(f"workspace 名稱不合法：{WORKSPACE_NAME_RULE}")
     return name
+
+
+def fleet_track_safe_name(track: str) -> str:
+    """Map the reserved final track to a filesystem/ref component ordinary tracks cannot alias."""
+    return FINAL_TRACK_SAFE_NAME if track == "@final" else track
 
 
 def workspace_path(root: Path, name: str) -> Path:
@@ -441,12 +474,12 @@ def repo_relative_path(repo: Path, rel: str) -> Path:
 
 
 class WorkspaceOperationLockError(RuntimeError):
-    """另一個 archive/restore 或 CLI 正在改同名 workspace 的 root entry。"""
+    """另一個建立、啟動或刪除流程正在改同名 workspace 的 root entry。"""
 
 
 @contextmanager
 def workspace_operation_lock(root: Path, name: str, *, blocking=True):
-    """跨 Dashboard/CLI 的 per-name root lock，保護「不存在→建立/還原」這類競態。"""
+    """跨 Dashboard/CLI 的 per-name root lock，保護建立、啟動與永久刪除競態。"""
     name = require_workspace_name(name)
     root = Path(root)
     try:
@@ -483,7 +516,7 @@ def workspace_operation_lock(root: Path, name: str, *, blocking=True):
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         except BlockingIOError as e:
-            raise WorkspaceOperationLockError(f"workspace {name} 正在進行 archive/restore 操作") from e
+            raise WorkspaceOperationLockError(f"workspace {name} 正在進行根目錄變更操作") from e
         yield
     finally:
         if lock_file is not None:
@@ -582,7 +615,7 @@ def release_run_locks() -> None:
             lock_file.close()
 
 
-def acquire_run_lock(path: Path, label: str) -> None:
+def acquire_run_lock(path: Path, label: str):
     """取得跨 Dashboard/terminal process 的單 writer 鎖；不等待、不猜 pid。"""
     try:
         ensure_real_directory(path.parent, f"{label} 父目錄")
@@ -605,6 +638,80 @@ def acquire_run_lock(path: Path, label: str) -> None:
                                ensure_ascii=False).encode("utf-8"))
     lock_file.flush()
     _RUN_LOCKS.append(lock_file)  # 強引用持有到 atexit；只留下 lock file，不靠檔案存在與否判斷
+    return lock_file
+
+
+def adopt_inherited_run_lock(fd: int, path: Path, label: str):
+    """Adopt a supervisor-held flock only when the inherited FD is the exact safe lock inode."""
+    try:
+        file_info = os.fstat(fd)
+        path_info = os.stat(path, follow_symlinks=False)
+        if (not stat.S_ISREG(file_info.st_mode) or file_info.st_nlink != 1 or
+                (file_info.st_dev, file_info.st_ino) != (path_info.st_dev, path_info.st_ino)):
+            raise ValueError("inherited lock FD 與預期 lock file 不符")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file = os.fdopen(os.dup(fd), "a+b", closefd=True)
+    except (OSError, ValueError) as error:
+        fail(f"preflight：{label} inherited lock 不安全:{error}")
+    _RUN_LOCKS.append(lock_file)
+    return lock_file
+
+
+def run_lock_held(path: Path) -> bool:
+    """Read a local flock as kernel truth without relying on a possibly stale PID."""
+    try:
+        fd = _open_regular(path, os.O_RDWR)
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+    lock_file = os.fdopen(fd, "a+b", closefd=True)
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        lock_file.close()
+
+
+def fleet_parent_lease_alive(parent_name: str, run_id: str | None = None,
+                             session_id: str | None = None) -> bool:
+    """Require both the kernel lease and the exact supervisor session recorded by this child."""
+    try:
+        parent = workspace_path(WORKSPACE_ROOT, parent_name)
+        ensure_real_directory(parent, "fleet parent workspace")
+        if run_id is not None or session_id is not None:
+            fleet = json.loads(read_regular_text(parent / "fleet.json", "fleet lease state"))
+            loop_state = fleet.get("loop") if isinstance(fleet.get("loop"), dict) else {}
+            if (fleet.get("workspace_kind") != "fleet-parent" or
+                    fleet.get("run_id") != run_id or
+                    loop_state.get("session_id") != session_id or
+                    not isinstance(loop_state.get("pid"), int)):
+                return False
+        fd = _open_regular(parent / ".fleet.run.lock", os.O_RDWR)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    lock_file = os.fdopen(fd, "a+b", closefd=True)
+    try:
+        lock_file.seek(0)
+        try:
+            owner = json.loads(lock_file.read().decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return False
+        if (not isinstance(owner, dict) or
+                owner.get("pid") != ((fleet.get("loop") or {}).get("pid")
+                                      if run_id is not None or session_id is not None
+                                      else owner.get("pid"))):
+            return False
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        lock_file.close()
 
 
 # 此 handler 比 main 內稍後註冊的 state stopped handler 更早註冊；atexit 為 LIFO，
@@ -686,6 +793,286 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def configure_runtime_identity(workspace_dir: Path, workspace_generation: str,
+                               session_id: str, *, workspace_name: str | None = None,
+                               repo: Path | None = None,
+                               previous_workspace_generation: str | None = None) -> None:
+    """Configure one coordinator's durable active agent/validator identity marker."""
+    global _RUNTIME_IDENTITY_CONTEXT
+    workspace_dir = Path(workspace_dir)
+    name = workspace_name or workspace_dir.name
+    require_workspace_name(name)
+    if re.fullmatch(r"[0-9a-f]{32}", str(workspace_generation or "")) is None:
+        raise ValueError("runtime identity 缺合法 workspace_generation")
+    if re.fullmatch(r"[0-9a-f]{32}", str(session_id or "")) is None:
+        raise ValueError("runtime identity 缺合法 session_id")
+    if (previous_workspace_generation is not None and
+            re.fullmatch(r"[0-9a-f]{32}", previous_workspace_generation) is None):
+        raise ValueError("runtime identity previous_workspace_generation 不合法")
+    if previous_workspace_generation == workspace_generation:
+        previous_workspace_generation = None
+    ensure_real_directory(workspace_dir, "runtime identity workspace")
+    owner = _runtime_process_identity(os.getpid())
+    if owner is None:
+        raise RuntimeError("無法取得 coordinator process identity")
+    root = workspace_dir.parent.resolve()
+    resolved_repo = Path(repo).expanduser().resolve() if repo is not None else None
+    context = {
+        "workspace_dir": workspace_dir,
+        "workspace_name": name,
+        "workspace_generation": workspace_generation,
+        "previous_workspace_generation": previous_workspace_generation,
+        "session_id": session_id,
+        "owner_pid": os.getpid(),
+        "workspace_root": str(root),
+        "repo": str(resolved_repo) if resolved_repo is not None else None,
+        "owner_started": owner["started"],
+        "owner_command": owner["command"],
+    }
+    coordinator = {
+        "schema_version": ACTIVE_RUNTIME_SCHEMA_VERSION,
+        "workspace_name": name, "workspace_root": str(root),
+        "repo": context["repo"], "workspace_generation": workspace_generation,
+        "previous_workspace_generation": previous_workspace_generation,
+        "session_id": session_id, "pid": owner["pid"],
+        "started": owner["started"], "command": owner["command"],
+    }
+    payload = json.dumps(coordinator, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(payload) > ACTIVE_RUNTIME_MAX_BYTES:
+        raise ValueError("coordinator runtime marker 超過 bounded 上限")
+    atomic_write_bytes(workspace_dir / COORDINATOR_RUNTIME_FILE, payload)
+    _RUNTIME_IDENTITY_CONTEXT = context
+
+
+def clear_runtime_identity_context() -> None:
+    """Clear process-local marker context (primarily for bounded tests/embedding)."""
+    global _RUNTIME_IDENTITY_CONTEXT
+    _RUNTIME_IDENTITY_CONTEXT = None
+
+
+def pending_runtime_marker_path(root: Path, workspace_name: str) -> Path:
+    """Return the deterministic root-scoped marker used before a workspace exists."""
+    require_workspace_name(workspace_name)
+    digest = hashlib.sha256(workspace_name.encode("utf-8")).hexdigest()[:32]
+    return Path(root) / WORKSPACE_OPS_DIR / f"{digest}{PENDING_RUNTIME_SUFFIX}"
+
+
+def configure_pending_runtime_identity(root: Path, workspace_name: str, repo: Path,
+                                       pending_generation: str, session_id: str) -> dict:
+    """Persist a fleet coordinator identity before preflight can spawn external tools."""
+    require_workspace_name(workspace_name)
+    if re.fullmatch(r"[0-9a-f]{32}", pending_generation or "") is None:
+        raise ValueError("pending runtime generation 不合法")
+    if re.fullmatch(r"[0-9a-f]{32}", session_id or "") is None:
+        raise ValueError("pending runtime session 不合法")
+    root = ensure_real_directory(Path(root), "workspace root")
+    ops = ensure_real_directory(root / WORKSPACE_OPS_DIR, "workspace operation lock 目錄")
+    owner = _runtime_process_identity(os.getpid())
+    if owner is None:
+        raise RuntimeError("無法取得 pending fleet coordinator identity")
+    marker = {
+        "schema_version": ACTIVE_RUNTIME_SCHEMA_VERSION, "kind": "fleet-pending",
+        "workspace_name": workspace_name, "workspace_root": str(root.resolve()),
+        "repo": str(Path(repo).expanduser().resolve()),
+        "pending_generation": pending_generation, "session_id": session_id,
+        "pid": owner["pid"], "started": owner["started"], "command": owner["command"],
+    }
+    payload = json.dumps(marker, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(payload) > ACTIVE_RUNTIME_MAX_BYTES:
+        raise ValueError("pending runtime marker 超過 bounded 上限")
+    path = pending_runtime_marker_path(root, workspace_name)
+    if path.parent != ops:
+        raise ValueError("pending runtime marker 路徑不合法")
+    atomic_write_bytes(path, payload)
+    marker["path"] = str(path)
+    return marker
+
+
+def remove_pending_runtime_identity(marker: dict | None) -> None:
+    """Remove only the exact pending marker created by this PID/session."""
+    if not isinstance(marker, dict):
+        return
+    try:
+        path = Path(marker["path"])
+        current = _read_bounded_runtime_marker(path)
+        if (current.get("kind") == "fleet-pending" and
+                current.get("workspace_name") == marker.get("workspace_name") and
+                current.get("pending_generation") == marker.get("pending_generation") and
+                current.get("session_id") == marker.get("session_id") and
+                current.get("pid") == marker.get("pid")):
+            path.unlink(missing_ok=True)
+    except (AttributeError, FileNotFoundError, OSError, TypeError, ValueError,
+            UnicodeDecodeError, json.JSONDecodeError):
+        pass
+
+
+def _read_bounded_runtime_marker(path: Path):
+    """Read a runtime marker without ever allocating beyond its fixed bound."""
+    path = workspace_file(path, "runtime marker")
+    if path.lstat().st_size > ACTIVE_RUNTIME_MAX_BYTES:
+        raise ValueError("runtime marker 超過 bounded 上限")
+    fd = _open_regular(path, os.O_RDONLY)
+    with os.fdopen(fd, "rb", closefd=True) as stream:
+        raw = stream.read(ACTIVE_RUNTIME_MAX_BYTES + 1)
+    if len(raw) > ACTIVE_RUNTIME_MAX_BYTES:
+        raise ValueError("runtime marker 超過 bounded 上限")
+    marker = json.loads(raw.decode("utf-8"))
+    if not isinstance(marker, dict):
+        raise ValueError("runtime marker 頂層必須是 object")
+    return marker
+
+
+def remove_runtime_identity_markers() -> None:
+    """Remove only markers owned by the configured coordinator session."""
+    context = _RUNTIME_IDENTITY_CONTEXT
+    if not context:
+        return
+    for filename in (ACTIVE_RUNTIME_FILE, COORDINATOR_RUNTIME_FILE):
+        path = context["workspace_dir"] / filename
+        try:
+            marker = _read_bounded_runtime_marker(path)
+            if (marker.get("workspace_name") == context["workspace_name"] and
+                    marker.get("workspace_generation") == context["workspace_generation"] and
+                    marker.get("session_id") == context["session_id"]):
+                path.unlink(missing_ok=True)
+        except (AttributeError, FileNotFoundError, OSError, TypeError, ValueError,
+                UnicodeDecodeError, json.JSONDecodeError):
+            pass
+
+
+def _runtime_process_identity(pid: int):
+    """Read the process-group identity used by the durable runtime marker."""
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "pid=,pgid=,lstart=,command="],
+        capture_output=True, text=True, check=False)
+    if result.returncode:
+        return None
+    line = next((line.strip() for line in result.stdout.splitlines() if line.strip()), "")
+    parts = line.split(None, 7)
+    if len(parts) < 8:
+        return None
+    try:
+        observed_pid, pgid = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if observed_pid != int(pid):
+        return None
+    # Darwin ps does not expose the POSIX SID.  start_new_session=True guarantees
+    # this leader's SID equals its PGID; persist that proven invariant explicitly.
+    return {"pid": observed_pid, "pgid": pgid, "sid": pgid,
+            "started": " ".join(parts[2:7]), "command": parts[7]}
+
+
+def _runtime_marker_path() -> Path | None:
+    context = _RUNTIME_IDENTITY_CONTEXT
+    return ((context["workspace_dir"] / ACTIVE_RUNTIME_FILE) if context else None)
+
+
+def _clear_runtime_marker(pid: int) -> None:
+    """Remove only this context/session's marker; never unlink a replacement marker."""
+    context = _RUNTIME_IDENTITY_CONTEXT
+    path = _runtime_marker_path()
+    if not context or path is None:
+        return
+    try:
+        marker = _read_bounded_runtime_marker(path)
+        if (marker.get("schema_version") == ACTIVE_RUNTIME_SCHEMA_VERSION and
+                marker.get("workspace_name") == context["workspace_name"] and
+                marker.get("workspace_generation") == context["workspace_generation"] and
+                marker.get("session_id") == context["session_id"] and
+                int(marker.get("pid")) == int(pid)):
+            path.unlink(missing_ok=True)
+    except (AttributeError, FileNotFoundError, OSError, TypeError, ValueError,
+            UnicodeDecodeError, json.JSONDecodeError):
+        return
+
+
+def _spawn_runtime_process(cmd, *, kind: str, cwd, env, **popen_kwargs):
+    """Start a gated process group and release it only after its marker is durable.
+
+    The returned Popen is the stable group leader, not the target child.  Keeping the
+    wrapper alive gives Dashboard a command identity that does not change across exec.
+    """
+    context = _RUNTIME_IDENTITY_CONTEXT
+    if context is None:
+        return subprocess.Popen(cmd, cwd=str(cwd), env=env, start_new_session=True,
+                                **popen_kwargs)
+    if kind not in {"agent", "validator"}:
+        raise ValueError(f"runtime process kind 不合法:{kind}")
+    target_json = json.dumps(list(cmd), ensure_ascii=False, separators=(",", ":"))
+    target_command = shlex.join(list(cmd))
+    if len(target_json.encode("utf-8")) > 8192 or len(target_command) > 8192:
+        raise ValueError("agent/validator command 過長，無法建立 bounded runtime identity")
+    read_fd, write_fd = os.pipe()
+    wrapper_env = dict(env)
+    wrapper_env["LOOP_AGENT_RUNTIME_ARGV"] = target_json
+    process = None
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", _RUNTIME_GATE_WRAPPER, str(read_fd)],
+            cwd=str(cwd), env=wrapper_env, start_new_session=True, pass_fds=(read_fd,),
+            **popen_kwargs)
+    finally:
+        os.close(read_fd)
+    try:
+        identity = previous_identity = None
+        deadline = time.monotonic() + 1.0
+        while identity is None and process.poll() is None and time.monotonic() < deadline:
+            observed = _runtime_process_identity(process.pid)
+            if observed is not None and observed == previous_identity:
+                identity = observed
+                break
+            previous_identity = observed
+            time.sleep(0.02)
+        if identity is None:
+            raise RuntimeError("無法取得 gated runtime process identity")
+        if identity["pgid"] != process.pid or identity["sid"] != process.pid:
+            raise RuntimeError("gated runtime process 未建立獨立 session/process group")
+        marker = {
+            "schema_version": ACTIVE_RUNTIME_SCHEMA_VERSION,
+            "kind": kind,
+            "workspace_name": context["workspace_name"],
+            "workspace_generation": context["workspace_generation"],
+            "previous_workspace_generation": context["previous_workspace_generation"],
+            "session_id": context["session_id"],
+            "owner_pid": context["owner_pid"],
+            "workspace_root": context["workspace_root"], "repo": context["repo"],
+            "owner_started": context["owner_started"],
+            "owner_command": context["owner_command"],
+            "pid": identity["pid"], "pgid": identity["pgid"], "sid": identity["sid"],
+            "started": identity["started"], "command": identity["command"],
+            "target_command": target_command,
+        }
+        payload = json.dumps(marker, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(payload) > ACTIVE_RUNTIME_MAX_BYTES:
+            raise ValueError("active runtime marker 超過 bounded 上限")
+        atomic_write_bytes(context["workspace_dir"] / ACTIVE_RUNTIME_FILE, payload)
+        os.write(write_fd, b"1")
+        return process
+    except BaseException:
+        # Closing without the release byte makes the wrapper exit 125 without ever
+        # starting the target, including fsync/replace failures.
+        try:
+            os.close(write_fd)
+        except OSError:
+            pass
+        if process is not None:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                process.wait()
+        raise
+    finally:
+        try:
+            os.close(write_fd)
+        except OSError:
+            pass
 
 
 def _stop_after_round_marker_matches(path: Path, pid, session_id) -> bool:
@@ -772,7 +1159,34 @@ def state_checkpoint_path(state_path: Path) -> Path:
 
 def validate_state_shape(state, label: str):
     """檢查 state 的核心欄位型別；允許舊版省略欄位，但不接受錯型真相。"""
-    if "phase" in state and state["phase"] not in ("plan", "exec", "done"):
+    if state.get("state_schema_version") != STATE_SCHEMA_VERSION:
+        raise StateLoadError(
+            f"{label} state_schema_version 必須是 {STATE_SCHEMA_VERSION}；"
+            "舊 workspace 不支援續跑，請刪除後重新開始")
+    if re.fullmatch(r"[0-9a-f]{32}", str(state.get("workspace_generation") or "")) is None:
+        raise StateLoadError(f"{label} workspace_generation 不合法")
+    workspace_kind = state.get("workspace_kind")
+    if workspace_kind not in WORKSPACE_KINDS:
+        raise StateLoadError(f"{label} workspace_kind 必須是 {sorted(WORKSPACE_KINDS)}")
+    fleet_run_id = state.get("fleet_run_id")
+    if workspace_kind == "standalone":
+        if fleet_run_id is not None:
+            raise StateLoadError(f"{label} standalone 的 fleet_run_id 必須是 null")
+    elif (not isinstance(fleet_run_id, str) or
+          re.fullmatch(r"[0-9a-f]{32}", fleet_run_id) is None):
+        raise StateLoadError(f"{label} fleet workspace 必須有 32 字元小寫 hex fleet_run_id")
+    if workspace_kind == "fleet-child":
+        if not valid_workspace_name(state.get("fleet_parent") or ""):
+            raise StateLoadError(f"{label} fleet-child 缺合法 fleet_parent")
+        track = state.get("track")
+        if (track != "@final" and
+                re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,23}", track or "") is None):
+            raise StateLoadError(f"{label} fleet-child 缺合法 track")
+        if not isinstance(state.get("merge_target_ref"), str) or not state["merge_target_ref"].startswith("refs/heads/"):
+            raise StateLoadError(f"{label} fleet-child 缺合法 merge_target_ref")
+        if re.fullmatch(r"[0-9a-f]{32}", state.get("fleet_parent_session_id") or "") is None:
+            raise StateLoadError(f"{label} fleet-child 缺合法 fleet_parent_session_id")
+    if "phase" in state and state["phase"] not in ("plan", "exec", "merge", "merge-ready", "done"):
         raise StateLoadError(f"{label} phase 不合法:{state['phase']!r}")
     integer_fields = ("round", "flag", "plan_version", "done_count", "red_streak",
                       "stall_rounds", "agent_failure_streak", "state_recovery_count")
@@ -799,8 +1213,15 @@ def validate_state_shape(state, label: str):
                     task["order"] < 1 or
                     not isinstance(task.get("task"), str) or not task["task"].strip() or
                     ("ref" in task and task["ref"] is not None and
-                     not isinstance(task["ref"], str))):
-                raise StateLoadError(f"{label} plan[{index}] 必須含有合法 order/task")
+                     not isinstance(task["ref"], str)) or
+                    not isinstance(task.get("track"), str) or
+                    not (task["track"] == "@final" or
+                         re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,23}", task["track"])) or
+                    ("scope" in task and
+                     (not isinstance(task["scope"], list) or not task["scope"] or
+                      any(not isinstance(value, str) or not value.strip()
+                          for value in task["scope"])))):
+                raise StateLoadError(f"{label} plan[{index}] 必須含有合法 order/task/track/ref/scope")
             plan_orders.append(task["order"])
         if plan_orders and plan_orders != list(range(1, len(plan_orders) + 1)):
             raise StateLoadError(f"{label} plan.order 必須從 1 依序連續遞增")
@@ -832,6 +1253,36 @@ def validate_state_shape(state, label: str):
                     ("ts" in issue and not isinstance(issue["ts"], str))):
                 raise StateLoadError(
                     f"{label} issues[{index}] 必須含有合法 round/text/where/ts")
+    if "phase_events" in state:
+        events = state["phase_events"]
+        if not isinstance(events, list) or len(events) > 500:
+            raise StateLoadError(f"{label} phase_events 必須是最多 500 項的陣列")
+        for index, event in enumerate(events):
+            if (not isinstance(event, dict) or
+                    event.get("phase") not in ("plan", "exec", "merge", "merge-ready", "done") or
+                    event.get("merge_stage") not in (None, "sync", "confirm") or
+                    not isinstance(event.get("round"), int) or
+                    isinstance(event.get("round"), bool) or event["round"] < 0 or
+                    not isinstance(event.get("at"), str) or not event["at"] or
+                    len(event["at"]) > 128):
+                raise StateLoadError(
+                    f"{label} phase_events[{index}] 必須含合法 phase/merge_stage/round/at")
+        event_sequences = [event.get("seq") for event in events if "seq" in event]
+        if event_sequences and (
+                len(event_sequences) != len(events) or
+                any(not isinstance(seq, int) or isinstance(seq, bool) or seq < 1
+                    for seq in event_sequences) or
+                event_sequences != sorted(set(event_sequences))):
+            raise StateLoadError(f"{label} phase_events.seq 必須是嚴格遞增正整數")
+        if "phase_event_seq" in state:
+            sequence = state["phase_event_seq"]
+            if (not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0 or
+                    event_sequences and event_sequences[-1] != sequence):
+                raise StateLoadError(f"{label} phase_event_seq 與 phase_events 不符")
+    elif "phase_event_seq" in state:
+        sequence = state["phase_event_seq"]
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+            raise StateLoadError(f"{label} phase_event_seq 不合法")
     for field in ("task_reset_counts", "config", "loop"):
         if field in state and not isinstance(state[field], dict):
             raise StateLoadError(f"{label} {field} 必須是 object")
@@ -982,6 +1433,18 @@ class Workspace:
             ensure_real_directory(self.dir, "workspace 目錄")
             for child in ("logs", "prompts", "snapshots"):
                 ensure_real_directory(self.dir / child, f"workspace/{child}")
+            info = self.dir.stat(follow_symlinks=False)
+            self._directory_identity = (info.st_dev, info.st_ino)
+            try:
+                initial_state, _data, _recovered = load_checkpointed_state(
+                    self.dir / "state.json", repair=False)
+                self._initial_workspace_generation = initial_state.get("workspace_generation")
+            except FileNotFoundError:
+                self._initial_workspace_generation = None
+            except (OSError, StateLoadError, ValueError):
+                # The later state load owns the detailed error.  A distinct sentinel still
+                # prevents a corrupt/replaced directory from being mistaken for a fresh one.
+                self._initial_workspace_generation = "invalid"
         self.state_path = self.dir / "state.json"
         self.checkpoint_path = state_checkpoint_path(self.state_path)
         self.history = self.dir / "history.log"
@@ -1001,10 +1464,52 @@ class Workspace:
         self._checkpoint_hash = None
         self.state_recovered = False
 
+    def acquire_writer_lock(self, expected_generation=""):
+        """Bridge the root operation-lock check to the long-lived workspace writer lock."""
+        with workspace_operation_lock(WORKSPACE_ROOT, self.name):
+            current = workspace_path(WORKSPACE_ROOT, self.name)
+            info = current.stat(follow_symlinks=False)
+            if (info.st_dev, info.st_ino) != self._directory_identity:
+                raise WorkspaceOperationLockError(
+                    f"workspace {self.name!r} 在啟動 writer 前已被同名重建")
+            try:
+                current_state, _data, _recovered = load_checkpointed_state(
+                    current / "state.json", repair=False)
+                current_generation = current_state.get("workspace_generation")
+            except FileNotFoundError:
+                current_generation = None
+            except (OSError, StateLoadError, ValueError):
+                current_generation = "invalid"
+            if current_generation != self._initial_workspace_generation:
+                raise WorkspaceOperationLockError(
+                    f"workspace {self.name!r} generation 在啟動 writer 前已更新")
+            if expected_generation:
+                expected = None if expected_generation == "new" else expected_generation
+                if current_generation != expected:
+                    raise WorkspaceOperationLockError(
+                        f"workspace {self.name!r} generation 與啟動請求不符")
+            acquire_run_lock(current / ".run.lock", f"workspace '{current.name}'")
+            after = current.stat(follow_symlinks=False)
+            if (after.st_dev, after.st_ino) != self._directory_identity:
+                raise WorkspaceOperationLockError(
+                    f"workspace {self.name!r} 在取得 writer lock 時已被替換")
+
     # ---- state.json ----
-    def fresh_state(self):
-        """建立向後相容的全新規劃期 state，所有收斂與異常計數歸零。"""
-        return {
+    def fresh_state(self, workspace_kind="standalone", fleet_run_id=None):
+        """建立 schema v2 全新規劃期 state，所有收斂與異常計數歸零。"""
+        if workspace_kind not in WORKSPACE_KINDS:
+            raise ValueError(f"workspace_kind 不合法:{workspace_kind}")
+        if workspace_kind == "standalone" and fleet_run_id is not None:
+            raise ValueError("standalone 的 fleet_run_id 必須是 null")
+        if workspace_kind != "standalone" and (
+                not isinstance(fleet_run_id, str) or
+                re.fullmatch(r"[0-9a-f]{32}", fleet_run_id) is None):
+            raise ValueError("fleet workspace 必須有 32 字元小寫 hex fleet_run_id")
+        state = {
+            "state_schema_version": STATE_SCHEMA_VERSION,
+            "workspace_generation": uuid.uuid4().hex,
+            "workspace_kind": workspace_kind,
+            "fleet_run_id": fleet_run_id,
             "phase": "plan", "round": 0, "flag": 0,
             "plan": [], "plan_version": 0,
             "current_order": 0, "done_count": 0,
@@ -1021,14 +1526,28 @@ class Workspace:
             "notes": [],
             "issues": [],               # agent 用 work.py issue 回報,給人類看,不影響計數
             "issues_acknowledged_round": -1,
+            "fleet_parent": None,
+            "fleet_parent_session_id": None,
+            "track": None,
+            "merge_stage": None,
+            "merge_target_ref": None,
+            "merge_target_tip": None,
+            "merge_ready_sha": None,
+            "merge_control_generation": 0,
         }
+        if workspace_kind == "fleet-parent":
+            # Dashboard fleet edits commit fleet truth and this parent mirror as a
+            # four-file transaction.  Revision zero must exist from the first state,
+            # otherwise a crash after the first fleet write can look like a valid pair.
+            state["fleet_truth_revision"] = 0
+        return state
 
-    def load_state(self):
+    def load_state(self, workspace_kind="standalone", fleet_run_id=None):
         """載入 primary/checkpoint；必要時受控復原並記錄本 session 的防竄改雜湊。"""
         try:
             state, data, recovered = load_checkpointed_state(self.state_path)
         except FileNotFoundError:
-            return self.fresh_state()
+            return self.fresh_state(workspace_kind, fleet_run_id)
         if recovered:
             self.state_recovered = True
             mark_state_recovered(state)
@@ -1041,6 +1560,31 @@ class Workspace:
 
     def save_state(self, state):
         """同步原子寫入 primary 與 checkpoint，並更新本 session 的防竄改基準。"""
+        phase_events = state.setdefault("phase_events", [])
+        sequence = state.get("phase_event_seq")
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+            sequence = 0
+        # Upgrade old states in-place.  Once sequence numbers exist, trimming the
+        # bounded list no longer makes the Fleet parent's cursor ambiguous.
+        if phase_events and any("seq" not in event for event in phase_events):
+            sequence = max(sequence, len(phase_events))
+            first = sequence - len(phase_events) + 1
+            for offset, event in enumerate(phase_events):
+                event["seq"] = first + offset
+        elif phase_events:
+            sequence = max(sequence, int(phase_events[-1]["seq"]))
+        identity = (state.get("phase"), state.get("merge_stage"))
+        previous = ((phase_events[-1].get("phase"), phase_events[-1].get("merge_stage"))
+                    if phase_events else None)
+        if identity != previous:
+            sequence += 1
+            phase_events.append({"phase": identity[0], "merge_stage": identity[1],
+                                 "round": state.get("round", 0),
+                                 "seq": sequence,
+                                 "at": datetime.now().astimezone().isoformat(timespec="milliseconds")})
+            if len(phase_events) > 500:
+                del phase_events[:-500]
+        state["phase_event_seq"] = sequence
         data = json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")
         write_checkpointed_state(self.state_path, data)
         self._state_hash = sha256_bytes(data)
@@ -1148,6 +1692,17 @@ class Workspace:
                 target.write_bytes(snap)
 
 
+def clear_agent_backoff_state(workspace, state):
+    """停機前清掉輪間暫態 backoff，避免 UI 顯示殘留等待。"""
+    if not isinstance(state, dict):
+        return
+    if state.get("agent_backoff_seconds", 0) == 0 and state.get("agent_backoff_until") is None:
+        return
+    state["agent_backoff_seconds"] = 0
+    state["agent_backoff_until"] = None
+    workspace.save_state(state)
+
+
 def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs, on_started=None):
     """跑一輪 agent:prompt 從檔案餵 stdin(避免大 payload 塞管線),
     stdout/stderr 逐行同步印上 console 並落 log 檔。
@@ -1159,9 +1714,8 @@ def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs, on_started=No
     prompt_fd = _open_regular(prompt_path, os.O_RDONLY)
     with os.fdopen(log_fd, "w", encoding="utf-8", closefd=True) as lf, \
             os.fdopen(prompt_fd, "rb", closefd=True) as pin:
-        p = subprocess.Popen(cmd, cwd=str(repo), env=env, stdin=pin,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             start_new_session=True)
+        p = _spawn_runtime_process(cmd, kind="agent", cwd=repo, env=env, stdin=pin,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         process_group = p.pid  # start_new_session=True → pgid 固定等於 child pid
         reader_errors = []
         escaped_pipe = False
@@ -1216,6 +1770,7 @@ def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs, on_started=No
                 log("⛔ Agent 有逃離 process group 的背景程序仍持有 stdout；為避免跨輪競寫，loop 停止")
             else:
                 p.stdout.close()
+            _clear_runtime_marker(p.pid)
         if escaped_pipe:
             raise RuntimeError("Agent 背景程序逃離 process group，無法安全進入下一輪")
         if reader_errors:
@@ -1238,27 +1793,30 @@ def notify(cmd, status, name):
 def run_validate(cmd, repo, timeout_secs=VALIDATE_TIMEOUT_SEC):
     """執行正式 validator；逾時或中斷時清掉整個 validator process group。"""
     try:
-        p = subprocess.Popen(cmd, cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, start_new_session=True)
+        p = _spawn_runtime_process(cmd, kind="validator", cwd=repo, env=os.environ,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     except FileNotFoundError:
         return False, f"找不到 Validate 命令：{cmd[0]}", False
     timed_out = False
     try:
-        out, _ = p.communicate(timeout=timeout_secs)
-    except subprocess.TimeoutExpired:
-        timed_out = True
         try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        out, _ = p.communicate()
-    except KeyboardInterrupt:
-        try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        p.wait()
-        raise
+            out, _ = p.communicate(timeout=timeout_secs)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            out, _ = p.communicate()
+        except KeyboardInterrupt:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            p.wait()
+            raise
+    finally:
+        _clear_runtime_marker(p.pid)
     out = (out or "").strip()
     tail = "\n".join(out.splitlines()[-VALIDATE_TAIL:])
     if timed_out:
@@ -1285,11 +1843,15 @@ def render_task_list(state):
 
 
 def build_prompt(tpl_path, mapping):
-    """以固定 placeholder 做純文字替換；不執行模板內容。"""
+    """Single-pass placeholder rendering; injected user text is never reinterpreted as template."""
     text = tpl_path.read_text(encoding="utf-8")
-    for k, v in mapping.items():
-        text = text.replace(f"<<{k}>>", v)
-    return text
+    pattern = re.compile(r"<<([A-Z][A-Z0-9_]*)>>")
+    markers = set(pattern.findall(text))
+    provided = set(mapping)
+    if markers != provided:
+        raise ValueError(f"prompt placeholder 契約不符：missing={sorted(markers - provided)} "
+                         f"extra={sorted(provided - markers)}")
+    return pattern.sub(lambda match: str(mapping[match.group(1)]), text)
 
 
 def fenced_block(text):
@@ -1349,8 +1911,21 @@ def build_argument_parser() -> argparse.ArgumentParser:
                         help="搭配 --import-plan:從規劃期(讓 agent 補完)或直接執行期開跑")
     parser.add_argument("--pause-after-plan", action="store_true",
                         help="規劃收斂後暫停:不自動進入執行期,人工按「▶ 運行」才開始執行輪")
+    parser.add_argument("--handoff-after-plan", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-kind", choices=tuple(sorted(WORKSPACE_KINDS)),
+                        default="standalone", help=argparse.SUPPRESS)
+    parser.add_argument("--fleet-run-id", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--fleet-parent", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--fleet-parent-session-id", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--inherited-worktree-lock-fd", type=int, default=-1,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--track", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--merge-target-ref", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--merge-threshold", type=int, default=2, help=argparse.SUPPRESS)
     parser.add_argument("--max-rounds", type=int, default=0, help="總輪數上限;0=不限(測試用)")
     parser.add_argument("--reset-state", action="store_true", help="清掉 workspace state 從頭跑")
+    parser.add_argument("--expected-workspace-generation", default="", help=argparse.SUPPRESS)
     parser.add_argument("--preflight-only", action="store_true",
                         help="只跑啟動前健檢(git/鎖/乾淨樹/goal 已 commit/validate)就退出;"
                              "不建 state、不動 snapshots、不啟動 agent")
@@ -1371,6 +1946,36 @@ def parse_runtime_options(argv=None) -> RuntimeOptions:
             parser.error(f"{option} 必須 ≥ 1")
     if args.max_rounds < 0:
         parser.error("--max-rounds 必須 ≥ 0")
+    if args.merge_threshold < 1:
+        parser.error("--merge-threshold 必須 ≥ 1")
+    if args.pause_after_plan and args.handoff_after_plan:
+        parser.error("--pause-after-plan 與 --handoff-after-plan 不可同時使用")
+    fleet_run_id = args.fleet_run_id or None
+    if args.workspace_kind == "standalone" and fleet_run_id is not None:
+        parser.error("standalone 不接受 --fleet-run-id")
+    if args.workspace_kind != "standalone" and (
+            fleet_run_id is None or re.fullmatch(r"[0-9a-f]{32}", fleet_run_id) is None):
+        parser.error("fleet workspace 的 --fleet-run-id 必須是 32 字元小寫 hex")
+    if args.workspace_kind == "fleet-child":
+        if not valid_workspace_name(args.fleet_parent):
+            parser.error("fleet-child 必須提供合法 --fleet-parent")
+        if (args.track != "@final" and
+                re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,23}", args.track or "") is None):
+            parser.error("fleet-child 必須提供合法 --track")
+        if not args.merge_target_ref.startswith("refs/heads/"):
+            parser.error("fleet-child 必須提供完整 --merge-target-ref")
+        if re.fullmatch(r"[0-9a-f]{32}", args.fleet_parent_session_id or "") is None:
+            parser.error("fleet-child 必須提供 32 字元小寫 hex --fleet-parent-session-id")
+    elif args.fleet_parent or args.fleet_parent_session_id or args.track or args.merge_target_ref:
+        parser.error("--fleet-parent/--fleet-parent-session-id/--track/--merge-target-ref 只適用 fleet-child")
+    if args.inherited_worktree_lock_fd >= 0:
+        if (args.workspace_kind != "fleet-parent" or
+                os.environ.get("LOOP_FLEET_RUN_ID") != (args.fleet_run_id or "")):
+            parser.error("inherited worktree lock 只接受同 run-id 的 fleet planning handoff")
+    if (args.expected_workspace_generation and
+            args.expected_workspace_generation != "new" and
+            re.fullmatch(r"[0-9a-f]{32}", args.expected_workspace_generation) is None):
+        parser.error("--expected-workspace-generation 必須是 new 或 32 字元小寫 hex")
     for attr, option, positive in (("round_timeout", "--round-timeout", False),
                                    ("agent_backoff_max", "--agent-backoff-max", False),
                                    ("validate_timeout", "--validate-timeout", True)):
@@ -1404,7 +2009,7 @@ def parse_runtime_options(argv=None) -> RuntimeOptions:
     )
 
 
-def guard_repository_baseline(repo: Path, protected) -> None:
+def guard_repository_baseline(repo: Path, protected, inherited_lock_fd: int = -1) -> None:
     """取得 worktree 單 writer 鎖，並確認 Git、乾淨樹與受保護檔案可作為起點。"""
     if git(repo, "rev-parse", "--is-inside-work-tree", check=False).returncode != 0:
         fail(f"preflight：{repo} 不是 git repo")
@@ -1413,7 +2018,11 @@ def guard_repository_baseline(repo: Path, protected) -> None:
     git_dir = Path(git(repo, "rev-parse", "--git-dir").stdout.strip())
     if not git_dir.is_absolute():
         git_dir = (repo / git_dir).resolve()
-    acquire_run_lock(git_dir / "loop-agent-lite.run.lock", f"Git worktree {repo}")
+    lock_path = git_dir / "loop-agent-lite.run.lock"
+    if inherited_lock_fd >= 0:
+        adopt_inherited_run_lock(inherited_lock_fd, lock_path, f"Git worktree {repo}")
+    else:
+        acquire_run_lock(lock_path, f"Git worktree {repo}")
     if is_dirty(repo):
         fail("preflight：工作樹不乾淨。之後的 reset --hard 會吃掉你的 WIP，先 commit 或 stash 再來")
     for relative_path in protected:
@@ -1494,6 +2103,8 @@ def ingest_pending_issues(workspace, state, round_token: str, round_number: int,
     pending_path.unlink()
     for line in issue_lines:
         log(f"⚠️ Agent 回報 issue｜{line}")
+        state.setdefault("notes", []).append(
+            f"⚠️ 前一輪 agent issue（作為下一輪 context，不是預設人工 gate）：{line}")
     if issue_lines:
         log(f"📌 Issue 累計｜目前有 {len(state.get('issues', []))} 條，"
             f"未讀 {unread_issue_count(state)} 條")
@@ -1572,7 +2183,16 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
         log("📨 Agent 指令｜create-plan｜執行期計畫已凍結，將忽略此指令")
 
     log(f"🧪 執行驗證｜命令：{shlex.join(validate_cmd)}")
+    validate_head_before = head_sha(repo)
+    validate_status_before = git(repo, "status", "--porcelain=v1", "-z").stdout
     ok, tail, validate_timed_out = run_validate(validate_cmd, repo, args.validate_timeout)
+    validate_head_after = head_sha(repo)
+    validate_status_after = git(repo, "status", "--porcelain=v1", "-z").stdout
+    if (validate_head_after, validate_status_after) != (validate_head_before, validate_status_before):
+        workspace.save_state(state)
+        fail(f"驗證命令 `{shlex.join(validate_cmd)}` 修改了 Git HEAD/index/worktree；"
+             "validator 必須是唯讀，已保留現場並停止")
+    dirty = bool(validate_status_after)
     validate_note = "PASS" if ok else "FAIL"
     if ok:
         log("✅ 驗證通過")
@@ -1611,7 +2231,8 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
         next_order = next((task["order"] for task in state["plan"]
                            if task["order"] > state["current_order"]), None)
         if next_order is None:
-            state["phase"] = "done"
+            state["phase"] = "merge" if state.get("workspace_kind") == "fleet-child" else "done"
+            state["merge_stage"] = "sync" if state["phase"] == "merge" else None
             state["red_streak"] = 0
             state["stall_rounds"] = 0
         else:
@@ -1656,6 +2277,63 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
     return event, validate_note
 
 
+def process_merge_round(state, workspace, round_token: str, *, repo: Path,
+                        validate_cmd, args, head_after: str, dirty: bool,
+                        tampered, changed, agent_failed: bool):
+    """讓 fleet-child 以 agent 多輪收斂到可供 fleet CAS 的 merge-ready candidate。"""
+    stage = state.get("merge_stage") or "sync"
+    done_signaled = workspace.signal("signal_done", round_token)
+    log("📨 Agent 指令｜done merge-main" if done_signaled else "ℹ️ Agent 本輪未送出 done merge-main")
+    validate_head_before = head_sha(repo)
+    validate_status_before = git(repo, "status", "--porcelain=v1", "-z").stdout
+    ok, tail, validate_timed_out = run_validate(validate_cmd, repo, args.validate_timeout)
+    validate_head_after = head_sha(repo)
+    validate_status_after = git(repo, "status", "--porcelain=v1", "-z").stdout
+    if (validate_head_after, validate_status_after) != (validate_head_before, validate_status_before):
+        workspace.save_state(state)
+        fail(f"整合驗證命令 `{shlex.join(validate_cmd)}` 修改了 Git HEAD/index/worktree；"
+             "validator 必須是唯讀，已保留現場並停止")
+    dirty = bool(validate_status_after)
+    validate_note = "PASS" if ok else "FAIL"
+    if ok and not dirty:
+        state["last_green_sha"] = head_after
+        state["red_streak"] = 0
+    else:
+        state["done_count"] = 0
+        state["red_streak"] = state.get("red_streak", 0) + 1
+        timeout_note = f"（逾時 {args.validate_timeout:g} 秒）" if validate_timed_out else ""
+        state["notes"].append(
+            f"❌ 整合收斂 validate 失敗{timeout_note}；請在下一輪自行重現並修復。輸出尾段:\n"
+            f"{fenced_block(tail)}")
+
+    integration_tip = state.get("merge_target_tip")
+    contains_tip = bool(integration_tip and is_ancestor(repo, integration_tip, head_after))
+    if stage == "sync":
+        state["done_count"] = 0
+        if ok and not dirty and contains_tip:
+            state["merge_stage"] = "confirm"
+            event = f"✅ 已整合 {integration_tip[:8]}，下一輪獨立確認"
+        else:
+            event = "↩️ integration tip 尚未成為 candidate 祖先，繼續 sync"
+    elif tampered or changed or agent_failed or dirty or not ok or not contains_tip:
+        state["done_count"] = 0
+        state["merge_stage"] = "sync" if not contains_tip else "confirm"
+        event = "↩️ 整合確認出現異動或異常，done 歸零"
+    elif done_signaled:
+        state["done_count"] += 1
+        event = f"✅ 整合確認 done {state['done_count']} / {args.merge_threshold}"
+    else:
+        event = "ℹ️ 整合確認未回 done，交下一輪繼續"
+
+    if (state["done_count"] >= args.merge_threshold and ok and not dirty and contains_tip and
+            head_after == state.get("last_green_sha")):
+        state["phase"] = "merge-ready"
+        state["merge_ready_sha"] = head_after
+        state["merge_stage"] = None
+        event = f"✅ merge-ready {head_after[:8]}"
+    return event, validate_note
+
+
 def main():
     """解析 CLI、執行 preflight，然後進入規劃/執行雙階段 coordinator loop。"""
     options = parse_runtime_options()
@@ -1674,33 +2352,64 @@ def main():
     except ValueError as e:
         build_argument_parser().error(f"--name {e}")
     configure_console(ws.dir / "console.log")
-    acquire_run_lock(ws.dir / ".run.lock", f"workspace '{ws.dir.name}'")
+    ws.acquire_writer_lock(args.expected_workspace_generation)
     startup_ready = ws.dir / "startup_ready.json"
     if not args.preflight_only:  # 健檢模式不得動到既有啟動 handshake 檔
         startup_ready.unlink(missing_ok=True)
 
-    guard_repository_baseline(repo, protected)
+    guard_repository_baseline(repo, protected, args.inherited_worktree_lock_fd)
     if args.preflight_only:
-        run_preflight_check(repo, validate_cmd, args.validate_timeout)
+        # A preflight-only validator is still an independent process group.  Track it
+        # with the existing generation (or an ephemeral one for a new/corrupt workspace)
+        # so a hard-killed CLI cannot leave an unidentifiable validator behind;
+        # successful preflight removes both markers.
+        try:
+            existing, _data, _recovered = load_checkpointed_state(ws.state_path, repair=False)
+            runtime_generation = existing["workspace_generation"]
+        except (FileNotFoundError, StateLoadError):
+            runtime_generation = uuid.uuid4().hex
+        configure_runtime_identity(ws.dir, runtime_generation, uuid.uuid4().hex,
+                                   workspace_name=workspace_name, repo=repo)
+        try:
+            run_preflight_check(repo, validate_cmd, args.validate_timeout)
+        finally:
+            remove_runtime_identity_markers()
+            clear_runtime_identity_context()
         return
 
     log(f"🚀 Loop 啟動｜workspace={ws.dir.name}｜repo={repo}")
+    state_existed = ws.state_path.exists()
+    persisted_generation = None
+    if state_existed:
+        try:
+            persisted_state, _persisted_data, _persisted_recovered = load_checkpointed_state(
+                ws.state_path, repair=False)
+            persisted_generation = persisted_state.get("workspace_generation")
+        except (FileNotFoundError, StateLoadError):
+            pass
     if args.reset_state:
         # Reset 必須是交易式的：先在記憶體建立全新 state，等所有 preflight（尤其 validate）
         # 通過後才由下方第一個 save_state 原子取代舊檔。若驗證失敗，舊 state 仍完整可讀，
         # 不會留下只有 workspace 目錄、沒有 state.json 的幽靈分頁。
-        state = ws.fresh_state()
+        state = ws.fresh_state(args.workspace_kind, args.fleet_run_id or None)
         log("🧹 準備重置既有 state｜啟動前檢查通過後才會正式清除舊進度")
     else:
         try:
-            state = ws.load_state()
+            state = ws.load_state(args.workspace_kind, args.fleet_run_id or None)
         except StateLoadError as e:
             fail(f"workspace state 無法復原：{e}。請由人工檢查 {ws.state_path} 與 {ws.checkpoint_path}")
         if ws.state_recovered:
             log(f"🛟 state.json 已從 last-good checkpoint 復原｜第 {state['state_recovery_count']} 次")
             state.setdefault("notes", []).append(
                 "🛟 協調 state 曾損壞或遺失，本次已從 last-good checkpoint 復原；"
-                "先核對目前 task 與 repo 現場再繼續。")
+                              "先核對目前 task 與 repo 現場再繼續。")
+
+    if state_existed and not (args.reset_state or args.import_plan):
+        requested_run_id = args.fleet_run_id or None
+        if (state.get("workspace_kind") != args.workspace_kind or
+                state.get("fleet_run_id") != requested_run_id):
+            fail(f"workspace 身分不符：state 是 {state.get('workspace_kind')}/"
+                 f"{state.get('fleet_run_id')}，本次啟動要求 {args.workspace_kind}/{requested_run_id}")
 
     # repo identity fail-closed:workspace 只按 name 載入,若既有 state 綁的是別的 repo,
     # 續跑會拿別人的 plan/completed/last_green_sha 去 reset --hard——寧可停也不帶病前進。
@@ -1719,15 +2428,27 @@ def main():
         normalized, errs = validate_plan(plan_obj)
         if errs:
             fail("plan.json 校驗未過:\n- " + "\n- ".join(errs))
-        state = ws.fresh_state()
+        state = ws.fresh_state(args.workspace_kind, args.fleet_run_id or None)
         state["plan"] = normalized
         state["plan_version"] = 1
         state["phase"] = args.start_phase
         if args.start_phase == "exec":
             state["current_order"] = normalized[0]["order"]
+        if args.workspace_kind == "standalone":
+            tracks = {task["track"] for task in normalized}
+            if tracks != {"main"}:
+                fail("standalone plan 的 track 必須全部是 main；多軌或 @final 請使用 engine.fleet")
         log(f"📝 匯入計畫｜{len(normalized)} 條｜從 {'規劃期' if args.start_phase == 'plan' else '執行期'} 開始")
 
+    # The startup validator is also a potentially long-lived process group.  Give this
+    # coordinator its session identity before validation, without publishing it into
+    # state until every preflight has passed.
+    session_id = uuid.uuid4().hex
     fresh_start = bool(args.reset_state or args.import_plan)
+    configure_runtime_identity(ws.dir, state["workspace_generation"], session_id,
+                               workspace_name=workspace_name, repo=repo,
+                               previous_workspace_generation=(persisted_generation
+                                                              if fresh_start else None))
     # 一般 resume 要先拍快照供舊綠點驗證；reset/import 延後到 Validate 綠後，
     # 失敗的 staged 啟動就不會改掉舊 state 對應的 protected snapshot。
     if not fresh_start:
@@ -1754,6 +2475,48 @@ def main():
     elif not state.get("goal_changed"):
         state.pop("goal_previous_hash", None)
     state["goal_hash"] = goal_hash
+    if args.workspace_kind == "fleet-child":
+        expected_identity = (args.fleet_parent, args.track, args.merge_target_ref)
+        recorded_identity = (state.get("fleet_parent"), state.get("track"), state.get("merge_target_ref"))
+        if state_existed and not fresh_start and recorded_identity != expected_identity:
+            fail(f"fleet-child 身分不符：state={recorded_identity}，本次={expected_identity}")
+        state.update(fleet_parent=args.fleet_parent,
+                     fleet_parent_session_id=args.fleet_parent_session_id,
+                     track=args.track,
+                     merge_target_ref=args.merge_target_ref)
+        control_path = ws.dir / "fleet-control.json"
+        try:
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            control = None
+        except (OSError, json.JSONDecodeError) as e:
+            state.setdefault("notes", []).append(f"⚠️ fleet control 無法解析，已忽略:{e}")
+            control = None
+        if control is not None:
+            generation = control.get("generation")
+            current_generation = state.get("merge_control_generation", 0)
+            valid_control = (
+                control.get("schema_version") == 1 and
+                control.get("run_id") == args.fleet_run_id and
+                control.get("track") == args.track and
+                control.get("action") in {"repair", "stop", "lease"} and
+                isinstance(generation, int) and not isinstance(generation, bool) and
+                generation > current_generation and
+                control.get("expected_child_sha") == head_sha(repo))
+            if valid_control:
+                state["merge_control_generation"] = generation
+                if control["action"] == "repair":
+                    state.update(phase="merge", merge_stage="confirm", merge_ready_sha=None,
+                                 done_count=0)
+                    note = str(control.get("note") or "")[:8000]
+                    state.setdefault("notes", []).append(
+                        "🔁 integration validate 失敗且已自動 rollback。這是 integration worktree 的權威"
+                        "失敗證據；integration-only validator 在 child worktree 無法重現是預期行為。"
+                        "必須依錯誤內容完成修復，不得因 child local validate PASS 而忽略:\n" + note)
+                elif control["action"] == "stop":
+                    state.setdefault("notes", []).append("⏸ fleet 要求 child 停止")
+            else:
+                state.setdefault("notes", []).append("⚠️ 過期或身分不符的 fleet control 已忽略")
     try:
         state["agent_failure_streak"] = max(0, int(state.get("agent_failure_streak", 0)))
     except (TypeError, ValueError):
@@ -1770,18 +2533,25 @@ def main():
                        "pause_after_plan": bool(args.pause_after_plan),
                        "repo": str(repo), "agent_cmd": shlex.join(agent_cmd),
                        "validate_cmd": shlex.join(validate_cmd),
-                       "goal": args.goal, "plan_doc": args.plan_doc}
+                       "goal": args.goal, "plan_doc": args.plan_doc,
+                       "workspace_kind": args.workspace_kind,
+                       "fleet_run_id": args.fleet_run_id or None,
+                       "fleet_parent": args.fleet_parent or None,
+                       "fleet_parent_session_id": args.fleet_parent_session_id or None,
+                       "track": args.track or None,
+                       "merge_target_ref": args.merge_target_ref or None,
+                       "merge_threshold": args.merge_threshold}
     # 舊 session 的停止請求不可跨重啟生效；先清掉，再公開新 pid/session_id。
     ws.stop_after_round_path.unlink(missing_ok=True)
     ws.stop_after_round_claimed_path.unlink(missing_ok=True)
     for orphan in ws.dir.glob(f".{STOP_AFTER_ROUND_FILE}.consume.*"):
         orphan.unlink(missing_ok=True)
-    session_id = uuid.uuid4().hex
     state["loop"] = {"pid": os.getpid(), "session_id": session_id,
                      "started_at": datetime.now().isoformat(timespec="seconds")}
 
     def _mark_stopped():
         """正常退出時清 session 控制檔、凍結未完成輪時間並清除 state pid。"""
+        remove_runtime_identity_markers()
         # 若「本輪後停止」後又立刻按立即停止，或程序在輪末競態退出，不把請求留給下次 session。
         stop_after_round_requested(ws.dir, os.getpid(), session_id, consume=True)
         clear_stop_after_round_claimed(ws.dir, os.getpid(), session_id)
@@ -1829,7 +2599,14 @@ def main():
     issue_cmd = f"{work_module} issue"
     base_env = expose_checkout_package({**os.environ, "LOOP_WS": str(ws.dir)})
 
-    phase_name = "規劃期" if state["phase"] == "plan" else "執行期"
+    if state.get("phase") == "merge-ready" and args.workspace_kind == "fleet-child":
+        current_tip = git(repo, "rev-parse", args.merge_target_ref).stdout.strip()
+        if not is_ancestor(repo, current_tip, head_sha(repo)):
+            state.update(phase="merge", merge_stage="sync", merge_target_tip=current_tip,
+                         merge_ready_sha=None, done_count=0)
+            ws.save_state(state)
+    phase_name = {"plan": "規劃期", "exec": "執行期", "merge": "整合收斂期",
+                  "merge-ready": "待合併"}.get(state["phase"], state["phase"])
     log(f"📍 恢復進度｜階段：{phase_name}｜已完成 round {state['round']}")
     log(f"⚙️ 執行設定｜Agent：{shlex.join(agent_cmd)}｜驗證：{shlex.join(validate_cmd)}")
     log(f"⚙️ 收斂門檻｜flag>{args.flag_threshold}｜done≥{args.done_threshold}｜red-limit={args.red_limit}｜"
@@ -1840,7 +2617,15 @@ def main():
 
     goal_text = goal_path.read_text(encoding="utf-8")
 
-    while state["phase"] != "done":
+    while state["phase"] not in {"done", "merge-ready"}:
+        if (args.workspace_kind == "fleet-child" and
+                not fleet_parent_lease_alive(args.fleet_parent, args.fleet_run_id,
+                                             args.fleet_parent_session_id)):
+            state.setdefault("notes", []).append(
+                "⏸ fleet supervisor lease 已失效；本 child 未啟動下一輪，等待 parent resume")
+            ws.save_state(state)
+            log(f"⏸ Fleet lease 已失效｜完整保留至 round {state['round']}，未啟動下一輪")
+            break
         # 接住「上一輪落盤後、下一輪 while 開始前」送達的請求，不再 spawn 新 Agent。
         if ws.take_stop_after_round(os.getpid(), session_id):
             state["agent_backoff_seconds"] = 0
@@ -1879,7 +2664,13 @@ def main():
             ws.save_state(state)
             fail(f"執行期找不到 current_order={state['current_order']} 的任務"
                  f"（plan {len(state['plan'])} 條）——state 不合法，停機交由人員確認")
-        task_id = f"task-{state['current_order']}" if (phase == "exec" and cur_task) else ""
+        task_id = (f"task-{state['current_order']}" if (phase == "exec" and cur_task) else
+                   "merge-main" if phase == "merge" else "")
+        if phase == "merge":
+            integration_tip = git(repo, "rev-parse", args.merge_target_ref).stdout.strip()
+            state["merge_target_tip"] = integration_tip
+            state["merge_stage"] = ("confirm" if is_ancestor(repo, integration_tip, head_sha(repo))
+                                    else "sync")
         ws.clear_signals()
         round_token = uuid.uuid4().hex
         ws.write_dispatch(phase, task_id, round_token)
@@ -1899,10 +2690,15 @@ def main():
                 "CREATE_CMD": create_cmd,
                 "PLANOK_CMD": planok_cmd,
                 "ISSUE_CMD": issue_cmd,
+                "PLAN_MODE_CONTEXT": (
+                    "這是 standalone 規劃：每一條 task 的 track 都必須是 `main`，不得使用 `@final`。"
+                    if state.get("workspace_kind") == "standalone" else
+                    "這是 parallel fleet 規劃：可依下列規則拆成多個 track，跨軌收尾放 `@final`。"),
                 "NOTES": notes_text,
             })
-        else:
+        elif phase == "exec":
             done_cmd = f"{work_module} done {task_id}"
+            track = cur_task.get("track", "main")
             prompt = build_prompt(HERE / "prompts" / "exec.md", {
                 "GOAL": goal_text.strip(),
                 "PLAN_DOC": plan_doc_display,
@@ -1910,11 +2706,33 @@ def main():
                 "TASK_TEXT": cur_task["task"],
                 "TASK_REF": cur_task.get("ref") or "(無)",
                 "TASK_LIST": render_task_list(state),
+                "TRACK_CONTEXT": (
+                    ("" if state.get("workspace_kind") == "standalone" else
+                     f"本任務屬於並行軌道 `{track}`；其他軌道會在隔離 worktree 同時進行。")
+                    + f"\n- 允許的探索範圍：{', '.join(cur_task.get('scope') or ['任務文字與 ref 直接點名的路徑'])}。"
+                    + "這是探索/資料量邊界，不取代任務完成所需的必要修改與驗證。"),
+                "TASK_TAG": task_id if state.get("workspace_kind") == "standalone" else f"{track}/{task_id}",
                 "DONE_CMD": done_cmd,
                 "ISSUE_CMD": issue_cmd,
                 "VALIDATE_CMD": shlex.join(validate_cmd),
                 "NOTES": notes_text,
             })
+        else:
+            stage = state.get("merge_stage") or "sync"
+            template = "merge-confirm.md" if stage == "confirm" else "merge-sync.md"
+            merge_mapping = {
+                "GOAL": goal_text.strip(),
+                "TRACK_NAME": state.get("track") or "main",
+                "MERGE_TARGET": args.merge_target_ref,
+                "INTEGRATION_TIP": state["merge_target_tip"],
+                "TRACK_TASKS_FULL": json.dumps(state.get("plan") or [], ensure_ascii=False, indent=2),
+                "REPAIR_CONTEXT": notes_text,
+                "ISSUE_CMD": issue_cmd,
+                "VALIDATE_CMD": shlex.join(validate_cmd),
+            }
+            if stage == "confirm":
+                merge_mapping["DONE_CMD"] = f"{work_module} done merge-main"
+            prompt = build_prompt(HERE / "prompts" / template, merge_mapping)
         prompt_path = ws.dir / "prompts" / f"round-{rnd:04d}.md"
         workspace_file(prompt_path, "round prompt")
         atomic_write_bytes(prompt_path, prompt.encode("utf-8"))
@@ -1929,7 +2747,7 @@ def main():
             old.unlink(missing_ok=True)
 
         head_before = head_sha(repo)
-        phase_name = "規劃期" if phase == "plan" else "執行期"
+        phase_name = {"plan": "規劃期", "exec": "執行期", "merge": "整合收斂期"}.get(phase, phase)
         task_summary = f"｜{task_id}：{cur_task['task']}" if cur_task else ""
         log(f"🔄 第 {rnd} 輪開始｜{phase_name}{task_summary}｜flag={state['flag']}｜done={state['done_count']}")
         log(f"🤖 啟動 Agent｜命令：{shlex.join(agent_cmd)}")
@@ -1943,7 +2761,7 @@ def main():
         agent_reported_done = (
             (phase == "plan" and (ws.signal("called_create_plan", round_token) or
                                   ws.signal("signal_plan_ok", round_token))) or
-            (phase == "exec" and ws.signal("signal_done", round_token))
+            (phase in {"exec", "merge"} and ws.signal("signal_done", round_token))
         )
         missing_done = not agent_reported_done
         state["last_round_seconds"] = round(secs, 3)
@@ -2017,16 +2835,26 @@ def main():
                 state, ws, round_token, tampered=tampered, changed=changed,
                 agent_failed=agent_failed, flag_threshold=args.flag_threshold)
             validate_note = "-"
-        else:
+            if state["phase"] == "exec" and state.get("workspace_kind") == "standalone":
+                tracks = {task["track"] for task in state.get("plan") or []}
+                if tracks != {"main"}:
+                    ws.save_state(state)
+                    fail("standalone 規劃只能產生 main track；多軌或 @final 請使用 engine.fleet")
+        elif phase == "exec":
             event, validate_note = process_exec_round(
                 state, ws, round_token, task_id=task_id, round_number=rnd, repo=repo,
                 protected=protected, validate_cmd=validate_cmd, args=args,
                 head_after=head_after, dirty=dirty, tampered=tampered, changed=changed,
                 agent_failed=agent_failed)
+        else:
+            event, validate_note = process_merge_round(
+                state, ws, round_token, repo=repo, validate_cmd=validate_cmd, args=args,
+                head_after=head_after, dirty=dirty, tampered=tampered, changed=changed,
+                agent_failed=agent_failed)
 
         ingest_pending_issues(ws, state, round_token, rnd, task_id, phase)
 
-        will_retry = (agent_failed and state["phase"] != "done" and
+        will_retry = (agent_failed and state["phase"] not in {"done", "merge-ready"} and
                       not (args.max_rounds and state["round"] >= args.max_rounds))
         retry_delay = agent_failure_backoff(state["agent_failure_streak"], args.agent_backoff_max) \
             if will_retry else 0.0
@@ -2063,32 +2891,49 @@ def main():
             log(f"⏳ Agent CLI 連續異常 {state['agent_failure_streak']} 輪｜{retry_delay:g} 秒後重試"
                 f"（上限 {args.agent_backoff_max:g} 秒）")
         ws.save_state(state)
-        stop_after_round = ws.take_stop_after_round(os.getpid(), session_id)
-        if retry_delay and not stop_after_round:
-            try:
-                # 退避已位於兩輪之間；此時收到請求應立即停，不必等完退避，更不能再開一輪。
-                deadline = time.monotonic() + retry_delay
-                while True:
-                    if ws.take_stop_after_round(os.getpid(), session_id):
-                        stop_after_round = True
-                        break
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    time.sleep(min(0.2, remaining))
-            finally:
-                # Ctrl-C/正常醒來都清掉 UI 的等待狀態；failure streak 留到下一輪成功才歸零。
-                state["agent_backoff_seconds"] = 0
-                state["agent_backoff_until"] = None
-                ws.save_state(state)
-        if stop_after_round:
-            state["agent_backoff_seconds"] = 0
-            state["agent_backoff_until"] = None
-            ws.save_state(state)
-            log(f"⏸ 已依要求停止｜round {rnd} 已完整處理並落盤，未啟動下一輪")
-            break
+        try:
+            lease_expired = (args.workspace_kind == "fleet-child" and
+                             not fleet_parent_lease_alive(args.fleet_parent, args.fleet_run_id,
+                                                          args.fleet_parent_session_id))
+            stop_after_round = ws.take_stop_after_round(os.getpid(), session_id) or lease_expired
+            if retry_delay and not stop_after_round:
+                try:
+                    # 退避已位於兩輪之間；此時收到請求應立即停，不必等完退避，更不能再開一輪。
+                    deadline = time.monotonic() + retry_delay
+                    while True:
+                        if ws.take_stop_after_round(os.getpid(), session_id):
+                            stop_after_round = True
+                            break
+                        if (args.workspace_kind == "fleet-child" and
+                                not fleet_parent_lease_alive(args.fleet_parent, args.fleet_run_id,
+                                                             args.fleet_parent_session_id)):
+                            lease_expired = stop_after_round = True
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        time.sleep(min(0.2, remaining))
+                finally:
+                    # Ctrl-C/正常醒來都清掉 UI 的等待狀態；failure streak 留到下一輪成功才歸零。
+                    clear_agent_backoff_state(ws, state)
+            if stop_after_round:
+                clear_agent_backoff_state(ws, state)
+                if lease_expired:
+                    state.setdefault("notes", []).append(
+                        "⏸ fleet supervisor lease 已失效；已完成本輪並等待 parent resume")
+                    ws.save_state(state)
+                    log(f"⏸ Fleet lease 已失效｜round {rnd} 已完整處理並落盤，未啟動下一輪")
+                else:
+                    log(f"⏸ 已依要求停止｜round {rnd} 已完整處理並落盤，未啟動下一輪")
+                break
+        except KeyboardInterrupt:
+            clear_agent_backoff_state(ws, state)
+            raise
         # 規劃剛收斂(本輪 phase=plan、state 已切到 exec)且啟用「規劃後暫停」:
         # 停在執行期起點,不 spawn 執行輪;人工核對計畫後按「▶ 運行」直接從 exec 續跑。
+        if phase == "plan" and state["phase"] == "exec" and args.handoff_after_plan:
+            log("🤝 規劃已收斂｜依 fleet handoff 設定停止，未啟動 master plan 執行輪")
+            break
         if phase == "plan" and state["phase"] == "exec" and args.pause_after_plan:
             log("⏸ 規劃已收斂｜依「規劃後暫停」設定停止，未啟動執行輪；"
                 "核對計畫後按「▶ 運行」開始執行期")
@@ -2099,6 +2944,8 @@ def main():
         report_path = write_run_report(repo, ws, state)
         log(f"🏁 全部任務收斂。報告:{report_path}")
         notify(args.notify_cmd, "completed", ws.dir.name)
+    elif state["phase"] == "merge-ready":
+        log(f"🔀 軌道已達 merge-ready｜candidate={state.get('merge_ready_sha', '')[:8]}")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,86 @@
 /** 前後端 JSON 契約型別；可選欄位代表舊 workspace 或錯誤投影可能尚未提供該資料。 */
-export type Phase = "plan" | "exec" | "done";
+export type Phase = "plan" | "exec" | "merge" | "merge-ready" | "done";
+export type WorkspaceKind = "standalone" | "fleet-parent" | "fleet-child";
+export type TrackStatus = "pending" | "running" | "merge-ready" | "merging" | "repairing" | "merged" | "stopped" | "failed" | "cleaned";
+
+export interface TrackEvent {
+  event: string;
+  at: string;
+  phase?: string | null;
+  merge_stage?: "sync" | "confirm" | null;
+  status?: TrackStatus;
+  round?: number | null;
+  recovered?: boolean;
+  [key: string]: unknown;
+}
+
+export interface TrackState {
+  name: string;
+  safe_name: string;
+  status: TrackStatus;
+  child_workspace: string;
+  branch_ref: string;
+  worktree: string;
+  tip?: string | null;
+  pid?: number | null;
+  restart_count: number;
+  integration_validate_failures: number;
+  last_integration_error?: string | null;
+  evidence_path?: string | null;
+  evidence_sha256?: string | null;
+  status_history?: Array<{ status: TrackStatus; at: string }>;
+  event_history?: TrackEvent[];
+}
+
+export interface MergeTransaction {
+  track: string;
+  expected_sha: string;
+  candidate_sha: string;
+  stage: string;
+  validation_error?: string | null;
+}
+
+export interface ParallelRunState {
+  schema_version: 1;
+  run_id: string;
+  workspace_kind: "fleet-parent";
+  phase: string;
+  integration_ref: string;
+  expected_integration_sha: string;
+  plan_generation: number;
+  plan_sha256: string | null;
+  error?: string | null;
+  stop_reason?: string | null;
+  resume_phase?: string | null;
+  resumable?: boolean;
+  last_error?: { at: string; phase?: string | null; message: string } | null;
+  tracks: TrackState[];
+  merge_queue: string[];
+  merge_tx: MergeTransaction | null;
+}
 
 export interface WorkspaceSummary {
   name: string;
+  /** Immutable v2 generation, or a read-only legacy delete snapshot generation. */
+  workspace_generation?: string;
+  /** 舊 schema workspace 的明確後端分類；只能顯示錯誤並永久刪除，不可當成 standalone 操作。 */
+  legacy_delete_only?: boolean;
+  legacy_reason?: string;
+  workspace_kind?: WorkspaceKind;
+  fleet_run_id?: string | null;
+  fleet_parent?: string | null;
+  track?: string | null;
+  merge_stage?: "sync" | "confirm" | null;
+  parallel_phase?: string | null;
+  parallel_error?: string | null;
+  parallel_stop_reason?: string | null;
+  parallel_resume_phase?: string | null;
+  parallel_resumable?: boolean;
+  parallel_tracks?: TrackState[];
+  parallel_merge_queue?: string[];
+  parallel_merge_tx?: MergeTransaction | null;
+  parallel_phase_history?: Array<{ phase: string; started_at: string; ended_at?: string | null; duration_seconds?: number | null }>;
+  parallel_merge_history?: Array<MergeTransaction & { at: string }>;
   error?: string;
   phase: Phase | null;
   running: boolean;
@@ -127,12 +205,16 @@ export interface PlanTask {
   order: number;
   task: string;
   ref?: string | null;
+  track: string;
+  scope?: string[];
 }
 
 export interface PlanEditTask {
   order: number | null;
   task: string;
   ref?: string | null;
+  track: string;
+  scope?: string[];
 }
 
 export interface CompletedTask {
@@ -146,6 +228,14 @@ export interface Issue {
   where?: string;
   text: string;
   ts?: string;
+  /** fleet-parent 聚合診斷才有；用來顯示來源並導向仍存在的 child。 */
+  track?: string | null;
+  child_workspace?: string | null;
+  /** integration rollback 等 coordinator 診斷可在後續修復，但仍保留稽核資料。 */
+  resolved?: boolean;
+  /** coordinator synthetic issue 不可透過一般 Agent issue API 標記／清除。 */
+  read_only?: boolean;
+  synthetic?: boolean;
 }
 
 export interface DashboardConfig {
@@ -161,6 +251,8 @@ export interface DashboardConfig {
   stall_limit?: number;
   /** 規劃收斂後暫停：不自動進入執行期，需人工按「▶ 運行」。 */
   pause_after_plan?: boolean;
+  max_parallel?: number;
+  max_child_restarts?: number;
 }
 
 export interface StartupResponse {
@@ -182,6 +274,18 @@ export interface StartupStatus {
 
 export interface WorkspaceState {
   error?: string;
+  state_schema_version?: number;
+  workspace_generation?: string;
+  workspace_kind?: WorkspaceKind;
+  fleet_run_id?: string | null;
+  parallel_run?: ParallelRunState;
+  parallel_run_error?: string;
+  fleet_parent?: string | null;
+  track?: string | null;
+  merge_stage?: "sync" | "confirm" | null;
+  merge_target_ref?: string | null;
+  merge_target_tip?: string | null;
+  merge_ready_sha?: string | null;
   phase: Phase;
   round: number;
   flag: number;
@@ -259,6 +363,9 @@ export interface JobInfo {
   name: string;
   repo: string;
   pid: number;
+  kind: "loop" | "fleet";
+  run_id?: string;
+  workspace_generation?: string;
   alive: boolean;
   rc?: number | null;
   tail?: string;
@@ -273,35 +380,5 @@ export interface IncrementalResponse {
 }
 
 export interface BootstrapResponse {
-  readonly: boolean;
   preselect: string;
-}
-
-export interface ArchiveSummary {
-  id: string;
-  name: string;
-  archived_at: string;
-  legacy?: boolean;
-  phase?: Phase | null;
-  round?: number | null;
-}
-
-export interface ArchivesResponse {
-  archives: ArchiveSummary[];
-  error?: string;
-}
-
-export interface RestoreArchiveResponse {
-  ok?: boolean;
-  name?: string;
-  archive_id?: string;
-  error?: string;
-}
-
-export interface DeleteArchiveResponse {
-  ok?: boolean;
-  deleted?: boolean;
-  name?: string;
-  archive_id?: string;
-  error?: string;
 }

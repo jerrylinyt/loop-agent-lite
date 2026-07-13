@@ -12,7 +12,16 @@ const typeScriptParserOptions = {
 };
 
 export default [
-  { ignores: ["../engine/ui/**", "node_modules/**", "playwright-report/**", "test-results/**"] },
+  {
+    ignores: [
+      "../engine/ui/**",
+      "node_modules/**",
+      "playwright-report/**",
+      "playwright-report-real/**",
+      "test-results/**",
+      "test-results-real/**",
+    ],
+  },
   js.configs.recommended,
   {
     files: ["src/**/*.{ts,tsx}"],

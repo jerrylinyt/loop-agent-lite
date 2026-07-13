@@ -121,6 +121,19 @@ class TestPromptTemplateCatalog(unittest.TestCase):
                 self.assertTrue(item["requirement_placeholder"].strip())
                 self.assertGreaterEqual(item["instructions"].count("- "), 4)
 
+    def test_every_projected_template_keeps_discovery_targeted_and_agent_first(self):
+        templates, warnings = P.prompt_template_projection({
+            "prompt_templates": [team_template()]
+        })
+        self.assertFalse(warnings)
+        for item in templates:
+            with self.subTest(template=item["id"]):
+                self.assertTrue(item["instructions"].startswith(P.LIMITED_DISCOVERY_PREFIX))
+                self.assertIn("不授權全 repo 列檔、廣域搜巡", item["instructions"])
+        new_feature = next(item for item in templates if item["id"] == "new-feature")
+        self.assertIn("不要求固定六層矩陣", new_feature["instructions"])
+        self.assertIn("不為格式增加 ID", new_feature["instructions"])
+
     def test_high_risk_migration_templates_require_versioned_evidence_and_real_validation(self):
         catalog = {item["id"]: item for item in P.BUILTIN_PROMPT_TEMPLATES}
         self.assertIn("來源／目標資料庫", catalog["db-migration"]["instructions"])
@@ -143,7 +156,7 @@ class TestPromptTemplateCatalog(unittest.TestCase):
         )
         self.assertIn("不得交付恆綠測試", catalog["java-test-completion"]["instructions"])
         self.assertIn(
-            "不得假設存在", catalog["java-test-completion"]["instructions"]
+            "規劃成前置任務並由 agent", catalog["java-test-completion"]["instructions"]
         )
         self.assertIn(
             "避免測試只證明 mock 本身", catalog["java-test-completion"]["instructions"]
@@ -175,18 +188,75 @@ class TestPromptTemplateCatalog(unittest.TestCase):
         self.assertIn(
             "新增欄位是否破壞消費端", catalog["api-contract-testing"]["instructions"]
         )
-        self.assertIn("端點×情境矩陣", catalog["api-contract-testing"]["instructions"])
         self.assertIn(
-            "沒有則以證據標 N/A", catalog["api-contract-testing"]["instructions"]
+            "不為未涉及情境補固定矩陣或空列",
+            catalog["api-contract-testing"]["instructions"],
+        )
+        self.assertIn(
+            "只在整體取證邊界摘要一次",
+            catalog["api-contract-testing"]["instructions"],
         )
         self.assertIn("autoconfiguration", catalog["dependency-upgrade"]["instructions"])
-        self.assertIn("具備證據後才能判 N/A", catalog["dependency-upgrade"]["instructions"])
-        self.assertIn("pure YAML、Kustomize、Helm 三種", catalog["k8s-deployment-config"]["instructions"])
+        self.assertIn(
+            "不為每個未命中候選逐項造空列",
+            catalog["dependency-upgrade"]["instructions"],
+        )
+        self.assertIn(
+            "由 agent 依需求與現有 toolchain 選擇最小可維護方案",
+            catalog["k8s-deployment-config"]["instructions"],
+        )
         self.assertIn("不得把相關性寫成因果", catalog["incident-root-cause"]["instructions"])
         self.assertIn("不得靜默忽略", catalog["security-scan-remediation"]["instructions"])
         self.assertIn("重跑掃描並比對前後結果", catalog["security-scan-remediation"]["instructions"])
         self.assertIn("helm lint <chart-dir> -f <values-file>", catalog["k8s-deployment-config"]["instructions"])
         self.assertIn("helm template <release> <chart-dir> -f <values-file>", catalog["k8s-deployment-config"]["instructions"])
+
+    def test_specialized_templates_keep_normal_unknowns_agent_owned_and_avoid_fixed_na_rows(self):
+        catalog = {item["id"]: item for item in P.BUILTIN_PROMPT_TEMPLATES}
+
+        java = catalog["java-test-completion"]["instructions"]
+        self.assertIn("規劃成前置任務並由 agent", java)
+        self.assertIn("只有建立設施會改變需求意圖", java)
+        self.assertNotIn("先列前置任務或 human gate", java)
+
+        data_flow = catalog["api-data-flow-analysis"]["instructions"]
+        self.assertIn("沒有正式契約時", data_flow)
+        self.assertIn("由 agent 建立符合需求與 repo 慣例的最小契約", data_flow)
+        self.assertNotIn("authoritative contract 不存在", data_flow)
+
+        k8s = catalog["k8s-deployment-config"]["instructions"]
+        self.assertIn("若都無訊號，由 agent", k8s)
+        self.assertIn("只有來源衝突牽涉外部平台政策", k8s)
+        self.assertNotIn("三種方案並列 human gate", k8s)
+
+        forbidden_mechanical_requirements = (
+            "沒有則以證據標 N/A",
+            "具備證據後才能判 N/A",
+            "N/A 項附證據",
+            "不適用者附證據標 N/A",
+            "清單每一項都要有結論",
+            "端點×情境矩陣全數",
+            "建立相容矩陣：",
+            "機器比對至少包含",
+        )
+        for item in P.BUILTIN_PROMPT_TEMPLATES:
+            for phrase in forbidden_mechanical_requirements:
+                with self.subTest(template=item["id"], phrase=phrase):
+                    self.assertNotIn(phrase, item["instructions"])
+
+        for template_id in (
+            "api-contract-testing", "change-impact-analysis", "java-generic",
+            "db-migration", "oracle-mariadb-migration", "dependency-upgrade",
+            "k8s-deployment-config",
+        ):
+            with self.subTest(template=template_id):
+                instructions = catalog[template_id]["instructions"]
+                self.assertTrue(
+                    "取證邊界" in instructions
+                    or "停止邊界" in instructions
+                    or "未知邊界" in instructions,
+                    "移除機械空列後仍必須保留 bounded evidence/unknown 摘要",
+                )
 
     def test_valid_team_template_is_appended_without_replacing_contracts(self):
         templates, warnings = P.prompt_template_projection({
@@ -196,7 +266,10 @@ class TestPromptTemplateCatalog(unittest.TestCase):
         added = templates[-1]
         self.assertEqual(added["id"], "team-flow")
         self.assertEqual(added["source"], "team")
-        self.assertEqual(added["instructions"], "- 盤點狀態。\n- 追蹤資料流。")
+        self.assertEqual(
+            added["instructions"],
+            f"{P.LIMITED_DISCOVERY_PREFIX}\n- 盤點狀態。\n- 追蹤資料流。",
+        )
 
     def test_invalid_and_duplicate_team_templates_are_skipped_with_warnings(self):
         templates, warnings = P.prompt_template_projection({

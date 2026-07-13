@@ -1,5 +1,5 @@
 /** Fleet 監控總覽：聚合工作區、效能與事件，並處理本機視圖、篩選、排序及有條件的批次操作。 */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { FleetHistoryEntry, FleetRoundMetrics, WorkspaceSummary } from "../../shared/api/types";
 import AnomalyLogModal from "./AnomalyLogModal";
 import { deriveFleetEvents } from "./fleetEvents";
@@ -9,21 +9,60 @@ import ActionDialog from "../../shared/components/ActionDialog";
 import FleetWorkspaceCard from "./FleetWorkspaceCard";
 import {
   formatMetric, initialFleetFilter, initialFleetSort, loadSavedViews,
-  visibleFleetWorkspaces, workspaceNeedsAttention,
+  overviewWorkspaceProjection, visibleFleetWorkspaces, workspaceNeedsAttention,
 } from "./fleetViewModel";
 import type { FleetFilter, FleetSort, SavedFleetView } from "./fleetViewModel";
+import type { BeginOperation, EndOperation } from "../../shared/operationGate";
+
+type BulkAction = "ack" | "stop" | "delete";
+interface BulkTargetSnapshot {
+  name: string;
+  workspace_kind?: WorkspaceSummary["workspace_kind"];
+  fleet_run_id?: string | null;
+  workspace_generation?: string;
+  loop_pid?: number | null;
+  issues?: number;
+  unread_issues?: number;
+  running: boolean;
+}
+interface BulkConfirmation {
+  action: BulkAction;
+  eligible: BulkTargetSnapshot[];
+  skipped: BulkTargetSnapshot[];
+}
+
+function snapshotBulkTarget(workspace: WorkspaceSummary): BulkTargetSnapshot {
+  return {
+    name: workspace.name,
+    workspace_kind: workspace.workspace_kind,
+    fleet_run_id: workspace.fleet_run_id,
+    workspace_generation: workspace.workspace_generation,
+    loop_pid: workspace.loop_pid,
+    issues: workspace.issues,
+    unread_issues: workspace.unread_issues,
+    running: workspace.running,
+  };
+}
 
 /** 監控電視牆:聚合統計 + 全 fleet 即時卡片 + 事件推播。
  * 卡片與歷史事件都走同一條 SSE；事件流仍由前端從 history 尾段推導。 */
-export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, attentionRequest, readonly, onSelect, onChanged }: {
+export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, attentionRequest, operationPending, beginOperation, endOperation, onSelect, onChanged }: {
   workspaces: WorkspaceSummary[];
   fleetHistory: FleetHistoryEntry[];
   fleetMetrics: FleetRoundMetrics | null;
   attentionRequest: number;
-  readonly: boolean;
+  operationPending: boolean;
+  beginOperation: BeginOperation;
+  endOperation: EndOperation;
   onSelect: (name: string) => void;
   onChanged: () => void | Promise<void>;
 }) {
+  // fleet-child 由 parent 卡片的 track grid 投影；總覽不再把同一個 parallel run
+  // 重複算成 parent + N 個獨立 workspace。child 仍可由 workspace tabs 直接查看診斷。
+  const overviewWorkspaces = useMemo(() => {
+    // 正常 child 由 parent 卡片聚合；orphan 則保留獨立卡片供診斷。
+    return overviewWorkspaceProjection(workspaces);
+  }, [workspaces]);
   const events = useMemo(() => deriveFleetEvents(fleetHistory), [fleetHistory]);
   const metricsByWorkspace = useMemo(
     () => new Map(fleetHistory.map((entry) => [entry.name, entry.metrics])),
@@ -42,29 +81,72 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
   const [viewMessage, setViewMessage] = useState("");
   const [anomaliesOpen, setAnomaliesOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
-  const [selectedNames, setSelectedNames] = useState<string[]>([]);
-  const [bulkAction, setBulkAction] = useState<"ack" | "stop" | "archive" | null>(null);
+  const [selectedTargets, setSelectedTargets] = useState<BulkTargetSnapshot[]>([]);
+  const [bulkConfirmation, setBulkConfirmation] = useState<BulkConfirmation | null>(null);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const bulkPending = useRef(false);
   const [bulkMessage, setBulkMessage] = useState("");
-  const selectedWorkspaces = workspaces.filter((workspace) => selectedNames.includes(workspace.name));
-  // 每種批次操作都有不同前置條件。確認視窗同時列出 eligible 與被跳過項目，
-  // 避免使用者以為「選到了」就一定會被修改。
-  const eligible = bulkAction === "ack" ? selectedWorkspaces.filter((workspace) => (workspace.unread_issues ?? workspace.issues ?? 0) > 0 && !workspace.running)
-    : bulkAction === "stop" ? selectedWorkspaces.filter((workspace) => workspace.running)
-      : bulkAction === "archive" ? selectedWorkspaces.filter((workspace) => !workspace.running) : [];
+  const bulkBlocked = bulkBusy || operationPending;
+  const selectedStoppable = selectedTargets.filter((workspace) => workspace.running && workspace.workspace_kind !== "fleet-child");
+  const selectedGracefulStops = selectedStoppable.filter((workspace) => workspace.workspace_kind === "fleet-parent");
+  const selectedImmediateStops = selectedStoppable.filter((workspace) => workspace.workspace_kind !== "fleet-parent");
+  const stopActionLabel = selectedGracefulStops.length && !selectedImmediateStops.length ? "本輪後停止"
+    : selectedImmediateStops.length && !selectedGracefulStops.length ? "立即停止"
+      : "停止（依類型）";
+  const openBulkConfirmation = (action: BulkAction) => {
+    // Eligibility and identity are one confirmation snapshot. A same-name replacement arriving
+    // over SSE while the dialog is open must never retarget the pending confirmation.
+    const candidates = [...selectedTargets];
+    const eligible = action === "ack" ? candidates.filter((workspace) => workspace.workspace_kind === "standalone" && (workspace.unread_issues ?? workspace.issues ?? 0) > 0 && !workspace.running)
+      : action === "stop" ? candidates.filter((workspace) => workspace.running && workspace.workspace_kind !== "fleet-child")
+        : candidates.filter((workspace) => !workspace.running && workspace.workspace_kind !== "fleet-child");
+    const eligibleNames = new Set(eligible.map((workspace) => workspace.name));
+    setBulkConfirmation({
+      action,
+      eligible: [...eligible],
+      skipped: candidates.filter((workspace) => !eligibleNames.has(workspace.name)),
+    });
+  };
+  const gracefulStopTargets = bulkConfirmation?.action === "stop"
+    ? bulkConfirmation.eligible.filter((workspace) => workspace.workspace_kind === "fleet-parent") : [];
+  const immediateStopTargets = bulkConfirmation?.action === "stop"
+    ? bulkConfirmation.eligible.filter((workspace) => workspace.workspace_kind !== "fleet-parent") : [];
   const runBulk = async () => {
-    if (!bulkAction) return;
-    const targets = [...eligible]; setBulkAction(null);
+    if (!bulkConfirmation || bulkBlocked || bulkPending.current) return;
+    const { action, eligible: targets } = bulkConfirmation;
+    const token = beginOperation(`bulk:${action}`);
+    if (!token) return;
+    bulkPending.current = true;
+    setBulkBusy(true);
+    setBulkMessage("批次處理中…");
+    setBulkConfirmation(null);
     let failed = 0;
-    // 刻意逐筆呼叫既有單 workspace API：單筆鎖或狀態失敗不回滾其他 workspace，
-    // 也不另開一條能繞過既有安全檢查的批次後端捷徑。
-    for (const workspace of targets) {
-      const response = bulkAction === "ack" ? await postJson("/api/edit-state", { name: workspace.name, ack_issues: true })
-        : bulkAction === "stop" ? await postJson("/api/stop", { name: workspace.name })
-          : await postJson("/api/archive-workspace", { name: workspace.name });
-      if (response.error) failed += 1;
+    try {
+      // 刻意逐筆呼叫既有單 workspace API：單筆鎖或狀態失敗不回滾其他 workspace，
+      // 也不另開一條能繞過既有安全檢查的批次後端捷徑。
+      for (const workspace of targets) {
+        const expectedPid = action === "stop" && Number.isInteger(workspace.loop_pid)
+          ? { expected_pid: workspace.loop_pid }
+          : {};
+        const identity = workspace.workspace_kind === "fleet-parent"
+          ? { run_id: workspace.fleet_run_id, ...expectedPid }
+          : {
+              workspace_generation: workspace.workspace_generation,
+              ...expectedPid,
+            };
+        const response = action === "ack" ? await postJson("/api/edit-state", { name: workspace.name, ack_issues: true, ...identity })
+          : action === "stop" ? await postJson("/api/stop", { name: workspace.name, ...identity })
+            : await postJson("/api/delete-workspace", { name: workspace.name, ...identity });
+        if (response.error) failed += 1;
+      }
+      setBulkMessage(`已處理 ${targets.length - failed}/${targets.length} 個 workspace${failed ? `，${failed} 個失敗` : ""}`);
+      setSelectedTargets([]);
+      await Promise.resolve(onChanged());
+    } finally {
+      bulkPending.current = false;
+      setBulkBusy(false);
+      endOperation(token);
     }
-    setBulkMessage(`已處理 ${targets.length - failed}/${targets.length} 個 workspace${failed ? `，${failed} 個失敗` : ""}`);
-    setSelectedNames([]); await Promise.resolve(onChanged());
   };
 
   useEffect(() => {
@@ -139,19 +221,23 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
     setViewMessage(`已刪除「${selected.name}」`);
   };
 
-  const running = workspaces.filter((workspace) => workspace.running).length;
-  const done = workspaces.filter((workspace) => workspace.phase === "done").length;
-  const planning = workspaces.filter((workspace) => workspace.phase === "plan").length;
-  const executing = workspaces.filter((workspace) => workspace.phase === "exec").length;
-  const totalTasks = workspaces.reduce((sum, workspace) => sum + (workspace.plan_len ?? 0), 0);
-  const doneTasks = workspaces.reduce((sum, workspace) => sum + (workspace.completed ?? 0), 0);
-  const alerts = workspaces.filter(workspaceNeedsAttention).length;
+  const running = overviewWorkspaces.filter((workspace) => workspace.running).length;
+  const done = overviewWorkspaces.filter((workspace) => workspace.phase === "done" || workspace.parallel_phase === "done").length;
+  const planning = overviewWorkspaces.filter((workspace) => workspace.workspace_kind === "fleet-parent"
+    ? ["planning", "awaiting-approval"].includes(workspace.parallel_phase ?? "planning")
+    : workspace.phase === "plan").length;
+  const executing = overviewWorkspaces.filter((workspace) => workspace.workspace_kind === "fleet-parent"
+    ? !["planning", "awaiting-approval", "done", "failed", "stopped"].includes(workspace.parallel_phase ?? "planning")
+    : workspace.phase === "exec").length;
+  const totalTasks = overviewWorkspaces.reduce((sum, workspace) => sum + (workspace.plan_len ?? 0), 0);
+  const doneTasks = overviewWorkspaces.reduce((sum, workspace) => sum + (workspace.completed ?? 0), 0);
+  const alerts = overviewWorkspaces.filter(workspaceNeedsAttention).length;
   const visibleWorkspaces = useMemo(
-    () => visibleFleetWorkspaces(workspaces, filter, search, sort),
-    [filter, search, sort, workspaces]
+    () => visibleFleetWorkspaces(overviewWorkspaces, filter, search, sort),
+    [filter, search, sort, overviewWorkspaces]
   );
   const filters: Array<{ id: FleetFilter; label: string; count: number }> = [
-    { id: "all", label: "全部", count: workspaces.length },
+    { id: "all", label: "全部", count: overviewWorkspaces.length },
     { id: "attention", label: "需關注", count: alerts },
     { id: "running", label: "執行中", count: running },
     { id: "done", label: "已完成", count: done },
@@ -161,7 +247,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
   return (
     <main id="main-content" tabIndex={-1} className={`fleet-overview${compact ? " compact-cards" : ""}`} aria-label="工作區總覽">
       <div className="fleet-stats" role="list" aria-label="工作區統計">
-        <div className="fleet-stat" role="listitem"><strong>{workspaces.length}</strong><span>workspaces</span></div>
+        <div className="fleet-stat" role="listitem"><strong>{overviewWorkspaces.length}</strong><span>workspace groups</span></div>
         <div className="fleet-stat running" role="listitem"><strong>{running}</strong><span>執行中</span></div>
         <div className="fleet-stat" role="listitem"><strong>{planning} / {executing} / {done}</strong><span>規劃 / 執行 / 完成</span></div>
         <div className={`fleet-stat${alerts > 0 ? " warning" : ""}`} role="listitem"><strong>{alerts}</strong><span>需要關注</span></div>
@@ -205,7 +291,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
           <option value="name">名稱排序</option><option value="attention">需關注優先</option><option value="running">執行中優先</option><option value="progress">完成度優先</option>
         </select>
         <label className="compact-toggle"><input type="checkbox" checked={compact} onChange={(event) => changeCompact(event.target.checked)} /> 精簡卡片</label>
-        <span className="muted">顯示 {visibleWorkspaces.length} / {workspaces.length}</span>
+        <span className="muted">顯示 {visibleWorkspaces.length} / {overviewWorkspaces.length}</span>
       </div>
       <div className="saved-view-row">
         <select aria-label="已儲存監控視圖" value={selectedView} onChange={(event) => applyView(event.target.value)}>
@@ -217,19 +303,29 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
         <button type="button" className="danger-button compact-button" disabled={!selectedView} onClick={deleteView}>刪除視圖</button>
         <span className="muted" role="status">{viewMessage || `${savedViews.length}/20 個個人視圖`}</span>
       </div>
-      {!readonly && <div className="bulk-toolbar">
-        <button type="button" className="secondary-button compact-button" aria-expanded={bulkOpen} onClick={() => setBulkOpen((value) => !value)}>☑ 批次操作</button>
-        {bulkOpen && <><select multiple aria-label="批次選擇 workspace" value={selectedNames} onChange={(event) => setSelectedNames([...event.target.selectedOptions].map((option) => option.value))}>{visibleWorkspaces.map((workspace) => <option key={workspace.name} value={workspace.name}>{workspace.name} · {workspace.running ? "執行中" : "已停止"}</option>)}</select>
-          <button type="button" className="secondary-button compact-button" disabled={!selectedNames.length} onClick={() => setBulkAction("ack")}>Issues 已讀</button>
-          <button type="button" className="danger-button compact-button" disabled={!selectedNames.length} onClick={() => setBulkAction("stop")}>立即停止</button>
-          <button type="button" className="danger-button compact-button" disabled={!selectedNames.length} onClick={() => setBulkAction("archive")}>封存</button></>}
-        <span className="muted" role="status">{bulkMessage || (selectedNames.length ? `已選 ${selectedNames.length} 個` : "")}</span>
-      </div>}
+      <div className="bulk-toolbar">
+        <button type="button" className="secondary-button compact-button" aria-expanded={bulkOpen} disabled={bulkBlocked} onClick={() => setBulkOpen((value) => !value)}>☑ 批次操作</button>
+        {bulkOpen && <><select multiple aria-label="批次選擇 workspace" disabled={bulkBlocked} value={selectedTargets.map((workspace) => workspace.name)} onChange={(event) => {
+          const names = [...event.target.selectedOptions].map((option) => option.value);
+          setSelectedTargets((current) => {
+            const frozen = new Map(current.map((workspace) => [workspace.name, workspace]));
+            const visible = new Map(overviewWorkspaces.map((workspace) => [workspace.name, workspace]));
+            return names.flatMap((name) => {
+              const snapshot = frozen.get(name) ?? (visible.get(name) ? snapshotBulkTarget(visible.get(name)!) : undefined);
+              return snapshot ? [snapshot] : [];
+            });
+          });
+        }}>{visibleWorkspaces.map((workspace) => <option key={workspace.name} value={workspace.name}>{workspace.name} · {workspace.running ? "執行中" : "已停止"}</option>)}</select>
+          <button type="button" className="secondary-button compact-button" disabled={bulkBlocked || !selectedTargets.length} onClick={() => openBulkConfirmation("ack")}>Issues 已讀</button>
+          <button type="button" className="danger-button compact-button" disabled={bulkBlocked || !selectedTargets.length} onClick={() => openBulkConfirmation("stop")}>{stopActionLabel}</button>
+          <button type="button" className="danger-button compact-button" disabled={bulkBlocked || !selectedTargets.length} onClick={() => openBulkConfirmation("delete")}>刪除</button></>}
+        <span className="muted" role="status">{bulkMessage || (selectedTargets.length ? `已選 ${selectedTargets.length} 個` : "")}</span>
+      </div>
       <div className="fleet-body">
         <div className="fleet-grid">
           {visibleWorkspaces.map((workspace) => (
             <FleetWorkspaceCard key={workspace.name} workspace={workspace}
-              metrics={metricsByWorkspace.get(workspace.name)} roundNow={roundNow} onSelect={onSelect} />
+              metrics={metricsByWorkspace.get(workspace.name)} roundNow={roundNow} disabled={operationPending} onSelect={onSelect} />
           ))}
           {!visibleWorkspaces.length && <div className="empty-inline">{search.trim() ? "沒有符合搜尋的 workspace" : filter === "all" ? "尚未建立 workspace" : "沒有符合目前篩選的 workspace"}</div>}
         </div>
@@ -237,7 +333,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
           <div className="fleet-events-head"><strong>事件推播</strong><span className="muted">最近 {events.length} 則</span></div>
           <div className="fleet-events-list">
             {events.map((event, index) => (
-              <button key={`${event.ws}-${event.ts}-${index}`} type="button" className="fleet-event" onClick={() => onSelect(event.ws)}>
+              <button key={`${event.ws}-${event.ts}-${index}`} type="button" className="fleet-event" disabled={operationPending} onClick={() => onSelect(event.ws)}>
                 <span className="fleet-event-time">{event.time}</span>
                 <span className="fleet-event-ws">{event.ws}</span>
                 <span className="fleet-event-text">{event.text}</span>
@@ -248,11 +344,16 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
         </aside>
       </div>
       {anomaliesOpen && <AnomalyLogModal onClose={() => setAnomaliesOpen(false)} />}
-      {bulkAction && <ActionDialog title="確認批次操作" message={`將對 ${eligible.length} 個符合條件的 workspace 執行「${bulkAction === "ack" ? "Issues 已讀" : bulkAction === "stop" ? "立即停止" : "封存"}」；不符合條件者會跳過。`} confirmLabel={`執行 ${eligible.length} 個`} danger={bulkAction !== "ack"} preview={[
-        { label: "符合條件", value: eligible.map((workspace) => workspace.name).join(", ") || "無" },
-        { label: "自動跳過", value: selectedWorkspaces.filter((workspace) => !eligible.includes(workspace)).map((workspace) => workspace.name).join(", ") || "無", tone: "safe" },
+      {bulkConfirmation && <ActionDialog title="確認批次操作" message={bulkConfirmation.action === "stop"
+        ? `將停止 ${bulkConfirmation.eligible.length} 個符合條件的 workspace：Parallel parent 會在 active round 完整結束後停止；Standalone 會立即停止。不符合條件者會跳過。`
+        : `將對 ${bulkConfirmation.eligible.length} 個符合條件的 workspace 執行「${bulkConfirmation.action === "ack" ? "Issues 已讀" : "永久刪除"}」；不符合條件者會跳過。`} confirmLabel={`執行 ${bulkConfirmation.eligible.length} 個`} danger={bulkConfirmation.action !== "ack"} preview={[
+        ...(bulkConfirmation.action === "stop" ? [
+          { label: "本輪後停止（Parallel）", value: gracefulStopTargets.map((workspace) => workspace.name).join(", ") || "無" },
+          { label: "立即停止（Standalone）", value: immediateStopTargets.map((workspace) => workspace.name).join(", ") || "無" },
+        ] : [{ label: "符合條件", value: bulkConfirmation.eligible.map((workspace) => workspace.name).join(", ") || "無" }]),
+        { label: "自動跳過", value: bulkConfirmation.skipped.map((workspace) => workspace.name).join(", ") || "無", tone: "safe" },
         { label: "執行方式", value: "逐 workspace 呼叫既有安全 API；單筆失敗不會阻止其他項目" }
-      ]} onClose={() => setBulkAction(null)} onConfirm={() => void runBulk()} />}
+      ]} onClose={() => setBulkConfirmation(null)} onConfirm={() => void runBulk()} />}
     </main>
   );
 }

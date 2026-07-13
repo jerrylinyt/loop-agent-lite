@@ -20,7 +20,7 @@
     },
     {
       "label": "react build+test+e2e",
-      "cmd": "sh -c 'npm run build && npm test -- --run && npx playwright test'"
+      "cmd": "sh -c 'cd ui && npm run check:all'"
     }
   ],
   "repo_roots": [
@@ -42,6 +42,8 @@
     "stall_limit": 300,
     "stuck_stop": false,
     "stuck_stop_count": 100,
-    "pause_after_plan": false
+    "pause_after_plan": false,
+    "track_env": {},
+    "track_port_base": 0
   }
 }

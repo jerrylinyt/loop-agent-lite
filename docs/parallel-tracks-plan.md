@@ -1,933 +1,1183 @@
-# 規劃書:任務並行拆分 × Worktree 隔離 × 收斂式合併(fleet 並行架構)
+# 規劃書：任務並行拆分 × Worktree 隔離 × Agent 收斂式合併
 
-> 狀態:**v2,方向已拍板**(決議見 §14),可據此分期實施。
-> 對應需求:「拆解任務時讓 agent 拆分成可並行模式,幫他們開 worktree,模式參照現在的方式
-> 重複嘗試直到收斂,然後才同意合回來(由 agent 自己 merge main 到 worktree 自己解衝突),
-> 由程式判斷 done ≥ threshold + 可 ff merge。」
-> v2 變更:落地四項決議——①未決問題全採本文建議值;②worktree 預設放 workspace 目錄;
-> ③**不做舊版相容**(track 必填、舊格式直接拒絕);④新增完整的 Prompt 調整設計(§7)。
-> v3 變更:合併期拆成顯式子狀態(merge_stage 等欄位落 state),新增 Track 狀態機
-> 與 Dashboard 觀測設計(§6.6);修正 phase 值域漏列 merge-ready。
-> v4 變更:全面審視與既有功能的衝突(§15)——Plan 編輯器的前綴鎖定假設、封存/重置/
-> 階段切換的生命週期耦合、監控投影誤判、監督政策修訂(不自動重啟);新增不變量 I10。
-
----
-
-## 0. TL;DR 結論
-
-**可行,而且與現有架構高度相容。** 現有程式碼已為這個方向預留了關鍵邊界:
-
-- 單 writer 鎖是「每個 Git worktree 一把」(`engine/loop.py:1416`,鎖檔放在 worktree 專屬
-  git-dir),README 明文保留「不同 Git worktree 可各自運行」的並行隔離邊界(README.md:34)。
-- 收斂語意天然可組合:執行期「任何變更 → done 歸零」(`engine/loop.py:1594-1603`)正好就是
-  「merge main 進來 → 重新累積共識」所需要的機制,不用發明新規則。
-- `--import-plan --start-phase exec`(`engine/loop.py:1712-1728`)讓子迴圈可以直接吃一份
-  切好的計畫從執行期開跑;`--pause-after-plan`(`engine/loop.py:2092-2096`)是現成的
-  「拆分結果人工審核點」。
-- Dashboard 本來就以 workspace 為單位監控多個 loop(`engine/dashboard.py:429`),
-  每條並行軌道就是一個普通 workspace,MVP 期間 UI 幾乎零改動。
-
-**難度總評:中高。** 合併閘門本身(done 共識 + ff-only)反而是小而清晰的一塊;
-真正的工程量在(1)任務格式 v2 的全面漣漪、(2)父協調器(fleet)的生命週期與 resume 可靠性、
-(3)符合本 repo fail-closed 標準的測試(現有 `tests/test_guards.py` 已有 4,107 行,
-新功能的測試量級相當)、(4)四份 prompt 的弱模型收緊迭代(§7)。
-
-**路線:四期分階,每期獨立可用、可停損**(§12)。粗估總工期 23–35 個工作天(單人);
-MVP(Phase 0+1,並行執行+人工合併)約 9–13 個工作天。放棄舊版相容省下約 1 天,
-v4 的既有功能整合(§15:編輯器改造、生命週期防護欄)加回約 2–3 天。
+> 狀態：**v6，agent-first 方向已定案，可據此分期實作。**
+>
+> 核心需求：規劃 agent 將任務拆成可並行 track；程式建立隔離 worktree；每條 track
+> 沿用現有無狀態多輪 agent 收斂；track 完成後由 agent 自行整合最新主幹與解衝突；
+> 程式只在 done 共識、驗證與 fast-forward 條件成立時推進整合分支。
+>
+> v6 繼承 v5：①人工審核全部改為選配且預設關閉；②語意判斷交給 agent，多輪自動重試；
+> ③機械層只守 repo/state/worktree 不被破壞；④真正 CAS + journal + validate 失敗自動 rollback；
+> ⑤`@final` 也在隔離 worktree 執行；⑥移除 archive/restore 與舊 workspace resume；
+> ⑦fleet-managed plan 拆分後唯讀，移除複雜人工跨軌編輯；⑧移除 Dashboard read-only mode；
+> ⑨Dashboard 每次啟動在 serve 前必須停止全部已辨識 coordinator，不自動 resume，改由使用者手動啟動。
 
 ---
 
-## 1. 需求還原
+## 0. TL;DR
 
-| # | 需求 | 本文件對應 |
-|---|------|-----------|
-| R1 | 規劃期 agent 把任務拆成「可並行的軌道(track)」 | §4 任務格式 v2、§7.2 規劃期 prompt |
-| R2 | 程式替每條軌道開 Git worktree,各自隔離執行 | §3、§6.1 worktree 生命週期 |
-| R3 | 每條軌道沿用現行模式:單輪無狀態 agent、共識 AND gate、重複嘗試直到收斂 | §5.2 子迴圈重用 |
-| R4 | 收斂後才允許合併;合併前由 agent 在自己的 worktree 把 main merge 進來、自己解衝突 | §5.3 合併期、§7.4/§7.5 合併 prompt |
-| R5 | 合併回 main 由**程式**判斷:done 共識達門檻 **且** 可 fast-forward merge | §6.2 合併閘門(CAS) |
-| R6 | 任務格式調整以承載拆分資訊(**不需相容舊版**) | §4 |
-| R7 | Prompt 如何調整 | **§7(本版新增)** |
+方案可行。現有 loop 已具備可重用的單 worktree writer lock、無狀態 agent round、done
+共識、綠點 reset、受保護檔案與 import-plan。新工程量集中在：
 
-註:現行執行期收斂條件是 `done_count >= done_threshold`(預設 3,`engine/loop.py:1605`),
-本文統一寫 `done ≥ threshold`。
+1. `engine/fleet.py` 的父子生命週期與 crash resume。
+2. child 的 `merge / merge-ready` 狀態機。
+3. integration ref 的 CAS transaction、integration validate 與 rollback。
+4. Dashboard 的 fleet-parent / fleet-child 所有權與控制投影。
+5. 多 worktree、ref 競態、rollback 與自動修復整合測試。
+
+正常流程不需要人工介入：規劃收斂後自動拆分、執行、重併、驗收、CAS 合入、跑
+`@final`、清理 child。只有 state/repo 身分損壞、未知外力移動 integration ref、權限或
+磁碟等結構性錯誤才停機交人。
 
 ---
 
-## 2. 現況盤點:哪些機制直接可重用
+## 1. 需求與設計原則
 
-### 2.1 現行單軌流程(基準)
+| # | 需求 |
+|---|---|
+| R1 | 規劃 agent 產生帶 `track` 的可並行計畫 |
+| R2 | 每條一般 track 使用獨立 branch、Git worktree、workspace |
+| R3 | 每軌沿用現有單輪無狀態 agent + done AND gate，直到收斂 |
+| R4 | track 收斂後由 agent 在自己的 worktree 整合最新 integration tip、解衝突並再收斂 |
+| R5 | 程式確認 done、綠燈、乾淨、祖先與 CAS 條件後才推進 integration ref |
+| R6 | integration worktree validate 失敗時自動 rollback，錯誤交回原 track 再修 |
+| R7 | 全部一般 track 完成後自動執行 `@final`，全程無預設人工 gate |
+| R8 | 不相容舊版 plan/state；不支援 archive/restore 或跨大版本 resume |
+
+### 1.1 Agent 與機械層的責任邊界
+
+Agent 負責語意：
+
+- 如何拆 track、是否需要縮併 track。
+- 如何實作任務、如何解衝突、如何修整合缺陷。
+- DoD 是否真正滿足、是否還需要修改程式。
+- issue 是提供下一輪 agent 的 context，不是預設人工 gate。
+
+機械層只負責安全與交易：
+
+- workspace、state、branch、worktree、repo 身分與 schema 合法。
+- 同一 worktree 同時只有一個 writer。
+- goal、plan-doc、coordinator state 不可由 agent 改寫。
+- candidate 包含派發時的 integration tip、工作樹乾淨、validate 綠、done 達標。
+- integration ref 以 expected-old SHA 做 CAS；integration validate 紅時可自動 rollback。
+- crash 後只能從 journal 證據恢復，不猜測未知 Git 現場。
+
+scope、檔案接觸面與 merge commit 形狀都不是 hard gate。Prompt 會給保守建議，但程式不以
+scope overlap 或「第二 parent 必須等於 integration tip」拒絕一個已通過祖先、驗證與共識條件的結果。
+
+---
+
+## 2. 現有機制：可重用與不可誤認的邊界
+
+### 2.1 可直接重用
+
+| 現有機制 | 新用途 |
+|---|---|
+| linked worktree 專屬 git-dir lock | 每個 child loop 各自單 writer |
+| workspace `.run.lock` | 每個 child state 各自單 writer |
+| `--import-plan --start-phase exec` | child 直接吃切片計畫 |
+| round token / dispatch.json / work.py | merge round 也走同一套回報協定 |
+| 任一變更使 done 歸零 | merge 或 merge-fix 後自動重新累積確認 |
+| last-green + reset | 撤銷未收斂的壞整合結果 |
+| protected snapshot | 每條 worktree 保護 goal 與 plan-doc |
+| Dashboard 多 workspace projection | 顯示 parent 與 child，不直接寫 Git 真相 |
+
+### 2.2 不可直接沿用的假設
+
+- 現有 reset 判斷只處理 `exec`；`merge` 必須有自己的 no-progress、red/reset 與 ready 邏輯。
+- Git 禁止同一 branch 被兩個 worktree checkout，**不等於**其他 process 無法
+  `git update-ref` 修改該 branch。因此 `git merge --ff-only` 不是完整 CAS。
+- worktree 只隔離 checkout/build 目錄，不隔離 port、DB、Docker、`~/.m2`、npm cache 等外部資源。
+- Dashboard 現有 run/edit/phase/archive 都假設單一 standalone workspace，fleet child 不能直接繼承。
+- 主 worktree 不一定 checkout `main`；實作不得把 integration branch 寫死為 main。
+
+---
+
+## 3. 名詞與角色
+
+- **integration ref**：本次 fleet 要推進的本地 branch 完整 ref，例如 `refs/heads/main`。
+- **integration worktree**：啟動 fleet 時 checkout integration ref 的主 worktree。
+- **fleet-parent**：保存完整規劃快照、fleet.json、總 REPORT 與操作入口的 workspace。
+- **fleet-child**：一條一般 track 或 `@final` 的 loop workspace。
+- **candidate**：child 收斂後準備以 fast-forward 推進 integration ref 的 branch tip。
 
 ```text
-規劃期  agent 每輪 create-plan / plan-ok;plan-ok 且無任何異動 → flag+1;
-        有變動/異常 → flag 歸零;flag > 門檻 → 執行期(plan 凍結)
-執行期  依 current_order 派 task-N;agent 實作+commit(該輪不算票),
-        或什麼都不動 + done 回報;無異動+驗證綠+正常退出 → done+1;
-        任何異動/紅燈/異常 → done 歸零;done ≥ 門檻 → 記完成 SHA,派下一個
-防線    受保護檔案快照/還原(goal、plan-doc)、state 竄改偵測、round token 防舊輪污染、
-        紅燈連跳/HEAD 停滯 → reset --hard 回綠點、stuck-stop、單 writer 鎖(workspace+git-dir)
+fleet-parent / engine.fleet
+  ├─ planning handoff：既有 loop 只跑規劃，收斂後交回 fleet
+  ├─ track auth   → worktree/auth   + workspace parent--auth
+  ├─ track report → worktree/report + workspace parent--report
+  ├─ merge queue  → CAS transaction → integration worktree validate
+  └─ @final       → worktree/_final + workspace parent--_final → 同一 CAS gate
 ```
 
-### 2.2 可重用清單(可行性的主要依據)
-
-| 現有機制 | 位置 | 在並行架構中的角色 |
-|---|---|---|
-| git-dir 級單 writer 鎖 | `engine/loop.py:1408-1416` | 每個 worktree 有自己的 git-dir(`.git/worktrees/<name>`),天然允許 N 個子迴圈並行、又擋住同 worktree 雙寫 |
-| workspace 級單 writer 鎖 | `engine/loop.py:1677` | 每條軌道配一個 workspace,互不干擾 |
-| 「任何變更 → done 歸零」 | `engine/loop.py:1594-1603` | merge main 進 worktree 後自動重新累積共識 = 「重複嘗試直到收斂」免費獲得 |
-| 綠點錨定 + reset 防線 | `engine/loop.py:643-662, 1620-1656` | 每軌獨立回退;合併把事情弄壞時 reset 會自動撤銷未收斂的 merge 再重試 |
-| `--import-plan --start-phase exec` | `engine/loop.py:1712-1728` | 父協調器把切好的軌道計畫餵給子迴圈,子迴圈不需要知道「拆分」這件事的全貌 |
-| `--pause-after-plan` | `engine/loop.py:2092-2096` | 規劃收斂後停下 → 人工審核「拆分是否真的獨立」的現成掛點 |
-| dispatch.json + round token | `engine/loop.py:1102-1108`、`engine/work.py:42-59` | 合併期沿用同一套派工/簽核協定,只是 phase 多一種 |
-| 受保護檔案快照 | `engine/loop.py:1114-1148, 1959-1971` | 每個子 workspace 各自快照 goal/plan-doc;任何軌道都動不了人類真相 |
-| Dashboard 多 workspace 監控 | `engine/dashboard.py:429, 596-622`、`ui/FleetOverview` | 子軌道以普通 workspace 卡片出現,MVP 零 UI 改動 |
-| 封存/健檢/異常 log 等營運面 | 既有 | 子 workspace 全部直接繼承 |
-
-### 2.3 Git worktree 的關鍵性質(設計前提)
-
-- `git worktree add` 共享 object store 與 **refs**:子 worktree 內直接
-  `git merge main`、`git merge-base --is-ancestor main HEAD` 都是本地操作,
-  不需要任何跨 repo 傳輸——這讓合併協定變得非常簡單。
-- 磁碟成本 = 一份 checkout + 各自的 build 產物(object 不重複)。
-- Git 禁止同一分支同時被兩個 worktree checkout → main 只會在主 worktree 出現,
-  是「main 單一寫入點」不變量的免費保險。
+Agent 永遠不在 integration worktree 執行。integration worktree 只由 fleet 做 CAS 後的同步、
+validate 與必要 rollback。
 
 ---
 
-## 3. 總體設計
-
-### 3.1 角色
-
-```text
-┌──────────────────────────── fleet 協調器(新,engine/fleet.py)────────────────────────────┐
-│  主 worktree(main)                                                                      │
-│  1. 規劃期:直接跑既有 loop.py --pause-after-plan → 收斂出「帶 track 標記的計畫」          │
-│  2. 拆分:按 track 切片計畫、建 worktree + branch、建立子 workspace、--import-plan 派發    │
-│  3. 監督:讀子 state.json(唯讀)、重啟異常子迴圈、維護 fleet.json                          │
-│  4. 合併佇列:逐一處理 merge-ready 的軌道 → 在主 worktree `git merge --ff-only <tip>`     │
-│  5. 匯流:全部軌道併回後,在主 worktree 跑既有 loop 執行 @final 整合任務 → 總 REPORT       │
-└───────┬───────────────────────┬───────────────────────┬─────────────────────────────────┘
-        │ spawn                 │ spawn                 │ spawn
-┌───────▼────────┐     ┌────────▼───────┐      ┌────────▼───────┐
-│ 子迴圈 track-A │     │ 子迴圈 track-B │      │ 子迴圈 track-C │   ← 全部是「今天的 loop.py」
-│ worktree wt/A  │     │ worktree wt/B  │      │ worktree wt/C  │     + 新增合併期(§5.3)
-│ branch loop/A  │     │ branch loop/B  │      │ branch loop/C  │
-│ workspace ws--A│     │ workspace ws--B│      │ workspace ws--C│
-└────────────────┘     └────────────────┘      └────────────────┘
-```
-
-### 3.2 生命週期
-
-```text
-準備 target repo(goal.md + PLAN.md 已 commit,validate 綠)
-   │
-   ▼
-[父] 規劃期:沿用現行規劃迴圈,收斂出計畫 v2(任務帶 track)
-   │        └─ --pause-after-plan:人工審核拆分(並行模式預設開,§14)
-   ▼
-[父] 對每條 track:git worktree add + branch + 子 workspace + 切片計畫(order 重編 1..n)
-   ▼
-[子]×N 並行:執行期照舊逐 task 收斂(實作輪/驗收輪、done ≥ threshold、reset 防線)
-   │        全部 task 收斂後 → 進入合併期(merge phase)
-   ▼
-[子] 合併期(重複直到收斂):
-   │   main 不是我的祖先?→ 派「併入輪」(§7.4):git merge --no-commit、解衝突、
-   │                        驗證綠才 commit(HEAD 動了 → done 自動歸零,照現行規則)
-   │   main 已是我的祖先?→ 派「整合確認輪」(§7.5):逐條重跑 DoD + validate,
-   │                        無異動 → done 回報 → done+1
-   │   done ≥ merge 門檻(2)且 ancestor 條件成立 → 寫 merge-ready(tip SHA)→ 子迴圈正常停止
-   ▼
-[父] 合併閘門(逐軌序列化):
-   │   在主 worktree 執行 `git merge --ff-only <tip>`
-   │   ├─ 成功 → 標記 merged、在 main 重跑 validate(預設開,§14)、處理下一軌
-   │   └─ 失敗(main 已被別軌推進)→ 重啟該子迴圈(resume 回合併期)→ 它會再 merge 一次 main
-   ▼
-[父] 全軌 merged → 主 worktree 跑 @final 整合任務(既有循序迴圈)→ 聚合 REPORT → 完成
-```
-
-「重複嘗試直到收斂」出現在兩層:軌道內逐 task 的既有收斂,以及合併期
-「merge → 重新累積共識 → 閘門 → 失敗再 merge」的外圈,兩者用的是同一套 done 共識機制。
-
----
-
-## 4. 任務格式 v2(**track 必填,不相容舊版**)
-
-### 4.1 格式
+## 4. 計畫格式 v2
 
 ```json
 [
-  {"order": 1, "task": "……含 DoD……", "ref": "PLAN.md#auth", "track": "auth",
-   "scope": ["src/auth/**", "tests/auth/**"]},
-  {"order": 2, "task": "……含 DoD……",                        "track": "auth",
-   "scope": ["src/auth/**", "tests/auth/**"]},
-  {"order": 3, "task": "……含 DoD……", "ref": "PLAN.md#report", "track": "report",
-   "scope": ["src/report/**"]},
-  {"order": 4, "task": "跨模組整合驗收:……(在 main 上執行)",     "track": "@final"}
+  {
+    "order": 1,
+    "task": "實作 auth，包含可執行 DoD",
+    "ref": "PLAN.md#auth",
+    "track": "auth",
+    "scope": ["src/auth/**", "tests/auth/**"]
+  },
+  {
+    "order": 2,
+    "task": "實作 report，包含可執行 DoD",
+    "track": "report",
+    "scope": ["src/report/**"]
+  },
+  {
+    "order": 3,
+    "task": "跨模組整合與端到端驗收",
+    "track": "@final"
+  }
 ]
 ```
 
-規則(現行 order/task/ref 規則全數保留,疊加以下):
+### 4.1 Hard schema
 
-- `order`:**維持全域 1..N 連續遞增、唯一**。仍是任務身分、稽核與 UI 的主鍵。
-- `track`:**必填**字串,`[a-z0-9._-]{1,24}`;`@final` 是唯一允許以 `@` 開頭的保留名。
-  決議「不需相容舊版」後 track 從選填改必填:**沒有「缺省=舊行為」的混合狀態**,
-  規則只有一條——每條任務都寫 track,循序計畫就是全部填同一個名字(慣例用 `main`)。
-  這正符合本 repo「收緊契約、消除弱模型可偷懶的模糊空間」的既有哲學(commit 4880782)。
-- 同一 track 內的任務按 `order` 循序執行(軌內語意 = 今天的整條計畫);
-  不同 track 並行。`@final` 在所有一般軌道 merge 回 main 之後,於主 worktree 循序執行。
-- 跨軌依賴不支援顯式 DAG:一律用「拆進同一軌」或「放進 `@final`」表達(§13)。
-- `scope`:字串陣列(路徑 glob)。**多於一軌時,非 `@final` 任務必填**;單軌計畫與
-  `@final` 免填。P0 只進格式與校驗,重疊警告到 P3 才實作(決議 §14)。
-- 上限:track 數(含 @final)≤ 8;非 @final 軌 ≤ 1 時 fleet 退化為現行循序模式(不開 worktree)。
+- `order`：全域唯一且為 `1..N` 連續整數。
+- `task`：非空字串，必須自足並包含可執行 DoD。
+- `ref`：選填字串或 null。
+- `track`：必填；一般名稱使用 `[a-z0-9][a-z0-9_-]{0,23}`。
+- `@final`：唯一 `@` 保留名稱；fleet 在一般 track 全部合入後才建立及執行。
+- track 總數含 `@final` 最多 8；`--max-parallel` 預設 4。
+- `scope`：選填非空字串陣列，只作 agent 提示與 UI 顯示，不驅動檔案操作、不做 overlap hard gate。
+- 未知欄位拒絕，避免契約靜默漂移。
 
-### 4.2 不相容舊版的落地方式
+Prompt 建議把 `@final` 放在全域 order 尾端，但 scheduler 依 track 名提取，並不依位置判斷。
 
-- `engine/work.py:validate_plan`(`engine/work.py:70-99`):track 必填 + 命名規則 +
-  上限 + scope 條件必填。**舊格式(無 track)直接校驗失敗**,錯誤訊息附新格式範例
-  (沿用現有「錯在哪+合法格式+正確範例」的回報模式)。
-- `engine/loop.py:validate_state_shape`(`engine/loop.py:794-806`):plan 條目要求 track。
-  **舊 state 直接判定不合法** → 沿用既有 fail-closed 路徑停機,錯誤訊息明確指示:
-  「格式已升級,請 `--reset-state` 或重新匯入計畫」。不寫任何自動遷移碼。
-- `ui/planValidation.ts`、`PLAN_TEMPLATE`:同步收緊(欄位白名單 + track 必填 + scope 規則),
-  規則與 work.py 完全一致(該檔案第 1 行的既有約定)。
-- `engine/prompts/external-agent-plan.md`:輸出契約直接改為 v2(§7.6),不保留雙格式敘述。
-- 子迴圈吃**切片後重編 1..n 的計畫**(validate_plan 的連續性要求維持不動);
-  全域 order ↔ 軌內 order 對照表由 fleet.json 保存,總 REPORT 用它還原全域編號。
+### 4.2 單軌與多軌入口
 
-### 4.3 為什麼選 track 而不是 DAG
+- 普通 `engine.loop` 只執行一個一般 track 的 plan。
+- `engine.fleet` 負責多 track 與含 `@final` 的 plan。
+- fleet 規劃 subprocess 使用新旗標 `--handoff-after-plan`：規劃一收斂就停止並交回 fleet，
+  不會誤進 master plan 的 exec。
+- 只有一個一般 track且沒有 `@final` 時，fleet 可退化委派 standalone loop，不建 worktree。
+- 只有 `@final` 時視為 standalone task plan；不需要先建立空的一般 track。
 
-- DAG(每 task 帶 `deps:[...]`)表達力最強,但:弱模型很難穩定產出正確依賴圖、
-  排程/回退語意複雜化(某 task reset 時下游要不要跟著退?)、UI(PlanTable/編輯器)
-  複雜度暴增。本 repo 的 prompt 歷史(commit 4880782、797fb77)顯示「給弱模型的契約
-  必須收得很緊」,DAG 與這個哲學相悖。
-- track 模型 = 「幾條今天的計畫並排」,每一軌的心智模型、防線、測試全部沿用;
-  表達不了的依賴自然退化成同軌循序或 @final,**錯誤的代價是變慢,不是變錯**。
+### 4.3 Breaking upgrade
+
+- parent/child/standalone state 新增必填 `state_schema_version: 2` 與隨 workspace generation
+  建立的 32 字元 `workspace_generation`；reset/recreate 產生新值，刪除 journal 不得只靠可重用 inode
+  判斷同名目錄身分。
+- fleet.json 使用獨立 `schema_version: 1`。
+- 舊 plan 缺 track 直接拒絕。
+- 舊 workspace 不遷移、不 restore、不允許執行或重跑；Dashboard 只在確認讀到 v1 standalone
+  state 時投影 delete-only 畫面，允許安全永久刪除後重新開始。損壞或缺 generation 的 v2 state
+  不得降級成 legacy delete-only。
 
 ---
 
-## 5. 子迴圈(軌道)設計
-
-### 5.1 規劃期
-
-規劃仍在主 worktree 以現行規劃迴圈進行,收斂出帶 track 的計畫;
-`pause_after_plan` 在並行模式預設開啟,人工審核拆分後放行。
-規劃 prompt 的具體增修見 §7.2。
-
-### 5.2 執行期:零語意變更
-
-子迴圈就是今天的 `loop.py`,吃切片計畫、在自己的 worktree/branch/workspace 上跑:
-逐 task 共識、驗證、紅燈/停滯 reset、受保護檔案快照、issue 回報、異常 log——全部照舊。
-唯二差異:
-
-1. 啟動參數多 `--merge-target main`(由 fleet 帶入):最後一個 task 收斂後不進 `done`,
-   改進 `merge` phase。
-2. 受保護檔案快照來源是該 worktree 內的 goal/plan-doc(內容與 main 相同,見不變量 I5)。
-
-執行 prompt 的並行情境增修(接觸面紀律)見 §7.3。
-
-### 5.3 合併期(merge phase,新增)
-
-`state.phase` 值域擴為 `plan | exec | merge | merge-ready | done`(`validate_state_shape`
-同步放寬;v2 草稿漏列 merge-ready,此處修正)。合併期內部再以**顯式欄位**拆出
-「併入/確認」兩個子狀態——Dashboard 與 status CLI 是唯讀 state 投影、不執行 git 命令,
-子狀態不落 state 就分辨不出來(完整狀態機與 UI 對照見 §6.6):
-
-- `merge_stage`:`"sync"`(併入中)或 `"confirm"`(確認中);coordinator 每輪派工前
-  判定 ancestor 後,與 dispatch.json 一起寫入 state(沿用「spawn 前先落地」的既有時序,
-  `engine/loop.py:1891`);非合併期為 null。
-- `merge_target_tip`:派工當下的 main tip SHA(與 I9 檢查、prompt 的 `<<MAIN_TIP>>` 同源)。
-- `merge_ready_sha`:進入 merge-ready 時鎖定的本軌 tip(§6.2 G1 比對用)。
-
-每輪流程:
+## 5. 全生命週期
 
 ```text
-輪初:coordinator 檢查 git merge-base --is-ancestor refs/heads/main HEAD,
-     並 rev-parse 當下 main tip 寫入 dispatch.json(供 prompt 注入與 I9 檢查同源)
- ├─ 否(main 有我沒有的 commit)→ 派「併入輪」:dispatch phase=merge, task_id="merge-main",
- │    模板 merge-sync.md(§7.4)。統一走 git merge --no-commit <main-tip>:
- │    無衝突與有衝突同一條路徑——解衝突(若有)→ 驗證綠 → 才 commit。
- │    輪末:HEAD 動了 → changed → done 歸零(現行機制,engine/loop.py:1594-1603)
- │    機械檢查(新,I9):merge commit 的第二 parent 必須是派工當下記錄的 main tip,
- │                  否則視同竄改、該輪作廢(防 agent 亂 rebase/亂 reset)。
- └─ 是 → 派「整合確認輪」:模板 merge-confirm.md(§7.5)——逐條重跑本軌 DoD + validate,
-      什麼都不動,`work.py done merge-main` 回報;無異動+綠+正常退出 → done+1。
-輪末:done ≥ merge_threshold(預設 2)且 ancestor 條件仍成立
-      → state.phase = "merge-ready"、記錄 merge_ready_sha → 子迴圈正常停止(exit 0)
+1. preflight
+   - integration worktree 是實體 Git worktree、乾淨、validate 綠
+   - integration ref 正由該 worktree checkout，記錄 expected SHA
+   - goal/plan-doc 已 tracked 且在 HEAD
+   - submodule repo 目前明確不支援
+
+2. planning
+   - fleet spawn loop --handoff-after-plan
+   - agent 多輪 create-plan / plan-ok 收斂
+   - loop 停在 handoff 點，fleet 驗證 plan v2 並凍結 plan hash
+   - pause-after-plan 預設 off；若選配 on，才等待綁 plan hash 的 approve token
+
+3. split + exec
+   - 每條一般 track 建 branch/worktree/child workspace
+   - 計畫切片，child order 重編 1..n，fleet 保存 global/local order map
+   - 最多 max-parallel 個 child 自動執行至全部 task done
+
+4. child merge convergence
+   - integration tip 不是 child HEAD 祖先 → merge-sync agent
+   - 已是祖先 → merge-confirm agent
+   - 修改、修復、issue、驗證失敗都自動進下一輪
+   - 連續無異動 done 達 merge threshold → merge-ready
+
+5. fleet merge transaction
+   - gate 通過 → CAS 推進 integration ref
+   - 同步 integration worktree → integration validate
+   - PASS：track merged
+   - FAIL：自動 rollback；錯誤送回 child；child 重新確認/修復後再排隊
+
+6. @final
+   - 所有一般 track merged 後，從最新 integration SHA 建 final worktree
+   - 執行 @final 切片並走同一 merge-ready / CAS / validate 流程
+
+7. finish
+   - 聚合 REPORT
+   - 自動移除已合併 child/final worktree 與 child workspace
+   - branch 保留供稽核；fleet-parent 與 REPORT 保留，使用者可安全刪除
 ```
-
-history.log 的合併期行加 `stage=sync|confirm` 欄位(既有 key=value 格式,
-`round_metrics_from_history` 只取已知欄位、天然向前相容;samples 投影加 stage 供
-逐輪判定顯示)。「未回 DONE」異常判定沿用現行規則:併入輪如同執行期實作輪,
-以 commit 為產出、不回 done;確認輪以 done 為完成回報。
-
-- `merge_threshold` 預設 2(執行期維持 3):merge 後的樹已被軌內收斂驗過,
-  這裡主要驗「合併本身」(決議 §14)。
-- 紅燈/停滯 reset 在合併期照常生效:reset --hard 回軌道綠點 = **自動撤銷失敗的 merge**,
-  下一輪重新 merge——「重複嘗試直到收斂」的錯誤恢復不用另外寫。
-- 衝突解不動(連續 reset)→ 既有 stuck-stop / issue 機制升級人工,不會無限燒錢。
-- 收拾現場規則對 merge 半成品的處理(一律 `git merge --abort` 重來)寫死在模板(§7.4),
-  determinism 優先於接手省時間:半解的衝突現場對全新 context 的 agent 是負資產。
-
-### 5.4 work.py 變更
-
-- `cmd_done`:接受 `phase == "merge"` 且 `task_id == "merge-main"`(其餘驗證照舊,
-  `engine/work.py:138-150`)。
-- 其他命令不變;合併期打 `create-plan` 比照執行期:忽略 + 票作廢(現行語意)。
 
 ---
 
-## 6. 父協調器(fleet)設計
+## 6. Child loop 狀態機
 
-新檔 `engine/fleet.py`,職責刻意薄:**它不實作收斂,只做生命週期與合併閘門**。
+### 6.1 State 欄位
 
-### 6.1 Worktree / branch / workspace 生命週期
-
-- **位置(已定案,§14)**:`workspace/<parent>/worktrees/<track>/`。
-  好處:隨 workspace 封存/還原/刪除一起走、天然在 target repo 之外、
-  沿用既有 workspace 目錄的 O_NOFOLLOW/symlink 檢查紀律。
-  注意事項:workspace 封存(整目錄搬移)前必須先 `git worktree remove`——
-  搬走一個活的 worktree 會讓 repo 的 worktree 註冊表指向失效路徑;
-  封存流程加一步「worktree 已全數移除才可封存」的 fail-closed 檢查。
-- 建立(冪等):`git worktree add workspace/<parent>/worktrees/<track> -b loop/<run-id>/<track> <base-sha>`;
-  已存在且指向同 branch → 沿用(resume);存在但不符 → fail-closed 停機交人。
-- 子 workspace 命名 `"<parent>--<track>"`(決議 §14)。
-- 回收:merged 後 `git worktree remove` + branch 保留(稽核);失敗軌道保留現場。
-- 磁碟預算:N × (checkout + build 產物)。Java 專案粗估每軌 0.5–1 GiB,
-  `--max-parallel` 預設 4(決議 §14),啟動表單顯示估算。
-
-### 6.2 合併閘門(程式判斷,R5 核心)
-
-放行條件(全部機械檢查,缺一不可):
-
-```text
-G1 子 state.phase == "merge-ready",且記錄的 tip SHA == 該 branch 目前 tip
-G2 tip 在子 workspace 的 last_green_sha 上(= 該 SHA 驗證綠、工作樹乾淨時記錄)
-G3 done 共識已達 merge_threshold(G1 蘊含,由子迴圈落盤)
-G4 refs/heads/main 是 tip 的祖先(可 fast-forward)
-G5 主 worktree 乾淨、無其他 fleet 正在合併(fleet 持有主 worktree 的既有 git-dir 鎖)
+```json
+{
+  "state_schema_version": 2,
+  "workspace_generation": "<32-char-random-hex>",
+  "workspace_kind": "fleet-child",
+  "fleet_parent": "orders",
+  "fleet_run_id": "...",
+  "track": "auth",
+  "phase": "exec | merge | merge-ready | done",
+  "merge_stage": "sync | confirm | null",
+  "merge_target_ref": "refs/heads/main",
+  "merge_target_tip": "<sha-or-null>",
+  "merge_ready_sha": "<sha-or-null>",
+  "merge_control_generation": 3
+}
 ```
 
-執行:在主 worktree `git merge --ff-only <tip>`。因為 G5 保證 fleet 是 main 的唯一
-本地寫入者,`--ff-only` 本身就是安全的 CAS:main 若在 G4 檢查後被推進(理論競態),
-merge 直接失敗,fleet 把該軌重新排隊。**任何非 fleet 造成的 main 移動 =
-外力介入 → fleet 停機交人**(不變量 I1)。
+Standalone state 仍使用 `plan | exec | done`，`workspace_kind=standalone`。
 
-合併後在 main 重跑一次 validate(**預設開**,決議 §14)。ff 保證樹 identical,
-這一步驗的是環境耦合(路徑寫死、cache 差異);紅了就是重大訊號,停機交人。
+### 6.2 Exec → merge
 
-### 6.3 合併佇列與「合併風暴」控制
+- standalone 最後一個 task 完成後進 `done`。
+- fleet-child 最後一個 task 完成後進 `merge`，清空 done、red、stall 等暫態。
+- completed SHA 必須持續是目前 HEAD 的祖先；agent 不得改寫既有 track history。
 
-- 佇列嚴格序列化:一次只 ff 一軌。每次 main 前進後,其餘 merge-ready 軌道的 G4 必然失效
-  → fleet 以 resume 重啟它們,自然回到合併期再 merge 一次。
-- 成本上界:K 軌並行、最後合併的軌道最多重併 K-1 次,每次 ≈ 1 併入輪 + merge_threshold
-  確認輪。K=4、threshold=2 時最多約 9 輪額外開銷——這是共識模型的固有代價,
-  用「佇列按 readiness 先到先合」與「建議 track ≤ 4」控制。
-- `--pause-before-merge`(每次 ff 前等人工核可,比照 pause_after_plan)**預設關**(決議 §14)。
+### 6.3 Merge round 選擇
 
-### 6.4 fleet 真相與 resume
+輪初取得 `integration_tip` 並寫入 state + dispatch：
 
-`workspace/<parent>/fleet.json`(原子寫、比照 state.json 的 last-good checkpoint 防線):
+```text
+is-ancestor(integration_tip, HEAD)?
+  no  → stage=sync，派 merge-sync.md
+  yes → stage=confirm，派 merge-confirm.md
+```
+
+sync agent 的目標是「讓派發的 integration tip 成為 HEAD 祖先且驗證綠」。Prompt 建議
+`git merge --no-commit <tip>`，但機械層不要求固定第二 parent。Agent 可在不改寫既有歷史、
+不修改 integration ref 的前提下，自行解衝突並建立必要修復 commit。
+
+### 6.4 Merge round 結果
+
+| 結果 | Coordinator 動作 |
+|---|---|
+| HEAD/工作樹有變更且 validate 綠 | 更新 last-green；done 歸零；下一輪獨立確認 |
+| dirty 或 validate 紅 | done 歸零；依 merge red/stall 防線 reset 後自動下一輪 |
+| 無變更、沒有 done、正常退出 | 視為 no-progress；保留 issue/notes；自動換下一輪 agent |
+| confirm 無變更、validate 綠且 done | done +1 |
+| agent crash/timeout | signal 作廢；保留安全現場；child loop 依既有 backoff 自動重試 |
+| protected/state/ref 協定被破壞 | 回到 round-start SHA；結構性錯誤才停機 |
+
+語意型 retry 預設不設次數上限，與現有 loop 的「直到收斂」一致。營運者可用既有
+語意修復預設持續收斂，不設機械 retry 次數 gate；營運上若 child coordinator 本身反覆 crash，
+可用 fleet 的 `--max-child-restarts N` 選配封頂，`0` 表示不限且為預設。
+
+### 6.5 進入 merge-ready
+
+必須同時成立：
+
+- `done_count >= merge_threshold`，預設 2。
+- 最新 `integration_tip` 是 HEAD 祖先。
+- HEAD == `last_green_sha`。
+- worktree 乾淨。
+- completed anchors 都是 HEAD 祖先。
+
+成立後保存 `merge_ready_sha=HEAD`、phase=`merge-ready`，child 正常停止。
+
+### 6.6 merge-ready 自動重開
+
+Child resume 時先檢查：
+
+- integration ref 已前進且新 tip 不是 HEAD 祖先 → 自行切回 `merge/sync`。
+- 收到較新的 fleet repair control → 自行切回 `merge/confirm`，把 integration validate 錯誤注入 notes。
+- branch tip、HEAD、merge_ready_sha 不一致 → 不猜測，停機顯示結構錯誤。
+- 條件仍成立且沒有 control → 保持 merge-ready，不多跑 agent。
+
+Fleet 不直接寫 child state；它只原子寫入 token/run-id/generation 綁定的 sideband control。
+Child 驗證 control 後自行轉移並更新 state，維持單一 state writer。
+
+Sideband control schema 固定為：
 
 ```json
 {
   "schema_version": 1,
-  "run_id": "…", "phase": "exec | merging | final | done",
-  "base_branch": "main", "base_sha": "…",
-  "order_map": {"auth": {"1": 1, "2": 2}, "report": {"1": 3}},
-  "tracks": [
-    {"name": "auth", "branch": "loop/…/auth",
-     "worktree": "workspace/<parent>/worktrees/auth", "workspace": "<parent>--auth",
-     "status": "running | merge-ready | merging | merged | failed", "merged_sha": null,
-     "merge_attempts": 0}
-  ],
-  "merge_queue": ["report"]
+  "run_id": "32-char-lowercase-hex",
+  "track": "auth",
+  "generation": 4,
+  "action": "repair | stop | lease",
+  "expected_child_sha": "...",
+  "integration_sha": "...",
+  "note": "bounded validate tail"
 }
 ```
 
-- 父崩潰恢復:fleet.json + 各子 state.json + git 現場(branch/worktree 是否存在、
-  merge-base 關係)三方比對重建;所有步驟冪等(worktree add 檢查既存、ff merge 天然冪等)。
-- 子迴圈本來就 resume-first(state.json 續跑),fleet 重啟子迴圈 = 重跑同一條命令。
-- 監督:fleet 唯讀輪詢子 state(比照 Dashboard 的 read-only 投影),不寫子 workspace
-  (不變量 I8);監督迴圈同時比對 goal hash,變更即平順停全艦(§15.3)。
-  **fleet 預設不自動重啟異常退出或被人工停止的子軌**——標記需關注、交人決定;
-  只在它擁有的既定轉移重啟(初次派發、ff 失敗重排);政策理由見 §15.4。
-
-### 6.5 CLI / Dashboard 掛法
-
-- 新入口 `python -m engine.fleet --repo … --parallel --max-parallel 4 …`,
-  參數集 = loop.py 全集 + fleet 專屬(merge_threshold、max-parallel、pause-before-merge)。
-  非 @final 軌 ≤ 1 時 fleet 直接委派 loop.py 循序執行(不開 worktree)。
-- Dashboard:啟動表單加「並行模式」區塊(track 預覽、磁碟估算、max-parallel);
-  spawn fleet 而非 loop(`engine/dashboard.py:596-622` 加一個分支)。
-  子軌道自動以普通 workspace 卡片出現在總覽(零改動);父卡片顯示 fleet phase 與
-  merge queue(Phase 3 再做分組 UX)。
-
-### 6.6 Track 狀態機與 Dashboard 觀測(v3 補充)
-
-「併入」不是單一狀態:從軌道收斂到進 main,一條軌道會經過多個必須可分辨的狀態。
-真相分兩層——**子 state.json**(軌道自己的進度)與 **fleet.json**(佇列與合併結果)。
-Dashboard 顯示時以 fleet 層覆蓋:當 `fleet.track.status ∈ {merging, merged, failed}`
-時優先於子 state 的 merge-ready——子迴圈此時已停止,它的 state 不會再前進,
-之後的真相只在 fleet 這層。
-
-| 狀態 | 判定(真相來源) | 卡片 pill 文案(建議) |
-|---|---|---|
-| 執行中 | child:phase=exec(現行) | 執行中 task-N(現行不變) |
-| 併入中 | child:phase=merge ∧ merge_stage=sync | 🔀 併入 main(解衝突)@`merge_target_tip` 短碼 |
-| 重併中 | 同上 ∧ fleet:merge_attempts ≥ 1 | 🔁 第 n 次重併(main 已前進) |
-| 整合確認中 | child:phase=merge ∧ merge_stage=confirm | 🗳 整合確認 done x/2 |
-| 待合併 | child:phase=merge-ready(fleet 給佇列順位) | ⏳ 待合併(佇列第 k) |
-| 合併中 | fleet:track.status=merging(ff + main validate 執行中) | ⤴ 合併進 main 中 |
-| 已合併 | fleet:track.status=merged | ✔ 已合併 @`merged_sha` 短碼 |
-| 合併失敗停機 | fleet:track.status=failed(attempts 封頂/外力動 main) | ⛔ 合併失敗,需人工 |
-| 軌道停機/需關注 | child:既有停止、stuck、state 錯誤等判定 | 現行文案不變 |
-
-落地面:
-
-- `engine/status.py`:投影新增 phase(含 merge-ready)、merge_stage、merge_target_tip、
-  merge_ready_sha 與 done/merge_threshold;維持「純唯讀、不碰 git」的原則——
-  這正是子狀態必須顯式落在 state.json 的原因。
-- `validate_state_shape`:merge_stage ∈ {null, "sync", "confirm"};兩個 SHA 欄位
-  比照既有 40/64 hex 或 null 規則;phase enum 擴充。
-- 新 API `GET /api/fleet-state?ws=<parent>`(唯讀,O_NOFOLLOW 讀 fleet.json,
-  比照既有 bounded/safe reader):回傳 fleet phase、各軌 status/attempts/merged_sha
-  與 merge_queue;SSE 加 `fleet-state` event(與 health/fleet-round-metrics 同一連線、
-  同一原則:只推投影,不推原始檔)。
-- 子軌道卡片:pill 依上表;「fleet 覆蓋 child」的優先序在前端 view model
-  (`fleetViewModel.ts`)實作,資料來源 = 子 workspace state(既有掃描)⊕ fleet-state event。
-- 父 workspace 卡片:顯示 fleet phase、佇列(誰在合併、誰在等、各軌 attempts)、
-  已合併軌道與 merged_sha 清單;P1 期間(尚無自動合併)改列「track X 已完成於
-  branch Y,待人工合併」。
-- 輪次紀錄/時間軸:逐輪判定顯示 stage 標籤(併入/確認);sparkline 維持
-  「綠紅=驗證結果」語彙,merge 輪的視覺標記(如描邊)留待 P3 定稿——
-  pill 與逐輪文字已足以分辨,sparkline 只是輔助。
-- 分期:P1 交付「已完成待人工合併」狀態與父卡片 branch 清單;P2 交付 merge 子狀態
-  欄位、status.py 投影、fleet-state API/SSE 與覆蓋邏輯(自動合併與其觀測同期落地);
-  P3 交付分組視覺與 sparkline 標記。
+`note` 套用固定 bytes/chars 上限；舊 generation、錯 run-id/track/SHA、未知 action 一律忽略並
+記 anomaly，不可讓殘留控制檔影響新的 fleet run。
 
 ---
 
-## 7. Prompt 調整設計(本版重點)
+## 7. Fleet coordinator 與 merge transaction
 
-### 7.1 設計原則
+### 7.1 Fleet 真相
 
-沿用既有任務卡的全部結構慣例,四份 prompt 一體適用:
+`workspace/<parent>/fleet.json` 使用 checkpointed atomic write：
 
-1. **單輪無狀態身分**:開頭固定交代「你是收斂迴圈中的一輪,前人可能做錯/做一半,
-   你的產出會被之後輪次獨立檢驗」——這是共識機制成立的心理前提。
-2. **互斥動作、二選一**:每張卡收斂到「改東西(本輪不算票)」或「什麼都不動 + 回報」
-   兩條互斥路徑;同輪兩者都做 = 票作廢(機制已保證,prompt 明說)。
-3. **非互動與停止規則**逐卡照抄現行條款式樣:不得提問、命令成功即停、
-   權限被拒輸出 `tool permission blocked`、修不綠就輸出進度後停。
-4. **弱模型防偷懶**:動詞全部具體(「實際執行」「取得通過結果」),
-   禁止憑印象/前人紀錄/靜態對照;預期會像 4880782、797fb77 那樣做 2–3 輪收緊迭代。
-5. **placeholder 純文字替換**:維持 `build_prompt` 的 `<<KEY>>` 機制
-   (`engine/loop.py:1287-1292`),模板不含邏輯,分支由 coordinator 選模板/選值。
-6. **併入與確認分成兩張卡**:coordinator 在派工當下就知道 main 是否已是祖先,
-   與其在一張卡裡寫條件分支讓 agent 自判,不如直接派正確的卡——
-   消除誤判空間,也讓兩張卡各自保持「單一工作」的清晰度。
-
-### 7.2 `engine/prompts/plan.md` 增修
-
-**a. 「計畫 JSON 格式」段全面改寫**(格式 v2,不留舊格式敘述):
-
-範例更新為 §4.1 的形狀;欄位說明在現有 order/task/ref 三條之後新增:
-
-> - `track`:必填,`[a-z0-9._-]{1,24}`;同一 track 的任務依 order 循序執行,
->   不同 track 並行。整個計畫無法並行就全部填同一個名字(慣例 `main`)——
->   這是完全合法的計畫,不要為了並行而硬拆。
->   `@final` 是唯一允許以 `@` 開頭的保留名:放跨軌整合與最終驗收,
->   會在所有軌道合併回主幹後、於主幹上循序執行。
-> - `scope`:計畫多於一軌時,每條非 `@final` 任務必填——列出該任務預期會修改的
->   路徑 glob(如 `["src/auth/**", "tests/auth/**"]`);單軌計畫與 `@final` 省略。
-
-**b. 完整性定義修一句**(現行第 1 點「它只看得到該條 task 的全文與每行截 80 字的
-任務總覽」):
-
-> 每一條 task 都會交給一個**全新 context 的 agent** 在隔離的 worktree 獨立執行,
-> 它只看得到該條 task 的全文與**同一軌道**每行截 80 字的任務總覽——
-> 看不到其他軌道的任何內容;每條 task 都自足到能直接動工、逐條做完目標就達成,
-> 計畫才算完整。
-
-**c. 新增「拆軌規則」一節**(插在「計畫 JSON 格式」之後,全文):
-
-> ## 拆軌規則(並行執行)
->
-> 計畫會按 `track` 拆成並行軌道:每條軌道在各自隔離的 Git worktree 上由獨立迴圈
-> 循序執行;軌道全部任務收斂後,先把主幹最新變更併入自己的分支、解衝突並重新收斂,
-> 才會被合回主幹;`@final` 軌最後在主幹上循序執行。據此拆分:
->
-> - 會修改同一批檔案或同一模組的任務 → **必須同軌**。分軌的唯一目的是加速;
->   拆錯的代價是合併衝突與重工。**不確定能不能分,就放同一軌**——循序永遠是安全預設。
-> - 軌內任務只能依賴同軌前置任務與主幹起跑點;**不得依賴其他軌道尚未合回的產出**。
->   「前置:task-N 完成」只能指同一軌的任務。
-> - 跨軌整合、跨模組驗收、需要全部軌道成果才能做的工作 → 一律放 `@final`。
-> - 多於一軌時逐任務填 `scope`,並自行核對:不同軌道的 scope 不得重疊;
->   重疊就表示拆分錯誤,把相關任務併回同一軌。
-> - 軌道數(含 `@final`)不得超過 8;超過 4 通常已無加速收益,優先合併相近軌道。
-
-**d. 「計畫已完整」宣告的語意擴充**(在二選一的 plan-ok 分支加一句):
-
-> 宣告完整同時代表你已核對拆軌規則:接觸面不相交、無跨軌依賴、scope 已填。
-> 拆軌不符規則的計畫視為有缺,應重交新計畫而非 plan-ok。
-
-**e. placeholder**:無新增(拆軌規則是靜態文字;上限 8/4 與 validate_plan 寫死同值)。
-
-### 7.3 `engine/prompts/exec.md` 增修
-
-改動刻意最小——執行輪的心智模型不變,只加「接觸面紀律」:
-
-**a. 新增 placeholder `<<TRACK_CONTEXT>>`**(插在「你的工作」段之後、參考段落之前),
-由 coordinator 決定值:
-
-- 多軌 fleet 模式:
-  > 本任務屬於並行軌道 `<track>`;其他軌道正在別的 worktree 同時進行,完成後會互相合併。
-  > 只改動完成本任務所必需的檔案(參考任務的 scope 聲明);不要順手重構、搬移、
-  > 重新排版或「順便修」與本任務無關的程式碼——無謂的接觸面會直接變成合併衝突。
-- 單軌/現行模式:注入空字串(模板行留白,不影響現行輸出)。
-
-**b. commit message 規則改為 `<<TASK_TAG>>`**(現行第 34 行「commit message 帶上
-<<TASK_ID>>」):值由 coordinator 決定——多軌 = `<track>/task-N`(main 歷史裡兩條軌
-都有 task-1,不帶軌名無法稽核),單軌 = `task-N`(輸出與今天一字不差)。
-`work.py done` 的核對仍用 `<<TASK_ID>>`(軌內 id),兩者用途不同、並存。
-
-**c. 「任務總覽」標題**改為「本軌道任務總覽」(單軌時語意仍正確:整個計畫就是一軌)。
-
-### 7.4 `engine/prompts/merge-sync.md`(新檔,併入輪,完整草稿)
-
-````markdown
-# 併入輪任務卡(單輪、無狀態 agent)
-
-你是一個收斂迴圈中的一輪。本分支(並行軌道 <<TRACK_NAME>>)的全部任務已逐一收斂;
-現在主幹 <<MERGE_TARGET>> 有本分支沒有的新變更,必須先併進來、解掉衝突並讓驗證通過,
-本分支才有資格被合回主幹。前面可能已有 agent 併到一半 crash 或解錯衝突;
-你的產出也會被之後的輪次獨立驗收。
-
-## 目標(大方向,唯讀)
-
-<<GOAL>>
-
-## 本軌道已收斂的任務(唯讀,回顧用)
-
-```
-<<TASK_LIST>>
+```json
+{
+  "schema_version": 1,
+  "run_id": "...",
+  "workspace_kind": "fleet-parent",
+  "phase": "planning | awaiting-approval | splitting | exec | merging | final | cleaning | stopped | done | failed",
+  "resume_phase": "planning | splitting | exec | final | cleaning | null",
+  "integration_ref": "refs/heads/main",
+  "integration_worktree": "/absolute/repo/path",
+  "expected_integration_sha": "...",
+  "plan_sha256": "...",
+  "order_map": {"auth": {"1": 1}},
+  "tracks": [],
+  "merge_queue": [],
+  "merge_tx": null,
+  "loop": {"pid": 123, "session_id": "...", "started_at": "..."}
+}
 ```
 
-## 你的工作:merge-main(把 <<MERGE_TARGET>> 併入本分支)
+`failed` 必須保存合法 `resume_phase` 與 bounded `last_error`；下一次 resume 先回到該階段，
+不把 `failed` 當成可直接執行的 scheduler phase。每次 coordinator session 另記入最多 100 筆
+`supervisor_session_history`，供舊 child adoption、lease 與安全刪除核對；UI 顯示上次錯誤稽核，
+但只在 truth 無法安全讀取或 backend 明示不可續跑時隱藏 Run。
 
-要併入的確切 commit:<<MAIN_TIP>>
+Track 至少保存 logical name、safe directory、branch full ref、worktree canonical path、child
+workspace、status、tip、restart count、integration validate failure count、control generation。
+Track status 值域固定為
+`pending | running | merge-ready | merging | repairing | merged | stopped | failed | cleaned`；
+未知值拒絕，避免 Dashboard 與 resume 對同一狀態各自猜測。
 
-## 步驟(依序)
+### 7.2 Gate
 
-1. **收拾現場**:
-   - `git status` 顯示 merge 進行中(有 unmerged paths,或 `.git/MERGE_HEAD` 存在)→
-     那是前人併到一半的現場,一律 `git merge --abort` 回到乾淨狀態,從步驟 2 重新開始;
-     不要嘗試接手半解的衝突。
-   - 其他未 commit 殘留:對應得上「併入後的修復」就接手;對應不上就
-     `git reset --hard` + `git clean -fd` 清掉(staged 的一併清),
-     清完用 `git status` 確認乾淨。
-2. **併入**:執行 `git merge --no-commit <<MAIN_TIP>>`(必須是這個確切 commit)。
-   不得 rebase、不得 cherry-pick、不得 reset 到主幹、不得改寫或 amend 任何既有 commit。
-3. **解衝突**(若有):
-   - 主幹既有的行為與測試必須保留;本分支為達成 goal 所做的變更也必須保留其效果。
-   - 兩邊都改過的地方,以「合併後同時滿足雙方意圖」為準重寫;不確定時以測試可通過為準。
-   - 不得用單邊策略(ours/theirs)整檔覆蓋另一邊的實質變更。
-   - 解完把所有衝突檔 `git add`。
-4. **驗證**:實際跑 <<VALIDATE_CMD>> 直到綠;需要的修復一併改好(仍屬本輪併入工作)。
-5. **提交**:驗證綠之後才 `git commit`(沿用預設 merge 訊息即可);
-   工作區收乾淨,不留未 commit 的檔案。
-   **本輪已產生 merge commit,不必也不得執行 done——整合是否正確由之後的輪次獨立確認。**
+合入前只做必要機械檢查：
 
-## 非互動與停止規則
+```text
+G1 child phase=merge-ready，child coordinator 已停止
+G2 child HEAD = branch tip = merge_ready_sha = last_green_sha
+G3 child worktree 乾淨；completed anchors 都在 candidate 祖先鏈
+G4 expected integration SHA 是 candidate 祖先（可 ff）
+G5 integration ref 仍精確等於 fleet expected SHA
+G6 integration worktree 乾淨，fleet 持有其 git-dir writer lock
+```
 
-- 這是非互動式自動執行環境。不得詢問使用者、等待確認、列出選項或只建議「下一步」。
-- 完成步驟 5 後工作即結束:**立即停止**,不要繼續分析、修改檔案或執行其他命令。
-- 多次嘗試仍無法把驗證修綠:若 merge 尚未 commit,先 `git merge --abort` 還原現場;
-  輸出目前進度、已嘗試方向與驗證失敗尾段後直接停止,交由下一輪重試。
-  不得 commit 驗證仍紅的 merge 結果,也不得執行 done。
-- 衝突涉及真正的人類決策(兩邊意圖互斥、無法同時滿足)→ 執行
-  `<<ISSUE_CMD>> "一句話描述矛盾"` 回報,`git merge --abort` 還原現場後停止。
-- 若執行工具或權限遭拒,明確輸出 `tool permission blocked` 與原始錯誤後立即停止;
-  不得假裝命令已執行。
+不檢查 scope overlap、commit message、merge commit 第二 parent或特定衝突解法。
 
-## 禁區
+### 7.3 真正 CAS 與 journal
 
-- goal、參考文件、workspace 的 state.json / state.last-good.json / 計畫 JSON 是受保護真相:
-  直接改檔會被偵測、還原、該輪作廢。
-- 不得切換分支、不得 checkout 或推進 <<MERGE_TARGET>> 本身、不得 push、
-  不得操作其他 worktree 或其目錄。
-- 計畫已凍結:不能新增/修改/跳過任務。
+`git merge --ff-only` 不當作 CAS。流程如下：
 
-## 本輪情報(迴圈注入)
+```text
+1. fleet.json merge_tx = {
+     track, expected_sha, candidate_sha, stage: "prepared"
+   }
+2. git update-ref <integration_ref> <candidate_sha> <expected_sha>
+3. merge_tx.stage = "ref-updated"
+4. integration worktree: git reset --hard <candidate_sha>
+5. merge_tx.stage = "validating"
+6. run validate
+```
 
-<<NOTES>>
-````
+Validate PASS：
 
-### 7.5 `engine/prompts/merge-confirm.md`(新檔,整合確認輪,完整草稿)
+```text
+merge_tx.stage = "validated"
+expected_integration_sha = candidate_sha
+track.status = merged
+merge_tx = null
+```
 
-````markdown
-# 整合確認輪任務卡(單輪、無狀態 agent)
+Validate FAIL：
 
-你是一個收斂迴圈中的一輪。本分支(並行軌道 <<TRACK_NAME>>)已完成全部任務,
-且主幹 <<MERGE_TARGET>>(commit <<MAIN_TIP>>)已併入本分支。你要獨立驗收
-「整合後的分支」是否正確:連續多輪 agent 一致同意且無任何異動,本分支才會被合回主幹。
-前面的輪次可能解錯衝突、或以為修好了;不要輕信任何前人紀錄。
+```text
+merge_tx.stage = "rollback-prepared"
+git update-ref <integration_ref> <expected_sha> <candidate_sha>
+git reset --hard <expected_sha>
+重跑 baseline validate
+merge_tx.stage = "rolled-back"
+寫 child repair control（含失敗輸出尾段）
+重啟 child，自動重新確認/修復
+merge_tx = null
+```
 
-## 目標(大方向,唯讀)
+Rollback 後 baseline 也紅、ref 出現第三個未知 SHA、或 integration worktree 有非交易造成的
+dirty 狀態時，才停機交人；不得自行 reset 未知的人類變更。
 
-<<GOAL>>
+### 7.4 Crash resume 表
 
-## 本軌道任務全文(唯讀;驗收以每條任務的 DoD 為準)
+| Journal / Git 現場 | Resume |
+|---|---|
+| prepared + ref=expected | 重新執行 CAS |
+| prepared + ref=candidate | 視為 CAS 已成功，切 ref-updated |
+| ref-updated/validating + ref=candidate | 同步 worktree並重新 validate |
+| rollback-prepared + ref=candidate | 重試 rollback CAS |
+| rollback-prepared + ref=expected | 完成 worktree rollback與 baseline validate |
+| transaction 中 ref=第三個 SHA | 未知外力介入，停機 |
+| validated 但 track 尚未標 merged | 由 ref/candidate/validate checkpoint 補完冪等狀態 |
 
-<<TRACK_TASKS_FULL>>
+所有 Git 副作用前先寫 intent；所有 journal 清除前先把完成結果落 fleet checkpoint。
 
-## 你的工作:merge-main(驗收整合結果)
+### 7.5 Merge queue
 
-## 步驟(依序)
-
-1. **收拾現場**:
-   - merge 進行中(unmerged paths / `.git/MERGE_HEAD`)→ 前人半成品,
-     `git merge --abort` 清掉後繼續驗收目前的 HEAD。
-   - 其他未 commit 殘留:對應得上「整合修復」就接手做完;對應不上就
-     `git reset --hard` + `git clean -fd` 清掉,清完 `git status` 確認乾淨。
-2. **逐條驗收**:對上面列出的每一條任務,實際執行其 DoD 指定的命令或檢查,
-   並取得該 DoD 明定的通過結果。只確認「測試檔存在」「程式碼有對到」不算執行,
-   不得只憑印象或前人紀錄認定。
-3. **整體驗證**:之後實際跑 <<VALIDATE_CMD>> 為綠。
-4. 二選一(互斥):
-   - **發現缺陷**(任一 DoD 失敗、驗證紅,或整合遺失了主幹或本軌道的既有行為)→
-     修復;跑 <<VALIDATE_CMD>> 直到綠;只 commit 屬於整合修復的變更,
-     commit message 帶上 merge-fix;工作區收乾淨。
-     **本輪有任何 commit 就不必執行 done**——確認留給之後的輪次獨立判斷。
-   - **全部通過** → 什麼檔案都不要動、不要 commit,執行:
-     <<DONE_CMD>>
-     - 任一結果為失敗、未知或未執行,不得執行 done。
-     - 驗證產物必須是 gitignored;若驗證命令留下殘留,先還原現場再 done:
-       未追蹤的殘留直接刪掉,被改動的受版控檔案用 `git restore <路徑>` 還原。
-       跑完用 `git status` 確認無新異動;工作區有任何變更,該輪 done 票會作廢。
-
-## 非互動與停止規則
-
-- 這是非互動式自動執行環境。不得詢問使用者、等待確認、列出選項或只建議「下一步」。
-- 若本輪完成修復並已通過驗證、commit 且工作區乾淨,工作到此完成:**立即停止**;
-  不要再執行 done,也不要繼續分析、修改檔案或執行其他命令。
-- 若本輪判定整合正確,必須實際執行 done;命令成功後立即停止。
-- 若多次嘗試仍無法把驗證修綠:不要 commit 紅燈變更、不要硬跑 done;
-  輸出目前進度、已嘗試方向與驗證失敗尾段後直接停止,殘留交由下一輪依「收拾現場」判斷。
-- 只有整合本身存在人類才能裁決的矛盾時,才執行 `<<ISSUE_CMD>> "一句話描述問題"`
-  回報後停止。
-- 若執行工具或權限遭拒,明確輸出 `tool permission blocked` 與原始錯誤後立即停止;
-  不得假裝命令已執行。
-
-## 禁區
-
-- goal、參考文件、workspace 的 state.json / state.last-good.json / 計畫 JSON 是受保護真相:
-  直接改檔會被偵測、還原、該輪作廢。
-- 不得切換分支、不得 checkout 或推進 <<MERGE_TARGET>> 本身、不得 push、
-  不得操作其他 worktree 或其目錄。
-- 計畫已凍結:不能新增/修改/跳過任務。
-
-## 本輪情報(迴圈注入)
-
-<<NOTES>>
-````
-
-設計備註:確認輪注入的是 `<<TRACK_TASKS_FULL>>`(軌道任務**全文**逐條列出,含 DoD),
-不是截斷 80 字的 `<<TASK_LIST>>`——DoD 被截斷就無法驗收。切片後單軌任務數少,
-prompt 大小可控;fleet 在拆分時對「單軌任務全文總長」設上限告警(不截斷,超長改建議拆軌)。
-
-### 7.6 `engine/prompts/external-agent-plan.md` 契約 v2 增修
-
-不保留雙格式,直接改寫(對照現行行號):
-
-- **第 9 行**改為:「每個元素只能有 `order`、`task`、`track`,選填的 `ref` 與 `scope`,
-  不得出現其他欄位。」
-- **新增 track 條目**(第 10 行 order 條目之後):
-  > `track` 必須是非空字串,格式 `[a-z0-9._-]{1,24}`;`@final` 是唯一允許以 `@` 開頭的
-  > 保留名。同 track 任務依 order 循序執行,異 track 並行(各自在隔離 worktree 執行,
-  > 完成後合回主幹);`@final` 在全部軌道合回後於主幹循序執行。會修改同一批檔案或
-  > 同一模組的任務必須同 track;不確定就同 track。無法並行的計畫全部填同一名(慣例 `main`)。
-  > track 總數(含 `@final`)不得超過 8。
-- **新增 scope 條目**:
-  > 計畫多於一軌時,每條非 `@final` 任務必須有 `scope`:字串陣列,列出預期修改的路徑
-  > glob。輸出前自檢不同 track 的 scope 互不重疊;重疊代表拆分錯誤,必須併軌後再輸出。
-  > 單軌計畫與 `@final` 任務省略 scope。
-- **拆分規則區**(現行第 15–25 行)追加兩條:
-  > - 跨 track 依賴不得存在:「前置:order N 完成」只能引用同 track 的任務;
-  >   需要其他 track 產出的工作,放進該 track 或 `@final`。
-  > - 跨模組整合、端到端驗收與需要全部成果的工作一律放 `@final`。
-- **第 27 行合法形狀示意**:每個元素補上 `"track"`(示意用兩軌 + scope),
-  維持「內容必須改成實際分析結果」的既有告誡。
-
-### 7.7 Placeholder 對照與工程注意
-
-| 模板 | 既有 placeholder | 新增 |
-|---|---|---|
-| plan.md | GOAL, PLAN_DOC, PLAN_JSON, CREATE_CMD, PLANOK_CMD, ISSUE_CMD, NOTES | (無) |
-| exec.md | GOAL, PLAN_DOC, TASK_ID, TASK_TEXT, TASK_REF, TASK_LIST, DONE_CMD, ISSUE_CMD, VALIDATE_CMD, NOTES | TRACK_CONTEXT, TASK_TAG |
-| merge-sync.md(新) | — | GOAL, TRACK_NAME, TASK_LIST, MERGE_TARGET, MAIN_TIP, VALIDATE_CMD, ISSUE_CMD, NOTES |
-| merge-confirm.md(新) | — | GOAL, TRACK_NAME, TRACK_TASKS_FULL, MERGE_TARGET, MAIN_TIP, DONE_CMD, VALIDATE_CMD, ISSUE_CMD, NOTES |
-
-- `MAIN_TIP` 由 coordinator 在派工當下 `rev-parse` 並同步寫入 dispatch.json——
-  prompt 注入值與 I9 機械檢查(merge commit 第二 parent)同源,agent 看到的和
-  程式驗的是同一個 SHA。
-- `TRACK_CONTEXT`/`TASK_TAG` 由 coordinator 決定值:單軌模式分別注入空字串與
-  `task-N`,多軌注入並行提示與 `<track>/task-N`。模板無條件邏輯。
-- 外部產生器資源有 placeholder 漂移偵測(README:「placeholder 漂移時停用 Prompt
-  產生器」),`prompt_templates.py` 的預期清單需與 §7.6 同步更新;
-  `tests/test_prompt_templates.py` 對應調整。
-- engine 內部四份模板納入測試:檔案存在、`<<KEY>>` 全數被替換、無殘留 placeholder
-  (比照現有測試風格,新增於 test_guards 或獨立檔)。
-- 弱模型收緊迭代:merge 兩卡是全新文本,預期需 2–3 輪像 4880782/797fb77 的
-  「同視角全面掃描」修訂;估時已含在 §10。
+- 一次只處理一條 candidate。
+- integration ref 每次前進後，其餘 ready child 由 §6.6 自動回 merge。
+- readiness 先到先服務；不以 scope、track 大小或人工優先序重新排序。
+- merge queue 進入後由 coordinator 自動完成 CAS、validate、rollback 與修復回送，不設人工
+  pause-before-merge。需要停止時只使用 parent graceful stop，且不切斷已開始的 transaction。
 
 ---
 
-## 8. 不變量(fail-closed 清單)
+## 8. Supervisor、停止與 workspace 所有權
 
-| # | 不變量 | 保證機制 |
-|---|--------|---------|
-| I1 | 本地 refs/heads/main 只能由 fleet 以 ff 前進;偵測到任何外力移動 → 停機交人 | G4/G5 + base_sha 血緣檢查;git 禁止 main 被第二個 worktree checkout |
-| I2 | 任一 worktree 同時最多一個 writer(子迴圈或 fleet,不同時) | 既有 git-dir 鎖 + 「子停止後父才動它的分支」的停止式交接(§5.3) |
-| I3 | 進 main 的每個 SHA:在其 worktree 驗證綠、工作樹乾淨、done 共識達標、共識期間 HEAD 未動 | 既有執行期機制 + G1-G3 |
-| I4 | 不可 ff 就不合;合併失敗軌道回合併期重來,次數封頂後停機 | G4 + merge_attempts 上限 |
-| I5 | goal/plan-doc 在所有 worktree 受保護;fleet 運行期間 main 上的 goal 不變 | 既有快照防線(每子 workspace 各一份)+ I1 推論 |
-| I6 | 軌道間唯一耦合點是 main;reset/綠點/任務指標全部軌內獨立 | worktree + workspace 隔離 |
-| I7 | 計畫(含拆分)在規劃收斂時凍結;執行期/合併期不得改 | 既有「執行期計畫凍結」延伸 |
-| I8 | 子 state 是子迴圈真相、fleet.json 是父真相;互相只讀不寫 | 檔案所有權約定 + 既有竄改偵測 |
-| I9 | merge commit 的第二 parent 必須是派工當下的 main tip | §5.3 新機械檢查(與 prompt 注入的 MAIN_TIP 同源) |
-| I10 | fleet-managed 子 workspace 不接受 Dashboard 的 reset/匯入/回規劃期;計畫調整只能走「子軌停止時的既有編輯器路徑」或父層 fleet 動作 | 子 config 帶 `fleet_parent` 旗標 + Dashboard 路由檢查(§15.2) |
+### 8.1 Workspace kind
 
-殘餘風險(機械防線蓋不住、須誠實列出):agent 在解衝突時以「ours」策略**內容上**
-覆蓋掉 main 的既有行為——歷史上 main 的 commit 仍在(I9 擋不掉內容回退)。
-緩解:merge-sync 卡明文禁止單邊覆蓋(§7.4);main 的測試隨 merge 進入軌道、由 validate
-執行;merge-confirm 卡要求驗收「整合未遺失主幹既有行為」;@final 整合驗收;
-必要時開 pause-before-merge 人工抽查。這與現行單軌「agent 亂寫但驗證綠」的殘餘風險
-同級,不是並行新增的風險類別。
+```text
+standalone   → 現有 run/edit/phase/delete 語意
+fleet-parent → fleet 唯一操作入口；plan 拆分後唯讀
+fleet-child  → Dashboard 唯讀；只由 fleet spawn/resume/stop/delete
+```
+
+Dashboard 與 API 必須由 `workspace_kind + fleet_run_id` 判斷，不只依可被覆寫或遺漏的 config。
+Fleet planning subprocess 從建立 fresh state 起就帶
+`--workspace-kind fleet-parent --fleet-run-id <id>`，因此 parent `state.json` 在 fleet.json 尚未
+完成第一個 checkpoint 前也不會被誤認成 standalone；handoff 後 Dashboard 以 fleet.json 的
+pid/phase 覆蓋 planning state 中已清空的 loop pid。Child import-plan 則由 fleet 明確注入
+`workspace_kind=fleet-child`，不得由 plan JSON 或 agent 輸出決定。
+
+### 8.2 Plan 編輯
+
+- 規劃收斂前：沿用 create-plan / plan-ok。
+- 選配 pause-after-plan 時：允許在 parent 編輯完整 master plan，儲存後重算 plan hash。
+- 一旦 splitting 開始：parent master 與所有 child slice 全部唯讀。
+- 不支援拆分後人工跨軌移動、child 新增任務或 PlanEditor 修改 slice。
+- 需要新計畫時，停止並安全刪除 fleet 後重新規劃；branch 仍保留供取回成果。
+
+因此不需要 v4 的 `current_task_entered_round`、跨軌 A 刪/B 加、父聚合 plan 再編號，亦不需要
+以人工編輯為前提的 `--expect-plan-version`。
+
+### 8.3 自動 restart 與人工 stop 的區分
+
+- child coordinator 非預期退出：fleet 指數退避後自動重啟。
+- agent CLI crash/timeout：由 child loop 既有 backoff 處理，不需要 fleet 重啟 coordinator。
+- child 收到 fleet 內部帶 session/run-id 的 stop control：停止後不自動重啟。
+- Dashboard 不提供 child stop 入口或 child mutation API；一般與診斷操作都由 parent 統一管理。
+- parent graceful stop：先停止派發與 merge，再要求所有 child 完成本輪後停止，最後 parent 退出。
+- fleet process crash：child 在每輪邊界檢查 parent 持有的 kernel flock lease；process death 時
+  由 kernel 立即釋鎖，child 完成當輪即停，避免依賴時鐘 timeout 的 orphan writer。
+- resume fleet：以 O_NOFOLLOW 讀取並比對 fleet.json/checkpoint、child state、Git
+  worktree/branch/ref；仍持有合法 `.run.lock` 的舊 child 先 adoption，不重複 spawn，並把
+  `child-adopted` 寫入 bounded event history。
+
+`--max-child-restarts 0` 表示不限，預設 0；權限、state schema、repo 身分等結構錯誤不重啟。
+
+### 8.4 Planning handoff 與選配 approval
+
+Fleet process 從 preflight 起持有 parent `.fleet.run.lock`，並在 planning 前先取得 standalone 與
+Fleet 共用的 integration worktree 單 writer lock。Planning subprocess 另持有 parent `.run.lock`，
+且只接受同一 run-id 由 Fleet 透過 inherited FD 傳入的**同一把** integration lock；因此
+planning process 啟動、退出與 split 之間沒有 writer 空窗。Fleet 一直持鎖到 coordinator 退出。
+
+若使用者開啟 pause-after-plan，fleet 進 `awaiting-approval`，Dashboard 寫入包含
+`run_id + plan_sha256 + generation` 的一次性 approval control。預設 off 時不建立人工等待點。
+
+### 8.5 Goal 變更
+
+fleet 監看 integration worktree 中 tracked goal 的 HEAD blob/hash。運行期間偵測到 goal/ref
+被未知外力改變時，平順停 fleet並保留所有 branch。這是人類改變需求真相，不由 agent
+自行猜測是否可沿用舊計畫。
 
 ---
 
-## 9. 影響面盤點
+## 9. Worktree、清理與刪除
 
-| 檔案 | 變更 | 量級 |
-|---|---|---|
-| `engine/work.py` | validate_plan:track 必填/命名/上限、scope 條件必填;done 接受 merge phase | 小 |
-| `engine/loop.py` | validate_state_shape 要求 track(舊 state 拒絕)+ merge 狀態欄位 + current_task_entered_round;merge phase 狀態機(約 100–150 行)含 merge_stage/merge_target_tip/merge_ready_sha 落盤與 history stage 欄;`--merge-target`/`--merge-threshold`/`--expect-plan-version`;TASK_TAG/TRACK_CONTEXT 注入;render_task_list 分軌標示 | 中 |
-| `engine/fleet.py`(新) | 生命週期、監督、合併佇列、fleet.json、resume、總 REPORT、封存前 worktree 檢查 | 大(估 600–900 行,本 repo 風格含大量防線) |
-| `engine/prompts/merge-sync.md`、`merge-confirm.md`(新) | §7.4/§7.5 草稿落地 + 弱模型收緊迭代 | 小(文本)+迭代 |
-| `engine/prompts/plan.md`、`exec.md` | §7.2/§7.3 增修 | 小 |
-| `engine/prompts/external-agent-plan.md`、`prompt_templates.py` | §7.6 契約 v2 + placeholder 清單同步 | 小–中 |
-| `engine/dashboard.py` | 並行啟動分支、`/api/fleet-state` + `fleet-state` SSE(§6.6)、normalize_plan_edit v2 欄位與 merge 期規則(§15.1)、fleet_parent 攔截與封存前提(§15.2)、fleet 動作(確認拆分/解散/清理)、pid 判斷修正(§15.3) | 中–大 |
-| `engine/status.py` | merge 子狀態與 fleet 欄位投影(§6.6);pid_is_loop_alive 認得 engine.fleet(§15.3 M1) | 小 |
-| `ui/` planValidation.ts、PlanTable、PlanEditorModal、LauncherModal、fleetViewModel | 格式 v2(track 必填)+ 啟動選項 + 狀態 pill 與 fleet 覆蓋邏輯(§6.6)+ 編輯器 track/scope 欄位與規則(§15.1);分組 UX 延後 | 中 |
-| `tests/`(test_guards 擴充 + 新 test_fleet.py) | worktree fixture、閘門矩陣、resume/崩潰、外力動 main、竄改×合併期、prompt placeholder 檢查 | **大**(估與 fleet.py 本體等量或更多) |
-| `README.md`、`templates/GUIDE.md` | 流程圖、並行章節、格式 v2(含「舊格式需 reset/重匯入」升級說明) | 小–中 |
+### 9.1 建立
 
-不做舊版相容省下的工:格式雙軌驗證矩陣、state 自動遷移碼、外部契約雙格式敘述、
-「缺省=舊行為」的條件分支與其測試——合計約 1 個工作天,並永久降低格式規則的複雜度。
+- 路徑：`workspace/<parent>/worktrees/<safe-track>/`；`@final` 使用普通 track 不可能產生的 safe 名 `_final`。
+- `run_id` 使用 32 字元小寫 hex UUID；只作 ref/control 身分，不接受使用者自由文字。
+- branch：`refs/heads/loop/<run-id>/<safe-track>`，建立前以 `git check-ref-format` 驗證。
+- `git worktree add -b <branch> <path> <base-sha>`。
+- 建立前驗證 parent、`<parent>--<track>`、worktree component 與完整路徑長度；任何 component
+  超過檔案系統 `NAME_MAX` 或組合後 workspace 名不合法就於 preflight 拒絕。
+- resume 時 branch、HEAD、canonical path、common git-dir、fleet run-id 全部吻合才沿用。
+- 存在但不吻合不自動刪除或 force，停機保留證據。
+
+Worktree 是 checkout 隔離，不是 OS sandbox；agent 仍可能看見同使用者可讀路徑。Prompt 禁止
+操作其他 worktree/coordinator，fleet 以 ref/state 身分檢查偵測越界結果。
+
+### 9.2 成功清理
+
+每條 track 通過 CAS + integration validate 後：
+
+1. 確認 child process 已停、worktree 乾淨、branch tip 已是 integration ref 祖先。
+2. 在 parent `evidence/tracks/<safe>/evidence.json` 先保存 bounded state/no-progress、agent/validate
+   command hash、prompt hash/copies、console/history tails 與 event history，寫入 path + SHA-256。
+3. 依 `evidence-captured → worktree-removed → child-removing → child-removed → complete` journal
+   執行 `git worktree remove`、prune、child tombstone rename/rmtree；每一階段都可 crash/resume。
+4. 清除 per-track runtime temp/cache；branch 保留。
+
+全部完成後保留 fleet-parent、fleet.json、history 與 REPORT。
+
+### 9.3 安全刪除
+
+- v5 移除 archive/restore API 與 UI；不支援封存後重跑。
+- 既有 `.archive` 資料不自動刪除，但新版 UI 不提供 restore；由文件說明人工備份/移除。
+- standalone 停止後可直接安全刪除 workspace。
+- fleet-child 不接受單獨一般刪除。
+- fleet-parent 執行中只提供 group graceful stop；確認 parent/children 都已停止後，才提供永久刪除。
+  刪除本身是全 preflight 群組交易：核對 run/session/track/plan/command/branch/tip/tombstone 與所有
+  writer locks → 移除 registered worktree → prune → 刪 child workspace → 刪 parent workspace。
+- standalone/group 在第一個 Git remove 或 workspace rename 前，於 workspace root 的外部 operation
+  目錄持久化 bounded delete journal；journal 綁定 logical name、run-id、Git ref/tip/common-dir、每個
+  source inode、不可重用 generation 與 deterministic tombstone。v2 使用 state 的
+  `workspace_generation`；legacy delete-only 在持有 writer lock 的 workspace 內先建立並 fsync 獨立
+  `.delete-generation` transaction marker，再寫外部 journal。marker→journal 間 crash 時下次刪除重用
+  同一 marker，不依賴 legacy state migration。API 先恢復 pending journal，才讀一般 state，因此
+  rename、unlink、rmdir、prune 或回應前任一步驟中斷都可用同一請求續跑。
+- standalone 首次刪除的 state/kind/liveness revalidation、generation/marker 建立、journal 與 rename
+  必須綁在同一個 writer-locked directory descriptor；modern 比對 preflight `workspace_generation`，
+  legacy 比對 descriptor snapshot inode 並在鎖內重讀全部 state candidates。path preflight 後不得重新
+  open 未綁定身分的同名目錄，避免 rename replacement race。
+- recovery 只沿用 journal 精確記錄且 descriptor/inode/ref 仍吻合的項目；同名新 workspace、不同 branch
+  worktree 或被替換的 tombstone 一律保留並回 409 要求 fresh confirmation，不移除新 workspace 的 job、
+  不建立新的 writer lock，也不掃描任意 `.delete-*`。即使 filesystem 重用舊 inode，也必須以 generation
+  mismatch 辨識 replacement；只有無鎖 generation 初讀與取得舊 writer locks 後重讀都吻合才可續刪。
+  全部完成後才移除 journal；任一步失敗就停止並保留剩餘現場，絕不先遞迴刪 worktree 目錄再修
+  Git registration。
 
 ---
 
-## 10. 難度評估與工期
+## 10. Prompt 調整
 
-單人、含測試與文件、按本 repo 現行品質標準(fail-closed、O_NOFOLLOW 檔案紀律、
-原子寫、防竄改)估算:
+### 10.1 plan.md
 
-| 元件 | 難度 | 主要風險點 | 估時 |
+新增 track/schema 範例與拆軌原則：
+
+- 不確定能否獨立就同軌；不要為並行而硬拆。
+- 同一 track 只依賴 integration 起點與同軌前置任務。
+- 真正跨軌工作放 `@final`。
+- scope 是預期接觸面提示，不是承諾或機械限制；實作需要時 agent 可修改 scope 外檔案。
+- plan-ok 表示 agent 已獨立檢查無明顯跨軌依賴，但不需要人工確認才生效。
+- 本階段只允許 goal/ref/plan 影響面內的針對性取證，不做全 repo 列檔或 generated 產物巡檢。
+- 未指定的一般實作細節由 agent 依 goal、ref 與 repo 慣例自行決定；只有需求意圖、安全／
+  不可逆外部狀態或新外部權限的重大未決衝突才 issue。
+
+### 10.2 exec.md
+
+新增：
+
+- `TRACK_CONTEXT`：說明目前 track、其他 worktree 同時進行及避免無關大改的成本。
+- `TASK_TAG`：多軌 commit 建議 `<track>/task-N`，但 commit message 不作 gate。
+- 任務總覽只列同軌；task 全文與 DoD 仍是本輪真相。
+- crash 殘留只能依 diff/任務證據精準接手或清理，不允許全域 `git reset --hard` / `git clean -fd`
+  刪除未知工作。
+
+### 10.3 merge-sync.md
+
+任務卡要求：
+
+- 整合確切 `INTEGRATION_TIP`，使它成為 HEAD 祖先。
+- 先檢查/收拾半成品，保留兩邊行為，實際跑 validate。
+- 不得修改 integration ref、切換 branch、push、改寫既有 track history或操作其他 worktree。
+- 建議 `git merge --no-commit <tip>`，但允許 agent自行建立必要整合/修復 commit。
+- 有修改就不 done；無法完成可 issue 後結束，本輪資訊自動交給下一 agent，不直接要求人工。
+
+### 10.4 merge-confirm.md
+
+- 注入本軌所有 task 全文與 DoD，不使用 80 字截斷版。
+- 實跑每條 DoD + validate。
+- 發現缺陷就修、commit、停止；下一輪再獨立確認。
+- 全部通過且無異動才 `done merge-main`。
+- integration validate rollback 的輸出透過 NOTES 注入，且是權威失敗證據；integration-only
+  invariant 在 child 無法本地重現屬預期，agent 仍須依錯誤內容修復，不得把本地 PASS 當成完成或轉成人工 gate。
+
+### 10.5 Placeholder
+
+| 模板 | 新增 placeholder |
+|---|---|
+| exec.md | TRACK_CONTEXT、TASK_TAG |
+| merge-sync.md | TRACK_NAME、MERGE_TARGET、INTEGRATION_TIP、TRACK_TASKS_FULL |
+| merge-confirm.md | TRACK_NAME、MERGE_TARGET、INTEGRATION_TIP、TRACK_TASKS_FULL、REPAIR_CONTEXT、ISSUE_CMD |
+
+所有模板測試檔案存在、placeholder 完整替換且無殘留。外部 plan generator 契約同步更新。
+外部 generator 同樣限制在需求/context/ref 明列路徑內針對性取證，只有跨 task 才要求穩定 ID；
+未知命令改寫為可觀測結果與既有 script 的限定查找，不因命令名稱未知自動建立 human gate。
+
+---
+
+## 11. Dashboard、CLI 與觀測
+
+### 11.1 CLI
+
+```text
+python -m engine.fleet
+  --repo <integration-worktree>
+  --name <parent>
+  --integration-branch <optional; default=current branch>
+  --max-parallel 4
+  --merge-threshold 2
+  --pause-after-plan            # default off
+  --max-child-restarts 0        # 0=unlimited
+```
+
+Preflight 取得 current full ref；detached HEAD、integration branch 被別的 worktree checkout、
+dirty、goal 未 commit、validate 紅、submodule repo 都明確拒絕。
+
+### 11.2 Dashboard ownership
+
+- Launcher 加並行模式與 max-parallel；並行模式 spawn `engine.fleet`。
+- parent 顯示 fleet phase、queue、各 track 狀態與整體控制。
+- child 顯示 loop round、task、merge stage、issues、logs，但 mutation 預設隱藏。
+- parent 的 Run/Stop/Delete 分別對應 fleet resume、graceful cascade stop、群組安全刪除。
+- parent 只有在選配 `pause-after-plan` 的 `awaiting-approval` 階段可編輯完整 master plan；split
+  後不提供 fleet-managed plan edit、phase、set-task、reset/import 或 archive/restore。
+- 所有 parent mutation 都帶 immutable run-id；plan edit 另帶 plan generation，避免舊畫面操作
+  同名重建後的新 run 或覆蓋更新後的 plan。
+- 「以此為範本」剝除 run-id、fleet-parent、merge target 等執行期欄位。
+
+### 11.3 Track 狀態
+
+| 狀態 | 來源 |
+|---|---|
+| 執行中 task-N | child state exec |
+| 併入 integration | child merge/sync |
+| 整合確認 done x/2 | child merge/confirm |
+| 待合併 | child merge-ready + queue position |
+| CAS / integration validate | fleet merge_tx |
+| integration validate 失敗，回送修復 | fleet rolled-back + child control |
+| 已合併 | fleet track merged |
+| 自動重啟/backoff | fleet restart metadata |
+| 結構錯誤停機 | fleet/child failed reason |
+
+Dashboard 以 fleet track 狀態覆蓋已停止 child 的舊 merge-ready 投影。status CLI、Dashboard
+PID 判斷需同時認得 `engine.loop` 與 `engine.fleet`，父 health 不套用 round stall heuristic。
+
+history.log merge round 增加 `stage=sync|confirm`；missing-DONE 判定：sync 有有效變更不要求
+done，confirm 才以 done 作為完成訊號。
+
+### 11.4 通知
+
+child `notify_cmd` 一律空白；fleet 統一發：
+
+- `track_merged`
+- `track_repairing`
+- `fleet_completed`
+- `fleet_stopped`
+- `fleet_failed`
+
+不為每次 agent/no-progress retry 發終態通知，避免轟炸。
+
+### 11.5 UI 既有功能逐元件盤點
+
+現有 `FleetOverview` 的「Fleet」代表全域所有 workspace；新 `engine.fleet` 則代表單次並行
+run。前端命名不可混用：保留 `FleetOverview` 作全域頁，單次並行群組使用
+`ParallelRunGroup` / `ParallelRunState`。API 可以沿用 `/api/fleet-state`，但 TypeScript model
+與 view component 必須區分 global fleet metrics 與單次 parallel run truth。
+
+| 現有 UI/資料層 | v6 調整 |
+|---|---|
+| `App.tsx` / workspace navigation | parent 是群組入口；child 仍可開詳情，但 breadcrumb 顯示所屬 parent/track；parent 被刪除後清掉所有 child tab/selection；Dashboard 啟動不提供唯讀模式，所有 mutation 仍以 workspace kind、run/generation 與執行中 operation gate 控制 |
+| `useDashboardData.ts` | 合併 workspace SSE 與 parallel-run state；處理 parent/child 晚到、刪除與 stale generation；REST refresh 與 SSE callback 都必須核對目前 selection、identity 與 projection epoch，不得用舊 response/event 覆蓋新 run |
+| `shared/api/types.ts` | 分開 `FleetHealth`（全域）、`ParallelRunState`（單次）、`WorkspaceKind`、`MergeTransaction`、`TrackState`；Phase 納入 merge/merge-ready |
+| `LauncherModal` | 並行開關、max-parallel、選配 pause/retry cap；並行模式停用「另開 loop branch」等衝突選項；diff preview 顯示 integration ref、預估 track/worktree；validate/preflight/launch 共用全域 operation gate，進行中禁止重送、關閉、切 tab 或啟動另一個 mutation |
+| `PlanImportField` / `planValidation.ts` | plan v2 track hard schema、scope 選填；多 track plan 自動路由 fleet；舊格式顯示刪除/重建提示 |
+| `PlanTable` / `PlanEditorModal` | planning/選配 approval 前可編輯 master 的 track/scope；splitting 後 parent/child 全唯讀；不顯示跨軌拖曳或 done-count 人工修改 |
+| `WorkspaceView` | standalone 保留現有操作；parent 顯示 Run/Stop/Delete/queue/REPORT；child 隱藏 run/edit/phase/set-task/reset/import/archive/stop，只提供唯讀 logs/issues/prompt；所有停止統一由 parent 管理 |
+| `WorkspaceTabs` | child tab 顯示 track 與 merge stage；只在 parent kind、`fleet_parent`、`fleet_run_id` 全部相符，且 child workspace/track 存在 parent authoritative track mapping 時折疊在 parent 下；未登記 child 保持 orphan 可見；parent 完成後不把已清理 child 當失聯錯誤 |
+| `FleetOverview` / `FleetWorkspaceCard` | parent 卡顯示群組聚合與 attention；child 預設收在 exact-run 群組內，避免平鋪 N+1 張卡；可展開查看各軌；批次選取當下凍結 name/kind/generation/run-id/PID，identity replacement 必須清除選取並要求重選 |
+| `fleetViewModel.ts` | 全域 workspace/task 統計只計 standalone + fleet-parent 聚合，只排除 exact-run 且由 parent authoritative track mapping 登記的 child；mismatch-run、未登記或 orphan child 保持可見且其 error 不得從 health 消失；child error/issue 向正確 parent attention 彙總 |
+| `useStatusFavicon.ts` | 任一 running parallel run 視為 running；rollback/repairing 視為 warning；完成 parent 不受已清理 child 影響 |
+| `ConfigModal` | parent 可改下一次 resume 使用的營運參數；執行中的交易參數唯讀；child config 全唯讀且不暴露 fleet-only 複製值；目前 agent 命令若被 CLI 管理器移除，欄位維持未選並要求使用者明選，不得靜默 fallback 到第一項；送出 mutation 後整個表單與 nested manager 入口鎖定，不能讓延遲 response 吃掉後續輸入 |
+| `ConsolePane` | parent console 顯示 fleet/supervisor/CAS/rollback；child console 保留 agent round；不把所有 child stdout 混入 parent 造成無界輸出 |
+| `HistoryModal` / `TimelineModal` / `RoundSparkline` | child 顯示 exec/sync/confirm agent round；parent 的既有 history/timeline 只標示 planning round與 Dashboard 操作，fleet phase/CAS/rollback 由 `ParallelRunGroup` 的 bounded phase/merge history 顯示；不把 parent planning sample 假裝成 child aggregate |
+| `IssuesModal` | parent 只聚合 exact kind/parent/run/track 的 child 未讀數並標 track；點擊只導向同一 run 的 child；同名 replacement 不可借用或污染舊 run 診斷；已清理 child 的 issue 摘要保留在 parent REPORT/fleet history |
+| `PromptModal` | child 顯示 round prompt；parent 只在 planning/awaiting-approval 顯示明確標名的 planning prompt，splitting 後隱藏，不虛構目前 prompt |
+| `ReportModal` | parent 顯示全域 order、各 track branch/SHA、rollback/retry 摘要與 @final；child report 只作診斷，不當成 fleet 完成報告 |
+| `GoalModal` | parent 從 integration worktree 讀 goal；child 顯示唯讀快照並標示來源，不提供改 goal |
+| `RunCompareModal` | standalone 與 child 沿用各自 loop round；parent 隱藏，因本版刪除後重跑、不保留可比較的 previous fleet aggregate，避免混用 planning/child round 指標 |
+| `CommandPalette` / 批次操作 | fleet-child mutation 跳過並說明「由 parent 管理」；對 parent 的 stop/delete 呼叫群組 API，不逐 child 拼裝非交易批次 |
+| `LauncherJobs` | job 類型明確顯示 loop/fleet；row/action/message identity 至少包含 name+PID，已有 state 時再含 generation/run-id；poll 與 stop 後 refresh 共用 monotonic response revision，舊 GET 不得覆蓋較新的 stopped/replacement 結果；fleet stop 帶目前 PID 對應的 immutable run-id，啟動期尚未落 state 才以 job process 身分停止；完成狀態以 workspace/fleet UI 為真相，不把 process rc 當完成報告 |
+| `CliManagerModal` / `NotifyModal` / `RepoRootsModal` | mutation pending 時整個可編輯 fieldset、nested action 與關閉入口鎖定；request 完成後才恢復，避免已送出的舊快照與畫面最後輸入不一致 |
+| `ArchivesModal` | v5 移除入口、route 與按鈕；既有 `.archive` 僅在升級說明提示，不在 UI 自動搬移或刪除 |
+| `ActionDialog` / stale guard | stop/delete/選配 approve 顯示 run-id、track 數、worktree 清理範圍；所有 parent mutation 帶 run-id，plan/approve 再帶 generation/hash 防 stale 操作 |
+| styles / badges | 新增 sync、confirm、queued、CAS、validating、rollback、repairing、merged、failed；顏色語意與全域 health 一致 |
+
+全域 Overview 去重規則是資料契約而非純視覺：parent 的 `tasks_total/tasks_completed` 由
+fleet order map 聚合；child 只在 group detail 中計數，避免 workspace/task/attention 重複。
+全域「輪次效能」與事件 feed 仍可包含 child 的真 agent round，因 parent 並沒有等價 aggregate
+round；資料以 child workspace 名標示來源，不把它再加進 workspace/task group 數。
+
+### 11.6 UI/API 控制矩陣
+
+| 動作 | standalone | fleet-parent | fleet-child |
 |---|---|---|---|
-| 任務格式 v2(全契約面,無相容包袱) | ★★☆☆☆ | 機械但漣漪廣(10+ 檔案) | 2–3 天 |
-| Worktree 生命週期(含封存整合) | ★★★☆☆ | 冪等/殘留/鎖死/磁碟;封存前移除檢查;submodule 明示不支援 | 3–4 天 |
-| fleet 協調器(監督+resume) | ★★★★☆ | 父崩潰恢復、部分失敗、與子鎖的交接時序 | 5–8 天 |
-| 合併期 merge phase | ★★★☆☆ | 狀態機插入點、I9 檢查 | 2–3 天 |
-| Prompt 四卡(§7)含收緊迭代 | ★★★☆☆ | 弱模型偷懶出口;merge 卡全新文本需實測迭代 | 2–3 天 |
-| 合併閘門+佇列 | ★★★☆☆ | 程式碼小、正確性要求高;競態論證 | 2–3 天 |
-| 測試工程 | ★★★★☆ | 多 worktree fixture、長場景、時序注入 | 5–7 天 |
-| Dashboard/UI(MVP→分組) | ★★★☆☆ | MVP 近零;分組/佇列視圖另計 | 2–3 天(MVP)+3–5 天(UX) |
-| 既有功能整合(§15:編輯器 v2、生命週期防護欄、投影修正) | ★★★☆☆ | 前綴鎖定改造波及測試;攔截規則的完整矩陣 | 2–3 天 |
-| **合計** | **中高** | | **23–35 天;MVP(Phase 0+1)9–13 天** |
-
-判定:**難度的重心不在「合併協定」**(它小而清晰,且是業界成熟模式——本質上是
-bors/merge-queue 的本地化:在分支上驗合併結果、只允許 ff 推進主幹),
-而在 fleet 的可靠性工程與測試量。沒有需要發明的新理論。
+| Run/resume | 現有 loop | resume fleet | 拒絕；由 parent 管理 |
+| Graceful stop | 現有單 loop | 停派發後級聯 child | 拒絕；一律由 parent 管理 |
+| Edit plan | 停止時依現有規則 | 僅 planning/awaiting-approval | 拒絕 |
+| Change phase / set task | 現有規則 | 拒絕；重新規劃需刪除重建 | 拒絕 |
+| Reset/import | 現有規則 | 拒絕既有 run；新 run 從 Launcher 建立 | 拒絕 |
+| Delete | 安全刪單 workspace | 群組 stop→remove worktree→刪 children→刪 parent | 拒絕單獨一般刪除 |
+| Archive/restore | v5 移除 | v5 移除 | v5 移除 |
+| Copy as template | 保留 standalone 設定 | 保留使用者輸入設定，剝除 run/runtime 欄位 | 隱藏或導向 parent |
 
 ---
 
-## 11. 風險與對策
+## 12. 自動恢復與少數人工終態
 
-| # | 風險 | 對策 |
-|---|---|---|
-| R-1 | 弱模型解衝突品質差,合併期不收斂 | red-limit reset 自動撤銷壞 merge 重試;merge_attempts 封頂→停機;issue 升級;可開 pause-before-merge |
-| R-2 | 規劃期拆分不獨立 → 衝突風暴 | plan.md 拆軌規則(§7.2)+ scope 必填自檢;pause_after_plan 人工審核;「不確定就同軌」的保守預設 |
-| R-3 | 資源倍增(N agent + N validate 同時跑) | --max-parallel(預設 4);validate 產物天然 per-worktree;共享 cache(如 ~/.m2)併發問題文件化,必要時 per-track repo.local |
-| R-4 | 外力動 main / 人在跑動中操作 repo | I1 偵測停機;README 明示運行中不要手動碰 main |
-| R-5 | 收斂輪次成本疊加(§6.3) | merge_threshold=2;track ≤ 4 建議;佇列先到先合 |
-| R-6 | fleet 單點故障 | fleet.json checkpoint + 全步驟冪等 + resume 一級公民 + 崩潰注入測試 |
-| R-7 | 內容級回退 main 行為(§8 殘餘風險) | merge 兩卡明文條款 + validate 含 main 測試 + @final 驗收 + 人工抽查 |
-| R-8 | 測試量失控 | 分期交付;worktree fixture 抽象化;單軌回歸靠既有 4,107 行測試守住 |
-| R-9 | 舊 workspace/計畫升級後直接不可用 | 刻意接受(決議③);錯誤訊息明確指示 reset-state/重匯入;README 升級說明 |
+### 12.1 自動處理
+
+- agent 非零、timeout、未回 done。
+- merge conflict、merge abort、issue、驗證紅、無進展。
+- integration ref 因其他合法 track 前進而導致 candidate 過期。
+- integration validate 失敗且 rollback 成功。
+- child coordinator 非預期退出。
+- fleet 在已知 journal stage crash 後 resume。
+- 成功 track 的 worktree/workspace 清理。
+
+### 12.2 必須停機
+
+- primary + checkpoint state 都損壞或 schema 不符。
+- fleet.json、child state、branch/worktree/common git-dir 身分互相矛盾。
+- integration ref 出現非 fleet expected/candidate 的未知 SHA。
+- rollback 後 baseline validate 仍紅。
+- 權限拒絕、磁碟不足、Git object/ref 損壞、工具不存在。
+- tracked goal/plan-doc 被人類改變，原計畫真相已失效。
+- worktree 路徑存在但不是 fleet 記錄的實體 worktree。
+
+這些終態不靠更多 agent retry 能安全解決，停機是保護使用者資料，不是語意型品質裁決。
 
 ---
 
-## 12. 分期路線圖(每期獨立可用、可停損)
+## 13. 不變量
+
+| # | 不變量 |
+|---|---|
+| I1 | integration ref 只由 fleet 以 expected-old CAS 前進或 rollback |
+| I2 | agent 永遠不在 integration worktree 執行 |
+| I3 | 任一 child worktree同時最多一個 loop writer |
+| I4 | 進 integration ref 的 candidate 必須包含 expected tip、乾淨、綠燈、done 達標 |
+| I5 | integration validate 紅的 candidate 不留在 integration ref；可證明時自動 rollback |
+| I6 | child state 只由 child loop 寫；fleet 只寫具 run-id/generation 的 sideband control |
+| I7 | fleet.json 只由 fleet 寫；Dashboard只讀投影或寫控制請求 |
+| I8 | goal、plan-doc、凍結 plan hash 在 fleet run 期間不變 |
+| I9 | 拆分後 parent plan 與 child slice 唯讀，不存在雙向同步問題 |
+| I10 | fleet-child 不接受 standalone 的 run/edit/phase/reset/import/archive 操作 |
+| I11 | worktree registration 未安全移除前，不遞迴刪 worktree 目錄 |
+| I12 | 未知外力 Git 現場不自動 reset、clean、force-delete |
+| I13 | 每個 workspace root 只有一個 process-lifetime kernel-lock Dashboard；它只有在啟動清場以 durable root/repo/generation/session/process identity 確認停止 coordinator 與獨立 Agent/validator groups 後才 serve；不自動 resume，無法證明就 fail closed |
+
+---
+
+## 14. 影響面
+
+| 區域 | 主要變更 |
+|---|---|
+| `engine/work.py` | plan v2 schema；merge done；state/control 身分核對 |
+| `engine/loop.py` | state schema v2、handoff-after-plan、fleet-child merge 狀態機、sideband control、lease、merge prompt |
+| `engine/fleet.py` | planning handoff、split、supervisor、queue、CAS journal/rollback、final、cleanup、REPORT |
+| `engine/status.py` | fleet PID、merge/fleet projection、父 health 規則 |
+| `engine/dashboard.py` | spawn fleet、workspace kind mutation gate、fleet state/control API、群組 stop/delete、移除 archive/restore/read-only mode、啟動前全 workspace 清場 |
+| `engine/cli.py` | fleet entry/doctor/status routing與錯誤訊息 |
+| `engine/prompts/*` | plan/exec 更新；新增 merge-sync、merge-confirm |
+| `engine/prompt_templates.py` | external plan v2 契約與 placeholder drift |
+| `engine/dashboard.config.shared.json` | 修正目前呼叫不存在 `npm test` 的 React validate 選項；改用實際存在的 `npm run check` / `npm run check:all` |
+| `ui/src/shared/api/types.ts` | Phase、PlanTask track/scope、FleetState、MergeTransaction、WorkspaceKind |
+| `ui/LauncherModal` | 並行參數；pause 預設 off；不相容舊 workspace 提示 |
+| `ui/WorkspaceView` | parent 控制、child 唯讀、移除 fleet edit/archive |
+| `ui/FleetOverview` / view model | parent-child grouping、queue、repair/rollback 狀態 |
+| `ui/historyParser` / timeline / sparkline | merge stage 與 missing-DONE 語意 |
+| README / GUIDE | agent-first 流程、刪除取代封存、外部資源並行限制、升級說明 |
+| `tests/dry_run/`（新） | 完整 repo clone、隔離 config/workspace/venv、真 Codex CLI、fault injection、證據收集與 release gate orchestration |
+| `ui/e2e/parallel-real-dry-run.spec.ts`（新） | production Dashboard + 真 Codex 的瀏覽器完整驗收；與快速 fake-agent E2E 分開 |
+| `tests/e2e_server.py` | fake agent 輸出 plan v2；增加 parent/child/fleet fixture，但仍只負責快速 L3，不冒充真 Codex gate |
+| `ui/playwright.real.config.ts` / `ui/package.json`（新/改） | 長跑 real-dry-run 使用動態 server URL、workers=1、retries=0、獨立 timeout/artifacts；新增 `test:dry-run`，不併入一般 60 秒 spec |
+| `.gitignore` | 忽略本機 dry-run artifacts、trace、video、完整 console/state snapshot，避免證據誤入版控 |
+
+production UI build 產物 `engine/ui/` 必須在 UI 修改後重建並通過 offline asset 檢查。
+
+---
+
+## 15. 測試計畫
+
+### 15.1 Plan/state contract
+
+- track 合法/非法名稱，特別是 `.`、`..`、leading dot、過長、`@final`。
+- scope 選填、型別錯誤、未知欄位、track 上限。
+- state schema v2；空 plan 的舊 state 也必須被拒絕。
+- standalone/multi-track/final-only 入口路由。
+
+### 15.2 Worktree 與 supervisor
+
+- planning handoff 尚未產生 `fleet.json` 完整 plan 前收到 SIGINT/UI stop：必須先有可 resume journal、
+  parent loop PID 清空、phase 顯示 stopped；resume 沿用同一 run-id 繼續 planning，不得誤進 cleaning/done。
+- N track 建立、部分建立 crash、resume 冪等、branch/path 不符停機。
+- child crash 自動重啟；人工 stop token 不重啟。
+- parent graceful stop 級聯；parent kernel flock lease 釋放後 child 完成本輪停止。
+- max-parallel 排程與 final 延後建立。
+- submodule repo preflight 拒絕。
+
+### 15.3 Child merge
+
+- clean merge、真衝突、agent 修復 commit、issue/no-progress、red reset。
+- track 無獨有 commit時的 fast-forward整合，不依賴第二 parent。
+- merge-ready 後 integration tip 前進，自動回 sync。
+- integration validate repair control，自動回 confirm。
+- completed/green anchor 被改寫時 fail-closed。
+
+### 15.4 CAS transaction crash matrix
+
+- prepared 前/後 crash。
+- update-ref 成功但 journal 未更新。
+- ref-updated 後、worktree reset 前 crash。
+- validating 中 crash。
+- validate FAIL、rollback 前/後 crash。
+- rollback 後 baseline FAIL。
+- 外力把 ref 移到第三個 SHA。
+- integration worktree 出現未知 dirty 狀態。
+
+每個案例同時核對 ref、HEAD/index/worktree、fleet checkpoint、child status與可再次 resume。
+
+### 15.5 Dashboard/API
+
+- child 所有 standalone mutation 被拒絕。
+- parent run/stop/delete 操作正確傳播。
+- parent edit-config、awaiting-approval plan edit與所有 mutation 的 stale run-id/generation 被拒絕。
+- Jobs 分頁正確標示 loop/fleet，且 fleet stop 只使用與目前 process PID 相符的 run-id。
+- Dashboard 重開先取得 workspace-root singleton kernel lock，再做 startup sweep；第二個不同 port
+  instance 不得讀設定、signal 或 bind。Sweep 去重 standalone、fleet supervisor、planning loop、child
+  與 coordinator hard-crash 後 reparent 的 Agent/validator group；新 fleet 在 parent 建立前使用 root
+  `.ops` pending identity，reset/import 明示 old→pending generation。Agent/validator 由 gate wrapper 在
+  durable marker fsync 後才放行。所有停止依 root/repo/generation/session、PID/PGID、start-time、command
+  與已凍結 member identity 重驗；leader 缺失或 numeric PGID/SID 可能重用時 fail closed，不猜測 signal。
+  驗證 PID/PGID reuse、同名不同 root、marker replacement、corrupt truth、root scan failure、markerless
+  Job startup window 與 shutdown root sweep failure；任何無法確認或仍存活時 Dashboard 不 bind/serve，
+  成功後不自動 resume。
+- 選配 approval token 綁定 plan hash，舊 token 無效。
+- fleet PID/running/health/status/SSE 投影。
+- archive/restore 路由與 UI 已移除，既有 `.archive` 不被自動刪除。
+- legacy v1 standalone 只顯示 delete-only UI；run/edit/config/template 全隱藏且 API 繼續拒絕。
+  驗證 live legacy PID 拒刪、corrupt v2 不誤降級、marker→journal crash 可重試，以及 inode reuse
+  的同名 replacement 與新 job 都保留並要求 fresh confirmation。
+
+### 15.6 外部資源
+
+Worktree 不隔離外部服務。加入 fixture 或測試專案驗證：
+
+- 兩個 validate 搶同一 port/DB/schema 時能顯示明確失敗並重試。
+- Fleet 固定注入 `LOOP_TRACK_NAME/SAFE_NAME/INDEX/PORT`，並為每 track 分離 `TMPDIR`、
+  `XDG_CACHE_HOME`、`npm_config_cache`。`--track-port-base 0` 逐 track 動態配置唯一 loopback
+  port；非 0 時使用 `base + index - 1` 並在建立 workspace 前驗證範圍。
+- `--track-env-json` 只接受大寫 env 名稱與 `{track}`、`{safe_track}`、`{index}`、`{port}`
+  placeholder；不得覆蓋 coordinator/runtime 變數。因 config、fleet state與 evidence 會保留
+  env template，名稱含 token/password/secret/credential/key 的欄位直接拒絕；此入口不得放 secrets。
+- port 數字是協調契約，不是長期佔用 socket；child 服務必須實際綁定 `LOOP_TRACK_PORT`，
+  遇外部 process 搶占要明確失敗，由 agent 在本軌處理。
+- 無法證明 validate 可並行安全時，使用者可設 `--max-parallel 1`，功能仍正確。
+
+### 15.7 回歸
+
+- 現有 standalone 全測試保持綠。
+- Python unit/integration、UI lint/build/offline、Playwright 依 repo 實際命令全綠。
+- Prompt placeholder、保護檔案、state tamper、round token、reset、notify 回歸。
+
+### 15.8 測試層級與最終 gate
+
+測試分四層，前一層通過才能進下一層；L1–L3 都不能取代 L4：
+
+| 層級 | Agent/目標 | 用途 | 是否 release gate |
+|---|---|---|---|
+| L1 unit | 不啟動 agent；mock Git/process/clock | schema、state transition、CAS/recovery 純邏輯 | 必須通過，但不充分 |
+| L2 integration | scripted fake agent + 暫存小 repo | 故障注入、所有 crash point、快速重跑 | 必須通過，但不充分 |
+| L3 production E2E | fake agent + production Dashboard + Playwright | API/SSE/UI mutation、瀏覽器回歸 | 必須通過，但不充分 |
+| **L4 full-project local dry run** | **完整 loop-agent-lite clone + 真 Codex CLI + production Dashboard** | 驗證真 agent、真 repo、真 build/test、真 UI 長流程 | **唯一最終過關 gate** |
+
+功能不得因 unit、fake-agent E2E 或人工閱讀通過就宣告完成。Release candidate 必須在本機對
+**完整專案**完成 L4，且保存可追溯證據。任何需要直接改 state、手動 merge、手動修 code、
+跳過驗證或改用 fake agent 才完成的 L4，一律判定失敗，修正後從乾淨 clone 重跑。
+
+### 15.9 真 Codex CLI 契約
+
+目前本機 `dashboard.config.local.json` 中 label=`codex` 的已設定命令為：
+
+```text
+codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4
+```
+
+L4 規則：
+
+1. Orchestrator 從個人設定讀取 label=`codex`，以現有 `norm_cmd`/shlex 規則正規化；不把
+   個人設定整份複製進 artifacts。
+2. 啟動前保存 `command -v codex`、`codex --version`、正規化命令與 model 名；不得記錄
+   token、完整環境變數或 credential path。
+3. 真 dry run 的 planning/exec/merge/confirm/final 每一輪都使用該 Codex 命令；不得局部
+   改用 fake agent、Claude 或另一 model。
+4. Codex 未安裝、版本命令失敗、認證/網路/權限失敗都視為 L4 未通過；不可 fallback 後
+   宣稱成功。
+5. 測試 harness 只控制隔離 repo、goal、驗證器與 fault injection，不替 Codex 寫 commit、
+   回 done 或解 conflict。
+
+未來使用者若更新個人 Codex 設定，L4 使用執行當下 label=`codex` 的值並把版本證據寫入
+manifest；本文件中的 `gpt-5.4` 是此次已確認基線，不在程式中另寫第二份預設。
+
+### 15.10 完整專案 dry-run 環境
+
+不得在開發者目前 checkout 或其真 workspace 上做破壞性測試。`tests/dry_run/run_full_project.py`
+負責建立：
+
+```text
+<temp-root>/
+  source/       # git clone --no-hardlinks，固定 release candidate SHA
+  workspace/    # LOOP_AGENT_WORKSPACE_ROOT
+  home/         # LOOP_AGENT_HOME；只放本次隔離狀態
+  venv/         # pip install -e source，從 public `loop` entrypoint 啟動
+  config.json   # 只含本次 repo root、真 Codex entry、validate 與安全 defaults
+  harness/      # repo 外的 immutable fault validator/control；啟動前後核對 SHA-256
+  artifacts/    # manifest/log/state/git graph/screenshots/video/trace/report
+```
+
+環境準備：
+
+1. 原 checkout 必須乾淨；記錄 release candidate SHA。L4 結束簽署前再次確認原 checkout 仍是
+   同一 HEAD 且乾淨；執行期間若被其他程序改動，該次證據不可重現，直接 fail。
+2. 以 `git clone --no-hardlinks` 建完整獨立 clone，避免 dry run 共用或移動原 repo refs。
+3. 在 clone 設定測試 Git identity；建立並 commit 專用 `goal.md` 與必要 dry-run fixture，
+   所有變更只存在 clone。
+4. 建 temp venv、editable install clone；UI 執行 `npm ci`，不沿用原 checkout node_modules。
+5. 以動態空閒 port 啟動 production `loop dashboard`；不得 reuse 既有 dashboard server。
+6. 產生隔離 Dashboard config，只複製 label=`codex` 的命令；workspace/repo roots 指向 temp。
+7. 每個 track 可注入獨立 TEMP/cache/port；integration Dashboard、Playwright fixture 與 child
+   validate 不可共用固定 8876/8877。
+8. 本階段不開放廣域 repo 搜尋/巡檢。Planning 只讀 goal、規劃書明列影響面與既有 plan 路徑；
+   execution 只讀 task/ref/scope 直接點名的 source/test。禁止全庫列檔與掃描 `engine/ui/assets/**`、
+   `ui/node_modules/**`、coverage、build、trace、video 等 generated/minified 產物；只有任務直接要求
+   production artifact/source map 時才讀對應產物。資料不足時 agent 回 issue，不自行擴大讀取；
+   廣域搜尋留待後續有需要再加入。若 prompt/harness 未守住此邊界，記為效率缺陷並保存耗時證據。
+
+Child 每輪的完整專案 validate 使用無固定 server port的命令，例如：
+
+```text
+sh -c 'python3 -m unittest discover -s tests -t . -q && cd ui && npm ci --prefer-offline --no-audit --no-fund && npm run check'
+```
+
+`npm run check` 已包含 lint、TypeScript/build、offline assets，但不啟動固定 port Playwright。
+每個 child worktree 都必須自行依 lockfile 執行 `npm ci`；integration clone 的 ignored
+`ui/node_modules` 不會由 Git worktree 共用。各 track 使用獨立 `npm_config_cache`，不得因並行
+安裝互相覆寫 cache 或誤把 integration checkout 的依賴存在視為 child 可用。
+Validator subprocess 的 `LOOP_AGENT_WORKSPACE_ROOT` 與 `LOOP_AGENT_HOME` 也必須指向該 track
+的隔離 `TMPDIR`；不得讓兩條 track 的完整 tests 因固定 fixture workspace 名稱互撞。
+Dashboard 的「Agent CLI 執行確認」必須保留使用者 PATH/config，但在 spawn 被測 CLI 前移除
+`LOOP_WS`、`LOOP_ROUND_TOKEN` 與全部 `LOOP_FLEET_*`；CLI smoke test 不得誤繼承目前 child
+的 task/track 身分，否則 nested E2E 會測到 coordinator context 而非固定 prompt=`test`。
+L4 subprocess 也不得整包繼承宿主 credential/token/password/secret 類 env；真 Codex 應使用既有
+個人 config/keychain 認證。Harness 只在記憶體保留被移除之敏感 env 的值，用於 artifacts
+exact-value 防漏掃描，不把變數名稱或值寫入 manifest。敏感名稱按 `_` 分段判定；例如
+`SECRET_KEY_BASE`、`CLIENT_SECRET_JSON` 必須移除，但不得因一般名稱含相同字母片段而誤判
+`MONKEY`、`KEYBOARD_LAYOUT`。
+本 repo 的 production UI 產物 `engine/ui/` 受版控；frontend track 的 task/DoD 必須包含
+`npm run build` 後提交對應 assets。每次 validate 結束都再次執行 `git status --porcelain`，
+若 build 才產生未提交 asset，該輪不能算 done；不得把受版控 build output 誤當 ignored 產物。
+全部 track 與 `@final` 合入後，再在最終 integration tree 單獨執行完整 release validation：
+
+```text
+python3 -m unittest discover -s tests -t . -q
+cd ui && npm run check:all
+```
+
+shared config 的「react build+test+e2e」必須指向實際存在的 `npm run check:all`；L4 不得
+使用不存在的 script 或以忽略錯誤通過。
+
+### 15.11 L4 必跑場景
+
+每個 release candidate 至少完成下列兩次獨立 full clone run；兩次都用真 Codex：
+
+#### DR-1：自動規劃 + UI stop/resume + happy path
+
+- Goal 同時包含可獨立的 backend、frontend 工作及跨軌 `@final` 驗收，實際修改本專案程式與測試。
+- Gate 以每條 track 已 validated CAS 的 `expected_sha..candidate_sha` diff 歸屬交付：不同一般 track
+  必須分別產生 `engine/`+`tests/` 與 `ui/`+受版控 `engine/ui/` production assets；另以
+  `fixture_sha..final_sha` 確認上述改動都實際進入最終 integration，不以 plan 關鍵字代替證據。
+- 不匯入預製 plan；由 Codex planning rounds 產生 track。
+- 使用 shipped convergence defaults：flag threshold 10、exec done 3、merge done 2、
+  max-parallel 4；不得為省時間降成 1。
+- 從瀏覽器 Launcher 選擇完整 clone、label=`codex`、並行模式與實際 validate 命令後啟動。
+- child 執行中從 parent UI 要求 graceful stop，確認全部 child 完成本輪後停止；再由 parent
+  UI resume，不能透過 terminal 直接啟動 child。
+- 等待一般 tracks、`@final`、integration validate、REPORT、child cleanup 全部完成。
+
+#### DR-2：真 conflict + CAS rollback + agent repair
+
+- 使用完整 clone與一份受版控的 adversarial plan/fixture；刻意讓兩條 track 修改同一測試
+  contract，確保至少發生一次真 Git conflict。此場景允許從 UI 匯入 plan，因目的為固定
+  故障路徑；不可由 harness 直接寫 parent state。
+- Test-only integration validator 在 candidate 第一次進 integration worktree 時注入可重現、
+  有明確錯誤訊息的 integration-only invariant；child 原驗證仍跑完整 backend + UI check。
+- 必須觀察 CAS 前進、integration validate FAIL、CAS rollback、baseline validate PASS、
+  repair control 送回原 child、Codex 實際產生修復 commit、再次 done/merge-ready/CAS PASS。
+- Fault injection 只建立失敗條件，不得自行移除 invariant、替 agent commit 或直接把第二次
+  驗證改成無條件成功。
+- Repair control 必須明示 integration-only validator 在 child worktree 無法重現是預期行為；
+  integration failure tail 是已 rollback 的權威證據，Agent 不得因 child local PASS 忽略修復。
+- 不為測試 Issues UI 強迫 agent 先回報假 issue 或多跑一輪。Parent Issues 的 DR-2 證據直接來自
+  真實 integration validate failure／rollback diagnostic，保留錯誤摘要、track、attempt 與修復導向。
+- Fault validator 位於 target repo 外的 `harness/`，啟動前後核對 SHA-256；被 agent、測試或
+  其他 process 修改即判 L4 失敗，避免透過改測試器假裝修好產品。
+
+另外，CAS 各 crash point仍由 L2 scripted agent完整覆蓋；不要求用真 Codex 重跑每個
+process-kill 時序，避免把非語意 fault matrix 變成昂貴且不穩定的模型測試。
+
+### 15.12 前端實際 dry-run 完整驗收
+
+新增獨立 Playwright project/spec `parallel-real-dry-run.spec.ts`。它連到上述 production
+Dashboard 與完整 clone，**所有改變狀態的動作都透過畫面點擊/輸入**；允許 API/檔案只作
+唯讀取證，不可用直接 POST 取代 UI 操作。L4 從啟動、長流程驗收到最終刪除全程使用同一個
+可寫 production Dashboard，不另啟第二個 Dashboard 或切換 base URL。
+
+必驗收：
+
+- Launcher 正確顯示 integration ref、Codex CLI、parallel/max-parallel、validate 與 diff preview。
+- 啟動後 parent/child grouping 正確；全域 task/workspace/attention 不重複計數。
+- child 隱藏 edit/phase/set-task/reset/import/archive；parent 控制可用。
+- planning、exec、sync、confirm、queued、CAS、validating、rollback、repairing、merged、
+  final、cleaning、done 狀態依真 state/SSE 依序出現，頁面 reload/SSE reconnect 後不倒退。
+- parent graceful stop/resume；child 不被誤判 crash，也不被 supervisor 提前重啟。
+- DR-2 rollback/repair UI 顯示正確 track、attempt、錯誤摘要，不能短暫顯示已完成。
+- Console 分流、Issues 聚合與導向、Prompt、History、Timeline、Report 都能開啟且內容屬於
+  正確 parent/track；DR-2 Issues 必須顯示真 integration rollback failure，不使用人造 issue 標記；
+  清理 child 後 parent REPORT/歷史仍可讀。
+- FleetOverview、WorkspaceTabs、搜尋/篩選/排序、status favicon、CommandPalette、copy template
+  不因 parent-child model 產生重複、失聯或錯誤 mutation。
+- run 完成並保存 parent/track 證據後，仍在同一個 production Dashboard 從 UI 執行最終
+  parent Delete 群組安全刪除；確認 Git worktree registration、child/parent workspace 與 tab
+  全部消失，保留 branch 政策符合文件。
+- 桌面主要 viewport 與至少一個窄 viewport 無遮擋/溢位；長 track 名、長 issue、長 console
+  tail 不破版。
+
+Real dry-run Playwright 使用 `workers=1`、`retries=0`、每個 UI assertion 的短 timeout與
+**整體最多 4 小時**的長流程 timeout；失敗不得靠自動 retry 掩蓋，也不能因一般 E2E 的
+60 秒預設而誤殺正常 Codex 收斂。保留 trace、每個關鍵狀態 screenshot、video 與 browser
+console/network error。快速 `dashboard-flow.spec.ts` 繼續使用 fake agent，不與長跑 spec
+混在一般 CI timeout。
+
+### 15.13 證據與通過標準
+
+每次 L4 產生 `artifacts/manifest.json`，至少包含：
+
+- source SHA、開始/結束時間、OS/Python/Node/npm/Git/Codex 版本。
+- 正規化 Codex command/model、測試場景、thresholds、dynamic ports；不含 secrets。
+- parent/child workspace/run-id/track mapping。
+- 各 track branch、candidate、CAS expected/new、rollback與最終 integration SHA。
+- 每階段耗時、agent round count、restart/no-progress/repair次數。
+- Python/UI/Playwright最終命令、exit code與 log path。
+- REPORT、bounded console/history/state/fleet checkpoint snapshot、`git log --graph`、
+  `git worktree list --porcelain`、`git status --porcelain`、`git fsck --full` 結果。
+- Playwright trace/video/screenshot index。
+- 敏感宿主 env 不寫入 artifacts；簽署前以其實際值 exact-match 掃描所有文字 artifacts 與 zip
+  entry。命中時先移除受污染檔案，再以只含 artifact/entry 路徑的錯誤 fail，不得在錯誤或 manifest
+  重印敏感值。
+
+L4 通過必須全部成立：
+
+1. DR-1、DR-2 都由設定好的真 Codex 完成，過程沒有人工 state/code/Git 介入。
+2. 最終 integration tree乾淨，`git fsck --full`、完整 Python tests、`npm run check:all` 全綠。
+3. 所有 candidate 都經 CAS + integration validate；DR-2 rollback證據完整且 ref 無遺失 commit。
+4. 一般 track與 final 都 merged；成功 child worktree/workspace 已清理，parent REPORT 完整。
+5. UI 所有必驗收項目通過，browser 無未解釋 console error、page error或失敗 network request。
+   macOS/Chromium 長流程暫停 network I/O 時可能只在 console 產生精確的
+   `net::ERR_NETWORK_IO_SUSPENDED`；若 SSE 之後自動恢復、最終狀態與 REPORT 仍可由 UI 讀取，
+   可記為已解釋的 browser transient。不得以模糊字串過濾其他 network/console error。
+6. artifacts 可由 source SHA + manifest 重現，且未包含 credential/token/完整個人 config。
+
+任一條不成立即 release gate 失敗。修正後必須建立新的 clean full clone，完整重跑受影響場景；
+不可在失敗 clone 上手動修到綠後補簽。
+
+---
+
+## 16. 分期路線圖
+
+不再建立「人工合併」產品階段；各期以自動路徑為目標。
 
 | 期 | 內容 | DoD | 估時 |
 |---|---|---|---|
-| **P0 格式 v2** | track(必填)/scope 貫通所有契約面;plan.md/exec.md/external 契約增修(§7.2/7.3/7.6);編輯器 v2 欄位 + current_task_entered_round 解鎖(§15.1);單軌行為與今天等價 | 全測試綠;**舊格式被明確拒絕並提示升級路徑**;單軌(全同 track)計畫跑完整流程,輸出與現行一致(TASK_TAG=task-N、TRACK_CONTEXT 空);規劃剛收斂、exec 未跑輪前 task-1 可編輯 | 2–4 天 |
-| **P1 並行執行(人工合併)** | fleet 建 worktree(workspace 目錄下)、切片派發、並行監督、resume;fleet_parent 攔截、封存前提、pid 修正、「確認拆分並啟動」(§15.2/15.3);軌道收斂即停在 branch 上,**合併由人做** | K 軌並行完跑;父/子任一崩潰可 resume;Dashboard 可監控各軌並列出「已完成待人工合併」branch 清單;子軌 reset/匯入/階段切換被正確攔截;父封存在 worktree 未清時被擋 | 6–9 天 |
-| **P2 自動合併** | merge phase + merge 兩卡(§7.4/7.5)+ 閘門 + 佇列 + @final 匯流 + 總 REPORT + §6.6 狀態觀測(merge 子狀態、fleet-state API/SSE、pill 覆蓋)+ §15 P2 項(merge 期編輯規則、--expect-plan-version、統一通知、goal 監看) | 全自動端到端:含「兩軌衝突→agent 解掉→ff 進 main」整合測試;外力動 main 停機測試;merge 卡通過弱模型實測;**併入中/確認中/待合併/合併中/已合併在 Dashboard 全程可分辨**;編輯×fleet 重啟的版本握手測試 | 7–10 天 |
-| **P3 營運強化** | Dashboard 分組/佇列視圖、scope 重疊警告、pause-before-merge、磁碟/併發調參 | UX 驗收;文件與 GUIDE 更新 | 5–8 天 |
+| P0 Breaking foundation | plan v2、state schema v2、workspace kind、prompt 契約、移除 archive/restore、standalone 回歸 | 舊 workspace 明確拒絕；單軌完整流程全綠；安全刪除可用 | 3–5 天 |
+| P1 Fleet backend E2E | planning handoff、worktree/supervisor、child merge、merge-ready reopen、CAS journal/rollback、`@final`、cleanup | scripted fault matrix 全綠；另以完整 clone + 真 Codex 完成 CLI-only full-project smoke，無人工介入（DR-1 UI gate 留 P2） | 10–15 天 |
+| P2 Dashboard/operations | parent-child grouping、fleet control API/SSE、stop/resume/delete、repair 狀態、通知 | production Dashboard + 真 Codex 完成 DR-1 瀏覽器 stop/resume/happy path；逐元件 UI 矩陣通過 | 6–10 天 |
+| P3 Hardening / release gate | crash matrix、DR-2 conflict/rollback/repair、外部資源 env、磁碟/效能、選配 pause/retry caps、UX 打磨 | L1–L3 全綠，L4 DR-1/DR-2 clean full clone、真 Codex、實際前端 dry run與證據 manifest 全部通過 | 7–12 天 |
 
-P1 結束就有實際價值(隔離並行 + 人工整合);P2 才兌現全自動;P3 是體驗與營運。
+總估時約 26–42 個工作天。P1 是第一個可實際試用的自動化 vertical slice；P0 只是 breaking
+foundation，不把人工合併包裝成正式 MVP。
 
 ---
 
-## 13. 替代方案與否決理由
+## 17. 風險與對策
 
-| 方案 | 否決理由 |
+| 風險 | 對策 |
 |---|---|
-| 單行程多工(一個 loop 同時開 N 個 agent) | run_agent/signal/state 全部假設單輪序列;侵入式改造風險遠高於父子行程模型,且失去「子=今天的 loop」的重用與回歸保障 |
-| rebase 取代 merge | agent 對 rebase 衝突的處理更差;改寫 SHA 會打亂 completed 錨定與 changed 偵測;merge commit 保留稽核鏈且 I9 可機械驗證 |
-| 任務級 DAG 依賴 | 見 §4.3;弱模型產出品質與 UI/回退複雜度不成比例 |
-| 每完成一個 task 就合併回 main | 合併頻率×共識成本爆炸;軌道等於失去隔離意義。粒度定為「軌道完成才合併」 |
-| 用多個 clone 而非 worktree | 失去共享 refs/objects,合併協定要走 push/fetch,複雜且慢;worktree 的「main 不可雙 checkout」保險也沒了 |
-| 一張 merge 卡讓 agent 自判「該併入還是該確認」 | coordinator 派工當下已知 ancestor 狀態;讓 agent 自判只是新增誤判面(§7.1 原則 6) |
-| track 選填、缺省=單軌(v1 草案) | 決議不相容舊版後,必填規則更簡單、無混合狀態;舊計畫本來就要重新規劃 |
+| 弱模型反覆解不好衝突 | 無狀態多輪、完整 DoD、issue context、綠點 reset；選配 retry cap |
+| 拆軌錯誤造成衝突風暴 | Prompt 保守拆軌；agent 在 merge round 自行收斂；不以 scope hard gate |
+| integration validate 環境耦合 | CAS journal、rollback、錯誤回送 child、自動再修 |
+| fleet crash | 每個副作用前 intent、checkpoint、完整 crash matrix |
+| agent 誤動 shared ref | expected SHA CAS 與 ref 監看；未知 ref 停機，不 reset 人類現場 |
+| 外部服務/port/cache 互撞 | per-track env、max-parallel、文件化並行安全要求 |
+| 磁碟成長 | max-parallel、成功自動移除 child checkout、失敗保留供診斷 |
+| 自動 retry 成本失控 | UI 顯示輪次/成本；stuck-stop與 retry cap 均為選配，不預設打斷收斂 |
+| 廣域巡檢讀入過多 repo/產物資料 | 本階段只允許 task/ref/scope 的針對性讀取，禁止 generated/minified 掃描；資料不足由 agent issue，不靜默擴張 |
 
 ---
 
-## 14. 已拍板決議(2026-07-12)
+## 18. 已定案決議
 
-| # | 議題 | 決議 |
-|---|---|---|
-| D1 | pause_after_plan(審拆分)/ pause-before-merge(審合併)預設 | 並行模式:前者**開**、後者**關** |
-| D2 | merge_threshold | **2**(執行期維持 3) |
-| D3 | track 上限 / --max-parallel 預設 | **8 / 4** |
-| D4 | 合併後在 main 重跑 validate | **開** |
-| D5 | 子 workspace 命名 | **`<parent>--<track>`** |
-| D6 | worktree 存放位置 | **`workspace/<parent>/worktrees/<track>/`**(隨 workspace 生命週期管理;封存前強制移除 worktree) |
-| D7 | scope 欄位時程 | **P0 進格式與校驗,P3 才做重疊警告** |
-| D8 | 舊版相容 | **不做**:track 必填;舊 plan/state 直接拒絕並提示 `--reset-state` 或重新匯入;無遷移碼 |
-
----
-
-## 15. 既有功能衝突審視與調整(v4)
-
-逐一對照現有功能面與 v2/v3 設計,共識別 6 個結構衝突(Plan 編輯器)、
-7 類生命週期操作衝突、4 個監控投影衝突,及 1 項監督政策修訂。
-
-### 15.1 Plan 編輯器(核心結構衝突)
-
-現況語意(`engine/dashboard.py:1401-1480, 2102-2132`):停止狀態下整份快照編輯;
-鎖定範圍 = 「已完成任務 + 執行期目前任務」構成的**連續前綴**
-(`locked_plan_task_count` 取鎖定任務的最大 index+1);鎖定前綴的 order/內容不可變,
-pending 可增刪移並重新編號 1..N;`plan_version` 樂觀鎖防跨畫面覆蓋(409);
-phase=done 時 pending 不可調。
-
-衝突點:
-
-| # | 衝突 | 說明 |
-|---|---|---|
-| C1 | **連續前綴假設在拆分後的父 master plan 失效** | A 軌已完成 order 5、B 軌 order 3 還 pending → completed 不再是全域 order 的前綴;鎖定計算、「重新編號不改鎖定前綴」的驗證全部失真 |
-| C2 | **編輯真相層級不明** | 拆分後子軌各持重編 1..n 的切片;改父 master 不會自動到子,改子不會回寫父 |
-| C3 | **pause_after_plan 停下時 task-1 已被鎖** | 暫停點的 state 已切 exec 且 current_order=1(`engine/loop.py:1547-1550, 2092`)→ 現行規則鎖住 task-1 的內容與位置,**正好擋掉「審核拆分時調整任務」這個主要使用場景**;此問題今天就存在,並行只是放大它 |
-| C4 | **合併期無對應規則** | merge/merge-ready 不在編輯器的 phase 分支裡(只有 done 擋 pending)→ 會允許對 merge-ready 軌道加 pending task,而該轉移語意未定義 |
-| C5 | **fleet 重啟與人工編輯的寫入競態** | 編輯落盤若晚於子迴圈 load_state,輪末竄改偵測會把人工編輯當 tamper 還原——編輯靜默消失。今天單人操作罕見,fleet 自動化會讓它常態化 |
-| C6 | **欄位不含 track/scope** | 編輯 payload、鎖定內容比對(text/ref)、前端驗證都未涵蓋新欄位 |
-
-**建議調整——核心原則:編輯永遠發生在「循序性成立」的那一層,讓既有鎖定語意原封不動:**
-
-| 生命週期點 | 編輯對象 | 規則 |
-|---|---|---|
-| 拆分前(規劃期/規劃後暫停) | 父 master plan | 全開放:track/scope 可改,跨軌移動 = 改 track 欄位;儲存時整包過 work.py v2 驗證 |
-| 拆分後,軌道 exec 中 | **該子 workspace 的切片**(既有編輯器原樣適用——子軌嚴格循序,前綴假設完整成立) | 沿用「執行中鎖死、停止才可編輯」;track 欄唯讀顯示,scope 可改;跨軌移動不做原地支援,以「A 軌刪除 + B 軌新增」兩步表達(P3 再做 UI 糖) |
-| 軌道 merge / merge-ready / merged | 該子切片 | **比照 done**:「沒有可調整的 pending task」——v1 不支援對已離開 exec 的軌道加任務;要加就放 @final,或走解散重規劃 |
-| @final 執行期 | 父 workspace(此時是普通循序迴圈) | 既有編輯器原樣適用 |
-
-配套修改:
-
-- `normalize_plan_edit` / `planValidation.ts`:欄位擴充 track/scope;鎖定前綴的
-  內容不可變比對涵蓋新欄位;最終正規化結果交 `work.py validate_plan` 複驗
-  (單一真相,dashboard 不自維一套欄位規則);phase ∈ {merge, merge-ready} 併入
-  done 分支的「pending 不可調」規則(解 C4)。
-- 新 state 欄位 `current_task_entered_round`(進入或切換 current task 時記當下
-  round;僅當 `state.round > 該值`——即該任務真的跑過至少一輪——才鎖定 current):
-  解 C3。規劃剛收斂、exec 輪一輪未跑時,task-1 完整可編輯;
-  **這對單軌使用者同樣是體驗修正**,故放 P0。validate_state_shape 同步。
-- 子迴圈新 CLI 參數 `--expect-plan-version N`:fleet 重啟子軌時帶上它讀到的版本,
-  loop 於 load_state 後不符即乾淨退出、fleet 重讀重派——把 C5 的時序競態變成
-  顯式握手(解 C5;搭配 §15.4 的「不自動重啟」政策,常態下根本不會發生)。
-- 拆分後父 master 降級為快照:真相 = 各子切片 + fleet.json 的 order_map;
-  REPORT 聚合對「編輯後新增的任務」發新全域編號(解 C1/C2——父層不再有
-  需要鎖定語意的活 plan)。父 PlanTable 執行期顯示唯讀聚合視圖
-  (P2 定資料契約、P3 做視覺)。
-
-### 15.2 生命週期操作衝突
-
-| 功能 | 衝突 | 調整 |
-|---|---|---|
-| 封存(api_archive) | worktree 在父 workspace 目錄內(D6):父帶著活 worktree 封存 = 整目錄搬移毀掉 git worktree 註冊表、子 state.config.repo 指向失效 | 前提檢查(fail-closed):父封存需「全部子軌已封存或刪除,且 worktrees 已 `git worktree remove` + prune」;子軌封存需自己的 worktree 已移除。fleet 提供「清理已合併軌道」動作(移 worktree、留 branch)。還原不重建 worktree——fleet resume 冪等重建 |
-| 重置/匯入(reset-state、import plan) | 父在子軌存在時重置 → 孤兒子軌/branch/worktree;子軌被直接 import → 切片與 order_map 失聯 | 父 reset 前提 = 無 fleet-managed 子軌(或明確 cascade 雙重確認);**子軌的 reset/匯入一律拒絕**(I10,config 帶 `fleet_parent` 旗標,dashboard 路由據此擋並提示從父層操作) |
-| 階段切換(api_phase) | 子軌「回規劃期」無意義(切片沒有規劃期);父「回規劃期」= 解散拆分,具破壞性 | 子軌:擋(I10)。父:改為 fleet 動作「解散並重規劃」——僅當所有軌道無未合併 commit 才直接放行,否則列出將棄置的 branch 清單要求雙重確認(branch 一律保留供稽核) |
-| 停止 | 停父(fleet)是否級聯殺子?語意未定義 | 預設**不級聯**:子軌自主收斂,鎖保證安全,merge-ready 的原地等待;「停止整個 fleet(含子軌)」做成明確批次動作(順序:先父後子)。子軌單獨停止 = 合法人工介入,fleet 標記「已停止/需關注」,不自動搶回(§15.4) |
-| 一鍵重跑(api_run) | run-from-config 只會 spawn engine.loop | 父 config 帶並行旗標 → respawn `engine.fleet`;子 config 帶 fleet 參數照常 respawn engine.loop(單軌人工續跑合法);config 白名單驗證涵蓋新入口與新參數 |
-| 以此為範本啟動 | 子軌 config 含 fleet 專屬欄位,複製會產生殘缺設定 | 範本預填時剝除 `merge_target`/`fleet_parent` 等 fleet-only 欄位 |
-| 批次操作 | 預覽的跳過原因不認得 fleet 語意 | 跳過原因新增「fleet 管理中」類別;其餘沿用既有逐筆安全 API |
-
-另:規劃後暫停點的「▶ 運行」在並行模式改為「**確認拆分並啟動**」fleet 動作——
-先跑 §4 v2 整包校驗(含 track 數、scope 規則),過了才建 worktree 派發;
-這是 D1(pause_after_plan 預設開)與編輯器(15.1 拆分前全開放)的自然銜接點。
-
-### 15.3 監控與投影衝突
-
-| # | 衝突 | 調整 |
-|---|---|---|
-| M1 | `status.py:70` 的 `pid_is_loop_alive` 只認 `loop.py`/`engine.loop` → 父 workspace 由 engine.fleet 持有 pid 時被判「已停止」,整個執行期父卡片假死 | 判斷式納入 `engine.fleet`;dashboard 端同型 pid 檢查一併修 |
-| M2 | 執行期父 workspace 沒有輪次 → 停滯/需關注 heuristics 誤判 | health 對「fleet 執行中」的父 workspace 停用輪次型告警,以 §6.6 fleet-state 為準 |
-| M3 | notify_cmd:N 個子軌各自發終態通知 → 轟炸 | 子軌一律以空 notify 啟動;fleet 統一發 `track_merged` / `merge_failed` / `fleet_completed` / `plan_paused` / `stuck` |
-| M4 | goal 變更偵測空窗:執行期父不跑輪、子軌在隔離 worktree 永遠看不到 main 上的 goal 變更 | fleet 監督迴圈每輪比對 goal hash;變更即平順停全艦 + 需關注(拆分依據的 goal 已失效,必須人工重規劃) |
-
-### 15.4 監督政策修訂
-
-v2 原句「子迴圈異常退出 → 有限次數重啟 + 指數退避」**收回**。修訂為:
-fleet 預設**不自動重啟**異常退出或被人工停止的子軌——一律標記需關注、交人決定。
-理由:①符合本 repo「機械防線不猜測人類意圖」的一貫哲學(人工停止可能正是為了編輯
-計畫或檢查現場,自動搶回會直接製造 C5 競態);②crash 的根因(CLI 環境壞掉、磁碟滿)
-重啟通常無效,既有 agent-backoff 已在子迴圈內處理 CLI 級異常,fleet 層再疊一層
-重啟只是把問題藏久一點。fleet 只在**它擁有的既定轉移**重啟子軌:初次派發、
-ff 失敗重排回合併期、人工按下「恢復軌道」。`--auto-restart`(含退避與次數上限)
-留作 P3 選配。
-
-### 15.5 調整的分期歸屬
-
-- **P0**:編輯器 track/scope 欄位 + work.py 共用複驗;`current_task_entered_round`
-  解鎖修正(單軌即受益);planValidation 同步。
-- **P1**:`fleet_parent` 旗標與 dashboard 攔截(reset/匯入/階段切換,I10);
-  封存前提檢查與「清理已合併軌道」;M1 pid 判斷修正;「確認拆分並啟動」動作;
-  停止語意(不級聯 + 批次動作)。
-- **P2**:merge/merge-ready 的編輯規則(C4);`--expect-plan-version` 握手(C5);
-  M2 health 調整、M3 fleet 統一通知、M4 goal 監看;父唯讀聚合視圖資料契約。
-- **P3**:跨軌移動 UI 糖;解散重規劃流程精緻化;`--auto-restart` 選配;父聚合視覺。
+| # | 決議 |
+|---|---|
+| D1 | pause-after-plan 預設 off；不提供 pause-before-merge，merge transaction 自動收斂 |
+| D2 | exec done threshold 維持 3；merge threshold 預設 2 |
+| D3 | track 上限 8；max-parallel 預設 4 |
+| D4 | scope 選填且只作提示，不做 overlap gate |
+| D5 | integration branch 預設為啟動時 current branch，不寫死 main |
+| D6 | 合入使用 `git update-ref new old` CAS + journal；integration validate 紅自動 rollback |
+| D7 | 移除「merge commit 第二 parent」機械檢查，只保留祖先/綠燈/乾淨/done gate |
+| D8 | child crash 預設自動重啟；人工 stop 以 token 區分 |
+| D9 | 語意型 retry 預設不限；營運 cap 選配 |
+| D10 | `@final` 在隔離 final worktree 執行並走同一 gate |
+| D11 | 拆分後 plan/slice 唯讀，不支援 fleet-managed 人工跨軌編輯 |
+| D12 | 移除 archive/restore；舊 workspace 不遷移、不 resume，改安全刪除 |
+| D13 | 成功自動清 child worktree/workspace、保留 branch與 parent REPORT |
+| D14 | submodule repo 第一版明確不支援 |
+| D15 | Unit/fake-agent E2E 不足以過關；必須用完整本機 clone、設定好的 Codex CLI 與 production Dashboard 完成 L4 DR-1/DR-2 |
+| D16 | 前端最終驗收必須從真 UI 操作完整流程並保存 trace/video/screenshots；直接 API 驅動不能取代 UI dry run |
+| D17 | 本階段不開放 agent 廣域 repo 搜尋/巡檢；只允許 task/ref/scope 內針對性讀取，搜尋能力有實際需要再加入 |
+| D18 | 移除 Dashboard read-only instance；L3/L4 都使用單一可操作 production Dashboard，唯讀觀測保留在 `loop status` 與 GET API |
+| D19 | Dashboard 以 workspace-root singleton lease 串行化整個 instance 生命週期；每次啟動先依 durable coordinator/pending/runtime identity 停止 standalone/fleet/planning/child 與獨立 Agent/validator groups，無法確認清場或 identity ambiguous 就不 serve，後續只能手動啟動 |
 
 ---
 
-## 附錄 A:合併閘門時序(兩軌衝突場景)
+## 附錄 A：兩軌衝突與 rollback 時序
 
 ```text
-t0  main=M0;track-A、track-B 各自從 M0 開跑
-t1  A 全 task 收斂 → merge phase:is-ancestor(M0, A)成立 → 確認輪×2 → merge-ready(tipA)
-t2  fleet:ff merge tipA → main=A ✔(main 上 validate 綠)
-t3  B 全 task 收斂 → merge phase:is-ancestor(main=A, B)不成立
-      → 併入輪:agent 在 wt/B `git merge --no-commit A`,解衝突,validate 綠,commit
-        (HEAD 動 → done=0)
-      → 確認輪×2(逐條 DoD + validate,無異動)→ merge-ready(tipB')
-t4  fleet:ff merge tipB' → main=B' ✔ → 進 @final
-若 t3 的 merge 把東西弄壞:validate 紅 → done 歸零重試;連紅達 red-limit →
-reset --hard 回 B 的綠點(= 撤銷整個 merge)→ 下一輪重新 merge——直到收斂或 stuck-stop。
+t0 integration=M0；A/B 從 M0 開跑
+t1 A merge-ready(A1)
+t2 CAS integration M0→A1；integration validate PASS；A merged
+t3 B 發現 A1 不是 B HEAD 祖先
+   → merge-sync agent 整合 A1、解衝突、validate、commit B2
+   → confirm agent ×2 → merge-ready(B2)
+t4 CAS integration A1→B2；integration validate FAIL
+   → CAS rollback B2→A1；baseline validate PASS
+   → repair control(error tail) 送 B；B 自行回 confirm
+t5 B agent 修復環境耦合、commit B3；confirm ×2
+t6 CAS integration A1→B3；integration validate PASS；B merged
+t7 從 B3 建 final worktree；執行 @final；CAS + validate
+t8 聚合 REPORT；清除 A/B/final worktree與 child workspace
 ```
 
-## 附錄 B:與現行文件的銜接
+## 附錄 B：文件銜接
 
-- README「流程」章節在 P2 落地時加並行分支圖;README.md:34 的「目前不會自動拆任務、
-  合併分支」敘述屆時移除;新增「升級注意:任務格式 v2 不相容舊版」段落。
-- `templates/GUIDE.md` 與 Prompt 產生器補「什麼樣的 goal 適合並行」指引。
+- README 移除「不自動拆任務/合併」舊敘述，新增 agent-first fleet 流程。
+- GUIDE 說明適合/不適合並行的 goal、外部資源隔離、submodule 限制。
+- 升級說明明確寫：舊 plan/state/archive 不支援新版 resume；不自動刪既有資料。

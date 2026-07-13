@@ -3,11 +3,12 @@ import { useEffect, useRef, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
 import type { WorkspaceSummary } from "../shared/api/types";
 
-export default function useWorkspaceNavigation({ workspaces, selectWorkspace, setOverviewOpen, setPaletteOpen }: {
+export default function useWorkspaceNavigation({ workspaces, selectWorkspace, openOverview, setPaletteOpen, navigationBlocked }: {
   workspaces: WorkspaceSummary[];
   selectWorkspace: (name: string) => void;
-  setOverviewOpen: Dispatch<SetStateAction<boolean>>;
+  openOverview: () => void;
   setPaletteOpen: Dispatch<SetStateAction<boolean>>;
+  navigationBlocked: () => boolean;
 }): boolean {
   const [armed, setArmed] = useState(false);
   const timer = useRef<number | null>(null);
@@ -19,6 +20,11 @@ export default function useWorkspaceNavigation({ workspaces, selectWorkspace, se
       timer.current = null;
     };
     const listener = (event: KeyboardEvent) => {
+      if (navigationBlocked()) {
+        if ((event.metaKey || event.ctrlKey) && ["g", "k"].includes(event.key.toLowerCase())) event.preventDefault();
+        disarm();
+        return;
+      }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         setPaletteOpen(true);
@@ -39,20 +45,18 @@ export default function useWorkspaceNavigation({ workspaces, selectWorkspace, se
       event.preventDefault();
       disarm();
       if (event.key === "0") {
-        setOverviewOpen(true);
-        localStorage.setItem("fleet-overview", "1");
+        openOverview();
         return;
       }
       const next = workspaces[Number(event.key) - 1];
       // 超出現有 workspace 數量時維持原畫面，不把空位置當成錯誤。
       if (!next) return;
       selectWorkspace(next.name);
-      setOverviewOpen(false);
       localStorage.setItem("fleet-overview", "0");
     };
     document.addEventListener("keydown", listener);
     return () => document.removeEventListener("keydown", listener);
-  }, [armed, selectWorkspace, setOverviewOpen, setPaletteOpen, workspaces]);
+  }, [armed, navigationBlocked, openOverview, selectWorkspace, setPaletteOpen, workspaces]);
 
   useEffect(() => () => {
     if (timer.current !== null) window.clearTimeout(timer.current);

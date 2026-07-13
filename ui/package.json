@@ -9,9 +9,10 @@
     "lint": "eslint . --max-warnings 0",
     "check:offline": "node scripts/check-offline-assets.mjs",
     "check": "npm run lint && npm run build && npm run check:offline",
-    "test:e2e": "npm run build && playwright test",
-    "test:e2e:headed": "npm run build && playwright test --headed",
-    "check:all": "npm run check && playwright test"
+    "test:e2e": "npm run build && node scripts/run-playwright-e2e.mjs",
+    "test:e2e:headed": "npm run build && node scripts/run-playwright-e2e.mjs --headed",
+    "test:dry-run": "playwright test --config playwright.real.config.ts",
+    "check:all": "npm run check && node scripts/run-playwright-e2e.mjs"
   },
   "dependencies": {
     "react": "^19.2.7",

@@ -14,6 +14,9 @@ from pathlib import Path
 from engine import loop
 
 STATUS_SCHEMA_VERSION = 1
+FLEET_PHASES = {"planning", "splitting", "awaiting-approval", "exec", "merging",
+                "final", "stopping", "stopped", "cleaning", "done", "failed"}
+FLEET_RESUME_PHASES = {"planning", "splitting", "exec", "final", "cleaning"}
 
 
 def _parse_timestamp(value):
@@ -67,7 +70,129 @@ def pid_is_loop_alive(pid) -> bool:
                                  capture_output=True, text=True, check=False).stdout
     except OSError:
         return True
-    return "loop.py" in command or "engine.loop" in command
+    return any(token in command for token in ("loop.py", "engine.loop", "engine.fleet"))
+
+
+def read_fleet_projection(directory: Path, state: dict):
+    """Read primary/checkpoint fleet truth without repair; both invalid is a hard projection error."""
+    failures = []
+    for path, label in ((directory / "fleet.json", "fleet.json"),
+                        (directory / "fleet.last-good.json", "fleet.last-good.json")):
+        try:
+            path = loop.workspace_file(path, label)
+            fd = loop._open_regular(path, os.O_RDONLY)
+            with os.fdopen(fd, "r", encoding="utf-8", closefd=True) as stream:
+                fleet = json.load(stream)
+            if not isinstance(fleet, dict):
+                raise ValueError("頂層必須是 JSON object")
+            if (fleet.get("schema_version") != 1 or fleet.get("workspace_kind") != "fleet-parent" or
+                    fleet.get("run_id") != state.get("fleet_run_id")):
+                raise ValueError("與 parent state 身分不符")
+            mirror_revision = state.get("fleet_truth_revision")
+            if (mirror_revision is not None and
+                    fleet.get("dashboard_revision", 0) != mirror_revision):
+                raise ValueError("dashboard revision 與 parent mirror 不符")
+            if fleet.get("phase") not in FLEET_PHASES:
+                raise ValueError("phase 不合法")
+            resume_phase = fleet.get("resume_phase")
+            if resume_phase is not None and resume_phase not in FLEET_RESUME_PHASES:
+                raise ValueError("resume_phase 不合法")
+            if fleet.get("phase") == "failed" and resume_phase is None:
+                raise ValueError("failed fleet 缺少 resume_phase")
+            for field in ("plan", "tracks", "merge_queue"):
+                if field in fleet and not isinstance(fleet[field], list):
+                    raise ValueError(f"{field} 型別不合法")
+            if "loop" in fleet and not isinstance(fleet["loop"], dict):
+                raise ValueError("loop 型別不合法")
+            for track in fleet.get("tracks") or []:
+                if not isinstance(track, dict) or not isinstance(track.get("name"), str):
+                    raise ValueError("track 結構不合法")
+            if "error" in fleet and fleet["error"] is not None and not isinstance(fleet["error"], str):
+                raise ValueError("error 型別不合法")
+        except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
+            failures.append(f"{label}: {error}")
+            continue
+        if label != "fleet.json":
+            fleet = dict(fleet)
+            fleet["fleet_recovery_pending"] = True
+        return fleet
+    raise ValueError("fleet truth 無法讀取：" + "; ".join(failures))
+
+
+def fleet_progress_projection(directory: Path, fleet: dict):
+    """Project master completed/current/issues using validated child identity and global order mapping."""
+    plan = fleet.get("plan") if isinstance(fleet.get("plan"), list) else []
+    tracks = fleet.get("tracks") if isinstance(fleet.get("tracks"), list) else []
+    by_name = {track.get("name"): track for track in tracks if isinstance(track, dict)}
+    completed = []
+    current_orders = []
+    issues = []
+    order_map = fleet.get("order_map") if isinstance(fleet.get("order_map"), dict) else {}
+    for task in plan:
+        if not isinstance(task, dict) or not isinstance(task.get("order"), int):
+            continue
+        if (by_name.get(task.get("track")) or {}).get("status") in {"merged", "cleaned"}:
+            completed.append(task["order"])
+    for track_name, track in by_name.items():
+        diagnostics = track.get("diagnostics") if isinstance(track.get("diagnostics"), dict) else {}
+        child_issues = diagnostics.get("issues") if isinstance(diagnostics.get("issues"), list) else []
+        child = None
+        child_name = str(track.get("child_workspace") or "")
+        if loop.valid_workspace_name(child_name):
+            try:
+                child_dir = loop.workspace_path(loop.WORKSPACE_ROOT, child_name)
+                child, _data, _recovered = loop.load_checkpointed_state(
+                    child_dir / "state.json", repair=False)
+            except (FileNotFoundError, OSError, ValueError, loop.StateLoadError):
+                child = None
+        valid_child = bool(
+            child and child.get("workspace_kind") == "fleet-child" and
+            child.get("fleet_run_id") == fleet.get("run_id") and
+            child.get("fleet_parent") == directory.name and child.get("track") == track_name and
+            child.get("fleet_parent_session_id") == (fleet.get("loop") or {}).get("session_id"))
+        if not child_issues and valid_child:
+            child_issues = child.get("issues") if isinstance(child.get("issues"), list) else []
+        issues.extend({**issue, "track": track_name, "child_workspace": child_name}
+                      for issue in child_issues if isinstance(issue, dict))
+        integration_error = track.get("last_integration_error")
+        if isinstance(integration_error, str) and integration_error:
+            issues.append({"round": 0, "text": integration_error,
+                           "where": "fleet-integration-rollback", "source": "fleet",
+                           "synthetic": True, "read_only": True,
+                           "resolved": track.get("status") in {"merged", "cleaned"},
+                           "track": track_name, "child_workspace": child_name})
+        if track.get("status") in {"merged", "cleaned", "failed"}:
+            continue
+        if valid_child:
+            mapped = (order_map.get(track_name) or {}).get(str(child.get("current_order")))
+            if isinstance(mapped, int):
+                current_orders.append(mapped)
+                continue
+        track_orders = [task["order"] for task in plan if isinstance(task, dict) and
+                        task.get("track") == track_name and isinstance(task.get("order"), int)]
+        if track_orders and track.get("status") in {"pending", "running", "repairing"}:
+            current_orders.append(min(track_orders))
+    transaction = fleet.get("merge_tx")
+    if isinstance(transaction, dict) and (
+            transaction.get("stage") in {"rollback-prepared", "rolled-back"} or
+            isinstance(transaction.get("validation_error"), str)):
+        track = by_name.get(transaction.get("track")) or {}
+        message = transaction.get("validation_error")
+        if not isinstance(message, str) or not message:
+            message = f"integration rollback pending ({transaction.get('stage')})"
+        existing = next((issue for issue in issues
+                         if issue.get("track") == transaction.get("track") and
+                         issue.get("text") == message), None)
+        if existing is not None:
+            existing["resolved"] = track.get("status") in {"merged", "cleaned"}
+        else:
+            issues.append({"round": 0, "text": message,
+                           "where": "fleet-integration-rollback", "source": "fleet",
+                           "synthetic": True, "read_only": True,
+                           "resolved": track.get("status") in {"merged", "cleaned"},
+                           "track": transaction.get("track"),
+                           "child_workspace": track.get("child_workspace")})
+    return completed, sorted(set(current_orders)), issues
 
 
 def project_status(name: str, metrics_limit=0):
@@ -81,7 +206,11 @@ def project_status(name: str, metrics_limit=0):
     if not stat_is_directory(info.st_mode):
         raise ValueError(f"workspace {name} 必須是實體目錄")
     state, _data, recovered = loop.load_checkpointed_state(directory / "state.json", repair=False)
+    workspace_kind = state.get("workspace_kind") or "standalone"
+    fleet = read_fleet_projection(directory, state) if workspace_kind == "fleet-parent" else None
     loop_state = state.get("loop") if isinstance(state.get("loop"), dict) else {}
+    if fleet is not None:
+        loop_state = fleet.get("loop") if isinstance(fleet.get("loop"), dict) else {}
     pid = loop_state.get("pid")
     running = pid_is_loop_alive(pid)
     plan = state.get("plan") if isinstance(state.get("plan"), list) else []
@@ -96,16 +225,42 @@ def project_status(name: str, metrics_limit=0):
     round_deadline_at = state.get("round_deadline_at")
     round_interrupted_at = state.get("round_interrupted_at")
     round_timing = round_timing_projection(round_started_at, round_deadline_at, round_interrupted_at)
+    projected_phase = fleet.get("phase") if fleet is not None else state.get("phase")
+    projected_plan = fleet.get("plan") if fleet is not None and isinstance(fleet.get("plan"), list) else plan
+    projected_completed = len(completed)
+    tracks = fleet.get("tracks") if fleet is not None and isinstance(fleet.get("tracks"), list) else []
+    if fleet is not None:
+        completed_orders, current_orders, issues = fleet_progress_projection(directory, fleet)
+        projected_completed = len(completed_orders)
+        current_order = current_orders[0] if current_orders else None
+        current_task = next((task.get("task", "") for task in projected_plan
+                             if isinstance(task, dict) and task.get("order") == current_order), "")
+        if len(current_task) > 160:
+            current_task = current_task[:160] + "…"
     projection = {
         "name": name,
         "workspace": str(directory),
-        "phase": state.get("phase"),
+        "workspace_kind": workspace_kind,
+        "fleet_run_id": state.get("fleet_run_id"),
+        "fleet_parent": state.get("fleet_parent"),
+        "track": state.get("track"),
+        "merge_stage": state.get("merge_stage"),
+        "phase": projected_phase,
+        "parallel_phase": fleet.get("phase") if fleet is not None else None,
+        "parallel_error": fleet.get("error") if fleet is not None else None,
+        "parallel_stop_reason": fleet.get("stop_reason") if fleet is not None else None,
+        "parallel_resumable": fleet.get("phase") != "done" if fleet is not None else None,
+        "parallel_track_events": [
+            {"track": track.get("name"), "child_workspace": track.get("child_workspace"),
+             "event_history": track.get("event_history") or []}
+            for track in tracks if isinstance(track, dict)],
+        "parallel_tracks": tracks,
         "round": state.get("round", 0),
         "flag": state.get("flag", 0),
         "done_count": state.get("done_count", 0),
         "plan_version": state.get("plan_version", 0),
-        "plan_len": len(plan),
-        "completed": len(completed),
+        "plan_len": len(projected_plan),
+        "completed": projected_completed,
         "current_order": current_order,
         "current_task": current_task,
         "red_streak": state.get("red_streak", 0),
@@ -125,14 +280,15 @@ def project_status(name: str, metrics_limit=0):
         "goal_changed": bool(state.get("goal_changed")),
         "goal_previous_hash": state.get("goal_previous_hash"),
         "issues": len(issues),
-        "unread_issues": loop.unread_issue_count(state),
+        "unread_issues": (sum(1 for issue in issues if not issue.get("resolved"))
+                          if fleet is not None else loop.unread_issue_count(state)),
         "last_green_sha": state.get("last_green_sha"),
         "loop_pid": pid,
         "loop_session_id": loop_state.get("session_id"),
         "loop_started_at": loop_state.get("started_at"),
         "running": running,
         "stale_loop_pid": pid is not None and not running,
-        "state_recovery_pending": recovered,
+        "state_recovery_pending": recovered or bool(fleet and fleet.get("fleet_recovery_pending")),
     }
     if metrics_limit:
         projection["round_metrics"] = loop.read_round_metrics(directory / "history.log", metrics_limit)
@@ -172,27 +328,60 @@ def project_all_status(metrics_limit=0):
     return results
 
 
+def _parent_registers_fleet_child(parent, child):
+    """Return true only when parent projection registers this exact child/track pair."""
+    if (parent.get("workspace_kind") != "fleet-parent" or
+            child.get("workspace_kind") != "fleet-child" or
+            not isinstance(parent.get("name"), str) or
+            not isinstance(child.get("fleet_parent"), str) or
+            child.get("fleet_parent") != parent.get("name") or
+            not isinstance(child.get("fleet_run_id"), str) or
+            child.get("fleet_run_id") != parent.get("fleet_run_id") or
+            not isinstance(child.get("name"), str) or
+            not isinstance(child.get("track"), str)):
+        return False
+    tracks = parent.get("parallel_tracks")
+    if not isinstance(tracks, list):
+        tracks = parent.get("tracks")
+    if not isinstance(tracks, list):
+        return False
+    return any(
+        isinstance(track, dict) and
+        track.get("name") == child["track"] and
+        track.get("child_workspace") == child["name"]
+        for track in tracks
+    )
+
+
 def summarize_status(results):
     """將 fleet projection 聚合成 shell/CI 可直接使用的摘要。"""
     valid = [result for result in results if "error" not in result]
-    tasks_total = sum(result.get("plan_len", 0) for result in valid)
-    tasks_completed = sum(result.get("completed", 0) for result in valid)
+    parents = {result.get("name"): result for result in valid
+               if result.get("workspace_kind") == "fleet-parent"}
+    aggregate = [result for result in valid
+                 if not (result.get("workspace_kind") == "fleet-child" and
+                         _parent_registers_fleet_child(
+                             parents.get(result.get("fleet_parent"), {}), result))]
+    tasks_total = sum(result.get("plan_len", 0) for result in aggregate)
+    tasks_completed = sum(result.get("completed", 0) for result in aggregate)
     return {
         "workspace_count": len(results),
         "valid_count": len(valid),
         "error_count": len(results) - len(valid),
-        "running": sum(1 for result in valid if result.get("running")),
-        "planning": sum(1 for result in valid if result.get("phase") == "plan"),
-        "executing": sum(1 for result in valid if result.get("phase") == "exec"),
-        "done": sum(1 for result in valid if result.get("phase") == "done"),
-        "attention": sum(1 for result in valid if projection_needs_attention(result)),
-        "issues": sum(result.get("issues", 0) for result in valid),
-        "unread_issues": sum(result.get("unread_issues", result.get("issues", 0)) for result in valid),
-        "agent_failures": sum(result.get("agent_failure_streak", 0) for result in valid),
-        "round_timeouts": sum(1 for result in valid if result.get("last_round_timed_out")),
-        "state_recoveries": sum(result.get("state_recovery_count", 0) for result in valid),
-        "goal_changes": sum(1 for result in valid if result.get("goal_changed")),
-        "stale_loops": sum(1 for result in valid if result.get("stale_loop_pid")),
+        "running": sum(1 for result in aggregate if result.get("running")),
+        "planning": sum(1 for result in aggregate if result.get("phase") in {"plan", "planning"}),
+        "executing": sum(1 for result in aggregate if result.get("phase") in
+                         {"splitting", "exec", "merging", "final", "cleaning", "stopping"}),
+        "done": sum(1 for result in aggregate if result.get("phase") == "done"),
+        "attention": sum(1 for result in aggregate if projection_needs_attention(result)),
+        "issues": sum(result.get("issues", 0) for result in aggregate),
+        "unread_issues": sum(result.get("unread_issues", result.get("issues", 0))
+                             for result in aggregate),
+        "agent_failures": sum(result.get("agent_failure_streak", 0) for result in aggregate),
+        "round_timeouts": sum(1 for result in aggregate if result.get("last_round_timed_out")),
+        "state_recoveries": sum(result.get("state_recovery_count", 0) for result in aggregate),
+        "goal_changes": sum(1 for result in aggregate if result.get("goal_changed")),
+        "stale_loops": sum(1 for result in aggregate if result.get("stale_loop_pid")),
         "tasks_completed": tasks_completed,
         "tasks_total": tasks_total,
         "task_completion_pct": round(tasks_completed / tasks_total * 100) if tasks_total else 0,
@@ -213,6 +402,8 @@ def projection_needs_attention(result) -> bool:
         result.get("state_recovery_pending") or
         result.get("goal_changed") or
         result.get("stale_loop_pid") or
+        result.get("parallel_error") or
+        result.get("phase") == "failed" or
         (not completed and (
             result.get("red_streak", 0) > 0 or
             result.get("stall_rounds", 0) > 0 or
@@ -266,7 +457,10 @@ def filter_status_results(results, mode: str):
 
 def render_human(result, *, timestamp=False) -> None:
     """將單 workspace projection 轉成終端可掃讀摘要，不改變任何 state。"""
-    phase = {"plan": "規劃期", "exec": "執行期", "done": "完成"}.get(result["phase"], result["phase"] or "未知")
+    phase = {"plan": "規劃期", "planning": "並行規劃中", "splitting": "拆分中",
+             "exec": "並行執行中", "merging": "整合中", "final": "最終驗收中",
+             "cleaning": "清理中", "stopping": "停止中", "stopped": "已停止",
+             "failed": "失敗", "done": "完成"}.get(result["phase"], result["phase"] or "未知")
     running = "執行中" if result["running"] else "⚠ PID 殘留" if result.get("stale_loop_pid") else "已停止"
     prefix = f"[{time.strftime('%H:%M:%S')}] " if timestamp else ""
     task = f"｜task-{result['current_order']}：{result['current_task']}" if result.get("current_task") else ""
@@ -279,6 +473,10 @@ def render_human(result, *, timestamp=False) -> None:
     print(f"{prefix}{result['name']}｜{phase}｜round {result['round']}｜"
           f"任務 {result['completed']}/{result['plan_len']}{task}｜{running}｜"
           f"紅連跳 {result['red_streak']}｜停滯 {result['stall_rounds']}｜{issue_note}{round_note}", flush=True)
+    if result.get("workspace_kind") == "fleet-parent":
+        statuses = ", ".join(f"{track.get('name')}:{track.get('status')}"
+                             for track in result.get("parallel_tracks") or []) or "尚未拆軌"
+        print(f"🔀 parallel run {result.get('fleet_run_id')}｜{statuses}", flush=True)
     if result["state_recovery_pending"]:
         print("🛟 primary state 不可讀，目前只投影 last-good checkpoint（未修改檔案）", flush=True)
     if result.get("agent_failure_streak", 0):

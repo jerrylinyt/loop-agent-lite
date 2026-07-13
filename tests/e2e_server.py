@@ -45,6 +45,7 @@ def prepare_fixture():
         "    print('E2E Agent CLI test result', flush=True)\n"
         "    raise SystemExit(0)\n"
         "ws = Path(os.environ['LOOP_WS'])\n"
+        "state = json.loads((ws / 'state.json').read_text())\n"
         "phase = (ws / 'phase').read_text().strip()\n"
         "task = (ws / 'current_task').read_text().strip()\n"
         "print(f'E2E fake agent started phase={phase} task={task}', flush=True)\n"
@@ -53,14 +54,34 @@ def prepare_fixture():
         "if phase == 'plan':\n"
         "    marker = ws / '.e2e-plan-updated'\n"
         "    if not marker.exists():\n"
-        "        plan = [\n"
-        "            {'order': 1, 'task': '已由 E2E 更新的第一項功能', 'ref': 'README.md'},\n"
-        "            {'order': 2, 'task': '由 Agent 重新分析的第二項功能'},\n"
-        "        ]\n"
+        "        plan = ([\n"
+        "            {'order': 1, 'task': '建立 alpha.txt；DoD: test -f alpha.txt', 'track': 'alpha'},\n"
+        "            {'order': 2, 'task': '建立 beta.txt；DoD: test -f beta.txt', 'track': 'beta'},\n"
+        "            {'order': 3, 'task': '建立 final.txt；DoD: test -f final.txt', 'track': '@final'},\n"
+        "        ] if state.get('workspace_kind') == 'fleet-parent' else [\n"
+        "            {'order': 1, 'task': '已由 E2E 更新的第一項功能', 'ref': 'README.md', 'track': 'main'},\n"
+        "            {'order': 2, 'task': '由 Agent 重新分析的第二項功能', 'track': 'main'},\n"
+        "        ])\n"
         "        subprocess.run([sys.executable, '-m', 'engine.work', 'create-plan'], input=json.dumps(plan, ensure_ascii=False), text=True, env=os.environ, check=True)\n"
         "        marker.write_text('done')\n"
         "    else:\n"
         "        subprocess.run([sys.executable, '-m', 'engine.work', 'plan-ok'], env=os.environ, check=True)\n"
+        "elif phase == 'exec' and state.get('workspace_kind') == 'fleet-child':\n"
+        "    track = state['track']\n"
+        "    artifact = Path('final.txt' if track == '@final' else f'{track}.txt')\n"
+        "    if not artifact.exists():\n"
+        "        artifact.write_text(track + '\\n')\n"
+        "        subprocess.run(['git', 'add', artifact.name], check=True)\n"
+        "        subprocess.run(['git', 'commit', '-m', f'e2e {track}'], check=True)\n"
+        "    else:\n"
+        "        subprocess.run([sys.executable, '-m', 'engine.work', 'done', task], env=os.environ, check=True)\n"
+        "elif phase == 'merge':\n"
+        "    tip = state['merge_target_tip']\n"
+        "    ancestor = subprocess.run(['git', 'merge-base', '--is-ancestor', tip, 'HEAD']).returncode == 0\n"
+        "    if not ancestor:\n"
+        "        subprocess.run(['git', 'merge', '--no-edit', tip], check=True)\n"
+        "    else:\n"
+        "        subprocess.run([sys.executable, '-m', 'engine.work', 'done', 'merge-main'], env=os.environ, check=True)\n"
         "elif task:\n"
         "    subprocess.run([sys.executable, '-m', 'engine.work', 'done', task], env=os.environ, check=True)\n"
         "counter = ws / '.e2e-agent-count'\n"
@@ -111,10 +132,9 @@ def prepare_fixture():
 
 
 def main():
-    """啟動可寫或唯讀 E2E Dashboard，退出時清除整個暫存 fixture。"""
+    """啟動單一可寫 E2E Dashboard，退出時清除整個暫存 fixture。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--read-only", action="store_true")
     args = parser.parse_args()
     fixture, workspace, config_path = prepare_fixture()
     os.environ["LOOP_AGENT_WORKSPACE_ROOT"] = str(workspace)
@@ -122,7 +142,7 @@ def main():
     sys.path.insert(0, str(PROJECT_ROOT))
     try:
         from engine import dashboard
-        dashboard.run_dashboard(port=args.port, read_only=args.read_only)
+        dashboard.run_dashboard(port=args.port)
     finally:
         shutil.rmtree(fixture, ignore_errors=True)
 

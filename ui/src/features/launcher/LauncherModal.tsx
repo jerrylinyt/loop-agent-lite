@@ -5,11 +5,12 @@ import Modal from "../../shared/components/Modal";
 import { getJson, postJson, waitForJobStartup } from "../../shared/api/client";
 import useStaleGuard from "../../shared/hooks/useStaleGuard";
 import type { ConfigResponse, DashboardConfig, StartupResponse, WorkspaceState, WorkspaceSummary } from "../../shared/api/types";
+import type { BeginOperation, EndOperation } from "../../shared/operationGate";
 import PlanImportField from "./PlanImportField";
 import NotifyModal from "./NotifyModal";
 import PromptTemplateModal from "./PromptTemplateModal";
 import RepoRootsModal from "./RepoRootsModal";
-import { validatePlan } from "./planValidation";
+import { planRequiresParallel, validatePlan } from "./planValidation";
 import { isPromptTemplateBundleSupported, type PromptTemplateMode } from "./promptTemplateBuilder";
 import LauncherJobs from "./LauncherJobs";
 
@@ -22,6 +23,8 @@ interface ExecutionSettings {
   roundTimeout: number;
   agentBackoffMax: number;
   validateTimeout: number;
+  redLimit: number;
+  stallLimit: number;
   pauseAfterPlan: boolean;
 }
 const DEFAULT_EXECUTION_SETTINGS: ExecutionSettings = {
@@ -30,6 +33,8 @@ const DEFAULT_EXECUTION_SETTINGS: ExecutionSettings = {
   roundTimeout: 30,
   agentBackoffMax: 60,
   validateTimeout: 120,
+  redLimit: 20,
+  stallLimit: 300,
   pauseAfterPlan: false,
 };
 
@@ -44,6 +49,8 @@ function ExecutionSettingsFields({ value, onChange }: {
       <label>單輪上限（分）<input type="number" min={0} value={value.roundTimeout} onChange={(event) => onChange({ roundTimeout: +event.target.value })} /></label>
       <label>Agent 異常退避上限（秒）<input type="number" min={0} value={value.agentBackoffMax} onChange={(event) => onChange({ agentBackoffMax: +event.target.value })} /></label>
       <label>Validate 上限（秒）<input type="number" min={1} value={value.validateTimeout} onChange={(event) => onChange({ validateTimeout: +event.target.value })} /></label>
+      <label>紅燈連跳 reset<input type="number" min={1} value={value.redLimit} onChange={(event) => onChange({ redLimit: +event.target.value })} /></label>
+      <label>HEAD 停滯 reset<input type="number" min={1} value={value.stallLimit} onChange={(event) => onChange({ stallLimit: +event.target.value })} /></label>
     </div>
   );
 }
@@ -51,12 +58,20 @@ function ExecutionSettingsFields({ value, onChange }: {
 export default function LauncherModal({
   workspaces,
   templateConfig,
+  operationPending,
+  operationBlocked,
+  beginOperation,
+  endOperation,
   onClose,
   onLaunched
 }: {
   workspaces: WorkspaceSummary[];
   /** 「以此為範本啟動」帶入的來源 workspace config；只預填表單，不影響既有驗證與啟動路徑。 */
   templateConfig?: DashboardConfig | null;
+  operationPending: boolean;
+  operationBlocked: () => boolean;
+  beginOperation: BeginOperation;
+  endOperation: EndOperation;
   onClose: () => void;
   onLaunched: (name: string) => void;
 }) {
@@ -76,10 +91,17 @@ export default function LauncherModal({
   const [settings, setSettings] = useState<ExecutionSettings>(DEFAULT_EXECUTION_SETTINGS);
   const [resetState, setResetState] = useState(false);
   const [newBranch, setNewBranch] = useState(false);
+  const [parallelMode, setParallelMode] = useState(false);
+  const [maxParallel, setMaxParallel] = useState(4);
+  const [maxChildRestarts, setMaxChildRestarts] = useState(0);
   const [message, setMessage] = useState("");
+  const [templateAgentError, setTemplateAgentError] = useState("");
   const [launching, setLaunching] = useState(false);
+  const launchingPending = useRef(false);
   const [validating, setValidating] = useState(false);
+  const validatingPending = useRef(false);
   const [preflighting, setPreflighting] = useState(false);
+  const preflightingPending = useRef(false);
   const [validateResult, setValidateResult] = useState<{ ok: boolean; text: string; tail: string } | null>(null);
   const [preflightResult, setPreflightResult] = useState<{ ok: boolean; text: string; tail: string } | null>(null);
   const [managerModal, setManagerModal] = useState<"cli" | "repoRoots" | "notify" | null>(null);
@@ -88,6 +110,8 @@ export default function LauncherModal({
   const appliedTemplate = useRef(false);
   const validateGuard = useStaleGuard();
   const preflightGuard = useStaleGuard();
+  const mounted = useRef(true);
+  const identityGenerations = useRef(new Map<string, string | null>());
 
   const repo = repoChoice === "__custom__" ? customRepo.trim() : repoChoice;
   const matchingWorkspace = useMemo(() => workspaces.find((workspace) => workspace.repo === repo), [repo, workspaces]);
@@ -96,6 +120,23 @@ export default function LauncherModal({
   const promptTemplateUnavailableReason = config?.prompt_templates?.length && !promptTemplateAvailable
     ? config.prompt_template_bundle_error || "固定 Prompt 資源未載入或版本不相容，請重新啟動 Dashboard 後再試。"
     : "";
+  const importedPlanRequiresParallel = planRequiresParallel(planJson);
+  const resolvedWorkspaceName = name.trim() || repo.split(/[\\/]/).filter(Boolean).slice(-1)[0] || "";
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  useEffect(() => {
+    // Keep the identity first observed for this target name. SSE replacement updates must not
+    // silently retarget an already-open launch/reset form to the replacement generation.
+    if (!resolvedWorkspaceName || identityGenerations.current.has(resolvedWorkspaceName)) return;
+    identityGenerations.current.set(
+      resolvedWorkspaceName,
+      workspaces.find((item) => item.name === resolvedWorkspaceName)?.workspace_generation ?? null
+    );
+  }, [resolvedWorkspaceName, workspaces]);
 
   useEffect(() => {
     void getJson<ConfigResponse>("/api/config").then((response) => {
@@ -110,6 +151,8 @@ export default function LauncherModal({
         roundTimeout: response.defaults.round_timeout ?? 30,
         agentBackoffMax: response.defaults.agent_backoff_max ?? 60,
         validateTimeout: response.defaults.validate_timeout ?? 120,
+        redLimit: response.defaults.red_limit ?? 20,
+        stallLimit: response.defaults.stall_limit ?? 300,
         pauseAfterPlan: response.defaults.pause_after_plan ?? false,
       });
     });
@@ -135,7 +178,13 @@ export default function LauncherModal({
     }
     if (templateConfig.agent_cmd) {
       const agentMatch = config.agent_cmds.findIndex((item) => item.cmd === templateConfig.agent_cmd);
-      if (agentMatch >= 0) setAgentIndex(String(agentMatch));
+      if (agentMatch >= 0) {
+        setAgentIndex(String(agentMatch));
+        setTemplateAgentError("");
+      } else {
+        setAgentIndex("");
+        setTemplateAgentError(`來源 workspace 的 Agent CLI 已不在目前清單：${templateConfig.agent_cmd}`);
+      }
     }
     if (templateConfig.validate_cmd) {
       const validateMatch = config.validate_cmds.findIndex((item) => item.cmd === templateConfig.validate_cmd);
@@ -153,8 +202,15 @@ export default function LauncherModal({
       roundTimeout: templateConfig.round_timeout ?? value.roundTimeout,
       agentBackoffMax: templateConfig.agent_backoff_max ?? value.agentBackoffMax,
       validateTimeout: templateConfig.validate_timeout ?? value.validateTimeout,
+      redLimit: templateConfig.red_limit ?? value.redLimit,
+      stallLimit: templateConfig.stall_limit ?? value.stallLimit,
       pauseAfterPlan: templateConfig.pause_after_plan ?? value.pauseAfterPlan,
     }));
+    if (templateConfig.max_parallel !== undefined) {
+      setParallelMode(true);
+      setMaxParallel(templateConfig.max_parallel);
+      setMaxChildRestarts(templateConfig.max_child_restarts ?? 0);
+    }
   }, [config, templateConfig]);
 
   useEffect(() => {
@@ -205,6 +261,8 @@ export default function LauncherModal({
             roundTimeout: saved.round_timeout ?? config.defaults.round_timeout ?? 30,
             agentBackoffMax: saved.agent_backoff_max ?? config.defaults.agent_backoff_max ?? 60,
             validateTimeout: saved.validate_timeout ?? config.defaults.validate_timeout ?? 120,
+            redLimit: saved.red_limit ?? config.defaults.red_limit ?? 20,
+            stallLimit: saved.stall_limit ?? config.defaults.stall_limit ?? 300,
             pauseAfterPlan: saved.pause_after_plan ?? config.defaults.pause_after_plan ?? false,
           });
           return;
@@ -217,13 +275,13 @@ export default function LauncherModal({
 
   useEffect(() => {
     validateGuard.cancelPending();
-    setValidating(false);
+    if (!validatingPending.current) setValidating(false);
     setValidateResult(null);
   }, [customValidate, repo, settings.validateTimeout, validateChoice, validateGuard]);
 
   useEffect(() => {
     preflightGuard.cancelPending();
-    setPreflighting(false);
+    if (!preflightingPending.current) setPreflighting(false);
     setPreflightResult(null);
   }, [goalFile, name, newBranch, planJson, preflightGuard, repo, resetState, settings.validateTimeout, validateChoice]);
 
@@ -231,67 +289,95 @@ export default function LauncherModal({
     // 前端先擋明顯格式錯誤以提供即時回饋；後端仍會重新校驗 plan、路徑、Git 與數值。
     const planError = validatePlan(planJson);
     if (planError) return setMessage(`❌ plan.json 格式不對：${planError}`);
+    if (!selectedAgent) return setMessage("❌ 請重新選擇目前可用的 Agent CLI");
+    if (launchingPending.current) return;
+    const token = beginOperation(`launcher:${resolvedWorkspaceName || "unknown"}:launch`);
+    if (!token) return setMessage("❌ 另一個操作仍在進行中");
+    launchingPending.current = true;
     setLaunching(true);
     setMessage("啟動中…");
-    const body: Record<string, unknown> = {
-      repo,
-      name: name.trim(),
-      agent_idx: +agentIndex,
-      flag_threshold: settings.flagThreshold,
-      done_threshold: settings.doneThreshold,
-      round_timeout: settings.roundTimeout,
-      agent_backoff_max: settings.agentBackoffMax,
-      validate_timeout: settings.validateTimeout,
-      pause_after_plan: settings.pauseAfterPlan,
-      reset_state: resetState,
-      new_branch: newBranch,
-      plan_json: planJson,
-      start_phase: startPhase
-    };
-    if (goalFile) body.goal_content = await goalFile.text();
-    if (validateChoice === "__custom__") body.validate_custom = customValidate.trim();
-    else body.validate_idx = +validateChoice;
-    const response = await postJson<StartupResponse>("/api/launch", body);
-    if (response.error || !response.name || !response.pid) {
-      setLaunching(false);
-      return setMessage(`❌ ${response.error ?? "啟動失敗"}`);
-    }
-    if (response.starting) {
-      // 收到 pid 只代表 process 已 spawn；必須等待 startup handshake 才能關閉表單。
-      setMessage("啟動前檢查中…");
-      const startup = await waitForJobStartup(response.name, response.pid, response.startup_timeout ?? settings.validateTimeout + 15);
-      if (startup.error) {
-        setLaunching(false);
-        return setMessage(`❌ ${startup.error}`);
+    let launched: { name: string; pid: number } | null = null;
+    try {
+      const body: Record<string, unknown> = {
+        repo,
+        name: name.trim(),
+        workspace_generation: identityGenerations.current.get(resolvedWorkspaceName) ?? null,
+        agent_idx: +agentIndex,
+        flag_threshold: settings.flagThreshold,
+        done_threshold: settings.doneThreshold,
+        round_timeout: settings.roundTimeout,
+        agent_backoff_max: settings.agentBackoffMax,
+        validate_timeout: settings.validateTimeout,
+        red_limit: settings.redLimit,
+        stall_limit: settings.stallLimit,
+        pause_after_plan: settings.pauseAfterPlan,
+        reset_state: resetState,
+        new_branch: newBranch,
+        plan_json: planJson,
+        start_phase: startPhase,
+        parallel: parallelMode || importedPlanRequiresParallel,
+        max_parallel: maxParallel,
+        max_child_restarts: maxChildRestarts,
+        merge_threshold: 2
+      };
+      if (goalFile) body.goal_content = await goalFile.text();
+      if (validateChoice === "__custom__") body.validate_custom = customValidate.trim();
+      else body.validate_idx = +validateChoice;
+      const response = await postJson<StartupResponse>("/api/launch", body);
+      if (response.error || !response.name || !response.pid) {
+        if (mounted.current) setMessage(`❌ ${response.error ?? "啟動失敗"}`);
+        return;
       }
+      if (response.starting) {
+        // 收到 pid 只代表 process 已 spawn；必須等待 startup handshake 才能關閉表單。
+        if (mounted.current) setMessage("啟動前檢查中…");
+        const startup = await waitForJobStartup(response.name, response.pid, response.startup_timeout ?? settings.validateTimeout + 15);
+        if (startup.error) {
+          if (mounted.current) setMessage(`❌ ${startup.error}`);
+          return;
+        }
+      }
+      launched = { name: response.name, pid: response.pid };
+      if (mounted.current) setMessage(`✅ 已啟動 ${response.name}（pid ${response.pid}）`);
+    } finally {
+      launchingPending.current = false;
+      if (mounted.current) setLaunching(false);
+      endOperation(token);
     }
-    setLaunching(false);
-    setMessage(`✅ 已啟動 ${response.name}（pid ${response.pid}）`);
-    onLaunched(response.name);
+    if (launched && mounted.current) onLaunched(launched.name);
   };
 
   const verifyValidate = async () => {
+    if (validatingPending.current || preflightingPending.current || launchingPending.current) return;
+    const token = beginOperation(`launcher:${resolvedWorkspaceName || "unknown"}:validate`);
+    if (!token) return setMessage("❌ 另一個操作仍在進行中");
+    validatingPending.current = true;
     const isCurrent = validateGuard.begin();
     const validateCmd = validateChoice === "__custom__"
       ? customValidate.trim()
       : config?.validate_cmds[+validateChoice]?.cmd ?? "";
     setValidating(true);
     setValidateResult(null);
-    const response = await postJson<ValidateResponse>("/api/validate", { repo, validate_cmd: validateCmd, validate_timeout: settings.validateTimeout });
-    if (!isCurrent()) return;
-    setValidating(false);
-    if (response.error) {
-      setValidateResult({ ok: false, text: `❌ ${response.error}`, tail: "" });
-      return;
+    try {
+      const response = await postJson<ValidateResponse>("/api/validate", { repo, validate_cmd: validateCmd, validate_timeout: settings.validateTimeout });
+      if (!mounted.current || !isCurrent()) return;
+      if (response.error) {
+        setValidateResult({ ok: false, text: `❌ ${response.error}`, tail: "" });
+        return;
+      }
+      setValidateResult({
+        ok: !!response.ok,
+        text: response.timeout ? `❌ 執行逾時（${response.timeout_seconds ?? settings.validateTimeout} 秒）` : response.ok ? "✅ Validate 通過（exit 0）" : `❌ Validate 失敗（exit ${response.rc ?? "?"}）`,
+        tail: response.tail ?? ""
+      });
+    } finally {
+      validatingPending.current = false;
+      if (mounted.current) setValidating(false);
+      endOperation(token);
     }
-    setValidateResult({
-      ok: !!response.ok,
-      text: response.timeout ? `❌ 執行逾時（${response.timeout_seconds ?? settings.validateTimeout} 秒）` : response.ok ? "✅ Validate 通過（exit 0）" : `❌ Validate 失敗（exit ${response.rc ?? "?"}）`,
-      tail: response.tail ?? ""
-    });
   };
 
-  const hasPendingLaunchMutation = !!goalFile || !!planJson.trim() || resetState || newBranch;
+  const hasPendingLaunchMutation = !!goalFile || !!planJson.trim() || resetState || newBranch || parallelMode;
   const preflightBlockedByDraft = hasPendingLaunchMutation || validateChoice === "__custom__";
   const canPreflight = !preflighting && !!repo && !repoStatus?.error && !hasPendingLaunchMutation && validateChoice !== "__custom__";
   const preflightHint = hasPendingLaunchMutation
@@ -300,56 +386,67 @@ export default function LauncherModal({
       ? "完整健檢只使用已儲存的 Validate 命令；請先把手寫命令加入清單"
       : "檢查目前 repo 的 git、單 writer lock、乾淨工作樹、已 commit 的 goal 與 Validate；不建立 state 或啟動 Agent";
   const runPreflight = async () => {
+    if (preflightingPending.current || validatingPending.current || launchingPending.current) return;
+    const token = beginOperation(`launcher:${resolvedWorkspaceName || "unknown"}:preflight`);
+    if (!token) return setMessage("❌ 另一個操作仍在進行中");
+    preflightingPending.current = true;
     const isCurrent = preflightGuard.begin();
     setPreflighting(true);
     setPreflightResult(null);
-    const response = await postJson<PreflightResponse>("/api/preflight", {
-      repo,
-      name: name.trim(),
-      validate_idx: +validateChoice,
-      validate_timeout: settings.validateTimeout
-    });
-    if (!isCurrent()) return;
-    setPreflighting(false);
-    if (response.error) {
-      setPreflightResult({ ok: false, text: `❌ ${response.error}`, tail: "" });
-      return;
+    try {
+      const response = await postJson<PreflightResponse>("/api/preflight", {
+        repo,
+        name: name.trim(),
+        validate_idx: +validateChoice,
+        validate_timeout: settings.validateTimeout
+      });
+      if (!mounted.current || !isCurrent()) return;
+      if (response.error) {
+        setPreflightResult({ ok: false, text: `❌ ${response.error}`, tail: "" });
+        return;
+      }
+      setPreflightResult({
+        ok: !!response.ok,
+        text: response.timeout ? `❌ 完整健檢逾時（${response.timeout_seconds ?? settings.validateTimeout + 15} 秒）` : response.ok ? "✅ 完整啟動前健檢通過" : `❌ 完整健檢未通過（exit ${response.rc ?? "?"}）`,
+        tail: response.tail ?? ""
+      });
+    } finally {
+      preflightingPending.current = false;
+      if (mounted.current) setPreflighting(false);
+      endOperation(token);
     }
-    setPreflightResult({
-      ok: !!response.ok,
-      text: response.timeout ? `❌ 完整健檢逾時（${response.timeout_seconds ?? settings.validateTimeout + 15} 秒）` : response.ok ? "✅ 完整啟動前健檢通過" : `❌ 完整健檢未通過（exit ${response.rc ?? "?"}）`,
-      tail: response.tail ?? ""
-    });
   };
 
   const repoMark = (value?: string) => value === "committed" ? "✅ 已 commit" : value === "modified" ? "⚠ 已修改未 commit" : value === "untracked" ? "⚠ 尚未 commit" : "❌ 缺少";
-  const selectedAgent = config?.agent_cmds[+agentIndex]?.cmd ?? "";
+  const selectedAgent = agentIndex === "" ? "" : config?.agent_cmds[+agentIndex]?.cmd ?? "";
   const selectedValidate = validateChoice === "__custom__" ? customValidate.trim() : config?.validate_cmds[+validateChoice]?.cmd ?? "";
+  const launcherBusy = launching || validating || preflighting || operationPending;
   const importedPlanCount = (() => { try { const value = JSON.parse(planJson); return Array.isArray(value) ? value.length : 0; } catch { return 0; } })();
   const launchChanges = [
     { label: "goal.md", before: repoStatus?.goal === "committed" ? "沿用已 commit 版本" : repoMark(repoStatus?.goal), after: goalFile ? `以 ${goalFile.name} 取代（${goalFile.size} bytes）` : "不變" },
     { label: "plan / phase", before: matchingWorkspace ? `${matchingWorkspace.plan_len ?? 0} tasks · ${matchingWorkspace.phase ?? "—"}` : "新 workspace", after: planJson.trim() ? `${importedPlanCount} tasks · ${startPhase}` : resetState ? "重建 state" : "沿用" },
     { label: "Agent", before: matchingWorkspace ? "已儲存設定" : "預設設定", after: selectedAgent || "—" },
     { label: "Validate", before: matchingWorkspace ? "已儲存設定" : "預設設定", after: `${selectedValidate || "—"} · ${settings.validateTimeout}s` },
-    { label: "收斂 / timeout", before: matchingWorkspace ? "現有 workspace 設定" : "預設設定", after: `flag>${settings.flagThreshold} · done≥${settings.doneThreshold} · round ${settings.roundTimeout}m · backoff ${settings.agentBackoffMax}s${settings.pauseAfterPlan ? " · 規劃後暫停" : ""}` },
-    { label: "Git branch", before: repoStatus?.branch || "detached / unknown", after: newBranch ? `建立 loop/${name.trim() || repo.split("/").filter(Boolean).slice(-1)[0] || "workspace"}` : "不切換" },
+    { label: "收斂 / timeout", before: matchingWorkspace ? "現有 workspace 設定" : "預設設定", after: `flag>${settings.flagThreshold} · done≥${settings.doneThreshold} · round ${settings.roundTimeout}m · backoff ${settings.agentBackoffMax}s · red ${settings.redLimit} · stall ${settings.stallLimit}${settings.pauseAfterPlan ? " · 規劃後暫停" : ""}` },
+    { label: "執行模式", before: "單一 loop", after: parallelMode ? `Parallel run · 最多 ${maxParallel} 軌 · child restart ${maxChildRestarts ? `≤${maxChildRestarts}` : "不限"}` : "單一 loop" },
+    { label: "Git branch", before: repoStatus?.branch || "detached / unknown", after: parallelMode ? `integration ref refs/heads/${repoStatus?.branch || "<current>"} + 隔離 worktrees` : newBranch ? `建立 loop/${name.trim() || repo.split("/").filter(Boolean).slice(-1)[0] || "workspace"}` : "不切換" },
   ];
   const footer = tab === "launch" ? (
     <>
-      <button type="button" className="secondary-button" onClick={onClose}>取消</button>
-      <button type="button" className="primary-button" onClick={launch} disabled={launching || !repo}>▶ 啟動</button>
+      <button type="button" className="secondary-button" disabled={launcherBusy} onClick={() => { if (!launchingPending.current && !validatingPending.current && !preflightingPending.current && !operationBlocked()) onClose(); }}>取消</button>
+      <button type="button" className="primary-button" onClick={launch} disabled={launcherBusy || !repo || !selectedAgent}>▶ 啟動</button>
       <span className="inline-message" role="status">{message}</span>
     </>
-  ) : <button type="button" className="secondary-button" onClick={onClose}>關閉</button>;
+  ) : <button type="button" className="secondary-button" disabled={launcherBusy} onClick={() => { if (!launchingPending.current && !validatingPending.current && !preflightingPending.current && !operationBlocked()) onClose(); }}>關閉</button>;
 
   return (
-    <Modal title="啟動與管理" description="建立新 loop，或查看由這個 dashboard 啟動的工作" onClose={onClose} wide footer={footer}>
+    <Modal title="啟動與管理" description="建立新 loop，或查看由這個 dashboard 啟動的工作" closeDisabled={launcherBusy} onClose={() => { if (!launchingPending.current && !validatingPending.current && !preflightingPending.current && !operationBlocked()) onClose(); }} wide footer={footer}>
       <div className="segmented-tabs" role="tablist">
-        <button type="button" role="tab" aria-selected={tab === "launch"} className={tab === "launch" ? "active" : ""} onClick={() => setTab("launch")} data-autofocus>啟動新 loop</button>
-        <button type="button" role="tab" aria-selected={tab === "jobs"} className={tab === "jobs" ? "active" : ""} onClick={() => setTab("jobs")}>執行中的 jobs</button>
+        <button type="button" role="tab" aria-selected={tab === "launch"} className={tab === "launch" ? "active" : ""} disabled={launcherBusy} onClick={() => setTab("launch")} data-autofocus>啟動新 loop</button>
+        <button type="button" role="tab" aria-selected={tab === "jobs"} className={tab === "jobs" ? "active" : ""} disabled={launcherBusy} onClick={() => setTab("jobs")}>執行中的 jobs</button>
       </div>
       {tab === "launch" ? (
-        <div className="form-grid launcher-form">
+        <fieldset className="form-grid launcher-form launcher-fieldset" disabled={launcherBusy}>
           <div className="form-field repo-select-field"><span>Repo</span><div className="command-select-row"><select aria-label="Repo" value={repoChoice} onChange={(event) => setRepoChoice(event.target.value)}>
                 {(config?.repos ?? []).map((item) => <option key={item} value={item}>{item}</option>)}
                 <option value="__custom__">手動輸入…</option>
@@ -362,11 +459,25 @@ export default function LauncherModal({
             <div className="field-label-row"><label htmlFor="goal-file">goal.md <span className="label-help">留空＝沿用 repo 已 commit 的版本</span></label><button type="button" className="text-button" title={promptTemplateUnavailableReason || undefined} disabled={!promptTemplateAvailable} onClick={() => setPromptTemplateMode("goal")}>產生 Goal Prompt</button></div>
             <input id="goal-file" type="file" accept=".md,.markdown,.txt" onChange={(event) => setGoalFile(event.target.files?.[0] ?? null)} />
           </div>
-          <PlanImportField value={planJson} onChange={setPlanJson} startPhase={startPhase} onStartPhaseChange={setStartPhase} onOpenPromptTemplate={() => setPromptTemplateMode("plan")} promptTemplateAvailable={promptTemplateAvailable} />
+          <PlanImportField value={planJson} onChange={(value) => {
+            setPlanJson(value);
+            const requiresParallel = planRequiresParallel(value);
+            if (requiresParallel) {
+              setParallelMode(true);
+              setNewBranch(false);
+              setResetState(false);
+              setStartPhase("exec");
+            } else if (parallelMode && value.trim()) {
+              setStartPhase("exec");
+            }
+          }} startPhase={startPhase} onStartPhaseChange={setStartPhase} onOpenPromptTemplate={() => setPromptTemplateMode("plan")} promptTemplateAvailable={promptTemplateAvailable} />
+          {parallelMode && <p className="field-help">留空時由 Agent 自動規劃；DR-2／診斷可匯入至少兩個一般 track 的 plan v2，並固定從 exec 開始。</p>}
           {promptTemplateUnavailableReason && <p className="field-error" role="alert">Prompt 模板停用：{promptTemplateUnavailableReason}</p>}
           <label>Workspace 名稱 <span className="label-help">留空＝repo 目錄名</span><input value={name} onChange={(event) => setName(event.target.value)} /></label>
+          <label className="checkbox-row"><input type="checkbox" disabled={importedPlanRequiresParallel} checked={parallelMode || importedPlanRequiresParallel} onChange={(event) => { setParallelMode(event.target.checked); if (event.target.checked) { setNewBranch(false); setResetState(false); if (planJson.trim()) setStartPhase("exec"); } }} />Parallel tracks（Agent 自動拆軌、worktree 隔離、CAS 合入）{importedPlanRequiresParallel && <span className="label-help">多軌／@final plan 必須使用 parallel</span>}</label>
+          {parallelMode && <div className="number-grid"><label>最大並行軌道<input type="number" min={1} max={8} value={maxParallel} onChange={(event) => setMaxParallel(+event.target.value)} /></label><label>Child restart 上限 <span className="label-help">0＝不限</span><input type="number" min={0} value={maxChildRestarts} onChange={(event) => setMaxChildRestarts(+event.target.value)} /></label></div>}
           <div className="form-columns command-columns">
-            <div className="form-field agent-command-field"><span className="field-label-row"><span>Agent 命令</span></span><div className="command-select-row"><select aria-label="Agent 命令" value={agentIndex} onChange={(event) => setAgentIndex(event.target.value)}>{(config?.agent_cmds ?? []).map((agent, index) => <option key={agent.cmd} value={index}>{agent.label} — {agent.cmd}</option>)}</select><button type="button" className="icon-button cli-gear-button" aria-label="管理 Agent CLI" disabled={!config || !repo || !!repoStatus?.error} onClick={() => setManagerModal("cli")}>⚙</button></div></div>
+            <div className="form-field agent-command-field"><span className="field-label-row"><span>Agent 命令</span></span><div className="command-select-row"><select aria-label="Agent 命令" value={agentIndex} onChange={(event) => { setAgentIndex(event.target.value); setTemplateAgentError(""); }}>{agentIndex === "" && <option value="" disabled>請重新選擇可用的 Agent CLI</option>}{(config?.agent_cmds ?? []).map((agent, index) => <option key={agent.cmd} value={index}>{agent.label} — {agent.cmd}</option>)}</select><button type="button" className="icon-button cli-gear-button" aria-label="管理 Agent CLI" disabled={!config || !repo || !!repoStatus?.error} onClick={() => setManagerModal("cli")}>⚙</button></div>{templateAgentError && <p className="field-error" role="alert">{templateAgentError}</p>}</div>
             <div className="form-field validate-command-field"><span className="field-label-row"><span>Validate 命令</span><span className="field-actions"><button type="button" className="secondary-button compact-button" disabled={validating || !repo || !!repoStatus?.error || (validateChoice === "__custom__" && !customValidate.trim())} onClick={() => void verifyValidate()}>{validating ? "執行中…" : "執行確認"}</button><button type="button" className="secondary-button compact-button" title={preflightHint} disabled={!canPreflight} onClick={() => void runPreflight()}>{preflighting ? "健檢中…" : "完整健檢"}</button></span></span><select aria-label="Validate 命令" value={validateChoice} onChange={(event) => { setValidateChoice(event.target.value); setValidateResult(null); }}>{(config?.validate_cmds ?? []).map((command, index) => <option key={command.cmd} value={index}>{command.label} — {command.cmd}</option>)}<option value="__custom__">手寫…</option></select></div>
           </div>
           {validateChoice === "__custom__" && <input value={customValidate} onChange={(event) => { setCustomValidate(event.target.value); setValidateResult(null); }} placeholder="mvn -q test" aria-label="自訂 Validate 命令" />}
@@ -378,8 +489,8 @@ export default function LauncherModal({
             <ExecutionSettingsFields value={settings}
               onChange={(patch) => setSettings((value) => ({ ...value, ...patch }))} />
             <label className="checkbox-row"><input type="checkbox" checked={settings.pauseAfterPlan} onChange={(event) => setSettings((value) => ({ ...value, pauseAfterPlan: event.target.checked }))} />規劃收斂後暫停：不自動進入執行期，需回 Dashboard 按「▶ 運行」開始執行</label>
-            <label className="checkbox-row"><input type="checkbox" checked={resetState} onChange={(event) => setResetState(event.target.checked)} />重置 workspace state（清除舊進度）</label>
-            <label className="checkbox-row"><input type="checkbox" checked={newBranch} onChange={(event) => setNewBranch(event.target.checked)} />在新 branch 跑（loop/&lt;workspace 名&gt;）</label>
+            <label className="checkbox-row"><input type="checkbox" disabled={parallelMode} checked={resetState} onChange={(event) => setResetState(event.target.checked)} />重置 workspace state（清除舊進度）</label>
+            <label className="checkbox-row"><input type="checkbox" disabled={parallelMode} checked={newBranch} onChange={(event) => setNewBranch(event.target.checked)} />在新 branch 跑（loop/&lt;workspace 名&gt;）</label>
             <div className="notify-entry-row"><button type="button" className="secondary-button" disabled={!config} onClick={() => setManagerModal("notify")}>🔔 管理終態通知</button><span className="label-help">{config?.notify_cmd ? `目前：${config.notify_cmd}` : "目前未設定通知"}</span></div>
           </details>
           <details className="launch-diff" open={hasPendingLaunchMutation}>
@@ -388,16 +499,21 @@ export default function LauncherModal({
               {launchChanges.map((change) => <div className="launch-diff-row" role="listitem" key={change.label}><strong>{change.label}</strong><span className="diff-before">− {change.before}</span><span className="diff-after">＋ {change.after}</span></div>)}
             </div>
           </details>
-        </div>
-      ) : <LauncherJobs />}
-      {managerModal === "cli" && config && <CliManagerModal config={config} repo={repo} onClose={() => setManagerModal(null)} onSaved={(next) => {
-        const selectedCommand = config.agent_cmds[+agentIndex]?.cmd;
+        </fieldset>
+      ) : <LauncherJobs operationPending={operationPending} beginOperation={beginOperation} endOperation={endOperation} />}
+      {managerModal === "cli" && config && <CliManagerModal config={config} repo={repo} beginOperation={beginOperation} endOperation={endOperation} onClose={() => setManagerModal(null)} onSaved={(next) => {
+        const selectedCommand = agentIndex === "" ? templateConfig?.agent_cmd : config.agent_cmds[+agentIndex]?.cmd;
         const nextIndex = next.agent_cmds.findIndex((agent) => agent.cmd === selectedCommand);
         setConfig(next);
-        setAgentIndex(String(nextIndex >= 0 ? nextIndex : 0));
+        if (nextIndex >= 0) {
+          setAgentIndex(String(nextIndex));
+          setTemplateAgentError("");
+        } else {
+          setAgentIndex("");
+        }
       }} />}
-      {managerModal === "notify" && config && <NotifyModal config={config} onClose={() => setManagerModal(null)} onSaved={setConfig} />}
-      {managerModal === "repoRoots" && config && <RepoRootsModal config={config} onClose={() => setManagerModal(null)} onSaved={(next) => {
+      {managerModal === "notify" && config && <NotifyModal config={config} beginOperation={beginOperation} endOperation={endOperation} onClose={() => setManagerModal(null)} onSaved={setConfig} />}
+      {managerModal === "repoRoots" && config && <RepoRootsModal config={config} beginOperation={beginOperation} endOperation={endOperation} onClose={() => setManagerModal(null)} onSaved={(next) => {
         setConfig(next);
         if (repo !== "" && next.repos.includes(repo)) return;
         setRepoChoice(next.repos[0] ?? "__custom__");

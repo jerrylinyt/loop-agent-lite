@@ -9,8 +9,10 @@
 跑法:  python3 -m unittest tests.test_guards      # 或  python3 tests/test_guards.py
 """
 import io
+import hashlib
 import json
 import os
+import re
 import select
 import signal
 import shlex
@@ -21,6 +23,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -34,7 +37,7 @@ from engine import work as W  # noqa: E402
 WORK_CMD = [sys.executable, "-m", "engine.work"]
 LOOP_CMD = [sys.executable, "-m", "engine.loop"]
 STATUS_CMD = [sys.executable, "-m", "engine.status"]
-WS_ROOT = REPO_ROOT / "workspace"
+WS_ROOT = Path(os.environ.get("LOOP_AGENT_WORKSPACE_ROOT", REPO_ROOT / "workspace"))
 
 
 def git(repo, *a):
@@ -191,7 +194,7 @@ class TestStateCheckpointRecovery(unittest.TestCase):
             finally:
                 L.WORKSPACE_ROOT = old_root
 
-    def test_dashboard_readonly_falls_back_without_repair_then_writable_repairs(self):
+    def test_dashboard_projection_and_mutation_load_do_not_repair_primary(self):
         with tempfile.TemporaryDirectory() as d:
             old_values = (L.WORKSPACE_ROOT, D.ROOT)
             try:
@@ -203,11 +206,22 @@ class TestStateCheckpointRecovery(unittest.TestCase):
                 ws.save_state(state)
                 ws.state_path.write_text("broken")
 
-                readonly, err = D.read_state("dashboard-recover", repair=False)
+                projected, err = D.read_state("dashboard-recover", repair=False)
                 self.assertIsNone(err)
-                self.assertEqual(readonly["round"], 23)
-                self.assertTrue(readonly["state_recovery_pending"])
+                self.assertEqual(projected["round"], 23)
+                self.assertTrue(projected["state_recovery_pending"])
                 self.assertEqual(ws.state_path.read_text(), "broken", "唯讀 Dashboard 不得修檔")
+
+                class Handler:
+                    error = None
+
+                    def _err(self, message, code=400):
+                        self.error = code, message
+
+                mutation_state = D._load_state_or_err(Handler(), "dashboard-recover")
+                self.assertTrue(mutation_state["state_recovery_pending"])
+                self.assertEqual(ws.state_path.read_text(), "broken",
+                                 "Dashboard mutation pre-read 不得在 writer lock 外修檔")
 
                 repaired, err = D.read_state("dashboard-recover", repair=True)
                 self.assertIsNone(err)
@@ -367,7 +381,7 @@ class TestRoundTelemetry(unittest.TestCase):
             repo = make_repo(root)
             workspace_root = root / "workspace"
             plan = root / "plan.json"
-            plan.write_text('[{"order": 1, "task": "implement feature"}]')
+            plan.write_text('[{"order": 1, "task": "implement feature", "track": "main"}]')
             agent = root / "progress_agent.py"
             agent.write_text(
                 "import sys\n"
@@ -668,7 +682,7 @@ class TestAbnormalRoundVoided(unittest.TestCase):
             repo = make_repo(root)
             workspace_root = root / "workspace"
             plan = root / "plan.json"
-            plan.write_text('[{"order": 1, "task": "only task"}]')
+            plan.write_text('[{"order": 1, "task": "only task", "track": "main"}]')
             agent = root / "agent.py"
             agent.write_text(
                 "import os, subprocess, sys\n"
@@ -704,13 +718,31 @@ class TestPauseAfterPlan(unittest.TestCase):
         def _err(self, msg, code=400):
             self.response = code, {"error": msg}
 
+    def test_fleet_resume_command_uses_all_frozen_runtime_settings(self):
+        command = D.fleet_resume_command("parallel", {"integration_worktree": "/repo", "config": {
+            "repo": "/repo", "goal": "goal.md", "agent_cmd": "agent", "validate_cmd": "validate",
+            "max_parallel": 7, "merge_threshold": 4, "done_threshold": 5, "flag_threshold": 6,
+            "red_limit": 31, "stall_limit": 401, "round_timeout": 9, "validate_timeout": 88,
+            "agent_backoff_max": 17, "max_child_restarts": 3, "pause_after_plan": True,
+            "notify_cmd": "notify", "plan_doc": "plan.md",
+        }})
+        pairs = dict(zip(command, command[1:]))
+        self.assertEqual(pairs["--max-parallel"], "7")
+        self.assertEqual(pairs["--red-limit"], "31")
+        self.assertEqual(pairs["--stall-limit"], "401")
+        self.assertEqual(pairs["--agent-backoff-max"], "17")
+        self.assertEqual(pairs["--max-child-restarts"], "3")
+        self.assertIn("--pause-after-plan", command)
+        self.assertEqual(pairs["--notify-cmd"], "notify")
+        self.assertEqual(pairs["--plan-doc"], "plan.md")
+
     def test_loop_pauses_at_exec_start_and_resumes_into_exec(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             repo = make_repo(root)
             workspace_root = root / "workspace"
             plan = root / "plan.json"
-            plan.write_text('[{"order": 1, "task": "only task"}]')
+            plan.write_text('[{"order": 1, "task": "only task", "track": "main"}]')
             agent = root / "agent.py"
             agent.write_text(
                 "import os, subprocess, sys\n"
@@ -790,16 +822,19 @@ class TestPauseAfterPlan(unittest.TestCase):
                 self.assertEqual(handler.response[0], 200, handler.response)
                 self.assertFalse(captured["pause_after_plan"])
                 # launch:表單未指定時落回團隊 defaults
+                ws = L.Workspace("pause-flag")
+                state = ws.fresh_state()
+                ws.save_state(state)
                 handler = self.ResponseCapture()
                 D.Handler.api_launch(handler, {
                     "repo": str(repo), "name": "pause-flag", "agent_idx": 0,
                     "validate_idx": 0,
+                    "workspace_generation": state["workspace_generation"],
                 })
                 self.assertEqual(handler.response[0], 200, handler.response)
                 self.assertTrue(captured["pause_after_plan"])
 
                 # run:從 state.config 帶回同一開關
-                ws = L.Workspace("pause-flag")
                 state = ws.fresh_state()
                 state["config"] = {
                     "repo": str(repo), "agent_cmd": "true", "validate_cmd": "true",
@@ -807,26 +842,80 @@ class TestPauseAfterPlan(unittest.TestCase):
                 }
                 ws.save_state(state)
                 handler = self.ResponseCapture()
-                D.Handler.api_run(handler, {"name": "pause-flag"})
+                D.Handler.api_run(handler, {
+                    "name": "pause-flag", "workspace_generation": state["workspace_generation"]})
                 self.assertEqual(handler.response[0], 200, handler.response)
                 self.assertTrue(captured["pause_after_plan"])
 
                 # edit-config:停止狀態可切換,下一次運行生效
                 handler = self.ResponseCapture()
                 D.Handler.api_edit_config(handler, {
-                    "name": "pause-flag", "pause_after_plan": False,
+                    "name": "pause-flag", "workspace_generation": state["workspace_generation"],
+                    "pause_after_plan": False,
                 })
                 self.assertEqual(handler.response[0], 200, handler.response)
                 self.assertIn("pause_after_plan=off", handler.response[1]["changed"])
                 saved = json.loads(ws.state_path.read_text(encoding="utf-8"))
                 self.assertFalse(saved["config"]["pause_after_plan"])
                 handler = self.ResponseCapture()
-                D.Handler.api_run(handler, {"name": "pause-flag"})
+                D.Handler.api_run(handler, {
+                    "name": "pause-flag", "workspace_generation": state["workspace_generation"]})
                 self.assertEqual(handler.response[0], 200, handler.response)
                 self.assertFalse(captured["pause_after_plan"])
             finally:
                 D.JOBS.pop("pause-flag", None)
                 D.ROOT, L.WORKSPACE_ROOT, D.load_config, D.spawn_loop = old_values
+
+    def test_launch_null_generation_rejects_fleet_and_legacy_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            workspace_root.mkdir()
+            goal = repo / "goal.md"
+            goal.write_text("original\n", encoding="utf-8")
+            git(repo, "add", "goal.md")
+            git(repo, "commit", "-m", "goal")
+            before_head = git(repo, "rev-parse", "HEAD").stdout.strip()
+            config = {
+                "agent_cmds": [{"label": "true", "cmd": "true"}],
+                "validate_cmds": [{"label": "true", "cmd": "true"}],
+                "extra_path_dirs": [], "notify_cmd": "", "defaults": {},
+            }
+            old_values = D.ROOT, L.WORKSPACE_ROOT, D.load_config
+            D.ROOT, L.WORKSPACE_ROOT = workspace_root, workspace_root
+            D.load_config = lambda: config
+            try:
+                fixtures = {
+                    "occupied-fleet": L.Workspace.__new__(L.Workspace).fresh_state(
+                        "fleet-parent", "a" * 32),
+                    "occupied-legacy": {"phase": "done", "loop": {"pid": None}},
+                }
+                for name, state in fixtures.items():
+                    with self.subTest(name=name):
+                        entry = workspace_root / name
+                        entry.mkdir()
+                        state_bytes = json.dumps(state, sort_keys=True).encode()
+                        (entry / "state.json").write_bytes(state_bytes)
+                        handler = self.ResponseCapture()
+                        with mock.patch.object(D, "spawn_loop") as spawn:
+                            D.Handler.api_launch(handler, {
+                                "repo": str(repo), "name": name, "agent_idx": 0,
+                                "validate_idx": 0, "workspace_generation": None,
+                                "new_branch": True, "goal_content": "replacement\n",
+                                "plan_json": json.dumps([
+                                    {"order": 1, "task": "do work", "track": "main"}]),
+                            })
+                        self.assertEqual(handler.response[0], 409, handler.response)
+                        spawn.assert_not_called()
+                        self.assertEqual((entry / "state.json").read_bytes(), state_bytes)
+                        self.assertEqual(goal.read_text(encoding="utf-8"), "original\n")
+                        self.assertEqual(git(repo, "rev-parse", "HEAD").stdout.strip(), before_head)
+                        branches = git(repo, "branch", "--format=%(refname:short)").stdout
+                        self.assertNotIn(f"loop/{name}", branches)
+                        self.assertNotIn(name, D.JOBS)
+            finally:
+                D.ROOT, L.WORKSPACE_ROOT, D.load_config = old_values
 
 
 class TestAgentFailureBackoff(unittest.TestCase):
@@ -1036,13 +1125,41 @@ class TestStateSchemaGuard(unittest.TestCase):
             finally:
                 L.WORKSPACE_ROOT = old_root
 
+    def test_invalid_phase_events_fail_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d)
+                invalid_events = (
+                    {"bad": True},
+                    [{"phase": "exec", "merge_stage": "unknown", "round": 1,
+                      "at": "2026-07-13T00:00:00+08:00"}],
+                    [{"phase": "exec", "merge_stage": None, "round": False,
+                      "at": "2026-07-13T00:00:00+08:00"}],
+                    [{"phase": "exec", "merge_stage": None, "round": 1, "at": ""}],
+                    [{"phase": "exec", "merge_stage": None, "round": 1,
+                      "at": "2026-07-13T00:00:00+08:00"}] * 501,
+                )
+                for index, events in enumerate(invalid_events):
+                    ws = L.Workspace(f"schema-phase-events-{index}")
+                    invalid = ws.fresh_state()
+                    invalid["phase_events"] = events
+                    data = json.dumps(invalid)
+                    ws.state_path.write_text(data, encoding="utf-8")
+                    ws.checkpoint_path.write_text(data, encoding="utf-8")
+                    with self.subTest(index=index), self.assertRaises(L.StateLoadError):
+                        ws.load_state()
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
     def test_invalid_plan_and_completed_entries_fail_closed(self):
         invalid_states = [
-            {"phase": "plan", "plan": [{"order": 0, "task": "bad"}]},
+            {"phase": "plan", "plan": [{"order": 0, "task": "bad", "track": "main"}]},
             {"phase": "plan", "plan": [
-                {"order": 1, "task": "one"}, {"order": 1, "task": "duplicate"},
+                {"order": 1, "task": "one", "track": "main"},
+                {"order": 1, "task": "duplicate", "track": "main"},
             ]},
-            {"phase": "plan", "plan": [{"order": 1, "task": "bad ref", "ref": 3}]},
+            {"phase": "plan", "plan": [{"order": 1, "task": "bad ref", "ref": 3, "track": "main"}]},
             {"phase": "exec", "completed": [None]},
             {"phase": "exec", "completed": [{"order": 1, "round": 1}]},
             {"phase": "exec", "completed": [{
@@ -1254,7 +1371,7 @@ class TestStatusCli(unittest.TestCase):
                 L.WORKSPACE_ROOT = root / "workspace"
                 ws = L.Workspace("cli-status")
                 state = ws.fresh_state()
-                state.update(round=4, plan=[{"order": 1, "task": "one"}], current_order=1,
+                state.update(round=4, plan=[{"order": 1, "task": "one", "track": "main"}], current_order=1,
                              last_round_seconds=1.25, last_round_timed_out=False)
                 ws.save_state(state)
                 ws.state_path.write_text("{broken", encoding="utf-8")
@@ -1273,6 +1390,58 @@ class TestStatusCli(unittest.TestCase):
                 self.assertFalse(payload["last_round_timed_out"])
                 self.assertTrue(payload["state_recovery_pending"])
                 self.assertEqual(ws.state_path.read_bytes(), before, "status CLI 不得修復 primary state")
+            finally:
+                L.WORKSPACE_ROOT = old_root
+
+    def test_fleet_parent_uses_fleet_truth_and_summary_excludes_child_duplicates(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_root = L.WORKSPACE_ROOT
+            try:
+                L.WORKSPACE_ROOT = Path(d) / "workspace"
+                run_id = "a" * 32
+                session_id = "b" * 32
+                parent = L.Workspace("parallel")
+                parent_state = parent.fresh_state()
+                parent_state.update(workspace_kind="fleet-parent", fleet_run_id=run_id,
+                                    plan=[{"order": 1, "task": "placeholder", "track": "backend"}])
+                parent.save_state(parent_state)
+                fleet = {
+                    "schema_version": 1, "workspace_kind": "fleet-parent", "run_id": run_id,
+                    "phase": "merging", "loop": {"pid": None, "session_id": session_id},
+                    "plan": [{"order": 1, "task": "backend", "track": "backend"},
+                             {"order": 2, "task": "final", "track": "@final"}],
+                    "tracks": [{"name": "backend", "status": "cleaned",
+                                "child_workspace": "parallel--backend"},
+                               {"name": "@final", "status": "pending"}],
+                }
+                (parent.dir / "fleet.json").write_text(json.dumps(fleet), encoding="utf-8")
+                child = L.Workspace("parallel--backend")
+                child_state = child.fresh_state()
+                child_state.update(workspace_kind="fleet-child", fleet_run_id=run_id,
+                                   fleet_parent="parallel", track="backend",
+                                   fleet_parent_session_id=session_id,
+                                   merge_target_ref="refs/heads/main",
+                                   issues=[{"round": 1, "text": "child finding",
+                                            "resolved": False}],
+                                   plan=[{"order": 1, "task": "backend", "track": "backend"}])
+                child.save_state(child_state)
+                env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(L.WORKSPACE_ROOT)}
+                result = subprocess.run([*STATUS_CMD, "--all", "--json"], capture_output=True,
+                                        text=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                payload = json.loads(result.stdout)
+                projected_parent = next(item for item in payload["workspaces"] if item["name"] == "parallel")
+                self.assertEqual(projected_parent["phase"], "merging")
+                self.assertEqual(projected_parent["completed"], 1)
+                self.assertEqual(projected_parent["plan_len"], 2)
+                self.assertEqual(projected_parent["parallel_tracks"][0]["status"], "cleaned")
+                self.assertEqual(payload["summary"]["workspace_count"], 2)
+                self.assertEqual(payload["summary"]["tasks_total"], 2)
+                self.assertEqual(payload["summary"]["tasks_completed"], 1)
+                self.assertEqual(payload["summary"]["executing"], 1)
+                self.assertEqual(payload["summary"]["error_count"], 0)
+                self.assertEqual(payload["summary"]["issues"], 1)
+                self.assertEqual(payload["summary"]["attention"], 1)
             finally:
                 L.WORKSPACE_ROOT = old_root
 
@@ -1680,14 +1849,14 @@ class TestLoopSignalIngestionGuards(unittest.TestCase):
                 L.WORKSPACE_ROOT = root / "workspace"
                 ws = L.Workspace("signals")
                 outside = root / "outside.json"
-                outside.write_text(json.dumps([{"order": 1, "task": "outside"}]), encoding="utf-8")
+                outside.write_text(json.dumps([{"order": 1, "task": "outside", "track": "main"}]), encoding="utf-8")
                 token = "a" * 32
                 (ws.dir / f"pending_plan.{token}.json").symlink_to(outside)
                 (ws.dir / f"signal_plan_ok.{token}").symlink_to(outside)
                 self.assertIsNone(ws.take_pending_plan(token))
                 self.assertFalse(ws.signal("signal_plan_ok", token))
                 self.assertEqual(outside.read_text(encoding="utf-8"),
-                                 json.dumps([{"order": 1, "task": "outside"}]))
+                                 json.dumps([{"order": 1, "task": "outside", "track": "main"}]))
             finally:
                 L.WORKSPACE_ROOT = old_root
 
@@ -1727,7 +1896,7 @@ class TestTransactionalReset(unittest.TestCase):
             snapshot_before = snapshot_path.read_bytes()
             previous = L.Workspace.__new__(L.Workspace).fresh_state()
             previous["round"] = 77
-            previous["plan"] = [{"order": 1, "task": "must survive failed reset"}]
+            previous["plan"] = [{"order": 1, "task": "must survive failed reset", "track": "main"}]
             previous["plan_version"] = 9
             state_path = workspace / "state.json"
             state_path.write_text(json.dumps(previous))
@@ -1765,7 +1934,7 @@ class TestTransactionalReset(unittest.TestCase):
             (workspace / "pending_issues").write_text("old crashed issue\n")
             previous = L.Workspace.__new__(L.Workspace).fresh_state()
             previous["round"] = 77
-            previous["plan"] = [{"order": 1, "task": "must be cleared"}]
+            previous["plan"] = [{"order": 1, "task": "must be cleared", "track": "main"}]
             previous["plan_version"] = 9
             (workspace / "state.json").write_text(json.dumps(previous))
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
@@ -1883,7 +2052,7 @@ class TestTransactionalDashboardPlanImport(unittest.TestCase):
             workspace.mkdir(parents=True)
             previous = L.Workspace.__new__(L.Workspace).fresh_state()
             previous["round"] = 77
-            previous["plan"] = [{"order": 1, "task": "old plan survives"}]
+            previous["plan"] = [{"order": 1, "task": "old plan survives", "track": "main"}]
             previous["plan_version"] = 4
             state_path = workspace / "state.json"
             state_path.write_text(json.dumps(previous))
@@ -1911,7 +2080,8 @@ class TestTransactionalDashboardPlanImport(unittest.TestCase):
                 handler = ResponseCapture()
                 D.Handler.api_launch(handler, {
                     "repo": str(repo), "name": "import-safe", "agent_idx": 0, "validate_idx": 0,
-                    "plan_json": '[{"order":1,"task":"new imported plan"}]', "start_phase": "plan",
+                    "workspace_generation": previous["workspace_generation"],
+                    "plan_json": '[{"order":1,"task":"new imported plan","track":"main"}]', "start_phase": "plan",
                 })
                 self.assertEqual(handler.response[0], 200)
                 job = D.JOBS["import-safe"]
@@ -1976,6 +2146,100 @@ class TestWorkspaceFleetValidity(unittest.TestCase):
             finally:
                 D.ROOT = old_root
 
+    def test_parent_ui_projection_aggregates_child_issues_with_navigation_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_id = "a" * 32
+            session_id = "1" * 32
+            parent, child = root / "parent", root / "parent--backend"
+            parent.mkdir(); child.mkdir()
+            parent_state = L.Workspace.__new__(L.Workspace).fresh_state("fleet-parent", run_id)
+            child_state = L.Workspace.__new__(L.Workspace).fresh_state("fleet-child", run_id)
+            child_state.update(fleet_parent="parent", track="backend", merge_target_ref="refs/heads/main",
+                               fleet_parent_session_id=session_id,
+                               issues=[{"round": 3, "where": "engine/a.py", "text": "repair me"}])
+            (parent / "state.json").write_text(json.dumps(parent_state), encoding="utf-8")
+            (child / "state.json").write_text(json.dumps(child_state), encoding="utf-8")
+            fleet = {"schema_version": 1, "workspace_kind": "fleet-parent", "run_id": run_id,
+                     "phase": "exec", "loop": {"pid": None, "session_id": session_id},
+                     "tracks": [{"name": "backend", "child_workspace": child.name,
+                                                    "status": "repairing"}]}
+            (parent / "fleet.json").write_text(json.dumps(fleet), encoding="utf-8")
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                projected, error = D.project_state_for_ui("parent")
+                self.assertIsNone(error)
+                self.assertEqual(projected["parallel_run"]["phase"], "exec")
+                self.assertEqual(projected["issues"][0]["track"], "backend")
+                self.assertEqual(projected["issues"][0]["child_workspace"], child.name)
+                summaries = D.list_workspaces()
+                child_summary = next(item for item in summaries if item["name"] == child.name)
+                self.assertEqual(child_summary["fleet_parent"], "parent")
+                self.assertEqual(child_summary["track"], "backend")
+            finally:
+                D.ROOT = old_root
+
+    def test_replacement_child_with_wrong_run_does_not_pollute_parent_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent, child = root / "parent", root / "parent--backend"
+            parent.mkdir(); child.mkdir()
+            run_id = "a" * 32
+            parent_state = L.Workspace.__new__(L.Workspace).fresh_state("fleet-parent", run_id)
+            replacement = L.Workspace.__new__(L.Workspace).fresh_state("fleet-child", "b" * 32)
+            replacement.update(fleet_parent="parent", track="backend",
+                               issues=[{"round": 1, "text": "replacement issue"}])
+            (parent / "state.json").write_text(json.dumps(parent_state), encoding="utf-8")
+            (child / "state.json").write_text(json.dumps(replacement), encoding="utf-8")
+            fleet = {"schema_version": 1, "workspace_kind": "fleet-parent", "run_id": run_id,
+                     "phase": "exec", "loop": {"pid": None},
+                     "tracks": [{"name": "backend", "child_workspace": child.name,
+                                 "status": "repairing"}]}
+            (parent / "fleet.json").write_text(json.dumps(fleet), encoding="utf-8")
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                projected, error = D.project_state_for_ui("parent")
+                self.assertIsNone(error)
+                self.assertEqual(projected["issues"], [])
+                parent_summary = next(item for item in D.list_workspaces()
+                                      if item["name"] == "parent")
+                self.assertEqual(parent_summary["issues"], 0)
+            finally:
+                D.ROOT = old_root
+
+    def test_child_from_previous_supervisor_session_does_not_pollute_parent_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent, child = root / "parent", root / "parent--backend"
+            parent.mkdir(); child.mkdir()
+            run_id = "a" * 32
+            parent_state = L.Workspace.__new__(L.Workspace).fresh_state("fleet-parent", run_id)
+            stale_child = L.Workspace.__new__(L.Workspace).fresh_state("fleet-child", run_id)
+            stale_child.update(
+                fleet_parent="parent", track="backend",
+                fleet_parent_session_id="1" * 32,
+                issues=[{"round": 1, "text": "previous-session issue"}],
+            )
+            (parent / "state.json").write_text(json.dumps(parent_state), encoding="utf-8")
+            (child / "state.json").write_text(json.dumps(stale_child), encoding="utf-8")
+            fleet = {
+                "schema_version": 1, "workspace_kind": "fleet-parent", "run_id": run_id,
+                "phase": "exec", "loop": {"pid": None, "session_id": "2" * 32},
+                "tracks": [{"name": "backend", "child_workspace": child.name,
+                            "status": "repairing"}],
+            }
+            (parent / "fleet.json").write_text(json.dumps(fleet), encoding="utf-8")
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                projected, error = D.project_state_for_ui("parent")
+                self.assertIsNone(error)
+                self.assertEqual(projected["issues"], [])
+            finally:
+                D.ROOT = old_root
+
 
 class TestFleetHealthProjection(unittest.TestCase):
     """fleet health 是唯讀、可供 API/SSE/UI 共用的聚合 projection。"""
@@ -1994,19 +2258,21 @@ class TestFleetHealthProjection(unittest.TestCase):
             root = Path(td)
             healthy = root / "healthy"
             healthy.mkdir()
-            (healthy / "state.json").write_text(json.dumps({
-                "phase": "done", "stall_rounds": 2, "red_streak": 1,
-            }), encoding="utf-8")
+            healthy_state = L.Workspace.__new__(L.Workspace).fresh_state()
+            healthy_state.update(phase="done", stall_rounds=2, red_streak=1)
+            (healthy / "state.json").write_text(json.dumps(healthy_state), encoding="utf-8")
             attention = root / "attention"
             attention.mkdir()
-            (attention / "state.json").write_text(json.dumps({
+            attention_state = L.Workspace.__new__(L.Workspace).fresh_state()
+            attention_state.update({
                 "phase": "exec", "red_streak": 2,
                 "issues": [{"round": 1, "text": "a"}, {"round": 2, "text": "b"}],
                 "agent_failure_streak": 3, "state_recovery_count": 4,
                 "last_round_seconds": 60.2, "last_round_timed_out": True,
                 "state_recovery_pending": True, "goal_changed": True,
                 "loop": {"pid": 99999999, "session_id": "stale", "started_at": "2026-07-10T20:00:00"},
-            }), encoding="utf-8")
+            })
+            (attention / "state.json").write_text(json.dumps(attention_state), encoding="utf-8")
             broken = root / "broken"
             broken.mkdir()
             (broken / "state.json").write_text("{broken", encoding="utf-8")
@@ -2053,6 +2319,42 @@ class TestFleetHealthProjection(unittest.TestCase):
         self.assertEqual(projection["status"], "ok")
         self.assertEqual(projection["workspace_count"], 0)
         self.assertEqual(projection["attention"], 0)
+
+    def test_parent_group_deduplicates_child_but_orphan_stays_visible(self):
+        items = [
+            {"name": "parent", "workspace_kind": "fleet-parent", "phase": "exec",
+             "fleet_run_id": "a" * 32,
+             "parallel_phase": "merging",
+             "parallel_tracks": [{"name": "backend", "status": "repairing",
+                                   "child_workspace": "parent--backend"}],
+             "issues": 2, "unread_issues": 2},
+            {"name": "parent--backend", "workspace_kind": "fleet-child", "fleet_parent": "parent",
+             "fleet_run_id": "a" * 32, "track": "backend",
+             "phase": "exec", "issues": 2, "unread_issues": 2},
+            {"name": "standalone", "workspace_kind": "standalone", "phase": "done",
+             "issues": 0, "unread_issues": 0},
+            {"name": "orphan--ui", "workspace_kind": "fleet-child", "fleet_parent": "missing",
+             "phase": "exec", "issues": 1, "unread_issues": 1},
+        ]
+        projection = D.fleet_health_projection(items)
+        self.assertEqual(projection["workspace_count"], 3)
+        self.assertEqual(projection["issues"], 3)
+        self.assertEqual(projection["attention"], 2)
+
+    def test_mismatched_run_child_remains_visible_in_health(self):
+        items = [
+            {"name": "parent", "workspace_kind": "fleet-parent",
+             "fleet_run_id": "a" * 32, "phase": "exec", "issues": 0},
+            {"name": "parent--old", "workspace_kind": "fleet-child",
+             "fleet_parent": "parent", "fleet_run_id": "b" * 32,
+             "phase": "exec", "running": True, "error": "replacement mismatch",
+             "issues": 1, "unread_issues": 1},
+        ]
+        projection = D.fleet_health_projection(items)
+        self.assertEqual(projection["workspace_count"], 2)
+        self.assertEqual(projection["running"], 1)
+        self.assertEqual(projection["error_count"], 1)
+        self.assertEqual(projection["issues"], 1)
 
 
 class TestHistoryRetention(unittest.TestCase):
@@ -2114,6 +2416,20 @@ class TestIssueRetention(unittest.TestCase):
                     else:
                         os.environ[key] = value
 
+    def test_ingested_issue_is_next_agent_context_without_becoming_a_human_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ws = L.Workspace.__new__(L.Workspace)
+            ws.dir = Path(directory)
+            ws.history = ws.dir / "history.log"
+            token = "next-agent-context"
+            pending = ws.dir / f"pending_issues.{token}"
+            pending.write_text("L4-DR2-ISSUE-SENTINEL\n", encoding="utf-8")
+            ws.pending_issues = lambda _token: pending
+            state = {"issues": [], "notes": []}
+            L.ingest_pending_issues(ws, state, token, 3, "task-1", "exec")
+            self.assertEqual(state["issues"][0]["text"], "L4-DR2-ISSUE-SENTINEL")
+            self.assertIn("下一輪 context，不是預設人工 gate", state["notes"][0])
+
 
 class TestIssueAcknowledgement(unittest.TestCase):
     """標記已讀只更新 round watermark；issue 稽核資料保留，新 round 仍會重新告警。"""
@@ -2146,7 +2462,9 @@ class TestIssueAcknowledgement(unittest.TestCase):
                 self.assertEqual(D.fleet_health_projection()["status"], "degraded")
 
                 handler = self.ResponseCapture()
-                D.Handler.api_edit_state(handler, {"name": "demo", "ack_issues": True})
+                D.Handler.api_edit_state(handler, {
+                    "name": "demo", "workspace_generation": state["workspace_generation"],
+                    "ack_issues": True})
                 self.assertEqual(handler.response[0], 200, handler.response)
                 saved, error = D.read_state("demo", repair=False)
                 self.assertIsNone(error)
@@ -2169,7 +2487,9 @@ class TestIssueAcknowledgement(unittest.TestCase):
                 self.assertEqual(D.fleet_health_projection()["status"], "degraded")
 
                 clear = self.ResponseCapture()
-                D.Handler.api_edit_state(clear, {"name": "demo", "clear_issues": True})
+                D.Handler.api_edit_state(clear, {
+                    "name": "demo", "workspace_generation": state["workspace_generation"],
+                    "clear_issues": True})
                 self.assertEqual(clear.response[0], 200, clear.response)
                 cleared, error = D.read_state("demo", repair=False)
                 self.assertIsNone(error)
@@ -2198,11 +2518,12 @@ class TestPendingPlanEditing(unittest.TestCase):
         state = L.Workspace.__new__(L.Workspace).fresh_state()
         state.update(
             phase="exec", plan_version=7, current_order=2,
-            plan=[{"order": order, "task": f"task {order}", "ref": None}
+            plan=[{"order": order, "task": f"task {order}", "ref": None, "track": "main"}
                   for order in range(1, 5)],
             completed=[{"order": 1, "sha": "a" * 40, "round": 2}],
             task_reset_counts={"1": 1, "3": 4},
         )
+        self.generation = state["workspace_generation"]
         D.write_state("demo", state)
 
     def tearDown(self):
@@ -2212,16 +2533,28 @@ class TestPendingPlanEditing(unittest.TestCase):
     def call(self, tasks, version=7):
         handler = self.ResponseCapture()
         D.Handler.api_edit_state(handler, {
-            "name": "demo", "plan_edit": True, "plan_version": version, "tasks": tasks,
+            "name": "demo", "workspace_generation": self.generation,
+            "plan_edit": True, "plan_version": version, "tasks": tasks,
         })
         return handler.response
 
+    def test_standalone_edit_rejects_external_writer_lock_without_state_change(self):
+        before = (self.root / "demo" / "state.json").read_bytes()
+        handler = self.ResponseCapture()
+        with D.locked_workspace_entry("demo", (".run.lock",)):
+            D.Handler.api_edit_state(handler, {
+                "name": "demo", "workspace_generation": self.generation,
+                "done_count": 9,
+            })
+        self.assertEqual(handler.response[0], 409, handler.response)
+        self.assertEqual((self.root / "demo" / "state.json").read_bytes(), before)
+
     def test_reorders_deletes_and_inserts_only_after_current_task(self):
         response = self.call([
-            {"order": 1, "task": "task 1", "ref": None},
-            {"order": 2, "task": "task 2", "ref": None},
-            {"order": 4, "task": "task 4 moved", "ref": None},
-            {"order": None, "task": "inserted task", "ref": "spec.md"},
+            {"order": 1, "task": "task 1", "ref": None, "track": "main"},
+            {"order": 2, "task": "task 2", "ref": None, "track": "main"},
+            {"order": 4, "task": "task 4 moved", "ref": None, "track": "main"},
+            {"order": None, "task": "inserted task", "ref": "spec.md", "track": "main"},
         ])
         self.assertEqual(response[0], 200, response)
         saved, error = D.read_state("demo", repair=False)
@@ -2237,28 +2570,227 @@ class TestPendingPlanEditing(unittest.TestCase):
 
     def test_rejects_locked_task_move_and_stale_plan_version(self):
         moved = self.call([
-            {"order": 2, "task": "task 2", "ref": None},
-            {"order": 1, "task": "task 1", "ref": None},
-            {"order": 3, "task": "task 3", "ref": None},
-            {"order": 4, "task": "task 4", "ref": None},
+            {"order": 2, "task": "task 2", "ref": None, "track": "main"},
+            {"order": 1, "task": "task 1", "ref": None, "track": "main"},
+            {"order": 3, "task": "task 3", "ref": None, "track": "main"},
+            {"order": 4, "task": "task 4", "ref": None, "track": "main"},
         ])
         self.assertEqual(moved[0], 400)
         self.assertIn("不可移動", moved[1]["error"])
         stale = self.call([
-            {"order": order, "task": f"task {order}", "ref": None}
+            {"order": order, "task": f"task {order}", "ref": None, "track": "main"}
             for order in range(1, 5)
         ], version=6)
         self.assertEqual(stale[0], 409)
         self.assertIn("請重新載入", stale[1]["error"])
 
         modified = self.call([
-            {"order": 1, "task": "改寫已完成任務", "ref": None},
-            {"order": 2, "task": "task 2", "ref": None},
-            {"order": 3, "task": "task 3", "ref": None},
-            {"order": 4, "task": "task 4", "ref": None},
+            {"order": 1, "task": "改寫已完成任務", "ref": None, "track": "main"},
+            {"order": 2, "task": "task 2", "ref": None, "track": "main"},
+            {"order": 3, "task": "task 3", "ref": None, "track": "main"},
+            {"order": 4, "task": "task 4", "ref": None, "track": "main"},
         ])
         self.assertEqual(modified[0], 400)
         self.assertIn("不可修改內容", modified[1]["error"])
+
+    def test_awaiting_approval_parent_edits_fleet_truth_and_rehashes(self):
+        run_id = "b" * 32
+        parent = self.root / "parallel"
+        parent.mkdir()
+        plan = [
+            {"order": 1, "task": "backend old", "ref": None, "track": "backend"},
+            {"order": 2, "task": "frontend old", "ref": None, "track": "frontend"},
+        ]
+        state = L.Workspace.__new__(L.Workspace).fresh_state("fleet-parent", run_id)
+        state.update(phase="exec", plan=plan, plan_version=4, current_order=1)
+        D.write_state("parallel", state)
+        fleet = {"schema_version": 1, "workspace_kind": "fleet-parent", "run_id": run_id,
+                 "phase": "awaiting-approval", "plan": plan, "plan_generation": 4,
+                 "plan_sha256": "old", "tracks": [], "order_map": {}, "loop": {"pid": None}}
+        (parent / "fleet.json").write_text(json.dumps(fleet), encoding="utf-8")
+        handler = self.ResponseCapture()
+        tasks = [
+            {"order": 2, "task": "frontend first", "ref": None, "track": "frontend"},
+            {"order": 1, "task": "backend second", "ref": None, "track": "backend",
+             "scope": ["engine/**"]},
+            {"order": None, "task": "final checks", "ref": None, "track": "@final"},
+        ]
+        D.Handler.api_edit_state(handler, {"name": "parallel", "run_id": run_id, "plan_edit": True,
+                                           "plan_version": 4, "tasks": tasks})
+        self.assertEqual(handler.response[0], 200, handler.response)
+        updated = json.loads((parent / "fleet.json").read_text(encoding="utf-8"))
+        checkpoint = json.loads((parent / "fleet.last-good.json").read_text(encoding="utf-8"))
+        self.assertEqual(checkpoint, updated)
+        self.assertEqual(updated["plan_generation"], 5)
+        self.assertEqual([task["order"] for task in updated["plan"]], [1, 2, 3])
+        self.assertEqual(updated["plan"][0]["task"], "frontend first")
+        raw = json.dumps(updated["plan"], ensure_ascii=False, separators=(",", ":")).encode()
+        self.assertEqual(updated["plan_sha256"], __import__("hashlib").sha256(raw).hexdigest())
+        projected, error = D.project_state_for_ui("parallel")
+        self.assertIsNone(error)
+        self.assertEqual(projected["plan_version"], 5)
+        self.assertEqual(projected["plan"], updated["plan"])
+
+        (parent / "fleet.json").write_text("{broken", encoding="utf-8")
+        recovered = D.read_parallel_run("parallel")
+        self.assertTrue(recovered["fleet_recovery_pending"])
+        self.assertEqual(recovered["plan"], updated["plan"])
+
+        stale = self.ResponseCapture()
+        D.Handler.api_edit_state(stale, {"name": "parallel", "run_id": run_id, "plan_edit": True,
+                                         "plan_version": 4, "tasks": tasks})
+        self.assertEqual(stale.response[0], 409)
+        self.assertIn("請重新載入", stale.response[1]["error"])
+
+    def test_stopped_parent_config_updates_fleet_truth_with_run_guard(self):
+        run_id = "d" * 32
+        parent = self.root / "parallel-config"
+        parent.mkdir()
+        config = {"repo": "/repo", "agent_cmd": "agent", "validate_cmd": "true",
+                  "max_parallel": 4, "max_child_restarts": 0, "round_timeout": 30}
+        state = L.Workspace.__new__(L.Workspace).fresh_state("fleet-parent", run_id)
+        state["config"] = config
+        D.write_state("parallel-config", state)
+        fleet = {"schema_version": 1, "workspace_kind": "fleet-parent", "run_id": run_id,
+                 "phase": "stopped", "resume_phase": "exec", "plan": [], "tracks": [],
+                 "config": config, "loop": {"pid": None}}
+        (parent / "fleet.json").write_text(json.dumps(fleet), encoding="utf-8")
+        old_load = D.load_config
+        D.load_config = lambda: {"agent_cmds": [{"label": "agent", "cmd": "agent"}],
+                                 "defaults": {}, "extra_path_dirs": []}
+        try:
+            stale = self.ResponseCapture()
+            D.Handler.api_edit_config(stale, {"name": "parallel-config", "run_id": "e" * 32,
+                                              "max_parallel": 6})
+            self.assertEqual(stale.response[0], 409)
+            handler = self.ResponseCapture()
+            D.Handler.api_edit_config(handler, {"name": "parallel-config", "run_id": run_id,
+                                                "max_parallel": 6, "max_child_restarts": 2,
+                                                "round_timeout": 8})
+            self.assertEqual(handler.response[0], 200, handler.response)
+            saved = json.loads((parent / "fleet.json").read_text(encoding="utf-8"))["config"]
+            checkpoint = json.loads(
+                (parent / "fleet.last-good.json").read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint["config"], saved)
+            self.assertEqual(saved["max_parallel"], 6)
+            self.assertEqual(saved["max_child_restarts"], 2)
+            self.assertEqual(saved["round_timeout"], 8)
+            projected, error = D.project_state_for_ui("parallel-config")
+            self.assertIsNone(error)
+            self.assertEqual(projected["config"], saved)
+            (parent / "fleet.json").write_text("{broken", encoding="utf-8")
+            recovered = D.read_parallel_run("parallel-config")
+            self.assertTrue(recovered["fleet_recovery_pending"])
+            self.assertEqual(recovered["config"], saved)
+        finally:
+            D.load_config = old_load
+
+    def test_fleet_dashboard_transaction_rolls_back_each_partial_write(self):
+        run_id = "f" * 32
+        parent = self.root / "fleet-transaction"
+        parent.mkdir()
+        old_state = L.Workspace.__new__(L.Workspace).fresh_state("fleet-parent", run_id)
+        old_state.update(phase="exec", plan=[], plan_version=0,
+                         config={"repo": "/repo", "agent_cmd": "agent",
+                                 "validate_cmd": "true"})
+        D.write_state("fleet-transaction", old_state)
+        old_fleet = {
+            "schema_version": 1, "workspace_kind": "fleet-parent", "run_id": run_id,
+            "phase": "stopped", "resume_phase": "exec", "plan": [],
+            "plan_generation": 0, "plan_sha256": None, "dashboard_revision": 0,
+            "tracks": [], "merge_queue": [], "config": old_state["config"],
+            "loop": {"pid": None},
+        }
+        old_fleet_data = json.dumps(old_fleet, ensure_ascii=False, indent=2).encode()
+        for filename in ("fleet.json", "fleet.last-good.json"):
+            (parent / filename).write_bytes(old_fleet_data)
+        old_bytes = {path.name: path.read_bytes() for path in (
+            parent / "fleet.json", parent / "fleet.last-good.json",
+            parent / "state.json", parent / "state.last-good.json")}
+        new_fleet = json.loads(json.dumps(old_fleet))
+        new_fleet["dashboard_revision"] = 1
+        new_fleet["config"]["validate_cmd"] = "false"
+        new_state = json.loads(json.dumps(old_state))
+        new_state["config"] = new_fleet["config"]
+        new_state["fleet_truth_revision"] = 1
+
+        for failed_stage in ("after-fleet.json", "after-fleet.last-good.json",
+                             "after-state.json", "after-state.last-good.json"):
+            with self.subTest(stage=failed_stage):
+                for filename, data in old_bytes.items():
+                    (parent / filename).write_bytes(data)
+
+                def fail_at(stage, _name):
+                    if stage == failed_stage:
+                        raise RuntimeError(f"fault {stage}")
+
+                with mock.patch.object(D, "_fleet_edit_fault_hook", side_effect=fail_at):
+                    with self.assertRaisesRegex(RuntimeError, "fault"):
+                        D.write_parallel_dashboard_transaction(
+                            "fleet-transaction", new_fleet, new_state)
+                for filename, data in old_bytes.items():
+                    self.assertEqual((parent / filename).read_bytes(), data, filename)
+                projected = D.read_parallel_run("fleet-transaction")
+                self.assertNotIn("read_error", projected)
+                self.assertEqual(projected["dashboard_revision"], 0)
+
+    def test_fleet_dashboard_transaction_abrupt_exit_keeps_one_matching_pair(self):
+        run_id = "c" * 32
+        parent = self.root / "fleet-crash-transaction"
+        parent.mkdir()
+        old_state = L.Workspace.__new__(L.Workspace).fresh_state("fleet-parent", run_id)
+        old_state.update(phase="exec", plan=[], plan_version=0,
+                         config={"repo": "/repo", "agent_cmd": "agent",
+                                 "validate_cmd": "true"})
+        self.assertEqual(old_state["fleet_truth_revision"], 0)
+        D.write_state("fleet-crash-transaction", old_state)
+        old_fleet = {
+            "schema_version": 1, "workspace_kind": "fleet-parent", "run_id": run_id,
+            "phase": "stopped", "resume_phase": "exec", "plan": [],
+            "plan_generation": 0, "plan_sha256": None, "dashboard_revision": 0,
+            "tracks": [], "merge_queue": [], "config": old_state["config"],
+            "loop": {"pid": None},
+        }
+        old_fleet_data = json.dumps(old_fleet, ensure_ascii=False, indent=2).encode()
+        for filename in ("fleet.json", "fleet.last-good.json"):
+            (parent / filename).write_bytes(old_fleet_data)
+        baseline = {path.name: path.read_bytes() for path in (
+            parent / "fleet.json", parent / "fleet.last-good.json",
+            parent / "state.json", parent / "state.last-good.json")}
+        script = "\n".join((
+            "import json, os",
+            "from pathlib import Path",
+            "from engine import dashboard as D",
+            "D.ROOT = Path(os.environ['TX_ROOT'])",
+            "name = 'fleet-crash-transaction'",
+            "parent = D.ROOT / name",
+            "fleet = json.loads((parent / 'fleet.json').read_text())",
+            "state = json.loads((parent / 'state.json').read_text())",
+            "fleet['dashboard_revision'] = 1",
+            "fleet['config']['validate_cmd'] = 'false'",
+            "state['fleet_truth_revision'] = 1",
+            "state['config'] = fleet['config']",
+            "def crash(stage, _name):",
+            "    if stage == os.environ['TX_STAGE']:",
+            "        os._exit(97)",
+            "D._fleet_edit_fault_hook = crash",
+            "D.write_parallel_dashboard_transaction(name, fleet, state)",
+        ))
+        for stage, expected_revision in (
+                ("after-fleet.json", 0), ("after-state.json", 1),
+                ("after-fleet.last-good.json", 1),
+                ("after-state.last-good.json", 1)):
+            with self.subTest(stage=stage):
+                for filename, data in baseline.items():
+                    (parent / filename).write_bytes(data)
+                env = {**os.environ, "TX_ROOT": str(self.root), "TX_STAGE": stage,
+                       "PYTHONPATH": str(REPO_ROOT)}
+                result = subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT,
+                                        env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 97, result.stdout + result.stderr)
+                projected = D.read_parallel_run("fleet-crash-transaction")
+                self.assertNotIn("read_error", projected)
+                self.assertEqual(projected["dashboard_revision"], expected_revision)
 
 
 class TestStopIdempotency(unittest.TestCase):
@@ -2275,6 +2807,307 @@ class TestStopIdempotency(unittest.TestCase):
         D.Handler.api_stop(handler, {"name": "verifytmp-not-running"})
         self.assertEqual(handler.response[0], 200)
         self.assertTrue(handler.response[1]["already_stopped"])
+
+
+class TestExternalStandaloneStopIdentity(unittest.TestCase):
+    """External stop must bind state session to one exact OS process instance."""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    @staticmethod
+    def state(pid=4242):
+        value = L.Workspace.__new__(L.Workspace).fresh_state("standalone")
+        value["config"] = {"repo": "/tmp/external-repo", "agent_cmd": "agent",
+                           "validate_cmd": "true"}
+        value["loop"] = {"pid": pid, "session_id": "a" * 32,
+                         "started_at": "2026-07-13T12:00:00"}
+        return value
+
+    @staticmethod
+    def process(*, started="Mon Jul 13 12:00:00 2026", name="external-demo",
+                repo="/tmp/external-repo"):
+        return {"ppid": 1, "started": started,
+                "command": (f"python -m engine.loop --repo {repo} "
+                            f"--name {name} --agent-cmd agent --validate-cmd true")}
+
+    def call_stop(self, state, snapshots):
+        handler = self.ResponseCapture()
+        with mock.patch.object(D, "read_state", return_value=(state, None)), \
+                mock.patch.object(D, "freeze_workspace_stop_identity", return_value={}), \
+                mock.patch.object(D, "cleanup_frozen_runtime_group",
+                                  return_value=(True, None, 200)), \
+                mock.patch.object(D, "_process_snapshot", side_effect=snapshots), \
+                mock.patch.object(D, "workspace_console_log"), \
+                mock.patch.object(D.os, "kill") as send_signal:
+            D.Handler.api_stop(handler, {
+                "name": "external-demo",
+                "workspace_generation": state["workspace_generation"],
+                "expected_pid": state["loop"]["pid"],
+            })
+        return handler.response, send_signal.call_args_list
+
+    def test_wrong_workspace_process_with_same_pid_is_not_signaled(self):
+        state = self.state()
+        response, signals = self.call_stop(
+            state, [{4242: self.process(name="other-workspace")}])
+        self.assertEqual(response[0], 409, response)
+        self.assertIn("另一個程序或 workspace", response[1]["error"])
+        self.assertEqual(signals, [])
+
+    def test_pid_reuse_during_grace_never_receives_force_signal(self):
+        state = self.state()
+        original = {4242: self.process()}
+        reused = {4242: self.process(started="Mon Jul 13 12:00:01 2026")}
+        response, signals = self.call_stop(state, [original, original, reused])
+        self.assertEqual(response[0], 409, response)
+        self.assertIn("停止期間已被重用", response[1]["error"])
+        self.assertEqual(signals, [mock.call(4242, signal.SIGINT)])
+
+    def test_valid_external_process_gets_sigint_and_clean_success(self):
+        state = self.state()
+        original = {4242: self.process()}
+        response, signals = self.call_stop(state, [original, original, {}])
+        self.assertEqual(response[0], 200, response)
+        self.assertTrue(response[1]["external"])
+        self.assertEqual(signals, [mock.call(4242, signal.SIGINT)])
+
+
+class TestStopRuntimeGroupCleanup(unittest.TestCase):
+    @staticmethod
+    def process(pid, pgid, started, command):
+        return {"ppid": 1, "pgid": pgid, "sid": pgid,
+                "started": started, "command": command}
+
+    @staticmethod
+    def markers(root="/tmp/root", repo="/tmp/repo", name="demo"):
+        coordinator = {
+            "schema_version": L.ACTIVE_RUNTIME_SCHEMA_VERSION,
+            "workspace_name": name, "workspace_root": root, "repo": repo,
+            "workspace_generation": "a" * 32, "session_id": "b" * 32,
+            "pid": 100, "started": "owner-start", "command": (
+                f"python -m engine.loop --repo {repo} --name {name}"),
+        }
+        active = {
+            "schema_version": L.ACTIVE_RUNTIME_SCHEMA_VERSION, "kind": "agent",
+            "workspace_name": name, "workspace_root": root, "repo": repo,
+            "workspace_generation": "a" * 32, "session_id": "b" * 32,
+            "owner_pid": 100, "owner_started": "owner-start",
+            "owner_command": coordinator["command"],
+            "pid": 200, "pgid": 200, "sid": 200,
+            "started": "runtime-start", "command": "runtime-wrapper",
+            "target_command": "agent --work",
+        }
+        return coordinator, active
+
+    def test_external_stop_requires_current_root_scoped_coordinator_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "root"
+            repo = Path(directory) / "repo"
+            (root / "demo").mkdir(parents=True)
+            repo.mkdir()
+            state = L.Workspace.__new__(L.Workspace).fresh_state("standalone")
+            state["config"] = {"repo": str(repo)}
+            state["loop"] = {"pid": 100, "session_id": "b" * 32}
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                with mock.patch.object(D, "_process_snapshot", return_value={}):
+                    with self.assertRaisesRegex(D.RuntimeStopIdentityError, "缺少目前 workspace root"):
+                        D.freeze_workspace_stop_identity(
+                            "demo", repo, 100, state=state,
+                            require_coordinator_marker=True)
+                coordinator, _active = self.markers(
+                    root=str(Path(directory) / "other-root"), repo=str(repo))
+                L.atomic_write_bytes(root / "demo" / L.COORDINATOR_RUNTIME_FILE,
+                                     json.dumps(coordinator).encode())
+                with mock.patch.object(D, "_process_snapshot", return_value={}):
+                    with self.assertRaisesRegex(D.RuntimeStopIdentityError, "root/repo/PID"):
+                        D.freeze_workspace_stop_identity(
+                            "demo", repo, 100, state=state,
+                            require_coordinator_marker=True)
+            finally:
+                D.ROOT = old_root
+
+    def test_hung_runtime_group_is_signaled_and_must_be_empty(self):
+        coordinator, active = self.markers()
+        frozen = {"entry": Path("/tmp/root/demo"), "coordinator": coordinator,
+                  "active": active}
+        original = {200: self.process(200, 200, "runtime-start", "runtime-wrapper")}
+        with mock.patch.object(D, "_read_runtime_marker",
+                               side_effect=[coordinator, active]), \
+                mock.patch.object(D, "_process_snapshot",
+                                  side_effect=[original, original, original, {}]), \
+                mock.patch.object(D.os, "killpg") as killpg:
+            result = D.cleanup_frozen_runtime_group(
+                frozen, grace_seconds=0, force_seconds=0)
+        self.assertEqual(result, (True, None, 200))
+        self.assertEqual(killpg.call_args_list,
+                         [mock.call(200, signal.SIGINT), mock.call(200, signal.SIGKILL)])
+
+    def test_runtime_pgid_reuse_during_grace_is_not_force_killed(self):
+        coordinator, active = self.markers()
+        frozen = {"entry": Path("/tmp/root/demo"), "coordinator": coordinator,
+                  "active": active}
+        original = {200: self.process(200, 200, "runtime-start", "runtime-wrapper")}
+        reused = {200: self.process(200, 200, "replacement-start", "runtime-wrapper")}
+        with mock.patch.object(D, "_read_runtime_marker",
+                               side_effect=[coordinator, active]), \
+                mock.patch.object(D, "_process_snapshot",
+                                  side_effect=[original, original, reused]), \
+                mock.patch.object(D.os, "killpg") as killpg:
+            ok, message, code = D.cleanup_frozen_runtime_group(
+                frozen, grace_seconds=0, force_seconds=0)
+        self.assertFalse(ok)
+        self.assertEqual(code, 409)
+        self.assertIn("force 前", message)
+        self.assertEqual(killpg.call_args_list, [mock.call(200, signal.SIGINT)])
+
+    def test_replacement_runtime_marker_is_preserved_without_signal(self):
+        coordinator, active = self.markers()
+        replacement = dict(active, session_id="c" * 32, pid=300, pgid=300, sid=300,
+                           started="replacement-start")
+        frozen = {"entry": Path("/tmp/root/demo"), "coordinator": coordinator,
+                  "active": active}
+        snapshot = {300: self.process(300, 300, "replacement-start", "runtime-wrapper")}
+        with mock.patch.object(D, "_read_runtime_marker",
+                               side_effect=[coordinator, replacement]), \
+                mock.patch.object(D, "_process_snapshot", return_value=snapshot), \
+                mock.patch.object(D.os, "killpg") as killpg:
+            ok, _message, code = D.cleanup_frozen_runtime_group(frozen)
+        self.assertFalse(ok)
+        self.assertEqual(code, 409)
+        killpg.assert_not_called()
+
+    def test_job_stop_forces_hung_coordinator_then_verifies_runtime_cleanup(self):
+        coordinator, active = self.markers()
+        frozen = {"entry": Path("/tmp/root/demo"), "coordinator": coordinator,
+                  "active": active}
+
+        class HungProcess:
+            pid = 100
+
+            def __init__(self):
+                self.running = True
+                self.signals = []
+
+            def poll(self):
+                return None if self.running else -9
+
+            def send_signal(self, value):
+                self.signals.append(value)
+
+            def wait(self, timeout=None):
+                if timeout == 8:
+                    raise subprocess.TimeoutExpired(["coordinator"], timeout)
+                self.running = False
+                return -9
+
+        process = HungProcess()
+        job = D.Job.__new__(D.Job)
+        job.name, job.repo, job.popen, job.kind = "demo", "/tmp/repo", process, "loop"
+        job.last_stop_error, job.last_stop_code = None, 500
+        snapshot = {100: self.process(100, 100, "owner-start", coordinator["command"])}
+        with mock.patch.object(D, "read_state", return_value=(None, "missing")), \
+                mock.patch.object(D, "freeze_workspace_stop_identity", return_value=frozen), \
+                mock.patch.object(D, "_process_snapshot", return_value=snapshot), \
+                mock.patch.object(D.os, "getpgid", return_value=100), \
+                mock.patch.object(D.os, "killpg") as killpg, \
+                mock.patch.object(D, "cleanup_frozen_runtime_group",
+                                  return_value=(True, None, 200)) as cleanup:
+            self.assertTrue(job.stop(wait=True))
+        self.assertEqual(process.signals, [signal.SIGINT])
+        killpg.assert_called_once_with(100, signal.SIGKILL)
+        cleanup.assert_called_once_with(frozen)
+
+    def test_dashboard_shutdown_root_sweep_failure_propagates(self):
+        server = mock.Mock()
+        server.serve_forever.return_value = None
+        old_jobs = D.JOBS
+        D.JOBS = {}
+        try:
+            with mock.patch.object(D, "dashboard_instance_lease"), \
+                    mock.patch.object(D, "load_config", return_value={}), \
+                    mock.patch.object(D, "DashboardServer", return_value=server), \
+                    mock.patch.object(D.signal, "signal"), \
+                    mock.patch.object(
+                        D, "stop_workspace_coordinators",
+                        side_effect=[{"requested": 0, "forced": 0, "remaining": []},
+                                     RuntimeError("runtime remains")]):
+                with self.assertRaisesRegex(RuntimeError, "root-scoped runtime 清場失敗"):
+                    D.run_dashboard(port=18765)
+            server.server_close.assert_called_once()
+        finally:
+            D.JOBS = old_jobs
+
+    def test_markerless_job_cleans_child_that_ignores_group_sigint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            workspace_root = base / "workspace"
+            workspace_root.mkdir()
+            ready = base / "child-ready"
+            child_pid_path = base / "child-pid"
+            child_code = (
+                "import os,signal,time\n"
+                "from pathlib import Path\n"
+                "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+                f"Path({str(child_pid_path)!r}).write_text(str(os.getpid()))\n"
+                f"Path({str(ready)!r}).write_text('ready')\n"
+                "time.sleep(60)\n"
+            )
+            leader_code = (
+                "import signal,subprocess,sys,time\n"
+                f"subprocess.Popen([sys.executable,'-c',{child_code!r}])\n"
+                "signal.signal(signal.SIGINT, lambda *_: sys.exit(0))\n"
+                "time.sleep(60)\n"
+            )
+            leader = subprocess.Popen(
+                [sys.executable, "-c", leader_code], stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            old_root = D.ROOT
+            D.ROOT = workspace_root
+            job = D.Job("markerless", str(base), leader)
+            try:
+                deadline = time.monotonic() + 3
+                while not ready.exists() and time.monotonic() < deadline:
+                    if leader.poll() is not None:
+                        self.fail(f"markerless leader 提前退出 rc={leader.returncode}")
+                    time.sleep(0.02)
+                self.assertTrue(ready.exists(), "markerless child 未進入忽略 SIGINT 狀態")
+                child_pid = int(child_pid_path.read_text())
+                self.assertTrue(job.stop(wait=True), job.last_stop_error)
+                final = D._process_snapshot()
+                self.assertIsNotNone(final)
+                self.assertNotIn(child_pid, final, "Job.stop 回成功前必須清空 frozen child")
+            finally:
+                D.ROOT = old_root
+                if leader.poll() is None:
+                    try:
+                        os.killpg(leader.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    leader.wait(timeout=2)
+
+    def test_markerless_member_pid_reuse_is_preserved_without_force(self):
+        leader = self.process(100, 100, "leader-start", "coordinator")
+        child = self.process(101, 100, "child-start", "child")
+        frozen = {"pid": 100, "pgid": 100, "sid": 100,
+                  "leader": leader, "roster": {100: leader, 101: child}}
+        replacement = {101: self.process(101, 100, "replacement-start", "child")}
+        with mock.patch.object(D, "_process_snapshot", return_value=replacement), \
+                mock.patch.object(D.os, "kill") as kill:
+            ok, message, code = D.cleanup_markerless_job_group(
+                frozen, force_seconds=0)
+        self.assertFalse(ok)
+        self.assertEqual(code, 409)
+        self.assertIn("reused", message)
+        kill.assert_not_called()
 
 
 class TestGracefulRoundStop(unittest.TestCase):
@@ -2431,14 +3264,18 @@ class TestGracefulRoundStop(unittest.TestCase):
                 self.assertIsNotNone(state, "Agent 啟動後必須能由 Dashboard 看見目前 session")
 
                 handler = self.ResponseCapture()
-                D.Handler.api_drain(handler, {"name": "cancel-drain"})
+                D.Handler.api_drain(handler, {
+                    "name": "cancel-drain", "workspace_generation": state["workspace_generation"],
+                    "expected_pid": state["loop"]["pid"]})
                 self.assertEqual(handler.response[0], 200, handler.response)
                 self.assertTrue(handler.response[1]["requested"])
                 request_path = workspace_root / "cancel-drain" / L.STOP_AFTER_ROUND_FILE
                 self.assertTrue(request_path.exists())
 
                 handler = self.ResponseCapture()
-                D.Handler.api_cancel_drain(handler, {"name": "cancel-drain"})
+                D.Handler.api_cancel_drain(handler, {
+                    "name": "cancel-drain", "workspace_generation": state["workspace_generation"],
+                    "expected_pid": state["loop"]["pid"]})
                 self.assertEqual(handler.response[0], 200, handler.response)
                 self.assertTrue(handler.response[1]["cancelled"])
                 self.assertFalse(request_path.exists())
@@ -2473,9 +3310,9 @@ class TestClaimedDrainProjection(unittest.TestCase):
             root = Path(d)
             workspace = root / "demo"
             workspace.mkdir()
-            (workspace / "state.json").write_text(json.dumps({
-                "phase": "plan", "loop": {"pid": 4242, "session_id": "current-session"},
-            }))
+            state = L.Workspace.__new__(L.Workspace).fresh_state()
+            state.update(phase="plan", loop={"pid": 4242, "session_id": "current-session"})
+            (workspace / "state.json").write_text(json.dumps(state))
             L.atomic_write_bytes(
                 workspace / L.STOP_AFTER_ROUND_CLAIMED_FILE,
                 json.dumps({"pid": 4242, "session_id": "current-session"}).encode(),
@@ -2488,11 +3325,182 @@ class TestClaimedDrainProjection(unittest.TestCase):
                 self.assertTrue(fleet[0]["draining"])
                 self.assertTrue(fleet[0]["drain_claimed"])
                 handler = self.ResponseCapture()
-                D.Handler.api_cancel_drain(handler, {"name": "demo"})
+                D.Handler.api_cancel_drain(handler, {
+                    "name": "demo", "workspace_generation": state["workspace_generation"],
+                    "expected_pid": 4242})
                 self.assertEqual(handler.response[0], 409)
                 self.assertIn("已被 loop 取走", handler.response[1]["error"])
+
+                for method in (D.Handler.api_drain, D.Handler.api_cancel_drain):
+                    stale = self.ResponseCapture()
+                    method(stale, {"name": "demo",
+                                   "workspace_generation": state["workspace_generation"],
+                                   "expected_pid": 4241})
+                    self.assertEqual(stale.response[0], 409)
+                    self.assertIn("畫面過期", stale.response[1]["error"])
             finally:
                 D.ROOT, D.loop_pid_alive = old_root, old_alive
+
+
+class TestAgentPromptPolicy(unittest.TestCase):
+    """Agent 只能做針對性取證，且一般未知不得被機械地升級成人工處理。"""
+
+    def prompt(self, name):
+        return (REPO_ROOT / "engine" / "prompts" / name).read_text(encoding="utf-8")
+
+    def test_runtime_prompts_forbid_broad_search_and_destructive_bulk_cleanup(self):
+        for name in ("plan.md", "exec.md", "merge-sync.md", "merge-confirm.md"):
+            with self.subTest(name=name):
+                prompt = self.prompt(name)
+                self.assertIn("不開放廣域 repo 搜尋/巡檢", prompt)
+        for name in ("plan.md", "exec.md"):
+            with self.subTest(name=name):
+                prompt = self.prompt(name)
+                self.assertIn("不要用全域 `git reset --hard` 或 `git clean -fd`", prompt)
+
+    def test_external_planner_prefers_agent_judgment_over_mechanical_gates(self):
+        base = self.prompt("external-agent-base.md")
+        goal = self.prompt("external-agent-goal.md")
+        plan = self.prompt("external-agent-plan.md")
+        self.assertIn("本版本不做全 repo 列檔、廣域巡檢", base)
+        self.assertIn("一般實作細節由執行 agent", base)
+        self.assertIn("不得為證明「無」擴大成全 repo 負面搜尋", goal)
+        self.assertIn("不為格式完整強制建立 ID", goal)
+        self.assertIn("不必為了形式硬造 grep／腳本", goal)
+        self.assertIn("不因命令名稱未知就設 human gate", plan)
+        self.assertIn("不要為每個不相關候選產生 N/A", plan)
+
+    def test_exec_issue_is_next_agent_context_not_default_human_gate(self):
+        prompt = self.prompt("exec.md")
+        self.assertIn("context，不等於預設等待人工", prompt)
+        self.assertIn("把證據交給下一輪 agent 繼續收斂", prompt)
+        self.assertNotIn("交由人類處理", prompt)
+
+    def test_merge_confirm_requires_every_dod_and_only_accepts_authoritative_integration_result(self):
+        prompt = self.prompt("merge-confirm.md")
+        self.assertIn("每個 task 的每一條 DoD", prompt)
+        self.assertIn("不得自行把任何 DoD 判成「不適用」而跳過", prompt)
+        self.assertIn("只有前輪／修復情報已包含該次權威執行結果時", prompt)
+        self.assertIn("缺少 integration-only DoD 的權威結果", prompt)
+        self.assertNotIn("所有適用 DoD", prompt)
+
+    def test_all_runtime_prompts_render_without_placeholder_residue(self):
+        mappings = {
+            "plan.md": {
+                "GOAL": "goal", "PLAN_DOC": "plan.md", "PLAN_JSON": "[]",
+                "CREATE_CMD": "create", "PLANOK_CMD": "ok", "ISSUE_CMD": "issue",
+                "PLAN_MODE_CONTEXT": "parallel", "NOTES": "none",
+            },
+            "exec.md": {
+                "GOAL": "goal", "TASK_LIST": "tasks", "TASK_ID": "task-1",
+                "TASK_TEXT": "task", "TRACK_CONTEXT": "track", "TASK_REF": "ref",
+                "PLAN_DOC": "plan.md", "ISSUE_CMD": "issue", "VALIDATE_CMD": "validate",
+                "TASK_TAG": "track/task-1", "DONE_CMD": "done", "NOTES": "none",
+            },
+            "merge-sync.md": {
+                "TRACK_NAME": "track", "INTEGRATION_TIP": "a" * 40, "GOAL": "goal",
+                "TRACK_TASKS_FULL": "[]", "VALIDATE_CMD": "validate",
+                "MERGE_TARGET": "refs/heads/main", "ISSUE_CMD": "issue",
+                "REPAIR_CONTEXT": "none",
+            },
+            "merge-confirm.md": {
+                "TRACK_NAME": "track", "MERGE_TARGET": "refs/heads/main",
+                "INTEGRATION_TIP": "a" * 40, "GOAL": "goal", "TRACK_TASKS_FULL": "[]",
+                "ISSUE_CMD": "issue", "VALIDATE_CMD": "validate", "DONE_CMD": "done",
+                "REPAIR_CONTEXT": "none",
+            },
+        }
+        for name, mapping in mappings.items():
+            with self.subTest(name=name):
+                template = REPO_ROOT / "engine" / "prompts" / name
+                markers = set(re.findall(r"<<([A-Z][A-Z0-9_]*)>>", template.read_text(encoding="utf-8")))
+                self.assertEqual(markers, set(mapping), "placeholder 契約漂移時必須更新 renderer 與測試")
+                rendered = L.build_prompt(template, mapping)
+                self.assertNotRegex(rendered, r"<<[A-Z][A-Z0-9_]*>>")
+
+    def test_prompt_renderer_does_not_reinterpret_placeholder_literal_in_user_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            template = Path(directory) / "prompt.md"
+            template.write_text("goal=<<GOAL>> task=<<TASK>>", encoding="utf-8")
+            rendered = L.build_prompt(template, {"GOAL": "literal <<TASK>>", "TASK": "real task"})
+            self.assertEqual(rendered, "goal=literal <<TASK>> task=real task")
+
+
+class TestDashboardJobIdentity(unittest.TestCase):
+    """Jobs 分頁停止 fleet 時必須帶當前 process 對應的 immutable run identity。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_fleet_job_projects_kind_and_run_id_only_for_matching_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_root = D.ROOT
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(5)"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                start_new_session=True,
+            )
+            try:
+                D.ROOT = Path(directory)
+                run_id = "f" * 32
+                workspace = D.ROOT / "parallel-job"
+                workspace.mkdir()
+                state = L.Workspace.__new__(L.Workspace).fresh_state("fleet-parent", run_id)
+                D.write_state("parallel-job", state)
+                fleet = {
+                    "schema_version": 1, "workspace_kind": "fleet-parent", "run_id": run_id,
+                    "phase": "exec",
+                    "loop": {"pid": process.pid},
+                }
+                (workspace / "fleet.json").write_text(json.dumps(fleet), encoding="utf-8")
+                job = D.Job("parallel-job", directory, process, kind="fleet")
+                self.assertEqual(job.info()["kind"], "fleet")
+                self.assertEqual(job.info()["run_id"], run_id)
+                fleet["loop"]["pid"] = process.pid + 1
+                (workspace / "fleet.json").write_text(json.dumps(fleet), encoding="utf-8")
+                self.assertNotIn("run_id", job.info(), "stale job 不得取得同名新 run 的 identity")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                D.ROOT = old_root
+
+    def test_starting_standalone_job_requires_exact_expected_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_root = D.ROOT
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(5)"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                start_new_session=True,
+            )
+            try:
+                D.ROOT = Path(directory)
+                D.JOBS["starting-job"] = D.Job("starting-job", directory, process)
+                info = D.JOBS["starting-job"].info()
+                self.assertEqual(info["pid"], process.pid)
+                self.assertNotIn("workspace_generation", info)
+                for body in ({"name": "starting-job"},
+                             {"name": "starting-job", "expected_pid": process.pid + 1}):
+                    response = self.ResponseCapture()
+                    D.Handler.api_stop(response, body)
+                    self.assertEqual(response.response[0], 409)
+                    self.assertIsNone(process.poll())
+                response = self.ResponseCapture()
+                D.Handler.api_stop(response, {
+                    "name": "starting-job", "expected_pid": process.pid})
+                self.assertEqual(response.response[0], 200, response.response)
+            finally:
+                D.JOBS.pop("starting-job", None)
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                D.ROOT = old_root
 
 
 class TestPortableDashboardConfig(unittest.TestCase):
@@ -2523,6 +3531,35 @@ class TestPortableDashboardConfig(unittest.TestCase):
                     os.environ.pop("PATH", None)
                 else:
                     os.environ["PATH"] = old_path
+
+    def test_cli_smoke_environment_drops_round_and_fleet_identity(self):
+        keys = ("LOOP_WS", "LOOP_ROUND_TOKEN", "LOOP_FLEET_RUN_ID",
+                "LOOP_FLEET_TRACK", "LOOP_FLEET_CRASH_AT")
+        previous = {key: os.environ.get(key) for key in keys}
+        workspace_root = os.environ.get("LOOP_AGENT_WORKSPACE_ROOT")
+        try:
+            for key in keys:
+                os.environ[key] = f"secret-{key}"
+            os.environ["LOOP_AGENT_WORKSPACE_ROOT"] = "/tmp/keep-workspace-root"
+            env = D.command_test_env({"extra_path_dirs": []})
+            self.assertTrue(all(key not in env for key in keys))
+            self.assertEqual(env["LOOP_AGENT_WORKSPACE_ROOT"], "/tmp/keep-workspace-root")
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            if workspace_root is None:
+                os.environ.pop("LOOP_AGENT_WORKSPACE_ROOT", None)
+            else:
+                os.environ["LOOP_AGENT_WORKSPACE_ROOT"] = workspace_root
+
+    def test_merge_confirm_prompt_treats_integration_only_failure_as_authoritative(self):
+        prompt = (REPO_ROOT / "engine" / "prompts" / "merge-confirm.md").read_text(encoding="utf-8")
+        self.assertIn("無法重現是預期行為", prompt)
+        self.assertIn("不得因本地 validate PASS 就忽略", prompt)
+        self.assertIn("<<ISSUE_CMD>>", prompt)
 
     def test_personal_save_never_rewrites_project_config(self):
         with tempfile.TemporaryDirectory() as d:
@@ -2585,8 +3622,8 @@ class TestManualTaskProgressValidation(unittest.TestCase):
                 state.update({
                     "phase": "exec",
                     "plan": [
-                        {"order": 1, "task": "first", "ref": None},
-                        {"order": 2, "task": "second", "ref": None},
+                        {"order": 1, "task": "first", "ref": None, "track": "main"},
+                        {"order": 2, "task": "second", "ref": None, "track": "main"},
                     ],
                     "current_order": 1,
                     "config": {
@@ -2601,7 +3638,9 @@ class TestManualTaskProgressValidation(unittest.TestCase):
 
                 handler = self.ResponseCapture()
                 started = time.monotonic()
-                D.Handler.api_set_task(handler, {"name": "manual-progress", "order": 2})
+                D.Handler.api_set_task(handler, {
+                    "name": "manual-progress", "workspace_generation": state["workspace_generation"],
+                    "order": 2})
                 elapsed = time.monotonic() - started
 
                 self.assertEqual(handler.response[0], 400)
@@ -2618,7 +3657,7 @@ class TestDashboardStateLockCoverage(unittest.TestCase):
     """#3 run/launch 必須和 edit/phase 共用 workspace lock,不能在 stopped check 後競態。"""
 
     def test_all_workspace_mutations_are_decorated(self):
-        for method in ("api_launch", "api_run", "api_drain", "api_cancel_drain", "api_edit_state", "api_edit_config", "api_validate", "api_preflight", "api_test_agent", "api_phase", "api_set_task"):
+        for method in ("api_launch", "api_run", "api_drain", "api_cancel_drain", "api_edit_state", "api_edit_config", "api_validate", "api_preflight", "api_test_agent", "api_phase", "api_set_task", "api_delete_workspace"):
             self.assertTrue(hasattr(getattr(D.Handler, method), "__wrapped__"), f"{method} 必須套 workspace lock")
 
     def test_launch_blank_name_locks_repo_basename(self):
@@ -2685,12 +3724,12 @@ _AGENT_TAMPER = f'''import os, subprocess, sys
 sys.stdin.read()
 open("goal.md", "a").write("\\nTAMPERED BY AGENT\\n")   # 竄改受保護檔
 subprocess.run([sys.executable, "-m", "engine.work", "create-plan"],
-               input='[{{"order":1,"task":"stolen dirty task"}}]', text=True, env=dict(os.environ))
+               input='[{{"order":1,"task":"stolen dirty task","track":"main"}}]', text=True, env=dict(os.environ))
 '''
 _AGENT_CLEAN = f'''import os, subprocess, sys
 sys.stdin.read()
 subprocess.run([sys.executable, "-m", "engine.work", "create-plan"],
-               input='[{{"order":1,"task":"legit planned task"}}]', text=True, env=dict(os.environ))
+               input='[{{"order":1,"task":"legit planned task","track":"main"}}]', text=True, env=dict(os.environ))
 '''
 
 
@@ -2748,69 +3787,7 @@ class TestReportProjection(unittest.TestCase):
                 D.ROOT = old_root
 
 
-class TestWorkspaceArchive(unittest.TestCase):
-    """封存=軟刪除:停止狀態整目錄搬進 .archive/;執行中或單 writer 鎖被持有時 fail-closed 拒絕。"""
-
-    class ResponseCapture:
-        response = None
-
-        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
-            self.response = code, json.loads(body)
-
-        def _err(self, msg, code=400):
-            self.response = code, {"error": msg}
-
-    def test_refuses_running_and_held_lock_then_archives(self):
-        import fcntl
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "workspace"
-            (root / "demo").mkdir(parents=True)
-            (root / "demo" / "state.json").write_text(
-                json.dumps({"phase": "done", "loop": {"pid": None}}), encoding="utf-8")
-            old_root = D.ROOT
-            D.ROOT = root
-            try:
-                # 執行中 → 拒絕,目錄不動
-                old_running = D.ws_running
-                D.ws_running = lambda *a, **k: True
-                try:
-                    handler = self.ResponseCapture()
-                    D.Handler.api_archive_workspace(handler, {"name": "demo"})
-                finally:
-                    D.ws_running = old_running
-                self.assertEqual(handler.response[0], 400)
-                self.assertTrue((root / "demo").exists())
-
-                # 單 writer 鎖被持有 → fail-closed 拒絕(pid 偵測失準的兜底)
-                holder = open(root / "demo" / ".run.lock", "a+b")
-                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                try:
-                    handler = self.ResponseCapture()
-                    D.Handler.api_archive_workspace(handler, {"name": "demo"})
-                finally:
-                    fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
-                    holder.close()
-                self.assertEqual(handler.response[0], 409)
-                self.assertIn("單 writer 鎖", handler.response[1]["error"])
-                self.assertTrue((root / "demo").exists())
-
-                # 停止且無鎖 → 搬進 .archive/,原目錄消失、內容完整
-                handler = self.ResponseCapture()
-                D.Handler.api_archive_workspace(handler, {"name": "demo"})
-                self.assertEqual(handler.response[0], 200)
-                self.assertFalse((root / "demo").exists())
-                archived = [d for d in (root / ".archive").iterdir() if d.is_dir()]
-                self.assertEqual(len(archived), 1)
-                self.assertTrue((archived[0] / "state.json").exists())
-                # .archive 不得冒充 workspace 出現在 fleet
-                self.assertEqual(D.list_workspaces(), [])
-            finally:
-                D.ROOT = old_root
-
-
-class TestWorkspaceArchiveRestore(unittest.TestCase):
-    """封存還原必須只搬真實目錄、不覆寫既有目標，且不會暗中啟動 loop。"""
-
+class TestWorkspaceSafeDelete(unittest.TestCase):
     class ResponseCapture:
         response = None
 
@@ -2821,257 +3798,1341 @@ class TestWorkspaceArchiveRestore(unittest.TestCase):
             self.response = code, {"error": msg}
 
     @staticmethod
-    def _seed_workspace(root, name="demo", *, round_number=7):
-        workspace = root / name
-        workspace.mkdir(parents=True)
-        (workspace / "state.json").write_text(
-            json.dumps({"phase": "done", "round": round_number, "loop": {"pid": None}}), encoding="utf-8")
-        (workspace / "nested").mkdir()
-        (workspace / "nested" / "kept.txt").write_text("preserve me\n", encoding="utf-8")
-        return workspace
+    def legacy_state(*, pid=None):
+        """Last schema-v1 standalone shape: intentionally lacks v2 identity fields."""
+        return {"phase": "done", "round": 3, "flag": 0, "plan": [],
+                "plan_version": 1, "current_order": 0, "done_count": 0,
+                "completed": [], "loop": {"pid": pid, "session_id": None}}
 
-    def test_archive_list_and_restore_preserve_content_without_starting_loop(self):
+    @staticmethod
+    def delete_request(name):
+        """Build the same generation-bound delete request emitted by the Dashboard UI."""
+        summary = next(item for item in D.list_workspaces() if item["name"] == name)
+        return {"name": name, "workspace_generation": summary["workspace_generation"]}
+
+    def test_legacy_v1_is_projected_delete_only_and_can_be_safely_deleted(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "workspace"
-            workspace = self._seed_workspace(root)
+            legacy = root / "legacy"
+            legacy.mkdir(parents=True)
+            (legacy / "state.json").write_text(
+                json.dumps(self.legacy_state()), encoding="utf-8")
+            (legacy / "artifact.txt").write_text("legacy\n", encoding="utf-8")
             old_root = D.ROOT
+            D.ROOT = root
             try:
-                D.ROOT = root
-                archive = self.ResponseCapture()
-                D.Handler.api_archive_workspace(archive, {"name": "demo"})
-                self.assertEqual(archive.response[0], 200, archive.response)
-                archive_id = archive.response[1]["archive_id"]
-                self.assertRegex(archive_id, r"^demo--\d{8}T\d{6}Z--[0-9a-f]{32}$")
-                self.assertFalse(workspace.exists())
+                summary = D.list_workspaces()[0]
+                self.assertTrue(summary["legacy_delete_only"])
+                self.assertFalse(summary["running"])
 
-                listed = D.list_archives()
-                self.assertNotIn("error", listed)
-                self.assertEqual(len(listed["archives"]), 1)
-                self.assertEqual(listed["archives"][0]["id"], archive_id)
-                self.assertEqual(listed["archives"][0]["name"], "demo")
-                self.assertEqual(listed["archives"][0]["phase"], "done")
-                self.assertEqual(listed["archives"][0]["round"], 7)
+                refused_run = self.ResponseCapture()
+                D.Handler.api_run(refused_run, {"name": "legacy"})
+                self.assertEqual(refused_run.response[0], 400)
+                self.assertTrue(legacy.exists(), "legacy workspace 不得 resume")
 
-                restore = self.ResponseCapture()
-                D.Handler.api_restore_workspace(restore, {"archive_id": archive_id})
-                self.assertEqual(restore.response[0], 200, restore.response)
-                self.assertEqual(restore.response[1], {"ok": True, "name": "demo", "archive_id": archive_id})
-                self.assertEqual((root / "demo" / "nested" / "kept.txt").read_text(), "preserve me\n")
-                self.assertEqual(D.list_archives()["archives"], [])
-                self.assertEqual([item["name"] for item in D.list_workspaces()], ["demo"])
-                self.assertFalse(D.ws_running("demo"), "還原只恢復 state，不得自動啟動 loop")
+                deleted = self.ResponseCapture()
+                D.Handler.api_delete_workspace(deleted, self.delete_request("legacy"))
+                self.assertEqual(deleted.response, (
+                    200, {"ok": True, "name": "legacy", "deleted": True,
+                          "legacy_delete_only": True}))
+                self.assertFalse(legacy.exists())
+            finally:
+                D.ROOT = old_root
+
+    def test_legacy_delete_marker_survives_crash_before_journal(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            legacy = root / "legacy"
+            legacy.mkdir(parents=True)
+            (legacy / "state.json").write_text(
+                json.dumps(self.legacy_state()), encoding="utf-8")
+            old_root = D.ROOT
+            D.ROOT = root
+            fired = False
+
+            def fault(stage, name):
+                nonlocal fired
+                if not fired and stage == "after-delete-generation" and name == "legacy":
+                    fired = True
+                    raise OSError("injected marker-before-journal crash")
+
+            try:
+                first = self.ResponseCapture()
+                with mock.patch.object(D, "_delete_fault_hook", side_effect=fault):
+                    D.Handler.api_delete_workspace(first, self.delete_request("legacy"))
+                self.assertEqual(first.response[0], 409)
+                marker = legacy / D.DELETE_GENERATION_MARKER
+                generation = marker.read_text(encoding="ascii").strip()
+                self.assertRegex(generation, r"^[0-9a-f]{32}$")
+                self.assertFalse(D._delete_journal_path("legacy").exists())
+
+                retry = self.ResponseCapture()
+                D.Handler.api_delete_workspace(retry, self.delete_request("legacy"))
+                self.assertEqual(retry.response[0], 200)
+                self.assertFalse(legacy.exists())
+            finally:
+                D.ROOT = old_root
+
+    def test_legacy_stale_journal_preserves_same_inode_replacement_and_job(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            legacy = root / "legacy"
+            legacy.mkdir(parents=True)
+            (legacy / "state.json").write_text(
+                json.dumps(self.legacy_state()), encoding="utf-8")
+            old_root = D.ROOT
+            D.ROOT = root
+            fired = False
+
+            def fail_clear(stage, name):
+                nonlocal fired
+                if not fired and stage == "before-journal-clear" and name == "legacy":
+                    fired = True
+                    raise OSError("injected journal clear failure")
+
+            sentinel_job = mock.Mock()
+            sentinel_job.alive.return_value = False
+            try:
+                first = self.ResponseCapture()
+                with mock.patch.object(D, "_delete_fault_hook", side_effect=fail_clear):
+                    D.Handler.api_delete_workspace(first, self.delete_request("legacy"))
+                self.assertEqual(first.response[0], 409)
+                self.assertFalse(legacy.exists())
+
+                legacy.mkdir()
+                replacement = L.Workspace.__new__(L.Workspace).fresh_state()
+                replacement["phase"] = "done"
+                (legacy / "state.json").write_text(json.dumps(replacement), encoding="utf-8")
+                marker = legacy / "new-workspace.txt"
+                marker.write_text("must survive\n", encoding="utf-8")
+                journal_path = D._delete_journal_path("legacy")
+                journal = json.loads(journal_path.read_text(encoding="utf-8"))
+                self.assertEqual(journal["entries"][0]["generation_source"], "delete-marker")
+                replacement_info = legacy.lstat()
+                journal["entries"][0]["dev"] = replacement_info.st_dev
+                journal["entries"][0]["ino"] = replacement_info.st_ino
+                journal_path.write_text(json.dumps(journal), encoding="utf-8")
                 with D.JOBS_LOCK:
-                    self.assertNotIn("demo", D.JOBS)
+                    D.JOBS["legacy"] = sentinel_job
+
+                retry = self.ResponseCapture()
+                D.Handler.api_delete_workspace(retry, {"name": "legacy"})
+                self.assertEqual(retry.response[0], 409)
+                self.assertTrue(retry.response[1]["replacement_preserved"])
+                self.assertEqual(marker.read_text(encoding="utf-8"), "must survive\n")
+                with D.JOBS_LOCK:
+                    self.assertIs(D.JOBS.get("legacy"), sentinel_job)
+
+                confirmed = self.ResponseCapture()
+                D.Handler.api_delete_workspace(confirmed, self.delete_request("legacy"))
+                self.assertEqual(confirmed.response[0], 200)
+                self.assertFalse(legacy.exists())
             finally:
+                with D.JOBS_LOCK:
+                    D.JOBS.pop("legacy", None)
                 D.ROOT = old_root
 
-    def test_restores_legacy_archive_name(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "workspace"
-            archive_id = "legacy-orders-20250102-030405"
-            self._seed_workspace(root / ".archive", archive_id, round_number=3)
-            old_root = D.ROOT
-            try:
+    def test_legacy_live_pid_and_corrupt_v2_are_not_delete_only(self):
+        for case in ("live-legacy", "corrupt-v2"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "workspace"
+                workspace = root / "demo"
+                workspace.mkdir(parents=True)
+                state = (self.legacy_state(pid=4242) if case == "live-legacy" else {
+                    "state_schema_version": L.STATE_SCHEMA_VERSION,
+                    "workspace_generation": "not-valid",
+                    "workspace_kind": "standalone", "fleet_run_id": None,
+                    "phase": "done", "loop": {"pid": None},
+                })
+                (workspace / "state.json").write_text(json.dumps(state), encoding="utf-8")
+                old_root = D.ROOT
                 D.ROOT = root
-                listed = D.list_archives()["archives"]
-                self.assertEqual([(item["id"], item["name"]) for item in listed], [(archive_id, "legacy-orders")])
-                handler = self.ResponseCapture()
-                D.Handler.api_restore_workspace(handler, {"archive_id": archive_id})
-                self.assertEqual(handler.response[0], 200, handler.response)
-                self.assertTrue((root / "legacy-orders" / "state.json").is_file())
-            finally:
-                D.ROOT = old_root
-
-    def test_restore_rejects_invalid_or_colliding_destination_without_moving_source(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "workspace"
-            archive_id = "collision--20250102T030405Z--" + "a" * 32
-            archived = self._seed_workspace(root / ".archive", archive_id)
-            old_root = D.ROOT
-            try:
-                D.ROOT = root
-                for bad_id in ("", "..", "../" + archive_id, "/tmp/" + archive_id, "not-an-archive"):
-                    handler = self.ResponseCapture()
-                    D.Handler.api_restore_workspace(handler, {"archive_id": bad_id})
-                    with self.subTest(bad_id=bad_id):
-                        self.assertEqual(handler.response[0], 400)
-                        self.assertTrue(archived.exists())
-
-                with L.workspace_operation_lock(root, "collision"):
-                    handler = self.ResponseCapture()
-                    D.Handler.api_restore_workspace(handler, {"archive_id": archive_id})
-                    self.assertEqual(handler.response[0], 409, handler.response)
-                    self.assertTrue(archived.exists(), "CLI 建立 workspace 的 root lock 存在時不得搬移")
-
-                destination = root / "collision"
-                cases = {
-                    "directory": lambda: destination.mkdir(),
-                    "file": lambda: destination.write_text("occupied", encoding="utf-8"),
-                    "dangling symlink": lambda: destination.symlink_to(root / "missing-target"),
-                }
-                for kind, create in cases.items():
-                    create()
-                    handler = self.ResponseCapture()
-                    D.Handler.api_restore_workspace(handler, {"archive_id": archive_id})
-                    with self.subTest(destination=kind):
-                        self.assertEqual(handler.response[0], 409, handler.response)
-                        self.assertTrue(archived.exists(), "衝突不得讓來源消失")
-                    if destination.is_dir() and not destination.is_symlink():
-                        destination.rmdir()
+                try:
+                    with mock.patch.object(
+                            D, "loop_pid_alive", side_effect=lambda pid: pid == 4242):
+                        summary = D.list_workspaces()[0]
+                        response = self.ResponseCapture()
+                        request = ({"name": "demo", "workspace_generation": summary["workspace_generation"]}
+                                   if case == "live-legacy" else {"name": "demo"})
+                        D.Handler.api_delete_workspace(response, request)
+                    self.assertTrue(workspace.exists())
+                    self.assertFalse((workspace / D.DELETE_GENERATION_MARKER).exists())
+                    if case == "live-legacy":
+                        self.assertTrue(summary["legacy_delete_only"])
+                        self.assertTrue(summary["running"])
+                        self.assertEqual(response.response[0], 409)
                     else:
-                        destination.unlink(missing_ok=True)
-            finally:
-                D.ROOT = old_root
-
-    def test_archive_refuses_held_locks_and_symlink_archive_root(self):
-        import fcntl
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "workspace"
-            workspace = self._seed_workspace(root)
-            old_root = D.ROOT
-            try:
-                D.ROOT = root
-                holder = open(workspace / ".run.lock", "a+b")
-                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                try:
-                    handler = self.ResponseCapture()
-                    D.Handler.api_archive_workspace(handler, {"name": "demo"})
+                        self.assertNotIn("legacy_delete_only", summary)
+                        self.assertEqual(response.response[0], 400)
                 finally:
-                    fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
-                    holder.close()
-                self.assertEqual(handler.response[0], 409, handler.response)
-                self.assertTrue(workspace.exists())
+                    D.ROOT = old_root
 
-                archive_root = root / ".archive"
-                archive_root.mkdir(exist_ok=True)
-                holder = open(archive_root / ".ops.lock", "a+b")
-                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                try:
-                    handler = self.ResponseCapture()
-                    D.Handler.api_archive_workspace(handler, {"name": "demo"})
-                finally:
-                    fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
-                    holder.close()
-                self.assertEqual(handler.response[0], 409, handler.response)
-                self.assertTrue(workspace.exists())
-
-                shutil.rmtree(archive_root)
-                outside = Path(td) / "outside-archive"
-                outside.mkdir()
-                archive_root.symlink_to(outside, target_is_directory=True)
-                handler = self.ResponseCapture()
-                D.Handler.api_archive_workspace(handler, {"name": "demo"})
-                self.assertEqual(handler.response[0], 409, handler.response)
-                self.assertTrue(workspace.exists())
-                self.assertEqual(list(outside.iterdir()), [])
-
-                archive_root.unlink()
-                archive_root.mkdir()
-                outside_lock = Path(td) / "outside-run.lock"
-                (workspace / ".run.lock").unlink()
-                (workspace / ".run.lock").symlink_to(outside_lock)
-                handler = self.ResponseCapture()
-                D.Handler.api_archive_workspace(handler, {"name": "demo"})
-                self.assertEqual(handler.response[0], 409, handler.response)
-                self.assertTrue(workspace.exists())
-                self.assertFalse(outside_lock.exists(), "descriptor-relative lock 不得跟隨 workspace 內 symlink")
-
-                archive_id = "symlinked--20250102T030405Z--" + "b" * 32
-                outside_entry = Path(td) / "outside-entry"
-                outside_entry.mkdir()
-                (archive_root / archive_id).symlink_to(outside_entry, target_is_directory=True)
-                self.assertEqual(D.list_archives()["archives"], [], "封存列表不得投影 symlink entry")
-                handler = self.ResponseCapture()
-                D.Handler.api_restore_workspace(handler, {"archive_id": archive_id})
-                self.assertEqual(handler.response[0], 409, handler.response)
-                self.assertFalse((root / "symlinked").exists())
-            finally:
-                D.ROOT = old_root
-
-
-class TestWorkspaceArchiveDelete(unittest.TestCase):
-    """永久刪除只移除 archive entry，不跟隨 symlink，也尊重 archive 單 writer 鎖。"""
-
-    class ResponseCapture:
-        response = None
-
-        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
-            self.response = code, json.loads(body)
-
-        def _err(self, msg, code=400):
-            self.response = code, {"error": msg}
-
-    def test_deletes_nested_archive_without_following_symlink(self):
+    def test_corrupt_v2_primary_cannot_downgrade_via_legacy_checkpoint(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "workspace"
             workspace = root / "demo"
             workspace.mkdir(parents=True)
-            (workspace / "state.json").write_text(json.dumps({"phase": "done", "loop": {"pid": None}}))
-            (workspace / "nested").mkdir()
-            (workspace / "nested" / "kept.txt").write_text("keep")
-            outside = Path(td) / "outside"
-            outside.mkdir()
-            (outside / "must-survive.txt").write_text("outside")
+            (workspace / "state.json").write_bytes(
+                b'{"state_schema_version":2,"workspace_generation":')
+            (workspace / "state.last-good.json").write_text(
+                json.dumps(self.legacy_state()), encoding="utf-8")
             old_root = D.ROOT
             D.ROOT = root
             try:
-                archive = self.ResponseCapture()
-                D.Handler.api_archive_workspace(archive, {"name": "demo"})
-                self.assertEqual(archive.response[0], 200, archive.response)
-                archive_id = archive.response[1]["archive_id"]
-                archived = root / ".archive" / archive_id
-                (archived / "escape").symlink_to(outside, target_is_directory=True)
+                summary = D.list_workspaces()[0]
+                self.assertNotIn("legacy_delete_only", summary)
+                response = self.ResponseCapture()
+                D.Handler.api_delete_workspace(response, {"name": "demo"})
+                self.assertEqual(response.response[0], 400)
+                self.assertTrue(workspace.exists())
+                self.assertFalse((workspace / D.DELETE_GENERATION_MARKER).exists())
+            finally:
+                D.ROOT = old_root
 
-                delete = self.ResponseCapture()
-                D.Handler.api_delete_archive(delete, {"archive_id": archive_id})
-                self.assertEqual(delete.response[0], 200, delete.response)
-                self.assertEqual(delete.response[1], {"ok": True, "name": "demo",
-                                                       "archive_id": archive_id, "deleted": True})
-                self.assertFalse(archived.exists())
-                self.assertEqual(D.list_archives()["archives"], [])
-                self.assertTrue((outside / "must-survive.txt").exists())
+    def test_legacy_delete_only_classification_bounds_state_reads(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            workspace = root / "demo"
+            workspace.mkdir(parents=True)
+            (workspace / "state.json").write_text(
+                json.dumps(self.legacy_state()), encoding="utf-8")
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                with mock.patch.object(D, "LEGACY_STATE_MAX_BYTES", 32):
+                    self.assertIsNone(D.legacy_workspace_state_for_delete("demo"))
+                    summary = D.list_workspaces()[0]
+                self.assertNotIn("legacy_delete_only", summary)
+                self.assertTrue(workspace.exists())
+            finally:
+                D.ROOT = old_root
+
+    def test_arbitrary_or_ambiguous_json_is_not_legacy_delete_only(self):
+        ambiguous_v2 = self.legacy_state()
+        ambiguous_v2["workspace_kind"] = "standalone"
+        invalid_phase = self.legacy_state()
+        invalid_phase["phase"] = ["done"]
+        for candidate in ({}, ambiguous_v2, invalid_phase):
+            with self.subTest(candidate=candidate), tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "workspace"
+                workspace = root / "demo"
+                workspace.mkdir(parents=True)
+                (workspace / "state.json").write_text(
+                    json.dumps(candidate), encoding="utf-8")
+                old_root = D.ROOT
+                D.ROOT = root
+                try:
+                    self.assertIsNone(D.legacy_workspace_state_for_delete("demo"))
+                    response = self.ResponseCapture()
+                    D.Handler.api_delete_workspace(response, {"name": "demo"})
+                    self.assertEqual(response.response[0], 400)
+                    self.assertTrue(workspace.exists())
+                    self.assertFalse((workspace / D.DELETE_GENERATION_MARKER).exists())
+                finally:
+                    D.ROOT = old_root
+
+    def test_standalone_prelock_replacement_is_never_deleted(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "workspace"
+                workspace = root / "demo"
+                workspace.mkdir(parents=True)
+                original_state = (self.legacy_state() if legacy else
+                                  L.Workspace.__new__(L.Workspace).fresh_state())
+                original_state["phase"] = "done"
+                (workspace / "state.json").write_text(
+                    json.dumps(original_state), encoding="utf-8")
+                original_marker = workspace / "old-workspace.txt"
+                original_marker.write_text("old\n", encoding="utf-8")
+                displaced = root / "displaced"
+                replacement_marker = root / "replacement-marker-placeholder"
+                fired = False
+
+                def replace_before_writer_lock(stage, name):
+                    nonlocal fired, replacement_marker
+                    if (not fired and stage == "standalone-before-writer-lock" and
+                            name == "demo"):
+                        fired = True
+                        workspace.rename(displaced)
+                        workspace.mkdir()
+                        replacement = (self.legacy_state() if legacy else
+                                       L.Workspace.__new__(L.Workspace).fresh_state())
+                        replacement["phase"] = "done"
+                        (workspace / "state.json").write_text(
+                            json.dumps(replacement), encoding="utf-8")
+                        replacement_marker = workspace / "new-workspace.txt"
+                        replacement_marker.write_text("new\n", encoding="utf-8")
+
+                old_root = D.ROOT
+                D.ROOT = root
+                sentinel_job = mock.Mock()
+                sentinel_job.alive.return_value = False
+                try:
+                    with D.JOBS_LOCK:
+                        D.JOBS["demo"] = sentinel_job
+                    response = self.ResponseCapture()
+                    with mock.patch.object(
+                            D, "_delete_race_hook", side_effect=replace_before_writer_lock):
+                        D.Handler.api_delete_workspace(response, self.delete_request("demo"))
+                    self.assertEqual(response.response[0], 409)
+                    self.assertTrue(fired)
+                    self.assertEqual(replacement_marker.read_text(encoding="utf-8"), "new\n")
+                    self.assertEqual((displaced / "old-workspace.txt").read_text(
+                        encoding="utf-8"), "old\n")
+                    self.assertFalse(D._delete_journal_path("demo").exists())
+                    with D.JOBS_LOCK:
+                        self.assertIs(D.JOBS.get("demo"), sentinel_job)
+                finally:
+                    with D.JOBS_LOCK:
+                        D.JOBS.pop("demo", None)
+                    D.ROOT = old_root
+
+    def test_stale_browser_generation_cannot_mutate_or_delete_same_name_replacement(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "workspace"
+                workspace = root / "demo"
+                workspace.mkdir(parents=True)
+                original = (self.legacy_state() if legacy else
+                            L.Workspace.__new__(L.Workspace).fresh_state())
+                (workspace / "state.json").write_text(json.dumps(original), encoding="utf-8")
+                old_root = D.ROOT
+                D.ROOT = root
+                try:
+                    stale_generation = D.list_workspaces()[0]["workspace_generation"]
+                    displaced = root / "old-demo"
+                    workspace.rename(displaced)
+                    workspace.mkdir()
+                    replacement = (self.legacy_state() if legacy else
+                                   L.Workspace.__new__(L.Workspace).fresh_state())
+                    (workspace / "state.json").write_text(
+                        json.dumps(replacement), encoding="utf-8")
+                    marker = workspace / "replacement.txt"
+                    marker.write_text("survive\n", encoding="utf-8")
+
+                    if not legacy:
+                        edited = self.ResponseCapture()
+                        D.Handler.api_edit_state(edited, {
+                            "name": "demo", "workspace_generation": stale_generation,
+                            "ack_issues": True,
+                        })
+                        self.assertEqual(edited.response[0], 409)
+                    deleted = self.ResponseCapture()
+                    D.Handler.api_delete_workspace(deleted, {
+                        "name": "demo", "workspace_generation": stale_generation,
+                    })
+                    self.assertEqual(deleted.response[0], 409)
+                    self.assertEqual(marker.read_text(encoding="utf-8"), "survive\n")
+                    self.assertFalse(D._delete_journal_path("demo").exists())
+                finally:
+                    D.ROOT = old_root
+
+    def test_deletes_stopped_standalone_and_rejects_fleet_child(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                standalone = root / "demo"
+                standalone.mkdir(parents=True)
+                state = L.Workspace.__new__(L.Workspace).fresh_state()
+                state.update(phase="done")
+                (standalone / "state.json").write_text(json.dumps(state))
+                (standalone / "nested").mkdir()
+                (standalone / "nested" / "artifact.txt").write_text("delete me")
+                handler = self.ResponseCapture()
+                D.Handler.api_delete_workspace(handler, self.delete_request("demo"))
+                self.assertEqual(handler.response, (200, {"ok": True, "name": "demo", "deleted": True}))
+                self.assertFalse(standalone.exists())
+
+                child = root / "parent--alpha"
+                child.mkdir()
+                child_state = L.Workspace.__new__(L.Workspace).fresh_state(
+                    "fleet-child", "a" * 32)
+                child_state.update(fleet_parent="parent", track="alpha",
+                                   fleet_parent_session_id="1" * 32,
+                                   merge_target_ref="refs/heads/main")
+                (child / "state.json").write_text(json.dumps(child_state))
+                refused = self.ResponseCapture()
+                D.Handler.api_delete_workspace(refused, {"name": "parent--alpha"})
+                self.assertEqual(refused.response[0], 409)
+                self.assertTrue(child.exists())
+            finally:
+                D.ROOT = old_root
+
+    def test_parent_delete_removes_registered_worktree_and_child_group_but_keeps_branch(self):
+        with tempfile.TemporaryDirectory() as td:
+            temp = Path(td)
+            root = temp / "workspace"
+            repo = make_repo(td)
+            run_id = "b" * 32
+            session_id = "2" * 32
+            parent = root / "parent"
+            child = root / "parent--alpha"
+            parent.mkdir(parents=True)
+            child.mkdir()
+            parent_state = L.Workspace.__new__(L.Workspace).fresh_state("fleet-parent", run_id)
+            parent_state["config"] = {"repo": str(repo)}
+            child_state = L.Workspace.__new__(L.Workspace).fresh_state("fleet-child", run_id)
+            child_state.update(fleet_parent="parent", fleet_parent_session_id=session_id,
+                               track="alpha", merge_target_ref="refs/heads/main",
+                               config={"repo": str(parent / "worktrees" / "alpha"),
+                                       "agent_cmd": "true", "validate_cmd": "true"})
+            (parent / "state.json").write_text(json.dumps(parent_state))
+            (child / "state.json").write_text(json.dumps(child_state))
+            worktree = parent / "worktrees" / "alpha"
+            branch = f"loop/{run_id}/alpha"
+            subprocess.run(["git", "worktree", "add", "-b", branch, str(worktree)], cwd=repo,
+                           check=True, capture_output=True)
+            fleet = {"schema_version": 1, "workspace_kind": "fleet-parent", "run_id": run_id,
+                     "phase": "stopped", "integration_worktree": str(repo),
+                     "config": {"repo": str(repo), "agent_cmd": "true", "validate_cmd": "true"},
+                     "loop": {"pid": None, "session_id": session_id},
+                     "tracks": [{"name": "alpha", "safe_name": "alpha",
+                     "worktree": str(worktree), "branch_ref": f"refs/heads/{branch}",
+                     "child_workspace": "parent--alpha", "status": "stopped"}]}
+            (parent / "fleet.json").write_text(json.dumps(fleet))
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                stale = self.ResponseCapture()
+                D.Handler.api_delete_workspace(stale, {"name": "parent", "run_id": "c" * 32})
+                self.assertEqual(stale.response[0], 409)
+                self.assertTrue(parent.exists())
+                self.assertTrue(child.exists())
+                handler = self.ResponseCapture()
+                D.Handler.api_delete_workspace(handler, {"name": "parent", "run_id": run_id})
+                self.assertEqual(handler.response, (200, {"ok": True, "name": "parent", "deleted": True}))
+                self.assertFalse(parent.exists())
+                self.assertFalse(child.exists())
+                registered = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo,
+                                            text=True, capture_output=True, check=True).stdout
+                self.assertNotIn(str(worktree), registered)
+                self.assertEqual(subprocess.run(["git", "show-ref", "--verify", f"refs/heads/{branch}"],
+                                                cwd=repo, capture_output=True).returncode, 0)
+            finally:
+                D.ROOT = old_root
+
+    def test_standalone_delete_faults_are_journaled_and_retryable(self):
+        for stage in ("after-rename", "after-unlink", "before-rmdir"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "workspace"
+                root.mkdir()
+                workspace = root / "demo"
+                workspace.mkdir()
+                state = L.Workspace.__new__(L.Workspace).fresh_state()
+                state["phase"] = "done"
+                (workspace / "state.json").write_text(json.dumps(state), encoding="utf-8")
+                (workspace / "artifact.txt").write_text("preserve until retry\n", encoding="utf-8")
+                old_root = D.ROOT
+                D.ROOT = root
+                fired = False
+
+                def fault(candidate_stage, candidate_name):
+                    nonlocal fired
+                    if not fired and candidate_stage == stage and candidate_name == "demo":
+                        fired = True
+                        raise OSError(f"injected {stage}")
+
+                try:
+                    first = self.ResponseCapture()
+                    with mock.patch.object(D, "_delete_fault_hook", side_effect=fault):
+                        D.Handler.api_delete_workspace(first, self.delete_request("demo"))
+                    self.assertEqual(first.response[0], 409)
+                    self.assertIn("可安全重試", first.response[1]["error"])
+                    self.assertTrue(D._delete_journal_path("demo").is_file())
+
+                    replacement_marker = None
+                    if stage == "after-rename":
+                        workspace.mkdir()
+                        replacement = L.Workspace.__new__(L.Workspace).fresh_state()
+                        (workspace / "state.json").write_text(
+                            json.dumps(replacement), encoding="utf-8")
+                        replacement_marker = workspace / "new-workspace.txt"
+                        replacement_marker.write_text("must survive\n", encoding="utf-8")
+
+                    retry = self.ResponseCapture()
+                    D.Handler.api_delete_workspace(retry, {"name": "demo"})
+                    self.assertEqual(retry.response[0], 409 if replacement_marker else 200)
+                    if replacement_marker:
+                        self.assertTrue(retry.response[1]["replacement_preserved"])
+                    else:
+                        self.assertTrue(retry.response[1]["resumed_delete"])
+                    if replacement_marker is None:
+                        self.assertFalse(workspace.exists())
+                    else:
+                        self.assertEqual(replacement_marker.read_text(encoding="utf-8"),
+                                         "must survive\n")
+                    self.assertFalse(D._delete_journal_path("demo").exists())
+                    self.assertFalse(any(path.name.startswith(".delete-")
+                                         for path in root.iterdir()))
+                finally:
+                    D.ROOT = old_root
+
+    def test_completed_delete_stale_journal_never_touches_new_same_name_workspace(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            root.mkdir()
+            workspace = root / "demo"
+            workspace.mkdir()
+            state = L.Workspace.__new__(L.Workspace).fresh_state()
+            state["phase"] = "done"
+            (workspace / "state.json").write_text(json.dumps(state), encoding="utf-8")
+            old_root = D.ROOT
+            D.ROOT = root
+            fired = False
+
+            def fail_clear(stage, name):
+                nonlocal fired
+                if not fired and stage == "before-journal-clear" and name == "demo":
+                    fired = True
+                    raise OSError("injected journal clear failure")
+
+            try:
+                first = self.ResponseCapture()
+                with mock.patch.object(D, "_delete_fault_hook", side_effect=fail_clear):
+                    D.Handler.api_delete_workspace(first, self.delete_request("demo"))
+                self.assertEqual(first.response[0], 409)
+                self.assertFalse(workspace.exists())
+                self.assertTrue(D._delete_journal_path("demo").exists())
+
+                workspace.mkdir()
+                replacement = L.Workspace.__new__(L.Workspace).fresh_state()
+                (workspace / "state.json").write_text(json.dumps(replacement), encoding="utf-8")
+                marker = workspace / "new-workspace.txt"
+                marker.write_text("must survive\n", encoding="utf-8")
+                # 模擬檔案系統重用舊 inode；generation 仍必須辨識新 workspace。
+                journal_path = D._delete_journal_path("demo")
+                journal = json.loads(journal_path.read_text(encoding="utf-8"))
+                replacement_info = workspace.lstat()
+                journal["entries"][0]["dev"] = replacement_info.st_dev
+                journal["entries"][0]["ino"] = replacement_info.st_ino
+                self.assertNotEqual(journal["entries"][0]["generation"],
+                                    replacement["workspace_generation"])
+                journal_path.write_text(json.dumps(journal), encoding="utf-8")
+                sentinel_job = mock.Mock()
+                sentinel_job.alive.return_value = False
+                with D.JOBS_LOCK:
+                    D.JOBS["demo"] = sentinel_job
+                retry = self.ResponseCapture()
+                D.Handler.api_delete_workspace(retry, {"name": "demo"})
+                self.assertEqual(retry.response[0], 409)
+                self.assertTrue(retry.response[1]["replacement_preserved"])
+                self.assertEqual(marker.read_text(encoding="utf-8"), "must survive\n")
+                self.assertFalse(D._delete_journal_path("demo").exists())
+                with D.JOBS_LOCK:
+                    self.assertIs(D.JOBS.get("demo"), sentinel_job)
+                confirmed = self.ResponseCapture()
+                D.Handler.api_delete_workspace(confirmed, self.delete_request("demo"))
+                self.assertEqual(confirmed.response[0], 200)
                 self.assertFalse(workspace.exists())
             finally:
+                with D.JOBS_LOCK:
+                    D.JOBS.pop("demo", None)
                 D.ROOT = old_root
 
-    def test_rejects_invalid_symlink_and_held_archive_lock(self):
-        import fcntl
+    def test_group_git_retry_preserves_new_different_branch_at_old_worktree_path(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "workspace"
-            workspace = root / "demo"
-            workspace.mkdir(parents=True)
-            (workspace / "state.json").write_text(json.dumps({"phase": "done", "loop": {"pid": None}}))
+            parent = root / "parent"
+            worktrees = parent / "worktrees"
+            worktrees.mkdir(parents=True)
+            repo = make_repo(td)
+            old_run = "a" * 32
+            new_run = "b" * 32
+            path = worktrees / "alpha"
+            old_branch = f"refs/heads/loop/{old_run}/alpha"
+            subprocess.run(["git", "worktree", "add", "-b",
+                            old_branch.removeprefix("refs/heads/"), str(path)],
+                           cwd=repo, check=True, capture_output=True)
+            old_tip = subprocess.run(["git", "rev-parse", old_branch], cwd=repo,
+                                     text=True, capture_output=True, check=True).stdout.strip()
+            subprocess.run(["git", "worktree", "remove", str(path)], cwd=repo,
+                           check=True, capture_output=True)
+            new_branch = f"refs/heads/loop/{new_run}/alpha"
+            subprocess.run(["git", "worktree", "add", "-b",
+                            new_branch.removeprefix("refs/heads/"), str(path)],
+                           cwd=repo, check=True, capture_output=True)
+            common = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=repo,
+                                    text=True, capture_output=True, check=True).stdout.strip()
+            common_path = (Path(common) if Path(common).is_absolute() else repo / common).resolve()
+            journal = {"kind": "fleet-group", "git": {
+                "repo": str(repo.resolve()), "common_dir": str(common_path),
+                "integration_ref": "refs/heads/main",
+                "worktrees": [{"track": "alpha", "safe_name": "alpha",
+                               "path": str(path.resolve()), "branch_ref": old_branch,
+                               "branch_tip": old_tip}]}}
             old_root = D.ROOT
             D.ROOT = root
             try:
-                bad = self.ResponseCapture()
-                D.Handler.api_delete_archive(bad, {"archive_id": "../escape"})
-                self.assertEqual(bad.response[0], 400)
+                D._resume_delete_journal_git(journal)
+                self.assertTrue(path.is_dir())
+                actual = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=path,
+                                        text=True, capture_output=True, check=True).stdout.strip()
+                self.assertEqual(actual, new_branch)
+            finally:
+                D.ROOT = old_root
 
-                archive = self.ResponseCapture()
-                D.Handler.api_archive_workspace(archive, {"name": "demo"})
-                archive_id = archive.response[1]["archive_id"]
-                archived = root / ".archive" / archive_id
-                holder = open(archived / ".run.lock", "a+b")
-                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    def test_tampered_delete_journal_cannot_redirect_to_unrelated_workspace(self):
+        for mutation in ("entry", "tombstone"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "workspace"
+                demo = root / "demo"
+                victim = root / "victim"
+                demo.mkdir(parents=True)
+                victim.mkdir()
+                state = L.Workspace.__new__(L.Workspace).fresh_state()
+                state["phase"] = "done"
+                (demo / "state.json").write_text(json.dumps(state), encoding="utf-8")
+                marker = victim / "must-survive.txt"
+                marker.write_text("safe\n", encoding="utf-8")
+                info = demo.lstat()
+                identity = "demo\0\0demo"
+                tombstone = ".delete-" + hashlib.sha256(identity.encode()).hexdigest()[:32]
+                journal = {"schema_version": 1, "request_name": "demo",
+                           "kind": "standalone", "run_id": None,
+                           "entries": [{"name": "demo", "tombstone": tombstone,
+                                        "dev": info.st_dev, "ino": info.st_ino,
+                                        "generation": state["workspace_generation"],
+                                        "lock_names": [".run.lock"]}]}
+                if mutation == "entry":
+                    victim_info = victim.lstat()
+                    journal["entries"][0].update(
+                        name="victim", dev=victim_info.st_dev, ino=victim_info.st_ino)
+                else:
+                    journal["entries"][0]["tombstone"] = ".delete-attacker-chosen"
+                old_root = D.ROOT
+                D.ROOT = root
                 try:
-                    locked = self.ResponseCapture()
-                    D.Handler.api_delete_archive(locked, {"archive_id": archive_id})
+                    D._write_delete_journal(journal)
+                    handler = self.ResponseCapture()
+                    D.Handler.api_delete_workspace(handler, {"name": "demo"})
+                    self.assertEqual(handler.response[0], 409)
+                    self.assertTrue(demo.exists())
+                    self.assertEqual(marker.read_text(encoding="utf-8"), "safe\n")
                 finally:
-                    fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
-                    holder.close()
-                self.assertEqual(locked.response[0], 409, locked.response)
-                self.assertTrue(archived.exists())
+                    D.ROOT = old_root
 
-                outside = Path(td) / "outside-entry"
-                outside.mkdir()
-                symlink_id = "symlinked--20250102T030405Z--" + "c" * 32
-                (root / ".archive" / symlink_id).symlink_to(outside, target_is_directory=True)
-                symlink = self.ResponseCapture()
-                D.Handler.api_delete_archive(symlink, {"archive_id": symlink_id})
-                self.assertEqual(symlink.response[0], 409, symlink.response)
-                self.assertTrue((root / ".archive" / symlink_id).is_symlink())
-                self.assertTrue(outside.exists())
+    def test_delete_journal_rejects_unbounded_entry_list(self):
+        journal = {"schema_version": 1, "request_name": "demo", "kind": "fleet-group",
+                   "run_id": "a" * 32, "entries": [{} for _ in range(10)]}
+        with self.assertRaisesRegex(D.SafeDeleteError, "bounded 上限"):
+            D._validate_delete_journal(journal, "demo")
+
+    def test_delete_journal_rejects_escaping_worktree_component(self):
+        run_id = "a" * 32
+        identity = f"demo\0{run_id}\0demo"
+        journal = {
+            "schema_version": 1, "request_name": "demo", "kind": "fleet-group",
+            "run_id": run_id,
+            "entries": [{"name": "demo",
+                         "tombstone": ".delete-" + hashlib.sha256(
+                             identity.encode()).hexdigest()[:32],
+                         "dev": 1, "ino": 1,
+                         "generation": "b" * 32,
+                         "lock_names": [".fleet.run.lock", ".run.lock"]}],
+            "git": {"repo": "/tmp/repo", "common_dir": "/tmp/repo/.git",
+                    "integration_ref": "refs/heads/main",
+                    "worktrees": [{"track": "../../victim", "safe_name": "../../victim",
+                                   "path": "/tmp/victim",
+                                   "branch_ref": f"refs/heads/loop/{run_id}/../../victim",
+                                   "branch_tip": "0" * 40}],
+                    "children": []},
+        }
+        with self.assertRaisesRegex(D.SafeDeleteError, "worktree journal identity"):
+            D._validate_delete_journal(journal, "demo")
+
+    def test_fleet_delete_journal_rejects_unrelated_parent_prefix_workspace(self):
+        run_id = "a" * 32
+        entries = []
+        for entry_name, locks in (
+                ("demo", [".fleet.run.lock", ".run.lock"]),
+                ("demo--notes", [".run.lock"])):
+            identity = f"demo\0{run_id}\0{entry_name}"
+            entries.append({
+                "name": entry_name,
+                "tombstone": ".delete-" + hashlib.sha256(identity.encode()).hexdigest()[:32],
+                "dev": 1, "ino": len(entries) + 1, "generation": "b" * 32,
+                "generation_source": "state", "lock_names": locks,
+            })
+        journal = {
+            "schema_version": 1, "request_name": "demo", "kind": "fleet-group",
+            "run_id": run_id, "entries": entries,
+            "git": {
+                "repo": "/tmp/repo", "common_dir": "/tmp/repo/.git",
+                "integration_ref": "refs/heads/main",
+                "worktrees": [{"track": "alpha", "safe_name": "alpha",
+                               "path": str((Path("/tmp/workspace") /
+                                            "demo/worktrees/alpha").resolve()),
+                               "branch_ref": f"refs/heads/loop/{run_id}/alpha",
+                               "branch_tip": "0" * 40}],
+                # A journal editor cannot make an arbitrary prefixed workspace part of
+                # this run: every child must bijectively match the persisted track list.
+                "children": [{"track": "alpha", "safe_name": "alpha",
+                              "name": "demo--notes", "present": True}],
+            },
+        }
+        old_root = D.ROOT
+        D.ROOT = Path("/tmp/workspace")
+        try:
+            with self.assertRaisesRegex(D.SafeDeleteError, "child journal identity"):
+                D._validate_delete_journal(journal, "demo")
+        finally:
+            D.ROOT = old_root
+
+
+    def test_old_fleet_journal_preserves_new_run_and_requires_fresh_confirmation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            root.mkdir()
+            old_parent = root / "parallel"
+            old_parent.mkdir()
+            old_info = old_parent.lstat()
+            old_parent.rmdir()
+            replacement = root / "parallel"
+            replacement.mkdir()
+            marker = replacement / "new-run.txt"
+            marker.write_text("new\n", encoding="utf-8")
+            repo = make_repo(td)
+            common_raw = subprocess.run(
+                ["git", "rev-parse", "--git-common-dir"], cwd=repo, text=True,
+                capture_output=True, check=True).stdout.strip()
+            common = (Path(common_raw) if Path(common_raw).is_absolute()
+                      else repo / common_raw).resolve()
+            old_run, new_run = "a" * 32, "b" * 32
+            identity = f"parallel\0{old_run}\0parallel"
+            journal = {
+                "schema_version": 1, "request_name": "parallel", "kind": "fleet-group",
+                "run_id": old_run,
+                "entries": [{"name": "parallel",
+                             "tombstone": ".delete-" + hashlib.sha256(
+                                 identity.encode()).hexdigest()[:32],
+                             "dev": old_info.st_dev, "ino": old_info.st_ino,
+                             "generation": "c" * 32,
+                             "lock_names": [".fleet.run.lock", ".run.lock"]}],
+                "git": {"repo": str(repo.resolve()), "common_dir": str(common),
+                        "integration_ref": "refs/heads/main", "worktrees": [],
+                        "children": []},
+            }
+            old_root = D.ROOT
+            D.ROOT = root
+            sentinel_job = mock.Mock()
+            sentinel_job.alive.return_value = False
+            try:
+                D._write_delete_journal(journal)
+                with D.JOBS_LOCK:
+                    D.JOBS["parallel"] = sentinel_job
+                response = self.ResponseCapture()
+                D.Handler.api_delete_workspace(
+                    response, {"name": "parallel", "run_id": new_run})
+                self.assertEqual(response.response[0], 409)
+                self.assertTrue(response.response[1]["replacement_preserved"])
+                self.assertEqual(marker.read_text(encoding="utf-8"), "new\n")
+                self.assertFalse(D._delete_journal_path("parallel").exists())
+                with D.JOBS_LOCK:
+                    self.assertIs(D.JOBS.get("parallel"), sentinel_job)
+            finally:
+                with D.JOBS_LOCK:
+                    D.JOBS.pop("parallel", None)
+                D.ROOT = old_root
+
+
+class TestDurableRuntimeIdentity(unittest.TestCase):
+    def tearDown(self):
+        L.remove_runtime_identity_markers()
+        L.clear_runtime_identity_context()
+
+    def test_marker_write_failure_never_releases_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "demo"
+            workspace.mkdir()
+            target_started = root / "target-started"
+            generation, session_id = "a" * 32, "b" * 32
+            L.configure_runtime_identity(workspace, generation, session_id,
+                                         workspace_name="demo", repo=root)
+            real_atomic = L.atomic_write_bytes
+
+            def fail_active_marker(path, data):
+                if Path(path).name == L.ACTIVE_RUNTIME_FILE:
+                    raise OSError("simulated fsync failure")
+                return real_atomic(path, data)
+
+            command = [sys.executable, "-c",
+                       f"from pathlib import Path; Path({str(target_started)!r}).write_text('bad')"]
+            with mock.patch.object(L, "atomic_write_bytes", side_effect=fail_active_marker):
+                with self.assertRaisesRegex(OSError, "fsync failure"):
+                    L._spawn_runtime_process(command, kind="agent", cwd=root,
+                                             env=os.environ, stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL)
+            time.sleep(0.1)
+            self.assertFalse(target_started.exists(), "marker durable 前不得執行真命令")
+
+    def test_gate_wrapper_exits_on_eof_without_starting_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target_started = Path(directory) / "target-started"
+            read_fd, write_fd = os.pipe()
+            env = {**os.environ, "LOOP_AGENT_RUNTIME_ARGV": json.dumps([
+                sys.executable, "-c",
+                f"from pathlib import Path; Path({str(target_started)!r}).write_text('bad')",
+            ])}
+            process = subprocess.Popen(
+                [sys.executable, "-c", L._RUNTIME_GATE_WRAPPER, str(read_fd)],
+                pass_fds=(read_fd,), env=env, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+            os.close(read_fd)
+            os.close(write_fd)
+            self.assertEqual(process.wait(timeout=2), 125)
+            self.assertFalse(target_started.exists())
+
+    def test_hard_killed_coordinator_leaves_group_that_startup_sweep_cleans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "workspace-root"
+            root.mkdir()
+            workspace = root / "demo"
+            workspace.mkdir()
+            (workspace / "state.json").write_text("{corrupt", encoding="utf-8")
+            prompt = base / "prompt.md"
+            prompt.write_text("test\n", encoding="utf-8")
+            agent_pid_file = base / "agent.pid"
+            agent = base / "agent.py"
+            agent.write_text(
+                "import os,time\n"
+                "from pathlib import Path\n"
+                f"p=Path({str(agent_pid_file)!r})\n"
+                "p.write_text(str(os.getpid()))\n"
+                "with p.open('r') as f: os.fsync(f.fileno())\n"
+                "time.sleep(60)\n", encoding="utf-8")
+            generation, session_id = "a" * 32, "b" * 32
+            script = (
+                "import os,sys\n"
+                "from pathlib import Path\n"
+                "from engine import loop as L\n"
+                f"ws=Path({str(workspace)!r}); root=Path({str(base)!r})\n"
+                f"L.configure_runtime_identity(ws,{generation!r},{session_id!r},"
+                "workspace_name='demo',repo=root)\n"
+                f"L.run_agent([sys.executable,{str(agent)!r}],Path({str(prompt)!r}),root,"
+                f"os.environ,ws/'agent.log',60)\n"
+            )
+            env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
+            coordinator = subprocess.Popen(
+                [sys.executable, "-c", script], cwd=REPO_ROOT, env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                deadline = time.monotonic() + 5
+                while (not agent_pid_file.exists() or
+                       not (workspace / L.ACTIVE_RUNTIME_FILE).exists()):
+                    if coordinator.poll() is not None:
+                        self.fail(f"coordinator 提前退出 rc={coordinator.returncode}")
+                    if time.monotonic() >= deadline:
+                        self.fail("agent/runtime marker 未在期限內啟動")
+                    time.sleep(0.02)
+                os.kill(coordinator.pid, signal.SIGKILL)
+                coordinator.wait(timeout=2)
+                old_root = D.ROOT
+                D.ROOT = root
+                try:
+                    result = D.stop_workspace_coordinators(grace_seconds=0.2,
+                                                           force_seconds=1.0)
+                    self.assertGreaterEqual(result["requested"], 1)
+                    marker = json.loads((workspace / L.ACTIVE_RUNTIME_FILE).read_text())
+                    final = D._process_snapshot()
+                    self.assertIsNotNone(final)
+                    self.assertFalse(any(
+                        process.get("pgid") == marker["pgid"] and
+                        process.get("sid") == marker["sid"]
+                        for process in final.values()))
+                finally:
+                    D.ROOT = old_root
+            finally:
+                if coordinator.poll() is None:
+                    coordinator.kill()
+                    coordinator.wait()
+
+    def test_fleet_pending_marker_covers_window_before_parent_mkdir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "workspace-root"
+            root.mkdir()
+            ready = base / "ready"
+            script = (
+                "import os,time\n"
+                "from pathlib import Path\n"
+                "from engine import loop as L\n"
+                f"root=Path({str(root)!r}); repo=Path({str(base)!r})\n"
+                "L.configure_pending_runtime_identity(root,'parallel',repo,'a'*32,'b'*32)\n"
+                f"Path({str(ready)!r}).write_text(str(os.getpid()))\n"
+                "time.sleep(60)\n"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", script], cwd=REPO_ROOT,
+                env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                deadline = time.monotonic() + 5
+                pending_path = L.pending_runtime_marker_path(root, "parallel")
+                while not ready.exists() or not pending_path.exists():
+                    if process.poll() is not None:
+                        self.fail(f"pending fleet 提前退出 rc={process.returncode}")
+                    if time.monotonic() >= deadline:
+                        self.fail("pending fleet marker 未在期限內落盤")
+                    time.sleep(0.02)
+                self.assertFalse((root / "parallel").exists())
+                old_root = D.ROOT
+                D.ROOT = root
+                try:
+                    result = D.stop_workspace_coordinators(grace_seconds=1, force_seconds=1)
+                    self.assertEqual(result["requested"], 1)
+                finally:
+                    D.ROOT = old_root
+                process.wait(timeout=2)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+
+class TestDashboardStartupCoordinatorSweep(unittest.TestCase):
+    @staticmethod
+    def _write_marker(entry: Path, filename: str, payload: dict):
+        L.atomic_write_bytes(entry / filename,
+                             json.dumps(payload, separators=(",", ":")).encode())
+
+    @staticmethod
+    def _coordinator_marker(root: Path, name: str, generation: str, pid: int,
+                            started: str, command: str):
+        return {
+            "schema_version": L.ACTIVE_RUNTIME_SCHEMA_VERSION,
+            "workspace_name": name, "workspace_root": str(root.resolve()),
+            "repo": "/tmp/repo", "workspace_generation": generation,
+            "session_id": "d" * 32, "pid": pid,
+            "started": started, "command": command,
+        }
+
+    @staticmethod
+    def _active_marker(root: Path, name: str, generation: str, pid: int,
+                       started: str, command: str):
+        return {
+            "schema_version": L.ACTIVE_RUNTIME_SCHEMA_VERSION, "kind": "agent",
+            "workspace_name": name, "workspace_root": str(root.resolve()),
+            "repo": "/tmp/repo", "workspace_generation": generation,
+            "session_id": "d" * 32, "owner_pid": 77,
+            "owner_started": "owner-start", "owner_command": "owner-command",
+            "pid": pid, "pgid": pid, "sid": pid, "started": started,
+            "command": command, "target_command": "agent --work",
+        }
+    def test_collects_standalone_parent_planner_orphan_child_and_legacy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("standalone", "parallel", "parallel--alpha", "legacy"):
+                (root / name).mkdir()
+            states = {
+                "standalone": {"workspace_kind": "standalone", "loop": {"pid": 101}},
+                "parallel": {"workspace_kind": "fleet-parent", "loop": {"pid": 999}},
+                "parallel--alpha": {"workspace_kind": "fleet-child", "loop": {"pid": 303}},
+            }
+            snapshot = {
+                pid: {"ppid": 1, "started": f"start-{pid}", "command": command}
+                for pid, command in {
+                    101: "python -m engine.loop --name standalone",
+                    202: "python -m engine.fleet --name parallel",
+                    303: "python -m engine.loop --name parallel--alpha",
+                    404: "python -m engine.loop --name legacy",
+                    999: "python -m engine.loop --name parallel",
+                }.items()
+            }
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                def read(name, repair=False):
+                    return ((None, "legacy") if name == "legacy" else (states[name], None))
+
+                with mock.patch.object(D, "read_state", side_effect=read), \
+                        mock.patch.object(D, "read_parallel_run",
+                                          return_value={"loop": {"pid": 202}}), \
+                        mock.patch.object(
+                            D, "_pending_coordinator_pids",
+                            return_value=({"parallel": {202}}, set())), \
+                        mock.patch.object(
+                            D, "_coordinator_marker_pids",
+                            side_effect=lambda entry, _snapshot, _generation: ({
+                                "standalone": {101}, "parallel": {999},
+                                "parallel--alpha": {303}, "legacy": {404},
+                            }.get(entry.name, set()), None)), \
+                        mock.patch.object(
+                            D, "legacy_workspace_identity_for_delete",
+                            side_effect=lambda name: ({"state": {"loop": {"pid": 404}}}
+                                                      if name == "legacy" else None)):
+                    self.assertEqual(D._workspace_coordinator_pids(snapshot),
+                                     {101, 202, 303, 404, 999})
+            finally:
+                D.ROOT = old_root
+
+    def test_force_path_kills_captured_descendants_before_stuck_coordinator(self):
+        initial = {
+            100: {"ppid": 1, "started": "s100",
+                  "command": "python -m engine.loop --name demo"},
+            101: {"ppid": 100, "started": "s101", "command": "agent child --work"},
+            102: {"ppid": 101, "started": "s102", "command": "validator child"},
+        }
+        sent = []
+        with mock.patch.object(D, "_process_snapshot",
+                               side_effect=[initial, initial, initial, {}]), \
+                mock.patch.object(D, "_workspace_coordinator_pids", return_value={100}), \
+                mock.patch.object(D.os, "kill", side_effect=lambda pid, sig: sent.append((pid, sig))):
+            result = D.stop_workspace_coordinators(grace_seconds=0, force_seconds=0)
+        self.assertEqual(sent[0], (100, signal.SIGINT))
+        self.assertEqual(sent[1:], [(102, signal.SIGKILL), (101, signal.SIGKILL),
+                                    (100, signal.SIGKILL)])
+        self.assertEqual(result, {"requested": 1, "forced": 3, "remaining": []})
+
+    def test_force_path_still_kills_captured_child_after_reparent(self):
+        initial = {
+            100: {"ppid": 1, "started": "s100",
+                  "command": "python -m engine.loop --name demo"},
+            101: {"ppid": 100, "started": "s101", "command": "agent child --work"},
+        }
+        reparented = {
+            101: {"ppid": 1, "started": "s101", "command": "agent child --work"},
+        }
+        sent = []
+        with mock.patch.object(D, "_process_snapshot",
+                               side_effect=[initial, initial, reparented, {}]), \
+                mock.patch.object(D, "_workspace_coordinator_pids", return_value={100}), \
+                mock.patch.object(D.os, "kill",
+                                  side_effect=lambda pid, sig: sent.append((pid, sig))):
+            result = D.stop_workspace_coordinators(grace_seconds=0, force_seconds=0)
+        self.assertEqual(sent, [(100, signal.SIGINT), (101, signal.SIGKILL)])
+        self.assertEqual(result, {"requested": 1, "forced": 1, "remaining": []})
+
+    def test_stale_pid_owned_by_other_workspace_coordinator_is_not_signaled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "expected").mkdir()
+            state = {"workspace_kind": "standalone", "loop": {"pid": 101}}
+            snapshot = {
+                101: {"ppid": 1, "started": "start-101",
+                      "command": "python -m engine.loop --name=other --repo /tmp/expected"},
+            }
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                with mock.patch.object(D, "read_state", return_value=(state, None)):
+                    self.assertEqual(D._workspace_coordinator_pids(snapshot), set())
+            finally:
+                D.ROOT = old_root
+
+    def test_live_legacy_coordinator_without_marker_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "expected").mkdir()
+            state = {"workspace_kind": "standalone", "loop": {"pid": 101}}
+            snapshot = {
+                101: {"ppid": 1, "started": "start-101",
+                      "command": "python -m engine.loop --repo /tmp/expected"},
+            }
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                with mock.patch.object(D, "read_state", return_value=(state, None)):
+                    with self.assertRaisesRegex(RuntimeError, "缺 durable root marker"):
+                        D._workspace_coordinator_pids(snapshot)
+            finally:
+                D.ROOT = old_root
+
+    def test_force_does_not_kill_reused_pid_with_same_command(self):
+        initial = {100: {"ppid": 1, "started": "old-start",
+                         "command": "python -m engine.loop --name demo"}}
+        reused = {100: {"ppid": 77, "started": "new-start",
+                        "command": "python -m engine.loop --name demo"}}
+        sent = []
+        with mock.patch.object(D, "_process_snapshot",
+                               side_effect=[initial, reused, reused, {}]), \
+                mock.patch.object(D, "_workspace_coordinator_pids", return_value={100}), \
+                mock.patch.object(D.os, "kill", side_effect=lambda pid, sig: sent.append((pid, sig))):
+            result = D.stop_workspace_coordinators(grace_seconds=0, force_seconds=0)
+        self.assertEqual(sent, [])
+        self.assertEqual(result["forced"], 0)
+
+    def test_dead_runtime_leader_with_unrostered_same_pgid_member_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "demo"
+            entry.mkdir()
+            generation = "a" * 32
+            marker = self._active_marker(root, "demo", generation, 100,
+                                         "leader-start", "gate-wrapper nonce")
+            self._write_marker(entry, L.ACTIVE_RUNTIME_FILE, marker)
+            snapshot = {
+                201: {"ppid": 1, "pgid": 100, "sid": 100,
+                      "started": "member-start", "command": "agent child"},
+                202: {"ppid": 1, "pgid": 999, "sid": 999,
+                      "started": "other-start", "command": "other process"},
+            }
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                state = {"workspace_kind": "standalone",
+                         "workspace_generation": generation, "loop": {"pid": None}}
+                with mock.patch.object(D, "read_state", return_value=(state, None)), \
+                        mock.patch.object(D, "_process_snapshot", return_value=snapshot), \
+                        mock.patch.object(D.os, "kill") as kill:
+                    with self.assertRaisesRegex(RuntimeError, "未證明 members"):
+                        D.stop_workspace_coordinators(grace_seconds=0, force_seconds=0)
+                    kill.assert_not_called()
+            finally:
+                D.ROOT = old_root
+
+    def test_runtime_marker_pid_reuse_is_never_collected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "demo"
+            entry.mkdir()
+            generation = "a" * 32
+            marker = self._active_marker(root, "demo", generation, 100,
+                                         "old-start", "gate-wrapper nonce")
+            self._write_marker(entry, L.ACTIVE_RUNTIME_FILE, marker)
+            snapshot = {
+                100: {"ppid": 1, "pgid": 100, "sid": 100,
+                      "started": "new-start", "command": "gate-wrapper nonce"},
+            }
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                state = {"workspace_kind": "standalone",
+                         "workspace_generation": generation, "loop": {"pid": None}}
+                with mock.patch.object(D, "read_state", return_value=(state, None)):
+                    self.assertEqual(D._workspace_coordinator_pids(snapshot), set())
+            finally:
+                D.ROOT = old_root
+
+    def test_valid_state_cannot_bypass_coordinator_marker_pid_reuse_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "demo"
+            entry.mkdir()
+            generation = "a" * 32
+            command = "python -m engine.loop --repo /tmp/repo --name demo"
+            marker = self._coordinator_marker(root, "demo", generation, 101,
+                                              "old-start", command)
+            self._write_marker(entry, L.COORDINATOR_RUNTIME_FILE, marker)
+            snapshot = {101: {"ppid": 1, "pgid": 101, "sid": 101,
+                              "started": "new-start", "command": command}}
+            state = {"workspace_kind": "standalone",
+                     "workspace_generation": generation, "loop": {"pid": 101}}
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                with mock.patch.object(D, "read_state", return_value=(state, None)):
+                    with self.assertRaisesRegex(RuntimeError, "marker identity mismatch"):
+                        D._workspace_coordinator_pids(snapshot)
+            finally:
+                D.ROOT = old_root
+
+    def test_reset_pending_generation_accepts_old_disk_but_rejects_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "demo"
+            entry.mkdir()
+            old_generation, pending_generation = "a" * 32, "b" * 32
+            command = "python -m engine.loop --repo /tmp/repo --name demo --reset-state"
+            coordinator = self._coordinator_marker(
+                root, "demo", pending_generation, 101, "start-101", command)
+            coordinator["previous_workspace_generation"] = old_generation
+            active = self._active_marker(
+                root, "demo", pending_generation, 201, "start-201", "gate-wrapper")
+            active["previous_workspace_generation"] = old_generation
+            self._write_marker(entry, L.COORDINATOR_RUNTIME_FILE, coordinator)
+            self._write_marker(entry, L.ACTIVE_RUNTIME_FILE, active)
+            snapshot = {
+                101: {"ppid": 1, "pgid": 101, "sid": 101,
+                      "started": "start-101", "command": command},
+                201: {"ppid": 101, "pgid": 201, "sid": 201,
+                      "started": "start-201", "command": "gate-wrapper"},
+            }
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                old_state = {"workspace_kind": "standalone",
+                             "workspace_generation": old_generation,
+                             "loop": {"pid": 101}}
+                with mock.patch.object(D, "read_state", return_value=(old_state, None)):
+                    self.assertEqual(D._workspace_coordinator_pids(snapshot), {101, 201})
+                replacement = {**old_state, "workspace_generation": "c" * 32}
+                with mock.patch.object(D, "read_state", return_value=(replacement, None)):
+                    with self.assertRaisesRegex(RuntimeError, "marker identity mismatch"):
+                        D._workspace_coordinator_pids(snapshot)
+            finally:
+                D.ROOT = old_root
+
+    def test_corrupt_state_uses_exact_root_coordinator_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "demo"
+            entry.mkdir()
+            command = "python -m engine.loop --repo /tmp/repo --name demo"
+            marker = self._coordinator_marker(root, "demo", "a" * 32, 101,
+                                              "start-101", command)
+            self._write_marker(entry, L.COORDINATOR_RUNTIME_FILE, marker)
+            snapshot = {101: {"ppid": 1, "pgid": 101, "sid": 101,
+                              "started": "start-101", "command": command}}
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                with mock.patch.object(D, "read_state", return_value=(None, "corrupt")), \
+                        mock.patch.object(D, "legacy_workspace_identity_for_delete",
+                                          return_value=None):
+                    self.assertEqual(D._workspace_coordinator_pids(snapshot), {101})
+            finally:
+                D.ROOT = old_root
+
+    def test_corrupt_state_does_not_kill_same_name_from_another_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "root-a"
+            root.mkdir()
+            (root / "demo").mkdir()
+            command = "python -m engine.loop --repo /other/repo --name demo"
+            snapshot = {101: {"ppid": 1, "pgid": 101, "sid": 101,
+                              "started": "start-101", "command": command}}
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                with mock.patch.object(D, "read_state", return_value=(None, "corrupt")), \
+                        mock.patch.object(D, "legacy_workspace_identity_for_delete",
+                                          return_value=None), \
+                        mock.patch.object(D, "_process_snapshot", return_value=snapshot), \
+                        mock.patch.object(D.os, "kill") as kill:
+                    with self.assertRaisesRegex(RuntimeError, "未經 root marker 證明"):
+                        D.stop_workspace_coordinators(grace_seconds=0, force_seconds=0)
+                    kill.assert_not_called()
+            finally:
+                D.ROOT = old_root
+
+    def test_workspace_root_scan_failure_is_fail_closed(self):
+        class BrokenRoot:
+            def __truediv__(self, _name):
+                return Path("/definitely-missing-loop-agent-ops")
+
+            def iterdir(self):
+                raise PermissionError("denied")
+
+            def __str__(self):
+                return "broken-root"
+
+        broken_root = BrokenRoot()
+        old_root = D.ROOT
+        D.ROOT = broken_root
+        try:
+            with self.assertRaisesRegex(RuntimeError, "無法掃描 workspace root"):
+                D._workspace_coordinator_pids({})
+        finally:
+            D.ROOT = old_root
+
+    def test_run_dashboard_does_not_bind_when_startup_sweep_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_root = D.ROOT
+            D.ROOT = Path(directory) / "workspace-root"
+            try:
+                with mock.patch.object(D, "load_config", return_value={}), \
+                        mock.patch.object(D, "stop_workspace_coordinators",
+                                          side_effect=RuntimeError("still running")), \
+                        mock.patch.object(D, "DashboardServer") as server:
+                    with self.assertRaisesRegex(RuntimeError, "still running"):
+                        D.run_dashboard(port=8765)
+                server.assert_not_called()
+            finally:
+                D.ROOT = old_root
+
+    @staticmethod
+    def _start_dashboard_lease_holder(root: Path, ready: Path):
+        script = (
+            "import time\n"
+            "from pathlib import Path\n"
+            "from engine import dashboard as D\n"
+            "with D.dashboard_instance_lease():\n"
+            f"    Path({str(ready)!r}).write_text('ready', encoding='utf-8')\n"
+            "    time.sleep(60)\n"
+        )
+        env = {**os.environ, "PYTHONPATH": str(REPO_ROOT),
+               "LOOP_AGENT_WORKSPACE_ROOT": str(root)}
+        process = subprocess.Popen(
+            [sys.executable, "-c", script], cwd=REPO_ROOT, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + 5
+        while not ready.exists():
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                raise AssertionError(
+                    f"Dashboard lease holder 提前退出 rc={process.returncode}: {stdout}{stderr}")
+            if time.monotonic() >= deadline:
+                process.kill()
+                stdout, stderr = process.communicate()
+                raise AssertionError(f"Dashboard lease holder 未就緒: {stdout}{stderr}")
+            time.sleep(0.02)
+        return process
+
+    def test_second_instance_on_different_port_fails_before_config_sweep_or_bind(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace-root"
+            root.mkdir()
+            holder = self._start_dashboard_lease_holder(root, Path(directory) / "ready")
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                with mock.patch.object(D, "load_config") as load_config, \
+                        mock.patch.object(D, "stop_workspace_coordinators") as sweep, \
+                        mock.patch.object(D, "DashboardServer") as server:
+                    with self.assertRaisesRegex(RuntimeError, "singleton lease"):
+                        D.run_dashboard(port=54321)
+                load_config.assert_not_called()
+                sweep.assert_not_called()
+                server.assert_not_called()
+            finally:
+                if holder.poll() is None:
+                    holder.terminate()
+                holder.communicate(timeout=3)
+                D.ROOT = old_root
+
+    def test_dashboard_singleton_lease_is_released_by_process_crash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace-root"
+            root.mkdir()
+            holder = self._start_dashboard_lease_holder(root, Path(directory) / "ready")
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                os.kill(holder.pid, signal.SIGKILL)
+                holder.communicate(timeout=3)
+                with D.dashboard_instance_lease() as lease:
+                    self.assertFalse(lease.closed)
+            finally:
+                if holder.poll() is None:
+                    holder.kill()
+                    holder.communicate(timeout=3)
+                D.ROOT = old_root
+
+    def test_dashboard_singleton_lock_rejects_symlink_and_hardlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace-root"
+            root.mkdir()
+            victim = Path(directory) / "victim"
+            victim.write_text("safe", encoding="utf-8")
+            lock_path = root / D.DASHBOARD_INSTANCE_LOCK
+            lock_path.symlink_to(victim)
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                with self.assertRaisesRegex(RuntimeError, "symbolic link"):
+                    with D.dashboard_instance_lease():
+                        self.fail("symlink lock 不得取得 lease")
+                self.assertEqual(victim.read_text(encoding="utf-8"), "safe")
+                lock_path.unlink()
+                lock_path.write_text("", encoding="utf-8")
+                os.link(lock_path, root / ".dashboard.instance.alias")
+                with self.assertRaisesRegex(RuntimeError, "單一 regular file"):
+                    with D.dashboard_instance_lease():
+                        self.fail("hard-linked lock 不得取得 lease")
             finally:
                 D.ROOT = old_root
 
@@ -3156,7 +5217,7 @@ class TestCliArgumentGuards(unittest.TestCase):
             repo = make_repo(root)
             workspace_root = root / "workspace"
             plan = root / "plan.json"
-            plan.write_text(json.dumps([{"order": 1, "task": "不得被零門檻跳過"}]))
+            plan.write_text(json.dumps([{"order": 1, "task": "不得被零門檻跳過", "track": "main"}]))
             marker = root / "agent-started"
             agent = root / "noop_agent.py"
             agent.write_text(f"from pathlib import Path\nPath({str(marker)!r}).write_text('started')\n")
@@ -3243,7 +5304,8 @@ class TestDashboardNumericGuards(unittest.TestCase):
 
                 edit = self.ResponseCapture()
                 D.Handler.api_edit_config(edit, {
-                    "name": "bad-saved-number", "round_timeout": float("nan"),
+                    "name": "bad-saved-number", "workspace_generation": state["workspace_generation"],
+                    "round_timeout": float("nan"),
                 })
                 self.assertEqual(edit.response[0], 400)
                 saved = json.loads(ws.state_path.read_text(encoding="utf-8"))
@@ -3252,7 +5314,8 @@ class TestDashboardNumericGuards(unittest.TestCase):
                 saved["config"]["round_timeout"] = float("inf")
                 ws.save_state(saved)
                 run = self.ResponseCapture()
-                D.Handler.api_run(run, {"name": "bad-saved-number"})
+                D.Handler.api_run(run, {
+                    "name": "bad-saved-number", "workspace_generation": state["workspace_generation"]})
                 self.assertEqual(run.response[0], 400)
                 self.assertIn("非法數值", run.response[1]["error"])
                 self.assertNotIn("bad-saved-number", D.JOBS)
@@ -3447,10 +5510,9 @@ class TestProtectedPathGuards(unittest.TestCase):
                 D.ROOT = workspace_root
                 dashboard_workspace = workspace_root / "dashboard"
                 dashboard_workspace.mkdir(parents=True)
-                (dashboard_workspace / "state.json").write_text(json.dumps({
-                    "phase": "done",
-                    "config": {"repo": str(repo), "goal": "../outside.md"},
-                }), encoding="utf-8")
+                state = L.Workspace.__new__(L.Workspace).fresh_state()
+                state.update(phase="done", config={"repo": str(repo), "goal": "../outside.md"})
+                (dashboard_workspace / "state.json").write_text(json.dumps(state), encoding="utf-8")
                 projection = D.read_goal("dashboard")
                 self.assertIn("goal 路徑不合法", projection["error"])
                 self.assertNotIn("do not expose", json.dumps(projection, ensure_ascii=False))
@@ -3469,17 +5531,17 @@ class TestGoalProjection(unittest.TestCase):
             old_root = D.ROOT
             D.ROOT = root
             try:
-                # 舊版 state 缺 config.repo → 明確 error
-                (root / "demo" / "state.json").write_text(json.dumps({"phase": "plan"}), encoding="utf-8")
+                # 合法 v2 state 缺 config.repo → 明確 error
+                state = L.Workspace.__new__(L.Workspace).fresh_state()
+                (root / "demo" / "state.json").write_text(json.dumps(state), encoding="utf-8")
                 self.assertIn("缺 repo 設定", D.read_goal("demo")["error"])
                 # 壞 state 塞非字串 repo → 受控 error,不得拋 TypeError
-                (root / "demo" / "state.json").write_text(json.dumps(
-                    {"phase": "plan", "config": {"repo": 123}}), encoding="utf-8")
+                state["config"] = {"repo": 123}
+                (root / "demo" / "state.json").write_text(json.dumps(state), encoding="utf-8")
                 self.assertIn("缺 repo 設定", D.read_goal("demo")["error"])
                 # 正常:回 goal 內容與路徑,goal_changed 透傳
-                (root / "demo" / "state.json").write_text(json.dumps(
-                    {"phase": "plan", "goal_changed": True,
-                     "config": {"repo": str(repo), "goal": "goal.md"}}), encoding="utf-8")
+                state.update(goal_changed=True, config={"repo": str(repo), "goal": "goal.md"})
+                (root / "demo" / "state.json").write_text(json.dumps(state), encoding="utf-8")
                 result = D.read_goal("demo")
                 self.assertEqual(result["content"], "GOAL v1\n")
                 self.assertTrue(result["goal_changed"])
@@ -3510,7 +5572,7 @@ class TestGoalProjection(unittest.TestCase):
                 L.WORKSPACE_ROOT = workspace_root
                 ws = L.Workspace("goal-diff")
                 state = ws.fresh_state()
-                state.update(plan=[{"order": 1, "task": "existing plan"}], plan_version=1,
+                state.update(plan=[{"order": 1, "task": "existing plan", "track": "main"}], plan_version=1,
                              goal_hash=previous_hash)
                 ws.save_state(state)
             finally:
@@ -3725,14 +5787,16 @@ class TestFleetHistoryProjection(unittest.TestCase):
                     "timeout=False changed=False signal=- done_missing=True tamper=False agent_ok=True "
                     "validate=PASS flag=0 done=0")
             (root / "alpha" / "history.log").write_text(line + "\n", encoding="utf-8")
-            (root / "alpha" / "state.json").write_text(json.dumps({
+            state = L.Workspace.__new__(L.Workspace).fresh_state()
+            state.update({
                 "phase": "exec", "current_order": 2,
                 "round_started_at": "2026-07-10T10:00:00",
                 "round_deadline_at": "2026-07-10T10:30:00",
                 "round_interrupted_at": None,
-                "plan": [{"order": 1, "task": "第一項", "ref": None},
-                         {"order": 2, "task": "第二項很長" + "x" * 200, "ref": None}],
-            }), encoding="utf-8")
+                "plan": [{"order": 1, "task": "第一項", "ref": None, "track": "main"},
+                         {"order": 2, "task": "第二項很長" + "x" * 200, "ref": None, "track": "main"}],
+            })
+            (root / "alpha" / "state.json").write_text(json.dumps(state), encoding="utf-8")
             old_root = D.ROOT
             D.ROOT = root
             try:
@@ -4033,10 +6097,9 @@ class TestJobHistoryRetention(unittest.TestCase):
 
 
 class TestDashboardRequestLimit(unittest.TestCase):
-    """POST body 過大時應在讀取 payload 前拒絕，避免無界記憶體使用。"""
+    """POST body 必須有界且格式錯誤不讀取額外資料。"""
 
     class FakeHandler:
-        readonly = False
         path = "/api/launch"
 
         def __init__(self, length):
@@ -4061,7 +6124,6 @@ class TestDashboardRequestLimit(unittest.TestCase):
         D.Handler.do_POST(handler)
         self.assertEqual(handler.response[0], 400)
         self.assertIn("JSON", handler.response[1])
-
 
 class TestPreviousRunHistoryProjection(unittest.TestCase):
     """history.log.1 只讀投影可供 UI 稽核，且 run 參數不允許任意檔名。"""

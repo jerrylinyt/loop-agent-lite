@@ -15,6 +15,11 @@ PROMPT_PLACEHOLDER_RE = re.compile(r"<<[A-Z][A-Z0-9_]*>>")
 PROMPT_MARKER_RE = re.compile(r"<<[^\r\n]*?>>")
 MAX_PROMPT_RESOURCE_CHARS = 100_000
 PROMPT_TEMPLATE_BUNDLE_SCHEMA_VERSION = 1
+LIMITED_DISCOVERY_PREFIX = (
+    "- 取證邊界：只使用原始需求、project context、既有 ref 或已知錯誤直接點名的路徑，"
+    "並只在這些 source/test 目錄追蹤直接關聯；下列「盤點／全部／逐項」都只指這個已知邊界，"
+    "不授權全 repo 列檔、廣域搜巡或讀 generated/dependency/build 產物。"
+)
 PROMPT_RESOURCE_SPECS = {
     "base": (
         "external-agent-base.md",
@@ -47,9 +52,9 @@ BUILTIN_PROMPT_TEMPLATES = [
         "category": "開發",
         "description": "把產品需求轉成有邊界、可驗證且能逐步交付的目標或任務。",
         "requirement_placeholder": "例：新增可依狀態篩選 workspace 的功能，並保留重新整理後的選擇。",
-        "instructions": """- 先找出既有使用流程、相鄰功能、資料來源與可重用元件，不要另造平行架構。
-- 將驗收條件逐條編成穩定 ID（AC-1、AC-2…），明列使用者入口、正常流程、空狀態、錯誤狀態、權限或唯讀邊界及相容性影響。
-- 建立「驗收條件 → 適用層 → 驗證」對照；層軸固定為 UI、API／資料契約、服務邏輯、持久化、權限、背景工作六類，每層都必須下「涉及」或「N/A（附證據）」的結論，不得自增自減層別。
+        "instructions": """- 先找出已知範圍內的既有使用流程、相鄰功能、資料來源與可重用元件，不要另造平行架構。
+- 驗收條件需要跨多個 task 追蹤時才編穩定 ID；簡單需求直接在 task 內寫清楚入口、正常／空／錯誤狀態與相容性影響，不為格式增加 ID。
+- 只列實際有證據受影響的 UI、API／資料契約、服務邏輯、持久化、權限或背景工作；不要求固定六層矩陣，也不為未涉及層逐項製造 N/A。
 - 優先切出可獨立驗證的垂直功能片段，避免只按檔案或技術層拆任務。""",
     },
     {
@@ -78,10 +83,10 @@ BUILTIN_PROMPT_TEMPLATES = [
         "id": "project-logic-analysis",
         "label": "分析專案架構／邏輯",
         "category": "分析",
-        "description": "先做全局模組地圖，再深追需求指定流程的依賴與狀態真相來源。",
+        "description": "在需求指定邊界內建立模組地圖，再深追指定流程的依賴與狀態真相來源。",
         "requirement_placeholder": "例：分析整個專案如何從 Dashboard 啟動 loop，以及狀態如何回到 Overview。",
-        "instructions": """- 先界定要回答的架構問題、深追流程與排除項；repo-wide 部分只做淺層模組盤點（淺層＝僅模組清單、每模組一句責任與依賴方向，不深入函式層），避免無界展開。
-- 從目錄、建置檔、啟動入口與設定檔建立模組清單，說明每個模組責任及依賴方向。
+        "instructions": """- 先界定要回答的架構問題、深追流程與排除項；只盤點需求/context/ref 已指向的模組，不自行擴張成 repo-wide 地圖。
+- 從已知範圍內的目錄、建置檔、啟動入口與設定檔建立模組清單，說明每個模組責任及依賴方向。
 - 對需求指定流程追蹤入口 → 核心邏輯 → 持久化／外部程序 → 消費端投影，標出狀態真相來源。
 - 盤點跨模組契約、生命週期、錯誤處理、並行或鎖定邊界，以及測試覆蓋位置。
 - 將直接從程式讀到的事實與推論分開；推論要附理由並列出仍需驗證的證據。""",
@@ -103,7 +108,7 @@ BUILTIN_PROMPT_TEMPLATES = [
         "label": "分析測試缺口",
         "category": "品質",
         "description": "把需求、風險分支與既有測試做可追蹤的覆蓋對照。",
-        "requirement_placeholder": "例：分析 workspace 封存／還原流程的測試缺口，優先找資料遺失風險。",
+        "requirement_placeholder": "例：分析 workspace 永久刪除與中斷續刪流程的測試缺口，優先找誤刪或資料殘留風險。",
         "instructions": """- 先枚舉可觀察行為、風險分支與失敗模式，再對照現有 unit／integration／e2e 測試及 CI 實際執行路徑。
 - 將缺口分類為完全缺少、斷言過弱、flaky、skipped、只證明 mock 或未被 CI 執行；不以單純 coverage 百分比代替分析。
 - 建立需求或分支 → 測試檔與案例 → 缺口的追蹤關係，為每項選擇最低但足以可靠攔截回歸的測試層。
@@ -118,7 +123,7 @@ BUILTIN_PROMPT_TEMPLATES = [
         "requirement_placeholder": "例：為訂單服務的付款流程補齊測試，integration 用真實資料庫驗證交易行為，unit 覆蓋金額計算邊界。",
         "instructions": """- 先枚舉範圍內的可觀察行為與風險分支（正常、邊界、錯誤處理、並行），對照既有測試找出真缺口；已覆蓋的行為不重寫，缺口逐條對應到任務。
 - 測試層級以需求指定為準（unit／integration 擇一或並用）；需求未指定時選擇「最低但足以可靠攔截回歸的層級」並附理由，不得全部堆到最上層。
-- 從 repo 讀出實際測試棧與慣例（JUnit 版本、assertion 庫、命名、目錄結構、真實資料庫或內嵌替身、CI 實跑範圍），沿用不另創；repo 沒有的測試設施先列前置任務或 human gate，不得假設存在。
+- 從 repo 讀出實際測試棧與慣例（JUnit 版本、assertion 庫、命名、目錄結構、真實資料庫或內嵌替身、CI 實跑範圍），沿用不另創；repo 缺少但可在本次範圍內建立的測試設施，規劃成前置任務並由 agent 依需求與 repo 慣例選最小可用方案。只有建立設施會改變需求意圖、造成不可逆外部狀態或需要新外部權限時才列 human gate。
 - unit 測試釘行為不釘實作：斷言輸入→輸出與副作用，不 mock 被測邏輯自身；integration 測試優先用真實依賴（資料庫、訊息、交易邊界），mock 只用於不可控外部系統並標明邊界，避免測試只證明 mock 本身。
 - 每個新測試需先確認會因對應行為破壞而變紅（暫時破壞或 mutation 驗證），不得交付恆綠測試；時間、隨機、順序等 flaky 來源在測試內固定。
 - DoD：範圍內行為條目全數對應到測試與 `檔案:行號`，以 repo 實際測試命令全綠為準；無法自動化的行為明列原因與替代驗證。""",
@@ -163,11 +168,11 @@ BUILTIN_PROMPT_TEMPLATES = [
 - 逐端點鎖定請求側與回應側：
   - 請求側含接受的 Content-Type、path／query／header／body 的必填與選填參數、request body schema 與驗證語意。
   - 回應側含狀態碼、回應 schema（欄位名、型別、必填性、null 語意）、錯誤 body 格式與錯誤碼、預設值與分頁／排序行為、Content-Type 與編碼。
-  - repo 有統一回應包裝時其形狀在共用測試工具集中斷言，不在每條測試重複，沒有則以證據標 N/A。
+  - repo 有統一回應包裝時其形狀在共用測試工具集中斷言，不在每條測試重複；沒有時省略這個軸，只在整體取證邊界摘要一次，不逐端點製造空項。
 - 斷言「對外可觀察的形狀與語意」，不斷言內部實作；欄位比較用結構化比對並明列忽略欄位——僅限每次執行必然變動且不承載契約語意的欄位（如時間戳、trace id、隨機識別碼），狀態碼、錯誤碼與業務欄位不得列入忽略；不得整包字串 snapshot，避免雜訊改動造成全紅。
 - 測試環境優先沿用 repo 既有整合測試棧（如 MockMvc／WebTestClient 或真實服務加真實資料庫）；依賴外部系統的端點以受控替身固定，替身形狀附真實契約來源，不得自創欄位。
 - 相容規則明確化：新增欄位是否破壞消費端、未知欄位如何處理、enum 擴充語意，逐項寫成測試或明列為未定義行為交人裁決；版本共存窗口的行為差異分開鎖定。
-- DoD：端點×情境矩陣全數對應到測試與 `檔案:行號`，repo 實際測試命令全綠；文件與實際行為的不一致清單、未定義行為與 human gate 一併交付。""",
+- DoD：限定範圍內已由證據確認的端點行為都對應到測試與 `檔案:行號`，repo 實際測試命令全綠；只整理真正存在的文件／實際行為差異與重大未決 gate，不為未涉及情境補固定矩陣或空列。""",
     },
     {
         "id": "performance-analysis",
@@ -186,7 +191,7 @@ BUILTIN_PROMPT_TEMPLATES = [
         "category": "分析",
         "description": "追蹤跨前後端或服務邊界的資料契約、轉換與錯誤語意。",
         "requirement_placeholder": "例：分析異常紀錄從 loop 寫入、Dashboard API 到前端展開 log 的完整資料流。",
-        "instructions": """- 確認 authoritative contract、版本與所有 producer／consumer；authoritative contract 不存在、或多份候選（producer schema、consumer 型別、文件）互相衝突而權威不明時，不得自行選定權威——以實際行為描述現況、列出各候選與 `檔案:行號`，Goal 列入待確認事項，Plan 在第一個受影響 task 標 human gate。從生產者到消費者列出每段 schema、欄位語意、預設值、驗證與相容策略。
+        "instructions": """- 確認 authoritative contract、版本與所有 producer／consumer；沒有正式契約時，以實際 producer／consumer、測試與可觀測行為作現況真相，由 agent 建立符合需求與 repo 慣例的最小契約。多份候選衝突時先以原始需求、實際呼叫端與測試自行裁定；只有剩餘衝突會改變對外語意、安全／不可逆狀態或需要新外部權限時，才列重大未決 human gate。從生產者到消費者列出每段實際相關的 schema、欄位語意、預設值、驗證與相容策略。
 - 分開追蹤同步與非同步路徑的成功、空資料、部分失敗、逾時、重試、取消、權限拒絕、重複／亂序投遞及 idempotency 行為。
 - 標出資料真相來源、衍生投影、快取與失效時機，避免兩套狀態各自演進。
 - 說明 auth context、版本相容窗口與 producer／consumer 部署先後；安排 contract test 與至少一條端到端驗證路徑。""",
@@ -200,7 +205,7 @@ BUILTIN_PROMPT_TEMPLATES = [
         "instructions": """- 先固定變更前基線、預定變更與不變條件，再盤點 callers／callees、schema、持久資料、事件、設定、批次 job、外部 consumer 與操作文件。
 - 將每個候選影響面分類為需修改、相容但需驗證、不受影響或待確認；文字命中不等於語意受影響，文字未命中也不等於不受影響——持久資料、repo 外的 consumer、反射或動態組字串、設定驅動的引用等無法靠字面搜尋排除的面向，不得以搜尋未命中判「不受影響」，必須以資料樣本、契約／版本證據或消費端證據判定，取不到證據時列「待確認」；每項都要附判定證據。
 - 分析舊／新版本共存窗口、資料遷移或 backfill、feature flag、部署順序、監控訊號與回滾條件，不得只列編譯期影響。
-- 建立「變更 → 受影響面 → 驗證」對照，讓每個確認受影響項都能追到 task／DoD，N/A 也需證據。""",
+- 建立「變更 → 受影響面 → 驗證」對照，讓每個確認受影響項都能追到 task／DoD；未受影響候選不逐項造空列，只摘要限定取證邊界與仍未知的風險。""",
     },
     {
         "id": "incident-root-cause",
@@ -245,7 +250,7 @@ BUILTIN_PROMPT_TEMPLATES = [
         "requirement_placeholder": "例：在既有 Java 專案新增批次匯入，沿用目前分層與 ApiResponse 規格。",
         "instructions": """- 此模板只補充 Java 技術慣例；新功能、Bug、重構的行為分析仍依原始需求，不要把三者混成無界工作。
 - 逐條列出輸入 → 輸出／副作用與需求依據；重構先列不可變行為，Bug 在同一任務走 red → green。
-- 從 codebase 讀出實際分層、命名、Mapper／序列化、回應包裝與例外處理慣例；判定某慣例不存在不得只憑名稱搜尋未命中（同一慣例在不同 repo 命名不同），必須實讀代表性 controller／service／例外處理器並附 `檔案:行號` 佐證後才標 N/A，不要假設一定有 Mapper 或 ApiResponse。
+- 從限定範圍的 codebase 讀出本工作實際需要的分層、命名、序列化、回應與例外處理慣例；只記錄有證據且影響交付的慣例，不假設一定有 Mapper 或 ApiResponse，也不為不存在的候選逐項造空列。以已讀代表性入口及停止邊界摘要未涵蓋風險。
 - 測試骨架只有在可重用且本身能綠燈驗收時才獨立成前置任務，否則測試與實作放同一任務；每個行為條目都要能對到任務與測試證據。
 - 從 repo wrapper、multi-module 設定與 CI 判定實際 DoD（如 `./mvnw test` 或 `./gradlew test`）及執行目錄，不得預設 Maven。""",
     },
@@ -280,8 +285,8 @@ BUILTIN_PROMPT_TEMPLATES = [
         "requirement_placeholder": "例：把訂單模組從 Oracle 搬到 MariaDB，SQL 與交易行為維持等價。",
         "instructions": """- 固定來源／目標資料庫、driver／ORM dialect 的確切版本，以及範圍、資料量、允許停機、RPO／RTO；缺少者列為會阻擋切換設計的待確認事項。
 - 盤點 repo 自有 SQL、ORM／Mapper、動態 SQL、DDL、view、procedure、trigger、sequence／identity、外部 job、連線池與交易設定；記錄搜尋方法，無法靜態枚舉者明列邊界。
-- 建立相容矩陣：型別／轉型、函式、分頁、日期時區、NULL／空字串、encoding／collation、識別碼大小寫、鎖、隔離與錯誤語意；repo 使用點與官方版本證據分開引用。
-- 規劃可重跑／續跑且有版本紀錄的 schema／資料搬移與切換演練；機器比對至少包含筆數、checksum、業務 invariant、孤兒資料與 sequence 連續性五項，不適用者附證據標 N/A，只有不可機器化的業務簽核才列人工驗收。
+- 針對限定範圍內實際命中的型別／轉型、函式、分頁、日期時區、NULL／空字串、encoding／collation、識別碼大小寫、鎖、隔離或錯誤語意差異整理相容要求；repo 使用點與官方版本證據分開引用。未命中的候選不逐項填空，只摘要取證方法與未知邊界。
+- 規劃可重跑／續跑且有版本紀錄的 schema／資料搬移與切換演練；依實際資料模型與風險選擇筆數、checksum、業務 invariant、孤兒資料或 sequence 連續性等足以證明結果的機器比對，不強制固定五項。只有不可機器化且確實需要產品判斷的業務簽核才列人工驗收。
 - 同一套 characterization／contract 測試要分別在來源與目標資料庫執行並比較結果、副作用及關鍵 query plan／效能門檻；無法取得來源或目標資料庫的可測環境時，列為阻擋等價驗證的待確認事項並在第一個受影響 task 標 human gate，明列替代證據（生產快照、查詢紀錄回放等）及其限制，不得只在單庫跑過即宣稱行為等價。
 - 明列停止舊寫入、切換、驗證與回滾條件；切換後新寫入若讓回滾不再安全，必須標成 human gate，不得只寫 restore backup。""",
     },
@@ -292,11 +297,11 @@ BUILTIN_PROMPT_TEMPLATES = [
         "description": "把 Oracle 專屬 SQL、語意差異與 PL/SQL 展開成可枚舉的必查清單，以雙庫對照測試守住行為等價。",
         "requirement_placeholder": "例：把帳務模組從 Oracle 19c 搬到 MariaDB 10.11，MyBatis XML 內全部 SQL 需行為等價。",
         "instructions": """- 固定來源 Oracle 與目標 MariaDB 的確切版本及 driver／ORM dialect；等價物依 MariaDB 版本判定（如 SEQUENCE、window function、recursive CTE 支援度），不得以「MySQL 相容」概括，版本能力引官方文件證據。
-- 逐檔盤點 SQL 使用點（含 ORM／Mapper 動態 SQL、DDL、view、排程 job），逐項對照 Oracle 專屬語法必查清單：
+- 在需求／context／ref 已知的 SQL 範圍內做針對性取證（含 ORM／Mapper 動態 SQL、DDL、view、排程 job），以下 Oracle 專屬語法只作命中提示：
   - 結構與語法：DUAL、(+) 外連接、ROWNUM 分頁、CONNECT BY、MERGE、ROWID、隱含型別轉換。
   - 函式與日期：NVL／NVL2／DECODE、SYSDATE 與日期算術、TO_DATE／TO_CHAR 格式。
   - 取號：sequence.NEXTVAL／CURRVAL，對應 AUTO_INCREMENT／SEQUENCE 與 LAST_INSERT_ID()／ORM generated-key 取值路徑。
-  - 清單每一項都要有結論：命中者附 `檔案:行號` 與改寫方案，未命中者附搜尋方法標 N/A。以搜尋方法標 N/A 僅適用於有明確字面 token 的項目；隱含型別轉換、日期算術等無法靠字面搜尋排除的語意項不得以未命中判 N/A，必須依下一條語意差異規則以 schema 型別、比較述詞與雙庫測試證據下結論。無法靜態枚舉的動態拼接明列邊界。
+  - 只列實際命中項的 `檔案:行號` 與改寫方案；未命中的 token 不逐項造空列，改以一段 bounded 搜尋方法與動態拼接停止邊界摘要。隱含型別轉換、日期算術等無法靠字面搜尋排除的語意，僅對實際受影響的 schema 型別與比較述詞用雙庫測試下結論。
 - 語意差異逐項驗證而非假設：空字串與 NULL（Oracle 視為同一、MariaDB 區分）、預設交易隔離級別與鎖行為、識別碼大小寫與 collation、VARCHAR2 的 byte／char 長度語意、NUMBER 對 DECIMAL 精度、DATE 含時間成分的型別對應；受影響的讀寫路徑要有測試證據，不得只改到語法可執行。
 - PL/SQL（package、procedure、function、trigger、scheduler job）逐支判定改寫成對應的 MariaDB stored program（procedure／function／trigger／event）、搬到應用層或棄用；交易邊界與例外語意改寫後需測試證明，無法等價的能力（如 autonomous transaction）列 human gate，不自行替團隊決策。
 - 同一套 characterization 測試分別在 Oracle 與 MariaDB 執行並比對結果、副作用與錯誤語意，優先沿用 repo 既有測試棧的真實資料庫環境；資料搬移以筆數、checksum 與業務 invariant 對帳。無法取得 Oracle 或 MariaDB 的可測環境時，列為阻擋等價驗證的待確認事項並標 human gate，明列替代證據及其限制，不得只在單庫跑過即宣稱行為等價。
@@ -322,7 +327,7 @@ BUILTIN_PROMPT_TEMPLATES = [
         "requirement_placeholder": "例：把服務從 Spring Boot 2.7 升到 3.3（Java 17），列出全部 breaking changes 與修正任務。",
         "instructions": """- 固定目前與目標的精確版本，包含 runtime／JDK、build tool／plugin、直接依賴、lockfile 與實際解析的傳遞依賴；限定本次範圍，避免順手升級無關套件。
 - 逐條對照適用版本的官方 migration guide／release notes／相容矩陣；外部變更附 URL、版本與章節，repo 使用點附 `檔案:行號`。
-- 找不到直接使用點時先標「未找到」；還要核對 autoconfiguration、傳遞啟用、設定／預設值、啟動 log 與整合測試，具備證據後才能判 N/A。
+- 找不到直接使用點時，在限定範圍內再核對實際相關的 autoconfiguration、傳遞啟用、設定／預設值、啟動 log 或整合測試；記錄已查來源與停止邊界，不為每個未命中候選逐項造空列。
 - 區分編譯期、啟動期與特定流量才出現的差異，涵蓋序列化、日期時區、反射、classpath、資料格式與對外契約，逐項安排測試或 runtime smoke。
 - 依必須一起升級的相依群組切成連貫 checkpoint，每個 checkpoint 結束時 build／test／smoke 全綠；相容層只在確有跨版本共存需求時加入。
 - 每個 checkpoint 使用 repo 實際命令並列出回退方式；無法維持相容或不可逆的能力列為 human gate。""",
@@ -334,8 +339,8 @@ BUILTIN_PROMPT_TEMPLATES = [
         "description": "依待部署服務的實際需求與參考專案慣例，建立可逐環境 render、schema 驗證且不含明文憑證的 Kubernetes 設定。",
         "requirement_placeholder": "例：參考 payment-service 的 Helm chart，為 order-service 完成 base／sit／prod 部署設置，需通過 helm lint 與 helm template。",
         "instructions": """- 明確區分待部署服務與參考專案，固定目標 Kubernetes／API 版本、namespace、環境清單、可用 CRD 與政策限制；服務值只從待部署服務取證，參考專案只提供結構慣例。
-- 產出格式依原始需求 → 待部署 repo 既有慣例 → 參考 repo 依序判定；三個來源互相衝突、單一來源內並存多種格式而無明確主從、或都無訊號時，比較 pure YAML、Kustomize、Helm 三種方案並列 human gate，不得自行選定。
-- 盤點 workload、Service、Ingress、ServiceAccount／RBAC、ConfigMap、Secret 外部引用、volume／PVC、HPA、PDB、NetworkPolicy、securityContext、probe、rollout、affinity／toleration 與 image 注入點；N/A 項附證據。
+- 產出格式依原始需求 → 待部署 repo 既有慣例 → 參考 repo 依序判定；若都無訊號，由 agent 依需求與現有 toolchain 選擇最小可維護方案並記錄假設。只有來源衝突牽涉外部平台政策、不可逆狀態或新外部權限且現有證據無法裁定時才列 human gate。
+- 只盤點有證據影響部署的 workload、Service、Ingress、ServiceAccount／RBAC、ConfigMap、Secret 外部引用、volume／PVC、HPA、PDB、NetworkPolicy、securityContext、probe、rollout、affinity／toleration或 image 注入點；未涉及種類不逐項造空列，改摘要取證邊界與仍未知風險。
 - 從待部署服務確認 image、command／args、port、健康檢查、資源、環境變數、掛載與外部依賴，附 `檔案:行號`；不得複製參考服務的識別碼或專屬值。
 - 共用內容放 base／chart defaults，環境差異只放 overlay／values 並逐環境列出；Secret 僅用佔位或受控外部引用，不得輸出明文憑證。
 - 每個環境都以 repo 實際路徑驗證：pure YAML 做版本相符的 schema validation／dry-run；Kustomize 執行 `kustomize build <overlay-dir>` 後驗 schema；Helm 執行 `helm lint <chart-dir> -f <values-file>` 與 `helm template <release> <chart-dir> -f <values-file>` 後驗 schema。最終 DoD 的驗證命令與路徑不得保留 `<...>` 佔位符（上列命令中的 overlay-dir、chart-dir、values-file、release 須以實際值代入）；Secret 值依前條維持佔位或受控外部引用，不受此限。""",
@@ -430,7 +435,14 @@ def _read_text(item, key, index, warnings, *, required=False, maximum=400):
 
 def prompt_template_projection(cfg):
     """Merge built-ins with bounded, validated team templates from shared config."""
-    templates = [{**item, "source": "builtin"} for item in BUILTIN_PROMPT_TEMPLATES]
+    templates = [
+        {
+            **item,
+            "instructions": f"{LIMITED_DISCOVERY_PREFIX}\n{item['instructions']}",
+            "source": "builtin",
+        }
+        for item in BUILTIN_PROMPT_TEMPLATES
+    ]
     warnings = []
     raw_templates = cfg.get("prompt_templates")
     if raw_templates is None:
@@ -486,7 +498,9 @@ def prompt_template_projection(cfg):
             "label": label,
             "category": category or "團隊",
             "description": description or "團隊自訂任務類型",
-            "instructions": instructions,
+            # Team guidance can specialize the work, but it cannot silently reopen the
+            # broad-search/data-volume behavior intentionally disabled in this release.
+            "instructions": f"{LIMITED_DISCOVERY_PREFIX}\n{instructions}",
             "requirement_placeholder": placeholder or "請在這裡貼上完整需求與已知限制。",
             "source": "team",
         })

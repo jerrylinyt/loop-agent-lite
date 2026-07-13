@@ -12,19 +12,22 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
   onSave: (tasks: PlanEditTask[], doneCount: number) => Promise<string>;
 }) {
   const original = useMemo(() => state.plan ?? [], [state.plan]);
+  const isFleetMaster = state.workspace_kind === "fleet-parent" && state.parallel_run?.phase === "awaiting-approval";
   const completed = useMemo(() => new Set((state.completed ?? []).map((entry) => entry.order)), [state.completed]);
   const lockedCount = useMemo(() => {
+    if (isFleetMaster) return 0;
     // 鎖定區採「前綴」而不是零散列：完成任務或目前任務之前的順序都屬既有執行歷史，
     // 即使其中某列不是 completed，也不能讓 pending task 穿越這條邊界。
     const locked = new Set(completed);
     if (state.phase === "exec" && state.current_order) locked.add(state.current_order);
     return Math.max(-1, ...original.map((task, index) => locked.has(task.order) ? index : -1)) + 1;
-  }, [completed, original, state.current_order, state.phase]);
+  }, [completed, isFleetMaster, original, state.current_order, state.phase]);
   const initial = useMemo<DraftTask[]>(() => original.map((task) => ({ ...task, id: `task-${task.order}` })), [original]);
   const [drafts, setDrafts] = useState(initial);
   const [doneCount, setDoneCount] = useState(state.done_count ?? 0);
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
+  const savingPending = useRef(false);
   const [confirmClose, setConfirmClose] = useState(false);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
@@ -35,11 +38,12 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
   const inserted = drafts.filter((task) => task.order === null);
   const moved = drafts.slice(lockedCount).filter((task, index) => task.order !== null && task.order !== lockedCount + index + 1);
   const changedText = drafts.filter((task) => task.order !== null && original[task.order - 1] &&
-    (task.task !== original[task.order - 1].task || (task.ref ?? null) !== (original[task.order - 1].ref ?? null)));
+    (task.task !== original[task.order - 1].task || (task.ref ?? null) !== (original[task.order - 1].ref ?? null) ||
+      task.track !== original[task.order - 1].track || JSON.stringify(task.scope ?? []) !== JSON.stringify(original[task.order - 1].scope ?? [])));
   const emptyTaskCount = drafts.filter((task) => !task.task.trim()).length;
-  const dirty = JSON.stringify(drafts.map(({ order, task, ref }) => ({ order, task, ref: ref ?? null }))) !==
-    JSON.stringify(original.map(({ order, task, ref }) => ({ order, task, ref: ref ?? null }))) || doneCount !== (state.done_count ?? 0);
-  const canInsert = state.phase !== "done";
+  const dirty = JSON.stringify(drafts.map(({ order, task, ref, track, scope }) => ({ order, task, ref: ref ?? null, track, scope: scope ?? [] }))) !==
+    JSON.stringify(original.map(({ order, task, ref, track, scope }) => ({ order, task, ref: ref ?? null, track, scope: scope ?? [] }))) || doneCount !== (state.done_count ?? 0);
+  const canInsert = isFleetMaster || state.phase !== "done";
   const update = (index: number, values: Partial<DraftTask>) => setDrafts((items) => items.map((item, itemIndex) => itemIndex === index ? { ...item, ...values } : item));
   const move = (index: number, direction: -1 | 1) => setDrafts((items) => {
     // 按鈕與拖曳共用相同鎖定邊界；任何來源或目標落在 locked prefix 都直接不動。
@@ -65,22 +69,35 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
   };
   const insertAfter = (index: number) => setDrafts((items) => {
     const next = [...items];
-    next.splice(index + 1, 0, { id: `new-${nextId.current++}`, order: null, task: "", ref: null });
+    next.splice(index + 1, 0, { id: `new-${nextId.current++}`, order: null, task: "", ref: null, track: original[0]?.track ?? "main" });
     return next;
   });
   const remove = (index: number) => setDrafts((items) => index < lockedCount ? items : items.filter((_, itemIndex) => itemIndex !== index));
-  const requestClose = () => dirty ? setConfirmClose(true) : onClose();
+  const requestClose = () => {
+    if (savingPending.current) return;
+    if (dirty) setConfirmClose(true); else onClose();
+  };
   const save = async () => {
     // UI 在送出前先做完整性檢查；後端仍會在 workspace lock 內重做非空、版本與鎖定前綴校驗。
     if (!drafts.length) return setMessage("❌ plan 必須保留至少一項任務");
     if (drafts.some((task) => !task.task.trim())) return setMessage("❌ 每項任務都必須有內容");
+    if (savingPending.current) return;
+    savingPending.current = true;
     setSaving(true);
-    const result = await onSave(drafts.map(({ order, task, ref }) => ({ order, task: task.trim(), ref: ref?.trim() || null })), doneCount);
-    setSaving(false); setMessage(result);
-    if (result.startsWith("✅")) onClose();
+    try {
+      const result = await onSave(drafts.map(({ order, task, ref, track, scope }) => ({
+        order, task: task.trim(), ref: ref?.trim() || null, track: track.trim(),
+        ...(scope?.length ? { scope: scope.map((value) => value.trim()).filter(Boolean) } : {})
+      })), doneCount);
+      setMessage(result);
+      if (result.startsWith("✅")) onClose();
+    } finally {
+      savingPending.current = false;
+      setSaving(false);
+    }
   };
   return <>
-    <Modal title="Plan 編輯器" description={`plan v${state.plan_version} · 只有停止狀態下、尚未執行的任務可排序、刪除或插入`} onClose={requestClose} fullScreen footer={<>
+    <Modal title="Plan 編輯器" description={isFleetMaster ? `parallel master plan v${state.plan_version} · 尚未建立 tracks，可編輯完整拆分` : `plan v${state.plan_version} · 只有停止狀態下、尚未執行的任務可排序、刪除或插入`} closeDisabled={saving} onClose={requestClose} fullScreen footer={<>
       <button type="button" className="secondary-button" disabled={saving} onClick={requestClose}>取消</button>
       <button type="button" className="primary-button" disabled={saving || !dirty || emptyTaskCount > 0} onClick={() => void save()}>{saving ? "儲存中…" : "💾 儲存變更"}</button>
       <span className="inline-message" role="status">{message}</span>
@@ -101,6 +118,8 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
               </span></header>
               <label>任務內容<textarea rows={3} disabled={locked} aria-invalid={!task.task.trim()} value={task.task} onChange={(event) => update(index, { task: event.target.value })} /></label>
               <label>Ref（選填）<input disabled={locked} value={task.ref ?? ""} onChange={(event) => update(index, { ref: event.target.value })} /></label>
+              <label>Track<input disabled={locked} value={task.track} onChange={(event) => update(index, { track: event.target.value })} /></label>
+              <label>Scope（選填，逗號分隔）<input disabled={locked} value={(task.scope ?? []).join(", ")} onChange={(event) => update(index, { scope: event.target.value.split(",").map((value) => value.trim()).filter(Boolean) })} /></label>
               {canInsert && index >= lockedCount - 1 && <button type="button" className="insert-task-button" aria-label={`插入在 task-${index + 1} 之後`} title={`插入在 task-${index + 1} 之後`} onClick={() => insertAfter(index)}>＋</button>}
             </div>;
           })}
@@ -110,12 +129,12 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
         </div>
         <aside className="plan-editor-summary">
           <h3>變更摘要</h3>
-          <dl><div><dt>鎖定</dt><dd>{lockedCount} 項</dd></div><div><dt>新增</dt><dd>{inserted.length} 項</dd></div><div><dt>刪除</dt><dd>{deleted.length} 項</dd></div><div><dt>移動</dt><dd>{moved.length} 項</dd></div><div><dt>文字／Ref</dt><dd>{changedText.length} 項</dd></div></dl>
+          <dl><div><dt>鎖定</dt><dd>{lockedCount} 項</dd></div><div><dt>新增</dt><dd>{inserted.length} 項</dd></div><div><dt>刪除</dt><dd>{deleted.length} 項</dd></div><div><dt>移動</dt><dd>{moved.length} 項</dd></div><div><dt>內容／Track</dt><dd>{changedText.length} 項</dd></div></dl>
           {deleted.length > 0 && <div className="plan-editor-diff"><strong>將刪除</strong>{deleted.map((task) => <span key={task.order}>− task-{task.order}：{task.task}</span>)}</div>}
           {inserted.length > 0 && <div className="plan-editor-diff safe"><strong>將新增</strong>{inserted.map((task) => <span key={task.id}>＋ {task.task || "（尚未填寫）"}</span>)}</div>}
           {emptyTaskCount > 0 && <p className="plan-editor-validation" role="alert">尚有 {emptyTaskCount} 項任務未填寫，完成前不可儲存。</p>}
-          <label>done 計數<input type="number" min={0} value={doneCount} onChange={(event) => setDoneCount(+event.target.value)} /></label>
-          <p>儲存後 pending tasks 會依畫面順序重新編號；歷史紀錄、完成 commit 與目前任務不改寫。</p>
+          {!isFleetMaster && <label>done 計數<input type="number" min={0} value={doneCount} onChange={(event) => setDoneCount(+event.target.value)} /></label>}
+          <p>{isFleetMaster ? "儲存後會重算 plan hash 與 generation；按「▶ 運行」後才建立 worktrees。" : "儲存後 pending tasks 會依畫面順序重新編號；歷史紀錄、完成 commit 與目前任務不改寫。"}</p>
         </aside>
       </div>
     </Modal>

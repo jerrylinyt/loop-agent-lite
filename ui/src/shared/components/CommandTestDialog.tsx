@@ -14,6 +14,7 @@ export default function CommandTestDialog({ state, onClose }: { state: CommandTe
       title="Agent CLI 執行確認"
       description="固定測試 prompt：test"
       compact
+      closeDisabled={state.loading}
       onClose={onClose}
       footer={!state.loading && <button type="button" className="primary-button" onClick={onClose} data-autofocus>關閉</button>}
     >

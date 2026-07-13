@@ -13,7 +13,8 @@
   └─ goal.md + PLAN.md 已審核並 commit
           │
           ▼
-`loop dashboard` 啟動本機服務與 engine coordinator
+`loop dashboard` 啟動本機服務，先確認所有 coordinator 已停止
+          │  使用者從頁面手動按「啟動／運行」
           │
           ├─ preflight：validate、工作樹、goal/PLAN commit 檢查
           │       └─ 失敗：保留舊 state，不啟動新工作
@@ -31,11 +32,11 @@
 每輪都會保護 `goal.md`、計畫與 state。驗證失敗或偵測到竄改時，會回到最後綠點。`--reset-state` 和 Dashboard 的 plan 匯入都是交易式操作：新流程未通過啟動檢查時，舊進度仍保留。
 Dashboard 啟動若同時要求匯入 goal 與新 branch，會先完成 goal 路徑安全檢查，再進行 branch checkout；任何 goal 錯誤都不會留下半套 Git branch mutation。
 
-Loop 另以 OS 鎖維持單 writer：同一 workspace 或同一 Git worktree 不能同時跑兩個 loop（即使來自不同 Dashboard／終端機）。不同 Git worktree 可各自運行，保留日後有限並行的隔離邊界；目前不會自動拆任務、合併分支或建立多份協調 state。
+Loop 另以 OS 鎖維持單 writer：同一 workspace 或同一 Git worktree 不能同時跑兩個 loop。啟動表單開啟 Parallel tracks 後，規劃 Agent 產生 plan v2 tracks，fleet coordinator 會建立隔離 worktree/branch、並行執行、讓各軌 Agent 自行同步解衝突，再以 expected-old CAS 推進 integration ref。integration validate 失敗會自動 rollback 並把錯誤送回原 track 修復；一般 tracks 完成後才執行隔離的 `@final`。
 
 ## 安裝與啟動
 
-專案參考 v3 的 Python package／console-script 方式安裝；lite 版只公開 Dashboard：
+專案以 Python package／console-script 方式安裝：
 
 ```bash
 pipx install --editable .
@@ -46,7 +47,9 @@ loop dashboard
 若尚未安裝 pipx，可先執行 `brew install pipx`。
 
 開啟終端顯示的本機網址（預設從 <http://127.0.0.1:8765/> 開始；port 被占用會自動往上找）。
-安裝後不需要直接操作任何 Python 檔案；`loop` 目前唯一公開子命令就是 `dashboard`。
+安裝後可用 `loop dashboard`、`loop status` 與 `loop fleet`；後兩者分別提供唯讀 parent/child 狀態投影與終端 parallel coordinator。
+
+每個 workspace root 同時只允許一個可操作 Dashboard：process-lifetime kernel lock 會在設定讀取、清場與綁定 port 前取得，不同 port 的第二個 instance 也會直接拒絕。每次啟動 Dashboard 都會盤點 standalone、fleet parent、planning/child coordinator，以及 coordinator 被硬殺後仍存活的 Agent／validator process group；這些 runtime 會先經 durable root/repo/generation/session identity marker 與 PID/start-time/command 核對，再要求完整停止，寬限時間後才終止仍可證明屬於原 run 的成員。Agent／validator 由 gate wrapper 保證 marker fsync 完成前不會開始執行；state、marker、process snapshot 或 root 掃描無法證明安全清場時會 fail closed，不綁定 port，也不猜測性 signal 同名的其他 workspace root。只有確認清場完成才會開放頁面；之後不會自動 resume，必須由使用者按「▶ 運行」或從啟動器手動開始。Dashboard 不提供另一種唯讀 instance；唯讀查詢請使用 `loop status` 或 GET health/status API。
 
 ### 1. 準備 target repo
 
@@ -57,7 +60,6 @@ loop dashboard
 ```bash
 loop dashboard --port 8766
 loop dashboard --name <workspace>
-loop dashboard --read-only
 ```
 
 開啟 <http://127.0.0.1:8766/>，在「啟動／管理」設定：
@@ -80,7 +82,6 @@ Dashboard 也提供唯讀 `GET /api/health`，回傳 `schema_version: 1`、`stat
 ```text
 loop dashboard --name <workspace>  預選 workspace
 loop dashboard --port <port>       指定起始 port
-loop dashboard --read-only         啟動唯讀看板
 ```
 
 Agent、Validate、收斂門檻、timeout、plan 匯入、state 重置與新 branch 都在 Dashboard
@@ -97,27 +98,27 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 - 左側是 Loop 狀態；右側是 Agent 輸出，可切換 Agent／其他／全部，並可用「過濾…」輸入框對長 log 做文字過濾；Agent 的 ANSI 色碼會直接上色。
 - 瀏覽器 tab 標題與 favicon 會隨狀態變燈（執行＝綠、紅燈連跳＝紅、完成＝旗、停止＝灰），掛在背景 tab 也能監控。
 - workspace header 有輪次 sparkline（綠紅灰橙＝驗證綠／紅／規劃／reset，點擊開逐輪判定）與頂部健康色帶（越紅越接近 reset 防線）；進行中 round 會每秒顯示 elapsed 與 timeout 剩餘時間，最後 60 秒轉為警示。立即停止會凍結並保留中斷輪次時間；SIGKILL 無法留下停止時間時顯示「至少」已執行多久。若 loop 被強制終止後留下 stale PID，詳細頁也會保留警示。
-- 工具列「📺 總覽」切換電視牆模式：頂部在「任務完成」右側整合所有 workspace 依時間最新 500 筆輪次的平均、P50、P95、最慢、逾時率、未回 DONE 次數與全域異常率；點「未回 DONE」可展開異常 workspace／round 清單，再點輪次查看保留的 Agent log。下方各 workspace 卡片仍各自顯示近期最多 100 輪摘要及相同異常統計，點卡片切入；輪次紀錄中的異常數也可開啟同一種清單與 log 檢視。整合卡只透過 SSE 傳統計結果，不傳 500 筆原始樣本；卡片與事件推播共用同一連線，不另開輪詢，輪次計時由瀏覽器依 state 時間戳本地更新，不為時鐘製造高頻 SSE；可用名稱搜尋與「全部／需關注／執行中／已完成」篩選卡片，選擇會保存在瀏覽器；頁首只有在真的有問題時才顯示可點擊的「工作區需處理」，點下會直接篩出問題卡片，卡片列出原因並可切入指定 workspace。已完成 workspace 的歷史停滯／紅燈不再誤算為目前告警；未讀 issues、checkpoint、goal 變更、stale PID 與 state 錯誤仍會標示。搭配 `--read-only` 適合掛牆監控。
+- 工具列「📺 總覽」切換電視牆模式：頂部在「任務完成」右側整合所有 workspace 依時間最新 500 筆輪次的平均、P50、P95、最慢、逾時率、未回 DONE 次數與全域異常率；點「未回 DONE」可展開異常 workspace／round 清單，再點輪次查看保留的 Agent log。下方各 workspace 卡片仍各自顯示近期最多 100 輪摘要及相同異常統計，點卡片切入；輪次紀錄中的異常數也可開啟同一種清單與 log 檢視。整合卡只透過 SSE 傳統計結果，不傳 500 筆原始樣本；卡片與事件推播共用同一連線，不另開輪詢，輪次計時由瀏覽器依 state 時間戳本地更新，不為時鐘製造高頻 SSE；可用名稱搜尋與「全部／需關注／執行中／已完成」篩選卡片，選擇會保存在瀏覽器；頁首只有在真的有問題時才顯示可點擊的「工作區需處理」，點下會直接篩出問題卡片，卡片列出原因並可切入指定 workspace。已完成 workspace 的歷史停滯／紅燈不再誤算為目前告警；未讀 issues、checkpoint、goal 變更、stale PID 與 state 錯誤仍會標示，適合掛牆監控。
 - 總覽可將目前的狀態篩選、名稱搜尋、排序與緊湊卡片設定存成命名監控視圖；視圖只存在目前瀏覽器，最多保留 20 組，可套用或刪除。
 - workspace 狀態列的「🧭 時間軸」把歷史輪次、異常與目前 console 的操作紀錄整合成單一時間序；只有時間而沒有日期的 console 紀錄會明確標示為本機時間，避免把推定時間當成精確事實。
-- 階段切換、任務跳轉、Validate、封存、還原與永久刪除等操作，在確認視窗先列出將改變的 state、命令、timeout、workspace 目錄與不受影響的 target repo，讓操作者能在送出前核對影響範圍。
+- 階段切換、任務跳轉、Validate 與永久刪除等操作，在確認視窗先列出將改變的 state、命令、timeout、workspace 目錄與不受影響的 target repo，讓操作者能在送出前核對影響範圍。
 - 停止 loop 後可用全畫面 Plan 編輯器修改 pending tasks：已完成與目前任務鎖定，後方尚未執行的任務可從專用把手拖移，也可用上移／下移按鈕調整、刪除，或在兩項之間／尾端插入新任務。儲存以 plan version 防止覆蓋新狀態，並由後端原子驗證、重新編號；歷史與完成 commit 不改寫。
 - 啟動表單進階設定與 workspace「⚙ 設定」都可勾選「規劃收斂後暫停」：計畫收斂後 loop 停在執行期起點、不自動開始執行，人工核對（或用 Plan 編輯器調整）後按「▶ 運行」才進入執行輪；規劃期狀態列會顯示「⏸ 規劃後暫停」提示，`notify_cmd` 會收到 `plan_paused` 終態通知，團隊預設值在 shared 設定的 `defaults.pause_after_plan`。
 - 啟動表單的「執行前變更 Diff」會比較既有 repo／workspace 與本次 goal、plan、phase、Agent、Validate、門檻、timeout 及 branch 選擇；有待匯入內容時自動展開。
 - workspace 詳細頁的「📋 以此為範本啟動」會以該 workspace 的 repo、Agent、Validate 與門檻／timeout 設定預填啟動表單，workspace 名稱刻意留空讓你填新的；執行中、停止或已完成的 workspace 都可當範本，送出仍走原本的驗證與啟動流程。
 - workspace 的「⇄ Run 對比」並排顯示目前與上一個 run 的樣本數、平均、P95、最慢、逾時率、未回 DONE 與異常數；沒有 per-run snapshot 的設定與 commit 不會推測比較。
-- `⌘K`／`Ctrl+K` 可開啟快捷指令，搜尋 workspace 或前往總覽、封存與啟動管理。
+- `⌘K`／`Ctrl+K` 可開啟快捷指令，搜尋 workspace 或前往總覽與啟動管理。
 - 按 `Ctrl+G`（macOS 為 `⌘G`）後再按 `0` 可回總覽、按 `1～5` 可切換前五個 workspace；第二鍵需在 1.5 秒內輸入，表單或對話框開啟時不觸發。
-- 總覽的批次操作可多選 workspace 並標記 issues 已讀、立即停止或封存；不符合動作前置條件的項目會在確認預覽中列為跳過，符合者仍逐筆使用既有安全 API。
+- 總覽的批次操作可多選 workspace 並標記 issues 已讀、停止或永久刪除；fleet-child 由 parent 管理而不接受單獨 mutation，parent stop/delete 作用於整個群組。
 - Dashboard 提供跳至主要內容、清楚的 focus outline、Modal focus trap／Esc／焦點回復、reduced-motion 與 forced-colors 支援；首次空畫面則提供 repo、goal/plan、Validate 三步引導與常見失敗原因。
 - 分隔線可拖曳調整欄寬；箭頭可收合，設定會保存在瀏覽器。
 - 狀態列的「🎯 goal」「🕒 輪次紀錄」「📨 prompt」chips 分別顯示目前 goal 內容、history.log 逐輪判定（含每輪 Agent 耗時／逾時／是否未回 phase DONE）、以及最近一輪送給 Agent 的完整 prompt（全部唯讀）；「輪次紀錄」保留最近 100 輪的樣本數、平均、P50、P95、最慢輪、逾時率、未回 DONE 次數與異常率完整分析，Overview 卡片同步提供快速摘要。goal 在停機期間變更時，Goal 視窗會用保存的計畫基準 hash 從 Git 歷史重建並顯示 unified diff。
 - Issues 視窗可「標記已讀」而不刪除稽核紀錄；只有未讀 issues 會讓 fleet 顯示需關注，仍可用「清空全部」永久移除紀錄。
 - 全部任務收斂後，狀態列出現「📄 完成報告」直接檢視 REPORT.md。
-- 停止狀態可「🗄 封存」workspace：整個目錄以 UUID 封存 ID 移到 `workspace/.archive/`，target repo 不受影響；工具列的「🗃 已封存」可列出、安全還原或在雙重確認後永久刪除，還原不會自動啟動 loop。執行中、鎖定中、symlink 或目標名稱已存在時一律拒絕；永久刪除只作用於封存目錄，不會碰 target repo。
+- 新版不提供 archive/restore 或跨大版本 resume。停止後可安全永久刪除 coordinator workspace；fleet-parent 會先確認 child 已停止、移除已註冊 worktree，再刪除 child/parent workspace，保留 target repo、integration commit 與 track branches。刪除在第一個破壞動作前保存外部 journal，並以不可重用的 workspace generation 綁定；若檔案系統或 Git 操作中斷，以同一刪除操作即可依 generation/inode/ref 繼續。同名 replacement 會被保留、原 job 不會被移除，UI 會要求重新載入並 fresh confirm。舊 v1 standalone workspace 在 UI 只提供永久刪除：writer lock 內先建立並 fsync `.delete-generation` transaction marker，再寫外部 journal，因此 marker→journal、rename、unlink 或回應前 crash 都可安全重試。舊 `workspace/.archive/` 不會自動搬移或刪除，需要時請自行備份後移除。
 - 啟動表單進階設定內的「🔔 管理終態通知」可編輯、儲存並以 `status=test` 實測 `notify_cmd`（佔位符 `{status}`、`{name}`）。
 - 啟動表單的「完整健檢」會檢查目前已 commit repo 的 git／鎖／乾淨工作樹／goal 與 Validate，不建 state、不啟動 Agent；待匯入 goal、plan、reset 或新 branch 時會停用，實際啟動仍會再驗一次。
-- 啟動表單在 `goal.md` 與 `plan.json` 旁提供「產生 Goal Prompt／Plan Prompt」：選任務類型後需求欄會預填該模板範例（已輸入的內容不會被切換模板覆蓋，清空則維持輸入不足的擋下行為），改成實際需求並選填上下文後，可即時預覽、複製或下載 `.md` 給外部 Agent。兩種模式共用盤點、證據、範圍與 DoD 規則；Goal 模式只接受可存成 `goal.md` 的 Markdown，Plan 模式只接受可直接匯入且欄位限於 `order/task/ref` 的 JSON array。產生與下載都只在瀏覽器進行，不會改動 repo 或 workspace。
+- 啟動表單在 `goal.md` 與 `plan.json` 旁提供「產生 Goal Prompt／Plan Prompt」；Plan 模式輸出 plan v2，欄位限於 `order/task/track` 與選填 `ref/scope`。一般 track 可並行，跨軌驗收使用 `@final`。Parallel mode 預設由 Agent 自動規劃；DR-2 或診斷流程可從 UI 匯入至少兩個一般 tracks 的 plan v2 並直接進入 exec。
 - 正常要停時用「本輪後停止」：目前 Agent、Validate 與 state/history 落盤完成後才停，不會啟動下一輪。
 - 本輪尚未結束前按「↩ 繼續運行」可撤銷平順停止；如果 loop 已取走請求，會明確告知這一輪仍會收尾停止。
 - Agent CLI 卡死或明顯失控時用「立即停止」；它會中斷目前 round，state 可在下次運行時續用。
@@ -177,9 +178,13 @@ workspace/<name>/
 
 先在 target repo 手動執行同一個 command，確認工作目錄與依賴正確，再回 Dashboard 修改命令或 timeout。逾時會終止 validator 的整個 process group。
 
-**封存錯 workspace 想要還原**
+**舊版封存資料怎麼處理**
 
-在工具列開啟「🗃 已封存」，選擇對應項目後按「還原」。系統只會原子搬回原 workspace 名稱，若名稱已被使用或封存項目仍被鎖定會拒絕，不會覆寫資料，也不會自動啟動 loop。只有 Dashboard 無法啟動時才把手動搬移當作緊急救援，且務必先確認目的地不存在。
+新版不讀取或還原 `.archive`。先在檔案系統層備份仍需要的舊資料，再人工移除；不要把舊 state 搬回新版 workspace 冒充可 resume 狀態。要重跑請建立新的 workspace。
+
+**舊 v1 workspace 怎麼升級**
+
+v1 state 不遷移，也不能運行、重跑、編輯、改設定或當成啟動範本。Dashboard 會把可安全辨識的 v1 standalone workspace 顯示成「舊版（僅可刪除）」；確認 loop 已停止後可由 UI 永久刪除，再用目前版本建立新 workspace。損壞、過大、混有 v2 truth 或 primary/checkpoint 身分不一致的 state 不會降級成 delete-only，會維持 fail-closed。
 
 **workspace 顯示沒有 state.json**
 
@@ -196,6 +201,10 @@ python3 -m unittest discover -s tests -t . -q
 cd ui
 npm install
 npm run check
+
+# 完整 release gate（真 Codex、隔離 full clone、production UI）
+python3 tests/dry_run/run_full_project.py --scenario dr1 --keep
+python3 tests/dry_run/run_full_project.py --scenario dr2 --keep
 ```
 
 `engine/ui/` 已包含 production 靜態檔並隨 wheel 安裝，只有 Python 的環境也能執行 `loop dashboard`。

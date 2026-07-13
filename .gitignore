@@ -27,6 +27,9 @@ venv/
 ui/node_modules/
 ui/test-results/
 ui/playwright-report/
+ui/test-results-real/
+ui/playwright-report-real/
+artifacts/l4/
 
 # Claude Code session 資料與 agent worktree
 .claude/

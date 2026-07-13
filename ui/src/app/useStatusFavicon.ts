@@ -21,7 +21,9 @@ const TITLE_MARKS: Record<Exclude<Status, "none">, string> = {
 function deriveStatus(workspace: WorkspaceSummary | undefined, state: WorkspaceState | null): Status {
   // 優先序反映操作重要性：完成 > 執行中紅燈 > 執行中 > 停止；無 workspace 不覆蓋預設圖示。
   if (!workspace || !state || state.error) return "none";
-  if (state.phase === "done") return "done";
+  if (state.phase === "done" || workspace.parallel_phase === "done") return "done";
+  if (workspace.workspace_kind === "fleet-parent" &&
+      (workspace.parallel_phase === "failed" || workspace.parallel_tracks?.some((track) => ["repairing", "failed"].includes(track.status)))) return "warning";
   if (workspace.running && state.red_streak > 0) return "warning";
   if (workspace.running) return "running";
   return "idle";

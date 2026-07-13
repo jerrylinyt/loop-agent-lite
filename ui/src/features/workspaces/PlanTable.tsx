@@ -29,9 +29,9 @@ export default function PlanTable({
       previous.current = state;
       return;
     }
-    const old = new Map((previous.current.plan ?? []).map((task) => [task.order, `${task.task}|${task.ref ?? ""}`]));
+    const old = new Map((previous.current.plan ?? []).map((task) => [task.order, `${task.task}|${task.ref ?? ""}|${task.track}|${JSON.stringify(task.scope ?? [])}`]));
     const changed = new Set((state.plan ?? [])
-      .filter((task) => old.get(task.order) !== `${task.task}|${task.ref ?? ""}`)
+      .filter((task) => old.get(task.order) !== `${task.task}|${task.ref ?? ""}|${task.track}|${JSON.stringify(task.scope ?? [])}`)
       .map((task) => task.order));
     setFlashOrders(changed);
     setUpdatedVersion(state.plan_version);
@@ -68,6 +68,7 @@ export default function PlanTable({
   };
 
   const plan = state.plan ?? [];
+  const isFleetMaster = state.workspace_kind === "fleet-parent" && state.parallel_run?.phase === "awaiting-approval";
   const visibleTasks = plan.filter((task) => showDone || !completed.has(task.order));
   return (<>
     <section className="plan-pane">
@@ -100,7 +101,7 @@ export default function PlanTable({
             )}
             {visibleTasks.map((task) => {
               const done = completed.get(task.order);
-              const current = state.phase !== "plan" && task.order === state.current_order && !done;
+              const current = !isFleetMaster && state.phase !== "plan" && task.order === state.current_order && !done;
               const resetCount = state.task_reset_counts?.[String(task.order)];
               return (
                 <tr
@@ -120,12 +121,14 @@ export default function PlanTable({
                         return next;
                       })}
                     >{task.task}</button>
+                    <div className="task-ref">track: {task.track}</div>
                     {task.ref && <div className="task-ref">ref: {task.ref}</div>}
+                    {!!task.scope?.length && <div className="task-ref">scope: {task.scope.join(", ")}</div>}
                   </td>
                   <td className="task-status">
                     {done ? `✔ ${done.human ? "人工" : done.sha.slice(0, 8)}` : current ? "→ 進行中" : "·"}
                     {resetCount ? ` ⟲${resetCount}` : ""}
-                    {canEdit && (state.phase === "exec" || state.phase === "done") && task.order !== state.current_order && (
+                    {canEdit && !isFleetMaster && (state.phase === "exec" || state.phase === "done") && task.order !== state.current_order && (
                       <button type="button" className="goto-button" onClick={() => onGoto(task.order)} aria-label={`把進度設到 task-${task.order}`}>⏵</button>
                     )}
                   </td>
