@@ -9,9 +9,9 @@
 
 收斂機制(共識 AND gate):
 - 規劃期:agent call plan-ok 且該輪無任何異動 → flag+1;call create-plan(不論成敗)
-  或有任何異動/異常退出 → flag 歸零;flag > 10 → 執行期。
+  或有任何異動/未回完成訊號 → flag 歸零;flag > 10 → 執行期。
 - 執行期:per-task 內圈——agent call done(task id 正確)且 HEAD 沒動、工作樹乾淨、
-  驗證綠、CLI 正常退出 → done+1;有異動/驗證紅/異常退出 → done 歸零;
+  驗證綠、Agent 未逾時 → done+1;有異動/驗證紅/未回 done/逾時 → done 歸零;
   done ≥ threshold(預設 3)→ 派下一個任務。
 
 防線(全部機械、可關可調):
@@ -2016,8 +2016,8 @@ def main():
                                         ws.dir / "logs" / f"round-{rnd:04d}.log",
                                         args.round_timeout * 60, on_started=mark_startup_ready)
         # Agent process 已結束的當下先保存是否送出該 phase 的完成回報；Plan 的
-        # create-plan / plan-ok 是 DONE 等價訊號，Exec 則是 done。後續竄改／非零
-        # 退出可能清除 coordinator signals，但不能因此失去這個觀測事實。
+        # create-plan / plan-ok 是 DONE 等價訊號，Exec 則是 done。後續竄改／逾時
+        # 可能清除 coordinator signals，但不能因此失去這個觀測事實。
         agent_reported_done = (
             (phase == "plan" and (ws.signal("called_create_plan", round_token) or
                                   ws.signal("signal_plan_ok", round_token))) or
@@ -2069,20 +2069,22 @@ def main():
             ws.clear_signals()
             log(f"⚠️ 本輪作廢｜偵測到不允許的變更：{', '.join(tampered)}｜相關 signal 已丟棄")
 
-        # CLI 非零退出/逾時代表 round 沒有正常走完；即使它在 crash 前曾打過 done/plan-ok，
-        # 也不能把不完整的一輪算成共識票。執行期 repo 產出不回滾，仍留給下一輪收拾驗證。
-        agent_failed = rc != 0 or timed_out
+        # 不同 Agent CLI 對 exit code 的定義不一致，因此 rc 只供 log 診斷，不參與
+        # round 成敗。唯一的完成依據是該 phase 的 coordinator 訊號；逾時則仍作廢，
+        # 避免已失控、未按 prompt 在回報後停止的程序被算成完整一輪。
+        agent_failed = not agent_reported_done or timed_out
         if agent_failed:
             state["agent_failure_streak"] = state.get("agent_failure_streak", 0) + 1
             ws.clear_signals()
+            failure_reason = (f"逾時 {args.round_timeout:g} 分鐘"
+                              if timed_out else "未送出本階段完成回報")
             state["notes"].append(
-                f"⚠️ 上一輪 Agent 未正常結束(exit code={rc}"
-                + (f",逾時 {args.round_timeout:g} 分鐘" if timed_out else "")
-                + ")，該輪 coordinator 訊號已作廢；repo 殘留交下一輪檢查。")
-            log("⚠️ Agent round 異常｜本輪 coordinator 訊號已全部作廢")
+                f"⚠️ 上一輪 Agent {failure_reason}(exit code={rc} 僅供診斷)，"
+                "該輪 coordinator 訊號已作廢；repo 殘留交下一輪檢查。")
+            log(f"⚠️ Agent round 異常｜{failure_reason}｜本輪 coordinator 訊號已全部作廢")
         else:
             if state.get("agent_failure_streak", 0):
-                log(f"✅ Agent CLI 已恢復｜連續異常 {state['agent_failure_streak']} 輪後正常退出")
+                log(f"✅ Agent 完成回報已恢復｜連續異常 {state['agent_failure_streak']} 輪後收到有效訊號")
             state["agent_failure_streak"] = 0
 
         head_after = head_sha(repo)
@@ -2138,7 +2140,7 @@ def main():
             f"耗時={secs:.1f}s｜flag={state['flag']}｜done={state['done_count']}"
             + (f"｜{event}" if event else ""))
         if retry_delay:
-            log(f"⏳ Agent CLI 連續異常 {state['agent_failure_streak']} 輪｜{retry_delay:g} 秒後重試"
+            log(f"⏳ Agent 連續未完成 {state['agent_failure_streak']} 輪｜{retry_delay:g} 秒後重試"
                 f"（上限 {args.agent_backoff_max:g} 秒）")
         ws.save_state(state)
         stop_after_round = ws.take_stop_after_round(os.getpid(), session_id)

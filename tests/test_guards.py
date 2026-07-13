@@ -387,7 +387,7 @@ class TestRoundTelemetry(unittest.TestCase):
         history = (workspace_root / name / "history.log").read_text()
         return result, state, history
 
-    def test_successful_round_records_duration(self):
+    def test_zero_exit_without_completion_signal_records_failure(self):
         with tempfile.TemporaryDirectory() as d:
             result, state, history = self._run(
                 d, "round-duration", "import time\ntime.sleep(0.02)\n")
@@ -397,8 +397,10 @@ class TestRoundTelemetry(unittest.TestCase):
             self.assertIsNone(state["round_started_at"])
             self.assertIsNone(state["round_deadline_at"])
             self.assertIsNone(state["round_interrupted_at"])
+            self.assertEqual(state["agent_failure_streak"], 1)
             self.assertRegex(history, r" secs=\d+\.\d{3} timeout=False ")
             self.assertIn("done_missing=True", history, "Plan 結束但沒有 create-plan/plan-ok 應記為異常")
+            self.assertIn("agent_ok=False", history)
 
     def test_timed_out_round_records_timeout(self):
         with tempfile.TemporaryDirectory() as d:
@@ -710,10 +712,10 @@ class TestRoundMetrics(unittest.TestCase):
                 D.ROOT = old_root
 
 
-class TestAbnormalRoundVoided(unittest.TestCase):
-    """Agent crash 前打出的共識訊號不得被採信。"""
+class TestCompletionSignalControlsRound(unittest.TestCase):
+    """Agent round 以 coordinator 完成訊號判定；CLI exit code 只供診斷。"""
 
-    def test_plan_ok_then_nonzero_exit_does_not_advance_consensus(self):
+    def test_plan_ok_then_nonzero_exit_advances_consensus(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             repo = make_repo(root)
@@ -738,9 +740,49 @@ class TestAbnormalRoundVoided(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            state = json.loads((workspace_root / "abnormal-vote" / "state.json").read_text())
-            self.assertEqual(state["flag"], 0)
-            self.assertIn("coordinator 訊號已全部作廢", result.stdout)
+            workspace = workspace_root / "abnormal-vote"
+            state = json.loads((workspace / "state.json").read_text())
+            history = (workspace / "history.log").read_text()
+            self.assertEqual(state["flag"], 1)
+            self.assertEqual(state["agent_failure_streak"], 0)
+            self.assertIn("rc=7", history)
+            self.assertIn("signal=ok", history)
+            self.assertIn("agent_ok=True", history)
+
+    def test_done_then_nonzero_exit_completes_exec_round(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            plan = root / "plan.json"
+            plan.write_text('[{"order": 1, "task": "only task"}]')
+            agent = root / "agent.py"
+            agent.write_text(
+                "import os, subprocess, sys\n"
+                "sys.stdin.read()\n"
+                "subprocess.run([sys.executable, '-m', 'engine.work', 'done', 'task-1'], "
+                "env=dict(os.environ), check=True)\n"
+                "raise SystemExit(23)\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+
+            result = subprocess.run(
+                [*LOOP_CMD, "--repo", str(repo), "--name", "nonzero-done",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--import-plan", str(plan),
+                 "--start-phase", "exec", "--done-threshold", "1", "--max-rounds", "1"],
+                capture_output=True, text=True, env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            workspace = workspace_root / "nonzero-done"
+            state = json.loads((workspace / "state.json").read_text())
+            history = (workspace / "history.log").read_text()
+            self.assertEqual(state["phase"], "done")
+            self.assertEqual(state["agent_failure_streak"], 0)
+            self.assertIn("rc=23", history)
+            self.assertIn("signal=done", history)
+            self.assertIn("agent_ok=True", history)
 
 
 class TestPauseAfterPlan(unittest.TestCase):
@@ -881,7 +923,7 @@ class TestPauseAfterPlan(unittest.TestCase):
 
 
 class TestAgentFailureBackoff(unittest.TestCase):
-    """Agent CLI 秒退時要節流；成功後 failure streak 立即復原。"""
+    """Agent 未回完成訊號時要節流；收到訊號後 failure streak 立即復原。"""
 
     def test_exponential_backoff_is_capped_and_disableable(self):
         self.assertEqual([L.agent_failure_backoff(n, 10) for n in range(1, 6)], [1, 2, 4, 8, 10])
@@ -893,13 +935,20 @@ class TestAgentFailureBackoff(unittest.TestCase):
             root = Path(d)
             repo = make_repo(root)
             workspace_root = root / "workspace"
+            plan = root / "plan.json"
+            plan.write_text('[{"order": 1, "task": "only task"}]')
             agent = root / "flaky_agent.py"
             agent.write_text(
+                "import os, subprocess, sys\n"
                 "from pathlib import Path\n"
+                "sys.stdin.read()\n"
                 "marker = Path(__file__).with_suffix('.once')\n"
                 "if not marker.exists():\n"
                 "    marker.write_text('failed')\n"
                 "    raise SystemExit(7)\n"
+                "subprocess.run([sys.executable, '-m', 'engine.work', 'plan-ok'], "
+                "env=dict(os.environ), check=True)\n"
+                "raise SystemExit(19)\n"
             )
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             started = time.monotonic()
@@ -907,7 +956,8 @@ class TestAgentFailureBackoff(unittest.TestCase):
             result = subprocess.run(
                 [*LOOP_CMD, "--repo", str(repo), "--name", "flaky-backoff",
                  "--agent-cmd", shlex.join([sys.executable, str(agent)]),
-                 "--validate-cmd", "true", "--agent-backoff-max", "0.05", "--max-rounds", "2"],
+                 "--validate-cmd", "true", "--agent-backoff-max", "0.05", "--max-rounds", "2",
+                 "--import-plan", str(plan), "--start-phase", "plan"],
                 capture_output=True, text=True, env=env,
             )
 
@@ -918,7 +968,7 @@ class TestAgentFailureBackoff(unittest.TestCase):
             self.assertEqual(state["agent_backoff_seconds"], 0)
             self.assertIsNone(state["agent_backoff_until"])
             self.assertIn("0.05 秒後重試", result.stdout)
-            self.assertIn("Agent CLI 已恢復", result.stdout)
+            self.assertIn("Agent 完成回報已恢復", result.stdout)
 
     def test_backoff_is_visible_in_state_and_interruptible(self):
         with tempfile.TemporaryDirectory() as d:
