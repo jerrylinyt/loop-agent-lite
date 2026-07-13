@@ -44,6 +44,24 @@ class TestPromptTemplateResources(unittest.TestCase):
         self.assertIn("最終輸出契約：goal.md", bundle["goal"])
         self.assertIn("最終輸出契約：plan.json", bundle["plan"])
 
+    def test_plan_prompts_bound_task_context_and_submit_long_json_by_file(self):
+        bundle, error = P.prompt_template_bundle()
+        self.assertIsNone(error)
+        external_plan = bundle["plan"]
+        runtime_plan = P._read_prompt_resource("plan.md")
+        for prompt in (external_plan, runtime_plan):
+            with self.subTest(prompt="external" if prompt is external_plan else "runtime"):
+                self.assertIn("128k", prompt)
+                self.assertIn("三分之一", prompt)
+                self.assertIn("至少保留一半", prompt)
+                self.assertIn("working set", prompt)
+                self.assertIn("producer", prompt)
+                self.assertIn("大量重複搬移", prompt)
+        self.assertIn("mktemp", runtime_plan)
+        self.assertIn("不要先把整包 JSON 印到對話", runtime_plan)
+        self.assertIn("不要用 `echo`／`printf` 內嵌 JSON", runtime_plan)
+        self.assertIn("<<CREATE_CMD>> <暫存檔實際路徑>", runtime_plan)
+
     def test_goal_template_is_an_eight_section_artifact_skeleton_for_every_task_type(self):
         bundle, error = P.prompt_template_bundle()
         self.assertIsNone(error)
