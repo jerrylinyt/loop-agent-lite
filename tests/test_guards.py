@@ -3376,12 +3376,19 @@ class TestAgentPromptPolicy(unittest.TestCase):
         self.assertIn("把證據交給下一輪 agent 繼續收斂", prompt)
         self.assertNotIn("交由人類處理", prompt)
 
-    def test_merge_confirm_requires_every_dod_and_only_accepts_authoritative_integration_result(self):
+    def test_merge_confirm_delegates_pre_cas_integration_gate_but_requires_repair(self):
         prompt = self.prompt("merge-confirm.md")
         self.assertIn("每個 task 的每一條 DoD", prompt)
-        self.assertIn("不得自行把任何 DoD 判成「不適用」而跳過", prompt)
-        self.assertIn("只有前輪／修復情報已包含該次權威執行結果時", prompt)
-        self.assertIn("缺少 integration-only DoD 的權威結果", prompt)
+        self.assertIn("不得自行把一般 DoD 判成", prompt)
+        self.assertIn("「不適用」而跳過", prompt)
+        self.assertIn("由 parent 在 merge-ready/CAS 後負責", prompt)
+        self.assertIn("首次 pre-CAS confirm 尚無 integration-only 結果是預期時序", prompt)
+        self.assertIn("不得因此報 issue", prompt)
+        self.assertIn("rollback 後會把該次權威錯誤放進修復情報", prompt)
+        self.assertIn("上述可在 child 重現的 DoD 與", prompt)
+        self.assertIn("必須直接依錯誤內容", prompt)
+        self.assertIn("修復並 commit", prompt)
+        self.assertNotIn("缺少 integration-only DoD 的權威結果", prompt)
         self.assertNotIn("所有適用 DoD", prompt)
 
     def test_all_runtime_prompts_render_without_placeholder_residue(self):
