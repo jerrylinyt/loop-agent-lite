@@ -5,6 +5,8 @@ const repo = process.env.LOOP_L4_REPO ?? "";
 const validate = process.env.LOOP_L4_VALIDATE ?? "";
 const validateTimeout = process.env.LOOP_L4_VALIDATE_TIMEOUT ?? "";
 const importedPlan = process.env.LOOP_L4_PLAN ?? "";
+let lastFleetApiCheck = 0;
+let lastFleetApiFailure = "";
 const isExpectedLongRunNetworkSuspend = (message: string) =>
   message.trim() === "Failed to load resource: net::ERR_NETWORK_IO_SUSPENDED";
 
@@ -38,7 +40,27 @@ async function terminalFleetFailure(page: Page) {
       return (await alert.textContent())?.trim() ?? title;
     }
   }
-  return "";
+  // Child detail does not render the parent ParallelRunGroup. Poll the read-only
+  // parent state at a bounded rate so a terminal parent failure still aborts a
+  // long child prompt/history wait without mutating test state.
+  if (scenario && Date.now() - lastFleetApiCheck >= 2_000) {
+    lastFleetApiCheck = Date.now();
+    const response = await page.request.get(
+      `/api/parallel-run?ws=${encodeURIComponent(`l4-${scenario}`)}`
+    ).catch(() => null);
+    if (response?.ok()) {
+      const state = await response.json() as {
+        phase?: string;
+        error?: string | null;
+        read_error?: string;
+      };
+      if (state.read_error) lastFleetApiFailure = `Parallel truth 無法讀取 · ${state.read_error}`;
+      else if (state.phase === "failed") {
+        lastFleetApiFailure = `Parallel run 已失敗${state.error ? ` · ${state.error}` : ""}`;
+      }
+    }
+  }
+  return lastFleetApiFailure;
 }
 
 async function waitForVisibleOrFleetFailure(
@@ -137,18 +159,34 @@ async function inspectTimeline(page: Page, workspace: string) {
   await closeModal(page);
 }
 
-async function inspectChildPromptAndHistory(page: Page) {
+async function inspectChildPromptAndHistory(page: Page, firstRoundBudgetMs: number) {
+  await page.getByRole("button", { name: "🕒 輪次紀錄", exact: true }).click();
+  const history = page.getByRole("dialog", { name: "輪次紀錄" });
+  await expect(history).toBeVisible();
+  const firstRow = history.locator("tbody tr").first();
+  const refresh = history.getByRole("button", { name: "重新整理" });
+  const deadline = Date.now() + firstRoundBudgetMs;
+  let firstRowText = "";
+  while (Date.now() < deadline) {
+    firstRowText = (await firstRow.textContent({ timeout: 500 }).catch(() => ""))?.trim() ?? "";
+    if (firstRowText && !firstRowText.includes("尚無輪次紀錄")) break;
+    const failure = await terminalFleetFailure(page);
+    if (failure) throw new Error(`L4 first child round history aborted by terminal Fleet failure: ${failure}`);
+    if (await refresh.isEnabled()) await refresh.click();
+    await page.waitForTimeout(1_000);
+  }
+  if (!firstRowText || firstRowText.includes("尚無輪次紀錄")) {
+    throw new Error(
+      `L4 first child round history did not appear within ${Math.round(firstRoundBudgetMs / 1000)} seconds`
+    );
+  }
+  await expect(history).toContainText(/exec|merge|執行|整合/i);
+  await closeModal(page);
+
   await page.getByRole("button", { name: "📨 prompt", exact: true }).click();
   const prompt = page.getByRole("dialog", { name: "最近一輪 Prompt" });
   await expect(prompt.locator(".report-content")).not.toBeEmpty();
   await expect(prompt).toContainText(/fleet|track|並行軌道/i);
-  await closeModal(page);
-
-  await page.getByRole("button", { name: "🕒 輪次紀錄", exact: true }).click();
-  const history = page.getByRole("dialog", { name: "輪次紀錄" });
-  await expect(history).toBeVisible();
-  await expect(history.locator("tbody tr").first()).not.toContainText("尚無輪次紀錄");
-  await expect(history).toContainText(/exec|merge|執行|整合/i);
   await closeModal(page);
 }
 
@@ -242,7 +280,9 @@ test("full-project parallel run through production UI", async ({ page }, testInf
   expect(childWorkspace).toContain(`l4-${scenario}`);
   await expect(page.getByRole("button", { name: /運行|立即停止|本輪後停止|編輯計畫|回規劃期|進執行期|設定|刪除|以此為範本/ })).toHaveCount(0);
   await inspectGoal(page);
-  await inspectChildPromptAndHistory(page);
+  await inspectChildPromptAndHistory(
+    page, (30 * 60 + validateTimeoutSeconds + 60) * 1000
+  );
   await inspectTimeline(page, childWorkspace);
   await exerciseConsoleControls(page);
   // 用 palette 做一次真正的 child → parent 導航，避免之後 cleanup 已移除 child 時再依賴舊 tab。
