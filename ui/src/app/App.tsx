@@ -4,7 +4,6 @@ import ConsolePane from "../features/console/ConsolePane";
 import Splitter from "../features/layout/Splitter";
 import LauncherModal from "../features/launcher/LauncherModal";
 import ThemePicker from "../features/theme/ThemePicker";
-import ArchivesModal from "../features/workspaces/ArchivesModal";
 import FleetOverview from "../features/workspaces/FleetOverview";
 import WorkspaceTabs from "../features/workspaces/WorkspaceTabs";
 import WorkspaceView from "../features/workspaces/WorkspaceView";
@@ -19,7 +18,6 @@ export default function App() {
   const dashboard = useDashboardData();
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [launcherTemplate, setLauncherTemplate] = useState<DashboardConfig | null>(null);
-  const [archivesOpen, setArchivesOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [overviewOpen, setOverviewOpen] = useState(() => localStorage.getItem("fleet-overview") === "1");
   const [attentionRequest, setAttentionRequest] = useState(0);
@@ -62,11 +60,6 @@ export default function App() {
       return !value;
     });
   };
-  const restored = async (name: string) => {
-    dashboard.selectWorkspace(name);
-    await dashboard.refreshWorkspaces();
-    setArchivesOpen(false);
-  };
   const toggleOverview = () => {
     setOverviewOpen((value) => {
       localStorage.setItem("fleet-overview", value ? "0" : "1");
@@ -93,7 +86,6 @@ export default function App() {
   });
   const paletteCommands = useMemo(() => [
     { id: "overview", label: "開啟 Fleet 總覽", hint: "監控所有 workspace", run: () => { setOverviewOpen(true); localStorage.setItem("fleet-overview", "1"); } },
-    { id: "archives", label: "查看已封存", hint: "還原或永久刪除", run: () => setArchivesOpen(true) },
     ...(!dashboard.bootstrap.readonly ? [{ id: "launch", label: "啟動／管理", hint: "建立或重新啟動 loop", run: () => openLauncher() }] : [])
   ], [dashboard.bootstrap.readonly]);
 
@@ -114,7 +106,6 @@ export default function App() {
             <ThemePicker />
             <button type="button" className="secondary-button command-palette-trigger" aria-keyshortcuts="Meta+K Control+K" onClick={() => setPaletteOpen(true)}>⌘K</button>
             <button type="button" className={`secondary-button${overviewOpen ? " active-toggle" : ""}`} aria-pressed={overviewOpen} onClick={toggleOverview}>📺 總覽</button>
-            <button type="button" className="secondary-button" onClick={() => setArchivesOpen(true)}>🗃 已封存</button>
             {!dashboard.bootstrap.readonly && <button type="button" className="success-button" onClick={() => openLauncher()}>＋ 啟動／管理</button>}
           </div>
         </header>
@@ -143,7 +134,6 @@ export default function App() {
       </div>
       {navigationChord && <div className="navigation-chord" role="status">導覽：按 0 回總覽，1～5 切換 workspace</div>}
       {launcherOpen && <LauncherModal workspaces={dashboard.workspaces} templateConfig={launcherTemplate} onClose={closeLauncher} onLaunched={launched} />}
-      {archivesOpen && <ArchivesModal readonly={dashboard.bootstrap.readonly} onClose={() => setArchivesOpen(false)} onRestored={restored} />}
       {paletteOpen && <CommandPalette workspaces={dashboard.workspaces} commands={paletteCommands} onClose={() => setPaletteOpen(false)} onSelectWorkspace={(name) => { dashboard.selectWorkspace(name); setOverviewOpen(false); }} />}
     </>
   );

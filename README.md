@@ -75,6 +75,8 @@ Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace 
 Prompt 內容會由 engine 寫入 stdin pipe，Agent 不會取得 prompt 檔案路徑；workspace 內的 `prompts/` 僅保留稽核副本。另有 `LOOP_WS`（workspace 目錄）與 `LOOP_ROUND_TOKEN`（本輪 token，`work.py` 靠它核對呼叫來源）可用。
 
 Dashboard 也提供唯讀 `GET /api/health`，回傳 `schema_version: 1`、`status`（`ok`／`degraded`／`error`）與 workspace、執行中、需關注、state 錯誤、issues、Agent 異常、最近一輪逾時、state 復原、goal 變更及 stale PID 摘要；適合本機探針或外部監控。加上 `?strict=1` 時，`degraded`／`error` 會以 HTTP 503 回應，方便 readiness probe 直接判斷；預設仍維持 HTTP 200 並讓呼叫端讀取 status。瀏覽器頁首與即時 SSE 的 `health` event 使用同一份 projection，不會修復或改寫任何 workspace。
+
+停止中的 workspace 可從「設定」匯出純 plan 陣列為 `<workspace>.plan.json`，或匯入同格式檔案。設定內匯入只支援完整重置：沿用既有 plan schema 驗證 `order`／`task`／`ref`，拒絕整份 state 或完成進度，保留 workspace 執行設定與 target repo，清除 coordinator 進度及舊 run 產物後停在規劃期。
 `GET /api/round-metrics?ws=<name>&run=current&limit=100` 使用同一套 bounded/safe history reader，供 Dashboard 與外部觀測工具取得近期效能摘要、逐輪樣本，以及 Agent 結束但未送出 phase 完成回報的異常次數／異常率；Plan 以 `create-plan`／`plan-ok`、Exec 以 `done` 作為完成回報，即使本輪有 Git 變更，沒有回報仍算異常。人工立即中斷的未完成輪不寫入 history，因此不進入異常分子或總輪數；`run=previous` 可分析保留的上一個 run。
 `GET /api/fleet-round-metrics` 會將所有 workspace 的輪次依 timestamp 合併，只聚合全體最新 500 筆並回傳效能、未回 DONE 異常次數與全域異常率摘要；SSE 的 `fleet-round-metrics` event 使用同一 projection，瀏覽器不會收到原始樣本。
 `GET /api/anomalies[?ws=<name>&run=current]` 列出與 Overview 全域 500 輪或 workspace 100 輪統計一致的最近異常（最多 100 筆）；新發生的異常會把 Agent log 尾端最多 2 MiB 保存在 `logs/anomalies/`，每個 workspace 最多 100 份。`GET /api/anomaly-log?ws=<name>&id=<id>` 安全讀取其中一份；舊異常仍可列出輪次判定，但功能啟用前沒有可回補的 Agent log。
@@ -104,21 +106,21 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 - 工具列「📺 總覽」切換電視牆模式：頂部在「任務完成」右側整合所有 workspace 依時間最新 500 筆輪次的平均、P50、P95、最慢、逾時率、未回 DONE 次數與全域異常率；點「未回 DONE」可展開異常 workspace／round 清單，再點輪次查看保留的 Agent log。下方各 workspace 卡片仍各自顯示近期最多 100 輪摘要及相同異常統計，點卡片切入；輪次紀錄中的異常數也可開啟同一種清單與 log 檢視。整合卡只透過 SSE 傳統計結果，不傳 500 筆原始樣本；卡片與事件推播共用同一連線，不另開輪詢，輪次計時由瀏覽器依 state 時間戳本地更新，不為時鐘製造高頻 SSE；可用名稱搜尋與「全部／需關注／執行中／已完成」篩選卡片，選擇會保存在瀏覽器；頁首只有在真的有問題時才顯示可點擊的「工作區需處理」，點下會直接篩出問題卡片，卡片列出原因並可切入指定 workspace。已完成 workspace 的歷史停滯／紅燈不再誤算為目前告警；未讀 issues、checkpoint、goal 變更、stale PID 與 state 錯誤仍會標示。搭配 `--read-only` 適合掛牆監控。
 - 總覽可將目前的狀態篩選、名稱搜尋、排序與緊湊卡片設定存成命名監控視圖；視圖只存在目前瀏覽器，最多保留 20 組，可套用或刪除。
 - workspace 狀態列的「🧭 時間軸」把歷史輪次、異常與目前 console 的操作紀錄整合成單一時間序；只有時間而沒有日期的 console 紀錄會明確標示為本機時間，避免把推定時間當成精確事實。
-- 階段切換、任務跳轉、Validate、封存、還原與永久刪除等操作，在確認視窗先列出將改變的 state、命令、timeout、workspace 目錄與不受影響的 target repo，讓操作者能在送出前核對影響範圍。
+- 階段切換、任務跳轉、Validate 與永久刪除 workspace 等操作，在確認視窗先列出將改變的 state、命令、timeout、workspace 目錄與不受影響的 target repo，讓操作者能在送出前核對影響範圍。
 - 停止 loop 後可用全畫面 Plan 編輯器修改 pending tasks：已完成與目前任務鎖定，後方尚未執行的任務可從專用把手拖移，也可用上移／下移按鈕調整、刪除，或在兩項之間／尾端插入新任務。儲存以 plan version 防止覆蓋新狀態，並由後端原子驗證、重新編號；歷史與完成 commit 不改寫。
 - 啟動表單進階設定與 workspace「⚙ 設定」都可勾選「規劃收斂後暫停」：計畫收斂後 loop 停在執行期起點、不自動開始執行，人工核對（或用 Plan 編輯器調整）後按「▶ 運行」才進入執行輪；規劃期狀態列會顯示「⏸ 規劃後暫停」提示，`notify_cmd` 會收到 `plan_paused` 終態通知，團隊預設值在 shared 設定的 `defaults.pause_after_plan`。
 - 啟動表單的「執行前變更 Diff」會比較既有 repo／workspace 與本次 goal、plan、phase、Agent、Validate、門檻、timeout 及 branch 選擇；有待匯入內容時自動展開。
 - workspace 詳細頁的「📋 以此為範本啟動」會以該 workspace 的 repo、Agent、Validate 與門檻／timeout 設定預填啟動表單，workspace 名稱刻意留空讓你填新的；執行中、停止或已完成的 workspace 都可當範本，送出仍走原本的驗證與啟動流程。
 - workspace 的「⇄ Run 對比」並排顯示目前與上一個 run 的樣本數、平均、P95、最慢、逾時率、未回 DONE 與異常數；沒有 per-run snapshot 的設定與 commit 不會推測比較。
-- `⌘K`／`Ctrl+K` 可開啟快捷指令，搜尋 workspace 或前往總覽、封存與啟動管理。
+- `⌘K`／`Ctrl+K` 可開啟快捷指令，搜尋 workspace 或前往總覽與啟動管理。
 - 按 `Ctrl+G`（macOS 為 `⌘G`）後再按 `0` 可回總覽、按 `1～5` 可切換前五個 workspace；第二鍵需在 1.5 秒內輸入，表單或對話框開啟時不觸發。
-- 總覽的批次操作可多選 workspace 並標記 issues 已讀、立即停止或封存；不符合動作前置條件的項目會在確認預覽中列為跳過，符合者仍逐筆使用既有安全 API。
+- 總覽的批次操作可多選 workspace 並標記 issues 已讀或立即停止；不符合動作前置條件的項目會在確認預覽中列為跳過，符合者仍逐筆使用既有安全 API。
 - Dashboard 提供跳至主要內容、清楚的 focus outline、Modal focus trap／Esc／焦點回復、reduced-motion 與 forced-colors 支援；首次空畫面則提供 repo、goal/plan、Validate 三步引導與常見失敗原因。
 - 分隔線可拖曳調整欄寬；箭頭可收合，設定會保存在瀏覽器。
 - 狀態列的「🎯 goal」「🕒 輪次紀錄」「📨 prompt」chips 分別顯示目前 goal 內容、history.log 逐輪判定（含每輪 Agent 耗時／逾時／是否未回 phase DONE）、以及最近一輪送給 Agent 的完整 prompt（全部唯讀）；「輪次紀錄」保留最近 100 輪的樣本數、平均、P50、P95、最慢輪、逾時率、未回 DONE 次數與異常率完整分析，Overview 卡片同步提供快速摘要。goal 在停機期間變更時，Goal 視窗會用保存的計畫基準 hash 從 Git 歷史重建並顯示 unified diff。
 - Issues 視窗可「標記已讀」而不刪除稽核紀錄；只有未讀 issues 會讓 fleet 顯示需關注，仍可用「清空全部」永久移除紀錄。
 - 全部任務收斂後，狀態列出現「📄 完成報告」直接檢視 REPORT.md。
-- 停止狀態可「🗄 封存」workspace：整個目錄以 UUID 封存 ID 移到 `workspace/.archive/`，target repo 不受影響；工具列的「🗃 已封存」可列出、安全還原或在雙重確認後永久刪除，還原不會自動啟動 loop。執行中、鎖定中、symlink 或目標名稱已存在時一律拒絕；永久刪除只作用於封存目錄，不會碰 target repo。
+- 停止狀態可按「🗑 刪除」永久移除對應的完整 workspace 目錄；確認視窗會列出 state、history、console、logs、prompts、snapshots 與 REPORT 等受影響資料，並明示 target repo 不受影響。執行中、鎖定中或 workspace 路徑是 symlink 時一律拒絕；刪除會先把 root entry 原子改成隱藏暫存名稱，再以不跟隨 symlink 的方式移除整棵目錄，無法復原。
 - 啟動表單進階設定內的「🔔 管理終態通知」可編輯、儲存並以 `status=test` 實測 `notify_cmd`（佔位符 `{status}`、`{name}`）。
 - 啟動表單的「完整健檢」會檢查目前已 commit repo 的 git／鎖／乾淨工作樹／goal 與 Validate，不建 state、不啟動 Agent；待匯入 goal、plan、reset 或新 branch 時會停用，實際啟動仍會再驗一次。
 - 啟動表單在 `goal.md` 旁將「Goal 產生器 Prompt」與「Goal 成果模板」分成兩個入口：前者把需求、選填的專案限制與任務類型編譯成可直接貼給 Agent 的自然 Markdown，不再外露 `_json` 標籤，空白補充資訊也不會產生佔位段落；後者沿用 Goal 產生器的完整任務類型清單，逐類提供符合現行八段契約、具 SC／AC 追溯與 DoD 骨架的 `goal.md` 參考模板。兩個子視窗都可由「上一頁」回到啟動表單。`plan.json` 旁仍提供 Plan 產生器 Prompt，輸出只接受欄位限於 `order/task/ref` 的 JSON array。以上操作都只在瀏覽器進行，不會改動 repo 或 workspace。
@@ -180,10 +182,6 @@ workspace/<name>/
 **validate 失敗或逾時**
 
 先在 target repo 手動執行同一個 command，確認工作目錄與依賴正確，再回 Dashboard 修改命令或 timeout。逾時會終止 validator 的整個 process group。
-
-**封存錯 workspace 想要還原**
-
-在工具列開啟「🗃 已封存」，選擇對應項目後按「還原」。系統只會原子搬回原 workspace 名稱，若名稱已被使用或封存項目仍被鎖定會拒絕，不會覆寫資料，也不會自動啟動 loop。只有 Dashboard 無法啟動時才把手動搬移當作緊急救援，且務必先確認目的地不存在。
 
 **workspace 顯示沒有 state.json**
 

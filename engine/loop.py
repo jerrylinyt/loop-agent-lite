@@ -441,12 +441,12 @@ def repo_relative_path(repo: Path, rel: str) -> Path:
 
 
 class WorkspaceOperationLockError(RuntimeError):
-    """另一個 archive/restore 或 CLI 正在改同名 workspace 的 root entry。"""
+    """另一個 Dashboard 操作或 CLI 正在改同名 workspace 的 root entry。"""
 
 
 @contextmanager
 def workspace_operation_lock(root: Path, name: str, *, blocking=True):
-    """跨 Dashboard/CLI 的 per-name root lock，保護「不存在→建立/還原」這類競態。"""
+    """跨 Dashboard/CLI 的 per-name root lock，保護建立／刪除 root entry 的競態。"""
     name = require_workspace_name(name)
     root = Path(root)
     try:
@@ -483,7 +483,7 @@ def workspace_operation_lock(root: Path, name: str, *, blocking=True):
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         except BlockingIOError as e:
-            raise WorkspaceOperationLockError(f"workspace {name} 正在進行 archive/restore 操作") from e
+            raise WorkspaceOperationLockError(f"workspace {name} 正在進行建立或刪除操作") from e
         yield
     finally:
         if lock_file is not None:
@@ -1588,6 +1588,18 @@ def write_run_report(repo: Path, workspace, state) -> Path:
     return report_path
 
 
+def reset_run_artifacts(workspace) -> None:
+    """開始全新 run 時清除逐輪產物；history 僅輪替保留上一代供稽核。"""
+    (workspace.dir / "pending_issues").unlink(missing_ok=True)
+    (workspace.dir / "REPORT.md").unlink(missing_ok=True)
+    if workspace.history.exists():
+        os.replace(workspace.history, workspace.history.with_name(f"{workspace.history.name}.1"))
+    for old in (workspace.dir / "logs").glob("round-*.log"):
+        old.unlink(missing_ok=True)
+    for old in (workspace.dir / "prompts").glob("round-*.md"):
+        old.unlink(missing_ok=True)
+
+
 def process_plan_round(state, workspace, round_token: str, *, tampered, changed,
                        agent_failed: bool, flag_threshold: int) -> str:
     """套用規劃期訊號與共識規則，必要時切換到執行期，回傳本輪事件摘要。"""
@@ -1872,14 +1884,7 @@ def main():
         # 舊 history 會污染輪次紀錄/sparkline/事件流,舊 prompt(round 編號較大)會蓋過新 run 的
         # prompt 投影。history 具稽核價值,輪替保留一代 .1;其餘直接清除。
         # 清理與上面的 save_state 同屬 preflight 通過後的交易提交點:啟動檢查失敗時全數保留。
-        (ws.dir / "pending_issues").unlink(missing_ok=True)
-        (ws.dir / "REPORT.md").unlink(missing_ok=True)
-        if ws.history.exists():
-            os.replace(ws.history, ws.history.with_name(f"{ws.history.name}.1"))
-        for old in (ws.dir / "logs").glob("round-*.log"):
-            old.unlink(missing_ok=True)
-        for old in (ws.dir / "prompts").glob("round-*.md"):
-            old.unlink(missing_ok=True)
+        reset_run_artifacts(ws)
     if args.import_plan and getattr(args, "consume_import_plan", False):
         Path(args.import_plan).unlink(missing_ok=True)
 

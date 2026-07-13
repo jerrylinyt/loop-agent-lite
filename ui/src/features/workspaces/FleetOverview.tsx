@@ -43,14 +43,13 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
   const [anomaliesOpen, setAnomaliesOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [selectedNames, setSelectedNames] = useState<string[]>([]);
-  const [bulkAction, setBulkAction] = useState<"ack" | "stop" | "archive" | null>(null);
+  const [bulkAction, setBulkAction] = useState<"ack" | "stop" | null>(null);
   const [bulkMessage, setBulkMessage] = useState("");
   const selectedWorkspaces = workspaces.filter((workspace) => selectedNames.includes(workspace.name));
   // 每種批次操作都有不同前置條件。確認視窗同時列出 eligible 與被跳過項目，
   // 避免使用者以為「選到了」就一定會被修改。
   const eligible = bulkAction === "ack" ? selectedWorkspaces.filter((workspace) => (workspace.unread_issues ?? workspace.issues ?? 0) > 0 && !workspace.running)
-    : bulkAction === "stop" ? selectedWorkspaces.filter((workspace) => workspace.running)
-      : bulkAction === "archive" ? selectedWorkspaces.filter((workspace) => !workspace.running) : [];
+    : bulkAction === "stop" ? selectedWorkspaces.filter((workspace) => workspace.running) : [];
   const runBulk = async () => {
     if (!bulkAction) return;
     const targets = [...eligible]; setBulkAction(null);
@@ -59,8 +58,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
     // 也不另開一條能繞過既有安全檢查的批次後端捷徑。
     for (const workspace of targets) {
       const response = bulkAction === "ack" ? await postJson("/api/edit-state", { name: workspace.name, ack_issues: true })
-        : bulkAction === "stop" ? await postJson("/api/stop", { name: workspace.name })
-          : await postJson("/api/archive-workspace", { name: workspace.name });
+        : await postJson("/api/stop", { name: workspace.name });
       if (response.error) failed += 1;
     }
     setBulkMessage(`已處理 ${targets.length - failed}/${targets.length} 個 workspace${failed ? `，${failed} 個失敗` : ""}`);
@@ -221,8 +219,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
         <button type="button" className="secondary-button compact-button" aria-expanded={bulkOpen} onClick={() => setBulkOpen((value) => !value)}>☑ 批次操作</button>
         {bulkOpen && <><select multiple aria-label="批次選擇 workspace" value={selectedNames} onChange={(event) => setSelectedNames([...event.target.selectedOptions].map((option) => option.value))}>{visibleWorkspaces.map((workspace) => <option key={workspace.name} value={workspace.name}>{workspace.name} · {workspace.running ? "執行中" : "已停止"}</option>)}</select>
           <button type="button" className="secondary-button compact-button" disabled={!selectedNames.length} onClick={() => setBulkAction("ack")}>Issues 已讀</button>
-          <button type="button" className="danger-button compact-button" disabled={!selectedNames.length} onClick={() => setBulkAction("stop")}>立即停止</button>
-          <button type="button" className="danger-button compact-button" disabled={!selectedNames.length} onClick={() => setBulkAction("archive")}>封存</button></>}
+          <button type="button" className="danger-button compact-button" disabled={!selectedNames.length} onClick={() => setBulkAction("stop")}>立即停止</button></>}
         <span className="muted" role="status">{bulkMessage || (selectedNames.length ? `已選 ${selectedNames.length} 個` : "")}</span>
       </div>}
       <div className="fleet-body">
@@ -248,7 +245,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
         </aside>
       </div>
       {anomaliesOpen && <AnomalyLogModal onClose={() => setAnomaliesOpen(false)} />}
-      {bulkAction && <ActionDialog title="確認批次操作" message={`將對 ${eligible.length} 個符合條件的 workspace 執行「${bulkAction === "ack" ? "Issues 已讀" : bulkAction === "stop" ? "立即停止" : "封存"}」；不符合條件者會跳過。`} confirmLabel={`執行 ${eligible.length} 個`} danger={bulkAction !== "ack"} preview={[
+      {bulkAction && <ActionDialog title="確認批次操作" message={`將對 ${eligible.length} 個符合條件的 workspace 執行「${bulkAction === "ack" ? "Issues 已讀" : "立即停止"}」；不符合條件者會跳過。`} confirmLabel={`執行 ${eligible.length} 個`} danger={bulkAction !== "ack"} preview={[
         { label: "符合條件", value: eligible.map((workspace) => workspace.name).join(", ") || "無" },
         { label: "自動跳過", value: selectedWorkspaces.filter((workspace) => !eligible.includes(workspace)).map((workspace) => workspace.name).join(", ") || "無", tone: "safe" },
         { label: "執行方式", value: "逐 workspace 呼叫既有安全 API；單筆失敗不會阻止其他項目" }

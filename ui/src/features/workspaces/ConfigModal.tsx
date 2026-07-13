@@ -1,21 +1,24 @@
 /** 停止狀態下的 workspace 設定編輯器：載入可選命令、追蹤非同步測試，儲存時由後端重驗數值與白名單。 */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import CliManagerModal from "../cli/CliManagerModal";
+import ActionDialog from "../../shared/components/ActionDialog";
 import Modal from "../../shared/components/Modal";
 import { getJson, postJson } from "../../shared/api/client";
 import useStaleGuard from "../../shared/hooks/useStaleGuard";
-import type { ConfigResponse, DashboardConfig } from "../../shared/api/types";
+import type { ConfigResponse, DashboardConfig, PlanTask } from "../../shared/api/types";
 
 interface ValidateResponse { ok?: boolean; rc?: number; timeout?: boolean; timeout_seconds?: number; tail?: string }
 
 export default function ConfigModal({
   workspace,
   config,
+  plan,
   onClose,
   onChanged
 }: {
   workspace: string;
   config: DashboardConfig;
+  plan: PlanTask[];
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -37,6 +40,9 @@ export default function ConfigModal({
   const [validating, setValidating] = useState(false);
   const [validateResult, setValidateResult] = useState<{ ok: boolean; text: string; tail: string } | null>(null);
   const [cliManagerOpen, setCliManagerOpen] = useState(false);
+  const [pendingImport, setPendingImport] = useState<{ name: string; text: string; count: number } | null>(null);
+  const [importing, setImporting] = useState(false);
+  const importInput = useRef<HTMLInputElement>(null);
   const validateGuard = useStaleGuard();
 
   useEffect(() => { void getJson<ConfigResponse>("/api/config").then(setAvailable); }, []);
@@ -86,6 +92,53 @@ export default function ConfigModal({
     });
   };
 
+  const exportPlan = () => {
+    const blob = new Blob([`${JSON.stringify(plan, null, 2)}\n`], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${workspace}.plan.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    setMessage(`✅ 已匯出 ${plan.length} 條任務`);
+  };
+
+  const selectImport = async (file?: File) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const value: unknown = JSON.parse(text);
+      if (!Array.isArray(value)) {
+        setMessage("❌ plan.json 頂層必須是任務陣列；不可匯入整份 state.json");
+        return;
+      }
+      setPendingImport({ name: file.name, text, count: value.length });
+      setMessage("");
+    } catch (error) {
+      setMessage(`❌ plan.json 解析失敗：${error instanceof Error ? error.message : "未知錯誤"}`);
+    } finally {
+      if (importInput.current) importInput.current.value = "";
+    }
+  };
+
+  const importPlan = async () => {
+    if (!pendingImport) return;
+    setImporting(true);
+    const response = await postJson<{ plan_count?: number }>("/api/import-plan", {
+      name: workspace,
+      plan_json: pendingImport.text
+    });
+    setImporting(false);
+    if (response.error) {
+      setPendingImport(null);
+      setMessage(`❌ ${response.error}`);
+      return;
+    }
+    setPendingImport(null);
+    onChanged();
+    onClose();
+  };
+
   return (
     <Modal title="Workspace 設定" description="停止時才可修改，下一次運行生效" onClose={onClose} footer={
       <><button type="button" className="secondary-button" onClick={onClose}>取消</button><button type="button" className="primary-button" onClick={save}>儲存設定</button><span role="status">{message}</span></>
@@ -114,12 +167,27 @@ export default function ConfigModal({
           {numberField("stall_limit", "HEAD 停滯 reset", 1)}
         </div>
         <label className="checkbox-row"><input type="checkbox" checked={pauseAfterPlan} onChange={(event) => setPauseAfterPlan(event.target.checked)} />規劃收斂後暫停：不自動進入執行期，需按「▶ 運行」開始執行</label>
+        <section className="plan-transfer" aria-labelledby="plan-transfer-title">
+          <div><strong id="plan-transfer-title">plan.json</strong><span>只包含 order／task／ref，不包含完成進度</span></div>
+          <div className="plan-transfer-actions">
+            <button type="button" className="secondary-button" disabled={!plan.length || importing} onClick={exportPlan}>匯出 plan.json</button>
+            <label className={`secondary-button file-button${importing ? " disabled" : ""}`}>匯入並完整重置<input ref={importInput} type="file" accept="application/json,.json" disabled={importing} onChange={(event) => void selectImport(event.target.files?.[0])} /></label>
+          </div>
+          <p>匯入成功後會清除 round、完成紀錄、issues 與收斂計數，保留 workspace 設定和 target repo，並停在規劃期。</p>
+        </section>
       </div>
       {cliManagerOpen && available && <CliManagerModal config={available} repo={config.repo ?? ""} workspace={workspace} onClose={() => setCliManagerOpen(false)} onSaved={(next) => {
         setAvailable(next);
         const current = next.agent_cmds.findIndex((agent) => agent.cmd === config.agent_cmd);
         setAgentIndex(String(current >= 0 ? current : 0));
       }} />}
+      {pendingImport && <ActionDialog title="匯入 plan.json 並完整重置？" message="這項操作無法復原；匯入檔只會採用純 plan，不會採用任何完成狀態。" confirmLabel={importing ? "匯入中…" : "完整重置並匯入"} danger preview={[
+        { label: "檔案", value: pendingImport.name },
+        { label: "任務", value: `${pendingImport.count} 條` },
+        { label: "清除", value: "round、completed、current task、issues、done/flag 與舊 run 產物", tone: "warning" },
+        { label: "保留", value: "workspace 執行設定與 target repo 程式碼", tone: "safe" },
+        { label: "匯入後", value: "plan v1、規劃期（可直接按「進執行期」）" }
+      ]} onClose={() => !importing && setPendingImport(null)} onConfirm={() => { if (!importing) void importPlan(); }} />}
     </Modal>
   );
 }

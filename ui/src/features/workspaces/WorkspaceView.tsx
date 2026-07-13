@@ -57,6 +57,7 @@ export default function WorkspaceView({
     title: string;
     message: string;
     confirmLabel?: string;
+    danger?: boolean;
     preview?: ActionPreviewItem[];
     onConfirm?: () => void;
   } | null>(null);
@@ -155,21 +156,22 @@ export default function WorkspaceView({
     onRefresh();
     return `✅ 已儲存 ${response.changed?.join(", ") || "（無變更）"}`;
   };
-  const archiveWorkspace = () => {
+  const deleteWorkspace = () => {
     setDialog({
-      title: "請確認",
-      message: `封存 ${workspace?.name}？整個 workspace 會移到 workspace/.archive/，可從「🗃 已封存」安全還原；target repo 與程式碼不受影響。`,
-      confirmLabel: "封存",
+      title: "確認刪除 workspace",
+      message: `永久刪除 ${workspace?.name}？整個 workspace 的資料會直接移除，無法復原；target repo 與程式碼不受影響。`,
+      confirmLabel: "永久刪除",
+      danger: true,
       preview: [
-        { label: "搬移來源", value: `workspace/${workspace?.name}` },
+        { label: "永久刪除", value: `workspace/${workspace?.name}`, tone: "warning" },
+        { label: "包含", value: "state、history、console、logs、prompts、snapshots 與 REPORT" },
         { label: "目前狀態", value: `${state.phase} · round ${state.round} · 任務 ${completed}/${total}` },
         { label: "不受影響", value: state.config?.repo ? `target repo：${state.config.repo}` : "target repo 與程式碼", tone: "safe" },
-        { label: "可復原", value: "可從「已封存」以原 workspace 名稱還原", tone: "safe" },
       ],
       onConfirm: () => {
         setDialog(null);
         void (async () => {
-          const response = await postJson<{ ok?: boolean }>("/api/archive-workspace", { name: workspace?.name });
+          const response = await postJson<{ ok?: boolean; deleted?: boolean }>("/api/delete-workspace", { name: workspace?.name });
           if (response.error) {
             setDialog({ title: "操作失敗", message: response.error });
             return;
@@ -209,7 +211,7 @@ export default function WorkspaceView({
             {canChange && state.phase === "plan" && total > 0 && <button type="button" className="secondary-button" onClick={() => changePhase("exec")}>⏩ 進執行期</button>}
             {canChange && (state.phase === "exec" || state.phase === "done") && <button type="button" className="secondary-button" onClick={() => changePhase("plan")}>⏪ 回規劃期</button>}
             {canChange && <button type="button" className="secondary-button" onClick={() => setActiveModal("config")}>⚙ 設定</button>}
-            {canChange && <button type="button" className="secondary-button" onClick={archiveWorkspace}>🗄 封存</button>}
+            {canChange && <button type="button" className="danger-button" onClick={deleteWorkspace}>🗑 刪除</button>}
             <button type="button" className="secondary-button" disabled={!state.config} title={state.config ? "以這個 workspace 的設定預填啟動表單" : "state 缺少 config 區塊，無法以此為範本"} onClick={() => state.config && onLaunchFromTemplate(state.config)}>📋 以此為範本啟動</button>
           </div>}
         </div>
@@ -266,8 +268,8 @@ export default function WorkspaceView({
       {activeModal === "goal" && workspace && <GoalModal workspace={workspace.name} onClose={() => setActiveModal(null)} />}
       {activeModal === "prompt" && workspace && <PromptModal workspace={workspace.name} onClose={() => setActiveModal(null)} />}
       {activeModal === "report" && workspace && <ReportModal workspace={workspace.name} onClose={() => setActiveModal(null)} />}
-      {activeModal === "config" && workspace && <ConfigModal workspace={workspace.name} config={state.config ?? {}} onClose={() => setActiveModal(null)} onChanged={onRefresh} />}
-      {dialog && <ActionDialog title={dialog.title} message={dialog.message} confirmLabel={dialog.confirmLabel} preview={dialog.preview} onClose={() => setDialog(null)} onConfirm={dialog.onConfirm} />}
+      {activeModal === "config" && workspace && <ConfigModal workspace={workspace.name} config={state.config ?? {}} plan={state.plan ?? []} onClose={() => setActiveModal(null)} onChanged={onRefresh} />}
+      {dialog && <ActionDialog title={dialog.title} message={dialog.message} confirmLabel={dialog.confirmLabel} danger={dialog.danger} preview={dialog.preview} onClose={() => setDialog(null)} onConfirm={dialog.onConfirm} />}
     </section>
   );
 }

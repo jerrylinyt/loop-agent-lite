@@ -122,7 +122,7 @@ BUILTIN_PROMPT_TEMPLATES = [
         "label": "分析測試缺口",
         "category": "品質",
         "description": "把需求、風險分支與既有測試做可追蹤的覆蓋對照。",
-        "requirement_placeholder": "例：分析 workspace 封存／還原流程的測試缺口，優先找資料遺失風險。",
+        "requirement_placeholder": "例：分析停止 workspace 永久刪除流程的測試缺口，優先找資料誤刪與競態風險。",
         "instructions": """- 先枚舉可觀察行為、風險分支與失敗模式，再對照現有 unit／integration／e2e 測試及 CI 實際執行路徑。
 - 將缺口分類為完全缺少、斷言過弱、flaky、skipped、只證明 mock 或未被 CI 執行；不以單純 coverage 百分比代替分析。
 - 建立需求或分支 → 測試檔與案例 → 缺口的追蹤關係，為每項選擇最低但足以可靠攔截回歸的測試層。
