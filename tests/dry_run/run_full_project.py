@@ -25,6 +25,11 @@ ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_THRESHOLDS = {"flag": 10, "done": 3, "merge": 2, "max_parallel": 4}
 PLAYWRIGHT_TOTAL_SECONDS = 4 * 60 * 60
 PLAYWRIGHT_DELETE_MAX_SECONDS = 10 * 60
+# The L4 validator runs the complete Python suite, a clean UI install/build, and
+# the immutable integration validator.  Keep this separate from the lightweight
+# Dashboard default: the complete suite already takes longer than 120 seconds on
+# the supported local runner, especially while DR-1 and DR-2 run concurrently.
+L4_VALIDATE_TIMEOUT_SECONDS = 15 * 60
 SENSITIVE_OPTION_NAMES = {
     "--api-key", "--apikey", "--token", "--access-token", "--password", "--secret",
     "--credential", "--credentials",
@@ -904,6 +909,11 @@ def validate_parallel_run_evidence(fleet_state: dict, *, scenario: str, repo: Pa
         raise RuntimeError(f"fleet persisted validate command 不合法：{error}") from error
     if actual_validate_command != normalized_expected_validate:
         raise RuntimeError("fleet persisted validate command 不是 production UI 輸入的完整驗證命令")
+    actual_validate_timeout = config.get("validate_timeout")
+    if actual_validate_timeout != L4_VALIDATE_TIMEOUT_SECONDS:
+        raise RuntimeError(
+            f"fleet persisted validate_timeout 必須是 L4 的 {L4_VALIDATE_TIMEOUT_SECONDS} 秒；"
+            f"實際 {actual_validate_timeout!r}")
     child_workspaces = []
     track_ports = {}
     runtime_paths = set()
@@ -1022,6 +1032,7 @@ def validate_parallel_run_evidence(fleet_state: dict, *, scenario: str, repo: Pa
             raise RuntimeError("DR-1 fixture..final diff 缺少 deterministic backend/frontend contract 或 production assets")
 
     scenario_evidence = {"actual_thresholds": actual_thresholds,
+                         "actual_validate_timeout": actual_validate_timeout,
                          "child_workspaces": child_workspaces, "track_names": names,
                          "track_ports": track_ports,
                          **({"resumed_child_tracks": resumed_tracks}
@@ -1370,7 +1381,10 @@ def main(argv=None):
         config = home / "dashboard.config.local.json"
         config.write_text(json.dumps({"repo_roots": [str(temp_root)],
                                       "agent_cmds": [{"label": "codex", "cmd": codex_cmd}],
-                                      "extra_path_dirs": [str(Path(codex_path).parent)]}, indent=2), encoding="utf-8")
+                                      "extra_path_dirs": [str(Path(codex_path).parent)],
+                                      "defaults": {
+                                          "validate_timeout": L4_VALIDATE_TIMEOUT_SECONDS,
+                                      }}, indent=2), encoding="utf-8")
         port_reservation = reserve_loopback_port()
         port = port_reservation.port
         manifest.update(port=port, workspace=str(workspace), validator_sha256=validator_hash,
@@ -1380,6 +1394,7 @@ def main(argv=None):
                "LOOP_AGENT_HOME": str(home), "LOOP_AGENT_DASHBOARD_CONFIG": str(config),
                "LOOP_L4_BASE_URL": f"http://127.0.0.1:{port}", "LOOP_L4_REPO": str(clone),
                "LOOP_L4_SCENARIO": args.scenario, "LOOP_L4_VALIDATE": validate_cmd,
+               "LOOP_L4_VALIDATE_TIMEOUT": str(L4_VALIDATE_TIMEOUT_SECONDS),
                "LOOP_L4_PLAN": json.dumps(dr2_plan(), ensure_ascii=False),
                "LOOP_L4_ARTIFACTS": str(artifacts)}
         if args.prepare_only:

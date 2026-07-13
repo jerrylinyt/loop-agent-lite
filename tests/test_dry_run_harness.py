@@ -179,6 +179,10 @@ class TestDryRunEvidence(unittest.TestCase):
         command = harness.dashboard_command(Path("/tmp/venv/bin/loop"), 45678)
         self.assertEqual(command, ["/tmp/venv/bin/loop", "dashboard", "--port", "45678"])
 
+    def test_full_project_validator_has_a_bounded_long_run_timeout(self):
+        self.assertGreaterEqual(harness.L4_VALIDATE_TIMEOUT_SECONDS, 10 * 60)
+        self.assertLess(harness.L4_VALIDATE_TIMEOUT_SECONDS, harness.PLAYWRIGHT_TOTAL_SECONDS)
+
     def test_scoped_cleanup_runs_out_of_process_and_verifies_empty_remaining(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -459,7 +463,8 @@ class TestDryRunScenarioGate(unittest.TestCase):
             "expected_integration_sha": final,
             "config": {"flag_threshold": 10, "done_threshold": 3, "merge_threshold": 2,
                        "max_parallel": 4, "agent_cmd": self.command,
-                       "validate_cmd": self.validate_command},
+                       "validate_cmd": self.validate_command,
+                       "validate_timeout": harness.L4_VALIDATE_TIMEOUT_SECONDS},
             "plan": plan, "tracks": tracks,
             "phase_history": [{"phase": phase} for phase in phases],
             "merge_history": history,
@@ -596,6 +601,8 @@ class TestDryRunScenarioGate(unittest.TestCase):
                 expected_validate_command=self.validate_command,
                 fixture_sha=state["initial_integration_sha"])
             self.assertEqual(evidence["actual_thresholds"], harness.EXPECTED_THRESHOLDS)
+            self.assertEqual(evidence["actual_validate_timeout"],
+                             harness.L4_VALIDATE_TIMEOUT_SECONDS)
             self.assertIn("engine/l4_delivery_probe.py", evidence["track_changed_paths"]["backend"])
             self.assertEqual(set(evidence["resumed_child_tracks"]), {"backend", "frontend"})
             broken = json.loads(json.dumps(state))
@@ -610,6 +617,15 @@ class TestDryRunScenarioGate(unittest.TestCase):
             broken = json.loads(json.dumps(state))
             broken["config"]["validate_cmd"] = "python3 -m unittest -q"
             with self.assertRaisesRegex(RuntimeError, "production UI 輸入的完整驗證命令"):
+                harness.validate_parallel_run_evidence(
+                    broken, scenario="dr1", repo=repo, workspace_root=workspace,
+                    parent_state={"round": 4}, expected_agent_command=self.command,
+                    expected_validate_command=self.validate_command,
+                    fixture_sha=state["initial_integration_sha"])
+
+            broken = json.loads(json.dumps(state))
+            broken["config"]["validate_timeout"] = 120
+            with self.assertRaisesRegex(RuntimeError, "persisted validate_timeout"):
                 harness.validate_parallel_run_evidence(
                     broken, scenario="dr1", repo=repo, workspace_root=workspace,
                     parent_state={"round": 4}, expected_agent_command=self.command,

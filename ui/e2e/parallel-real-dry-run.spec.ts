@@ -1,8 +1,9 @@
-import { expect, test, type Page, type TestInfo } from "@playwright/test";
+import { expect, test, type Locator, type Page, type TestInfo } from "@playwright/test";
 
 const scenario = process.env.LOOP_L4_SCENARIO;
 const repo = process.env.LOOP_L4_REPO ?? "";
 const validate = process.env.LOOP_L4_VALIDATE ?? "";
+const validateTimeout = process.env.LOOP_L4_VALIDATE_TIMEOUT ?? "";
 const importedPlan = process.env.LOOP_L4_PLAN ?? "";
 const isExpectedLongRunNetworkSuspend = (message: string) =>
   message.trim() === "Failed to load resource: net::ERR_NETWORK_IO_SUSPENDED";
@@ -13,6 +14,44 @@ async function screenshot(page: Page, testInfo: TestInfo, name: string) {
 
 async function closeModal(page: Page) {
   await page.getByRole("dialog").getByRole("button", { name: "關閉對話框" }).click();
+}
+
+async function waitForWorkspaceOrLaunchError(page: Page, workspaceName: string, timeoutMs: number) {
+  const heading = page.getByRole("heading", { name: workspaceName });
+  const launchStatus = page.getByRole("dialog", { name: "啟動與管理" }).locator(".inline-message");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await heading.isVisible()) return;
+    const status = (await launchStatus.textContent({ timeout: 500 }).catch(() => ""))?.trim() ?? "";
+    if (status.startsWith("❌")) throw new Error(`L4 launch failed before workspace startup: ${status}`);
+    await page.waitForTimeout(500);
+  }
+  throw new Error(`L4 workspace ${workspaceName} did not start within ${Math.round(timeoutMs / 1000)} seconds`);
+}
+
+async function terminalFleetFailure(page: Page) {
+  const alerts = page.locator(".parallel-run-alert");
+  for (let index = 0; index < await alerts.count(); index += 1) {
+    const alert = alerts.nth(index);
+    const title = (await alert.locator("strong").textContent())?.trim() ?? "";
+    if (["Parallel run 已失敗", "Parallel truth 無法讀取"].includes(title)) {
+      return (await alert.textContent())?.trim() ?? title;
+    }
+  }
+  return "";
+}
+
+async function waitForVisibleOrFleetFailure(
+  page: Page, target: Locator, label: string, timeoutMs: number
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await target.isVisible()) return;
+    const failure = await terminalFleetFailure(page);
+    if (failure) throw new Error(`L4 ${label} aborted by terminal Fleet failure: ${failure}`);
+    await page.waitForTimeout(500);
+  }
+  throw new Error(`L4 ${label} was not visible within ${Math.round(timeoutMs / 1000)} seconds`);
 }
 
 function collectPageErrors(page: Page) {
@@ -115,7 +154,11 @@ async function inspectChildPromptAndHistory(page: Page) {
 
 test("full-project parallel run through production UI", async ({ page }, testInfo) => {
   test.skip(process.env.LOOP_L4_DELETE_PHASE === "1", "delete phase only");
-  if (!scenario || !repo || !validate) throw new Error("L4 environment is incomplete");
+  if (!scenario || !repo || !validate || !validateTimeout) throw new Error("L4 environment is incomplete");
+  const validateTimeoutSeconds = Number(validateTimeout);
+  if (!Number.isFinite(validateTimeoutSeconds) || validateTimeoutSeconds <= 0) {
+    throw new Error(`invalid LOOP_L4_VALIDATE_TIMEOUT: ${validateTimeout}`);
+  }
   const pageErrors = collectPageErrors(page);
 
   await page.goto("/");
@@ -129,8 +172,9 @@ test("full-project parallel run through production UI", async ({ page }, testInf
   await expect(launcher.getByRole("combobox", { name: "Agent 命令" }).locator("option:checked")).toContainText("codex");
   await launcher.getByRole("combobox", { name: "Validate 命令" }).selectOption("__custom__");
   await launcher.getByLabel("自訂 Validate 命令").fill(validate);
+  await launcher.getByText("進階設定").click();
+  await expect(launcher.getByLabel("Validate 上限（秒）")).toHaveValue(validateTimeout);
   if (scenario === "dr1") {
-    await launcher.getByText("進階設定").click();
     await launcher.getByLabel(/規劃收斂後暫停/).check();
   }
   const launchDiff = launcher.locator(".launch-diff");
@@ -142,10 +186,15 @@ test("full-project parallel run through production UI", async ({ page }, testInf
   }
   await screenshot(page, testInfo, "01-launcher-ready");
   await launcher.getByRole("button", { name: "▶ 啟動" }).click();
-  // Workspace 只會在完整 baseline validator 通過後建立。
-  await expect(page.getByRole("heading", { name: `l4-${scenario}` })).toBeVisible({ timeout: 180_000 });
+  // Startup handshake 只證明 coordinator truth 已落盤；baseline failure 由後續 Fleet wait fail-fast。
+  await waitForWorkspaceOrLaunchError(
+    page, `l4-${scenario}`, (validateTimeoutSeconds + 30) * 1000
+  );
   if (scenario === "dr1") {
-    await expect(page.locator(".workspace-title").getByText("等待核准", { exact: true })).toBeVisible({ timeout: 30 * 60 * 1000 });
+    await waitForVisibleOrFleetFailure(
+      page, page.locator(".workspace-title").getByText("等待核准", { exact: true }),
+      "planning approval", 30 * 60 * 1000
+    );
     await screenshot(page, testInfo, "02-awaiting-approval");
     await page.getByRole("button", { name: "✎ 編輯計畫" }).click();
     const planEditor = page.getByRole("dialog", { name: "Plan 編輯器" });
@@ -161,7 +210,9 @@ test("full-project parallel run through production UI", async ({ page }, testInf
   }
   let group = page.getByRole("region", { name: "Parallel run tracks" });
   await expect(group).toBeVisible();
-  await expect(group.locator(".parallel-track").first()).toBeVisible({ timeout: 30 * 60 * 1000 });
+  await waitForVisibleOrFleetFailure(
+    page, group.locator(".parallel-track").first(), "track creation", 30 * 60 * 1000
+  );
   if (scenario === "dr1") {
     await expect(group.locator(".parallel-run-head")).toHaveAttribute(
       "aria-label", /^Parallel tracks \d+\/\d+ merged$/
@@ -173,7 +224,7 @@ test("full-project parallel run through production UI", async ({ page }, testInf
   await inspectGoal(page);
   await exerciseConsoleControls(page);
   const childTab = page.locator(".workspace-tab-child").first();
-  await expect(childTab).toBeVisible({ timeout: 30 * 60 * 1000 });
+  await waitForVisibleOrFleetFailure(page, childTab, "child registration", 30 * 60 * 1000);
   const collapseTracks = page.getByRole("button", { name: `收合 l4-${scenario} tracks` });
   await collapseTracks.click();
   await expect(page.getByRole("button", { name: `展開 l4-${scenario} tracks` })).toHaveAttribute("aria-expanded", "false");
@@ -183,7 +234,7 @@ test("full-project parallel run through production UI", async ({ page }, testInf
   await expect(page.getByRole("button", { name: `收合 l4-${scenario} tracks` })).toHaveAttribute("aria-expanded", "true");
   await expect(childTab).toBeVisible();
   const activeChildTab = page.locator(".workspace-tab-child").filter({ has: page.locator('[aria-label="執行中"]') }).first();
-  await expect(activeChildTab).toBeVisible({ timeout: 30 * 60 * 1000 });
+  await waitForVisibleOrFleetFailure(page, activeChildTab, "active child", 30 * 60 * 1000);
   await activeChildTab.click();
   const breadcrumb = page.getByRole("navigation", { name: "Parallel run breadcrumb" });
   await expect(breadcrumb).toBeVisible();
@@ -209,9 +260,12 @@ test("full-project parallel run through production UI", async ({ page }, testInf
 
   if (scenario === "dr1") {
     const stop = page.getByRole("button", { name: "⏸ 本輪後停止" });
-    await expect(stop).toBeVisible({ timeout: 30 * 60 * 1000 });
+    await waitForVisibleOrFleetFailure(page, stop, "graceful-stop action", 30 * 60 * 1000);
     await stop.click();
-    await expect(page.locator(".workspace-title").getByText("已停止", { exact: true })).toBeVisible({ timeout: 40 * 60 * 1000 });
+    await waitForVisibleOrFleetFailure(
+      page, page.locator(".workspace-title").getByText("已停止", { exact: true }),
+      "graceful stop", 40 * 60 * 1000
+    );
     await expect(page.getByText("PID 殘留", { exact: false })).toHaveCount(0);
     group = page.getByRole("region", { name: "Parallel run tracks" });
     await expect(group.locator(".parallel-track.status-running")).toHaveCount(0);
@@ -254,11 +308,13 @@ test("full-project parallel run through production UI", async ({ page }, testInf
     await expect(template.getByLabel("Child restart 上限 0＝不限")).toHaveValue("0");
     await template.getByRole("button", { name: "取消", exact: true }).click();
     await page.getByRole("button", { name: "▶ 運行" }).click();
-    await expect(group.locator(".track-status-history").filter({
+    await waitForVisibleOrFleetFailure(page, group.locator(".track-status-history").filter({
       hasText: /執行中.*已停止.*執行中/
-    }).first()).toBeVisible({ timeout: 30 * 60 * 1000 });
+    }).first(), "stop/resume history", 30 * 60 * 1000);
   } else {
-    await expect(group.getByText(/rollback [1-9]/).first()).toBeVisible({ timeout: 3 * 60 * 60 * 1000 });
+    await waitForVisibleOrFleetFailure(
+      page, group.getByText(/rollback [1-9]/).first(), "rollback evidence", 3 * 60 * 60 * 1000
+    );
     const failedTrack = group.locator(".parallel-track").filter({ has: group.locator(".track-error-summary") }).first();
     await expect(failedTrack.locator(".track-error-summary")).toBeVisible();
     const failedTrackName = (await failedTrack.locator("strong").first().innerText()).trim();
@@ -315,7 +371,10 @@ test("full-project parallel run through production UI", async ({ page }, testInf
   const faviconHref = await page.evaluate(() => document.querySelector('link[rel="icon"]')?.getAttribute("href") ?? "");
   expect(faviconHref.startsWith("data:image/png")).toBeTruthy();
 
-  await expect(page.locator(".workspace-title").getByText("🏁 完成", { exact: true })).toBeVisible({ timeout: 4 * 60 * 60 * 1000 });
+  await waitForVisibleOrFleetFailure(
+    page, page.locator(".workspace-title").getByText("🏁 完成", { exact: true }),
+    "Fleet completion", 4 * 60 * 60 * 1000
+  );
   await screenshot(page, testInfo, "07-done");
   await page.getByRole("button", { name: "📄 完成報告" }).click();
   const report = page.getByRole("dialog", { name: "完成報告" });
