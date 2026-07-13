@@ -320,6 +320,78 @@ class TestDryRunEvidence(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "不再 deterministic"):
                 harness.assert_dr1_contract_absent(repo)
 
+    def test_l4_dashboard_environment_does_not_leak_fixture_metadata_to_agents(self):
+        base = {
+            "PATH": "/test/bin",
+            "OPENAI_API_KEY": "must-not-leak",
+            "LOOP_L4_PLAN": "stale adversarial plan",
+            "LOOP_L4_SCENARIO": "stale",
+            "LOOP_WS": "/stale/workspace",
+        }
+        common = {
+            "workspace": Path("/isolated/workspace"),
+            "home": Path("/isolated/home"),
+            "config": Path("/isolated/config.json"),
+            "base_url": "http://127.0.0.1:45678",
+            "repo": Path("/isolated/repo"),
+            "artifacts": Path("/isolated/artifacts"),
+            "validate_cmd": "python3 -m unittest",
+        }
+
+        original = dict(base)
+        dr1_dashboard, dr1_playwright, dr1_delete = harness.l4_process_environments(
+            base, scenario="dr1", **common)
+        dr2_dashboard, dr2_playwright, dr2_delete = harness.l4_process_environments(
+            base, scenario="dr2", **common)
+
+        self.assertEqual(base, original)
+        self.assertEqual(dr1_dashboard, dr2_dashboard)
+        self.assertEqual(dr1_dashboard["PATH"], "/test/bin")
+        self.assertNotIn("OPENAI_API_KEY", dr1_dashboard)
+        self.assertFalse(any(name.startswith("LOOP_L4_") for name in dr1_dashboard))
+        self.assertNotIn("LOOP_WS", dr1_dashboard)
+        self.assertFalse(any(name.startswith("LOOP_AGENT_") for name in dr1_playwright))
+        self.assertEqual(dr1_playwright["LOOP_L4_SCENARIO"], "dr1")
+        self.assertIn("LOOP_L4_PLANNING_TIMEOUT", dr1_playwright)
+        self.assertNotIn("LOOP_L4_PLAN", dr1_playwright)
+        self.assertEqual(dr2_playwright["LOOP_L4_SCENARIO"], "dr2")
+        self.assertEqual(json.loads(dr2_playwright["LOOP_L4_PLAN"]), harness.dr2_plan())
+        self.assertNotIn("LOOP_L4_PLANNING_TIMEOUT", dr2_playwright)
+        self.assertEqual(
+            {name for name in dr1_delete if name.startswith("LOOP_L4_")},
+            {"LOOP_L4_BASE_URL", "LOOP_L4_SCENARIO", "LOOP_L4_ARTIFACTS",
+             "LOOP_L4_DELETE_PHASE"})
+        self.assertEqual(dr1_delete["LOOP_L4_SCENARIO"], "dr1")
+        self.assertEqual(dr2_delete["LOOP_L4_SCENARIO"], "dr2")
+        with self.assertRaisesRegex(ValueError, "unsupported L4 scenario"):
+            harness.l4_process_environments(base, scenario="unexpected", **common)
+
+    def test_integration_fault_validator_is_dr2_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clone, fixture = root / "clone", root / "harness"
+            source = clone / "tests" / "dry_run" / "integration_validator.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("raise SystemExit('fault')\n", encoding="utf-8")
+            fixture.mkdir()
+
+            dr1_validator, dr1_hash = harness.prepare_integration_validator(
+                "dr1", clone, fixture)
+            self.assertIsNone(dr1_validator)
+            self.assertIsNone(dr1_hash)
+            self.assertEqual(list(fixture.iterdir()), [])
+            dr1_command = harness.l4_validate_command(Path("/venv/python"), dr1_validator)
+            self.assertIn("unittest discover", dr1_command)
+            self.assertIn("npm run check", dr1_command)
+            self.assertNotIn("integration_validator", dr1_command)
+
+            dr2_validator, dr2_hash = harness.prepare_integration_validator(
+                "dr2", clone, fixture)
+            self.assertEqual(dr2_validator, fixture / "integration_validator.py")
+            self.assertEqual(dr2_hash, harness.sha256_file(dr2_validator))
+            dr2_command = harness.l4_validate_command(Path("/venv/python"), dr2_validator)
+            self.assertIn(str(dr2_validator), dr2_command)
+
     def test_dr1_ui_contract_is_checked_after_production_bundle_reload(self):
         spec = (harness.ROOT / "ui" / "e2e" / "parallel-real-dry-run.spec.ts").read_text(
             encoding="utf-8")
@@ -330,6 +402,16 @@ class TestDryRunEvidence(unittest.TestCase):
         self.assertEqual(spec.count(assertion), 1)
         contract_assertion = spec.index(assertion)
         self.assertGreater(contract_assertion, bundle_reload)
+
+    def test_real_ui_scenarios_fail_fast_on_fixture_cross_contamination(self):
+        spec = (harness.ROOT / "ui" / "e2e" / "parallel-real-dry-run.spec.ts").read_text(
+            encoding="utf-8")
+        for contract in (
+                'scenario !== "dr1" && scenario !== "dr2"',
+                'DR-1 must not receive LOOP_L4_PLAN',
+                'DR-2 requires LOOP_L4_PLAN',
+                'DR-2 must not receive LOOP_L4_PLANNING_TIMEOUT'):
+            self.assertIn(contract, spec)
 
     def test_playwright_index_is_bounded_to_audit_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:

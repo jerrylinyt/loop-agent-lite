@@ -629,6 +629,69 @@ def goal_text(scenario: str):
 """
 
 
+def l4_process_environments(base_env: dict[str, str], *, workspace: Path, home: Path,
+                            config: Path, base_url: str, repo: Path, artifacts: Path,
+                            scenario: str, validate_cmd: str):
+    """隔離 Dashboard/Agent runtime 與只供 Playwright 使用的 L4 fixture metadata。"""
+    if scenario not in {"dr1", "dr2"}:
+        raise ValueError(f"unsupported L4 scenario: {scenario}")
+    # Dashboard 會再啟動 Fleet 與真 Codex；不得讓 harness scenario/plan 透過
+    # inherited env 洩漏給 Agent，否則 DR-1 的自主規劃證據不成立。
+    clean_base = sanitized_child_environment(base_env)
+    dashboard_env = {
+        **clean_base,
+        "LOOP_AGENT_WORKSPACE_ROOT": str(workspace),
+        "LOOP_AGENT_HOME": str(home),
+        "LOOP_AGENT_DASHBOARD_CONFIG": str(config),
+    }
+    playwright_env = {
+        **clean_base,
+        "LOOP_L4_BASE_URL": base_url,
+        "LOOP_L4_REPO": str(repo),
+        "LOOP_L4_SCENARIO": scenario,
+        "LOOP_L4_VALIDATE": validate_cmd,
+        "LOOP_L4_VALIDATE_TIMEOUT": str(L4_VALIDATE_TIMEOUT_SECONDS),
+        "LOOP_L4_ARTIFACTS": str(artifacts),
+    }
+    if scenario == "dr1":
+        playwright_env["LOOP_L4_PLANNING_TIMEOUT"] = str(L4_PLANNING_TIMEOUT_SECONDS)
+    else:
+        playwright_env["LOOP_L4_PLAN"] = json.dumps(dr2_plan(), ensure_ascii=False)
+    delete_env = {
+        **clean_base,
+        "LOOP_L4_BASE_URL": base_url,
+        "LOOP_L4_SCENARIO": scenario,
+        "LOOP_L4_ARTIFACTS": str(artifacts),
+        "LOOP_L4_DELETE_PHASE": "1",
+    }
+    return dashboard_env, playwright_env, delete_env
+
+
+def prepare_integration_validator(scenario: str, clone: Path, harness: Path):
+    """DR-2 才建立 repo 外 immutable fault validator；DR-1 不得看見或執行它。"""
+    if scenario == "dr1":
+        return None, None
+    if scenario != "dr2":
+        raise ValueError(f"unsupported L4 scenario: {scenario}")
+    validator = harness / "integration_validator.py"
+    validator.write_text(
+        (clone / "tests" / "dry_run" / "integration_validator.py").read_text(encoding="utf-8"),
+        encoding="utf-8")
+    return validator, hashlib.sha256(validator.read_bytes()).hexdigest()
+
+
+def l4_validate_command(python: Path, validator: Path | None):
+    python_arg = shlex.quote(str(python))
+    command = ("export LOOP_AGENT_WORKSPACE_ROOT=\"$TMPDIR/validation-workspace\"; "
+               "export LOOP_AGENT_HOME=\"$TMPDIR/validation-home\"; "
+               "mkdir -p \"$LOOP_AGENT_WORKSPACE_ROOT\" \"$LOOP_AGENT_HOME\" && "
+               f"{python_arg} -m unittest discover -s tests -t . -q && "
+               "cd ui && npm ci --prefer-offline --no-audit --no-fund && npm run check")
+    if validator is not None:
+        command += f" && cd .. && {python_arg} {shlex.quote(str(validator))}"
+    return shlex.join(["sh", "-c", command])
+
+
 def assert_dr1_contract_absent(repo: Path):
     existing = sorted(path for path in DR1_BACKEND_CONTRACT_PATHS |
                       {"ui/src/features/workspaces/l4DeliveryProbe.ts"}
@@ -1323,7 +1386,8 @@ def main(argv=None):
     dashboard_logs = []
     port_reservation = None
     python = None
-    env = None
+    dashboard_env = None
+    playwright_env = None
     host_sensitive_values = sensitive_environment_values()
     base_env = sanitized_child_environment()
     try:
@@ -1387,15 +1451,8 @@ def main(argv=None):
         loop_cli = venv / "bin" / "loop"
         if not loop_cli.is_file() or not os.access(loop_cli, os.X_OK):
             raise RuntimeError("editable install 未提供可執行的 venv/bin/loop")
-        validator = harness / "integration_validator.py"
-        validator.write_text((clone / "tests" / "dry_run" / "integration_validator.py").read_text(), encoding="utf-8")
-        validator_hash = hashlib.sha256(validator.read_bytes()).hexdigest()
-        validate_cmd = ("sh -c 'export LOOP_AGENT_WORKSPACE_ROOT=\"$TMPDIR/validation-workspace\"; "
-                        "export LOOP_AGENT_HOME=\"$TMPDIR/validation-home\"; "
-                        "mkdir -p \"$LOOP_AGENT_WORKSPACE_ROOT\" \"$LOOP_AGENT_HOME\" && "
-                        f"{python} -m unittest discover -s tests -t . -q && "
-                        "cd ui && npm ci --prefer-offline --no-audit --no-fund && npm run check && "
-                        f"cd .. && {python} {validator}'")
+        validator, validator_hash = prepare_integration_validator(args.scenario, clone, harness)
+        validate_cmd = l4_validate_command(python, validator)
         config = home / "dashboard.config.local.json"
         config.write_text(json.dumps({"repo_roots": [str(temp_root)],
                                       "agent_cmds": [{"label": "codex", "cmd": codex_cmd}],
@@ -1405,18 +1462,16 @@ def main(argv=None):
                                       }}, indent=2), encoding="utf-8")
         port_reservation = reserve_loopback_port()
         port = port_reservation.port
-        manifest.update(port=port, workspace=str(workspace), validator_sha256=validator_hash,
+        manifest.update(port=port, workspace=str(workspace),
                         thresholds=dict(EXPECTED_THRESHOLDS),
                         planning_timeout_seconds=L4_PLANNING_TIMEOUT_SECONDS,
                         port_reservation_lock=str(port_reservation.lock_path))
-        env = {**base_env, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace),
-               "LOOP_AGENT_HOME": str(home), "LOOP_AGENT_DASHBOARD_CONFIG": str(config),
-               "LOOP_L4_BASE_URL": f"http://127.0.0.1:{port}", "LOOP_L4_REPO": str(clone),
-               "LOOP_L4_SCENARIO": args.scenario, "LOOP_L4_VALIDATE": validate_cmd,
-               "LOOP_L4_VALIDATE_TIMEOUT": str(L4_VALIDATE_TIMEOUT_SECONDS),
-               "LOOP_L4_PLANNING_TIMEOUT": str(L4_PLANNING_TIMEOUT_SECONDS),
-               "LOOP_L4_PLAN": json.dumps(dr2_plan(), ensure_ascii=False),
-               "LOOP_L4_ARTIFACTS": str(artifacts)}
+        if validator_hash is not None:
+            manifest["validator_sha256"] = validator_hash
+        base_url = f"http://127.0.0.1:{port}"
+        dashboard_env, playwright_env, delete_env = l4_process_environments(
+            base_env, workspace=workspace, home=home, config=config, base_url=base_url,
+            repo=clone, artifacts=artifacts, scenario=args.scenario, validate_cmd=validate_cmd)
         if args.prepare_only:
             manifest["prepared"] = True
             return 0
@@ -1424,13 +1479,13 @@ def main(argv=None):
         dashboard_logs.append(dashboard_log)
         launch_command = dashboard_command(loop_cli, port)
         manifest.update(dashboard_entrypoint=str(loop_cli), dashboard_command=launch_command)
-        dashboard = subprocess.Popen(launch_command, cwd=clone, env=env, stdout=dashboard_log,
+        dashboard = subprocess.Popen(launch_command, cwd=clone, env=dashboard_env, stdout=dashboard_log,
                                      stderr=subprocess.STDOUT, start_new_session=True)
         dashboards.append(dashboard)
         manifest["dashboard_fixture"] = wait_for_dashboard_fixture(
-            dashboard, env["LOOP_L4_BASE_URL"], config)
+            dashboard, base_url, config)
         ui_deadline = time.monotonic() + PLAYWRIGHT_TOTAL_SECONDS
-        _, record = run(["npm", "run", "test:dry-run"], cwd=clone / "ui", env=env,
+        _, record = run(["npm", "run", "test:dry-run"], cwd=clone / "ui", env=playwright_env,
                         log=artifacts / "playwright-real.log",
                         timeout=PLAYWRIGHT_TOTAL_SECONDS - 15 * 60)
         manifest["commands"].append(record)
@@ -1443,7 +1498,8 @@ def main(argv=None):
             remaining = ui_deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError("單一 production Dashboard 的 UI 兩階段完整驗收已超過整體 4 小時")
-            _, record = run(command, cwd=cwd, env=env, log=artifacts / name, timeout=remaining)
+            _, record = run(command, cwd=cwd, env=dashboard_env, log=artifacts / name,
+                            timeout=remaining)
             manifest["commands"].append(record)
         parent = workspace / f"l4-{args.scenario}"
         snapshot_parallel_evidence(parent, artifacts, manifest)
@@ -1472,7 +1528,6 @@ def main(argv=None):
             raise RuntimeError("最終 integration worktree 不乾淨")
         if (artifacts / "git-worktrees.log").read_text(encoding="utf-8").count("worktree ") != 1:
             raise RuntimeError("成功後仍有 child worktree registration")
-        delete_env = {**env, "LOOP_L4_DELETE_PHASE": "1"}
         remaining = ui_deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeError("單一 production Dashboard 的 UI 兩階段完整驗收已超過整體 4 小時")
@@ -1514,7 +1569,8 @@ def main(argv=None):
             "retained_branches": retained_branches,
             "worktree_count": 1,
         }
-        if hashlib.sha256(validator.read_bytes()).hexdigest() != validator_hash:
+        if (validator is not None and
+                hashlib.sha256(validator.read_bytes()).hexdigest() != validator_hash):
             raise RuntimeError("immutable fault validator 被修改")
         if manifest["release_gate_eligible"]:
             assert_source_checkout_unchanged(source, source_head_at_start)
@@ -1548,10 +1604,10 @@ def main(argv=None):
                 except OSError:
                     pass
             dashboard_logs.clear()
-            if python is not None and env is not None and clone.is_dir():
+            if python is not None and dashboard_env is not None and clone.is_dir():
                 try:
                     cleanup, cleanup_record = run_scoped_coordinator_cleanup(
-                        python, clone, env, artifacts / "scoped-cleanup.log",
+                        python, clone, dashboard_env, artifacts / "scoped-cleanup.log",
                         f"l4-{args.scenario}")
                     manifest["commands"].append(cleanup_record)
                     manifest["scoped_cleanup"] = cleanup

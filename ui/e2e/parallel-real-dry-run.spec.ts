@@ -193,16 +193,25 @@ async function inspectChildPromptAndHistory(page: Page, firstRoundBudgetMs: numb
 
 test("full-project parallel run through production UI", async ({ page }, testInfo) => {
   test.skip(process.env.LOOP_L4_DELETE_PHASE === "1", "delete phase only");
-  if (!scenario || !repo || !validate || !validateTimeout || !planningTimeout) {
+  if (scenario !== "dr1" && scenario !== "dr2") {
+    throw new Error(`invalid LOOP_L4_SCENARIO: ${scenario ?? "<missing>"}`);
+  }
+  if (!repo || !validate || !validateTimeout) {
     throw new Error("L4 environment is incomplete");
   }
   const validateTimeoutSeconds = Number(validateTimeout);
-  const planningTimeoutSeconds = Number(planningTimeout);
   if (!Number.isFinite(validateTimeoutSeconds) || validateTimeoutSeconds <= 0) {
     throw new Error(`invalid LOOP_L4_VALIDATE_TIMEOUT: ${validateTimeout}`);
   }
-  if (!Number.isFinite(planningTimeoutSeconds) || planningTimeoutSeconds <= 0) {
-    throw new Error(`invalid LOOP_L4_PLANNING_TIMEOUT: ${planningTimeout}`);
+  const planningTimeoutSeconds = scenario === "dr1" ? Number(planningTimeout) : 0;
+  if (scenario === "dr1") {
+    if (!planningTimeout || !Number.isFinite(planningTimeoutSeconds) || planningTimeoutSeconds <= 0) {
+      throw new Error(`invalid LOOP_L4_PLANNING_TIMEOUT: ${planningTimeout || "<missing>"}`);
+    }
+    if (importedPlan) throw new Error("DR-1 must not receive LOOP_L4_PLAN");
+  } else {
+    if (!importedPlan) throw new Error("DR-2 requires LOOP_L4_PLAN");
+    if (planningTimeout) throw new Error("DR-2 must not receive LOOP_L4_PLANNING_TIMEOUT");
   }
   const pageErrors = collectPageErrors(page);
 
@@ -523,7 +532,9 @@ test("full-project parallel run through production UI", async ({ page }, testInf
 
 test("production writable UI group delete", async ({ page }) => {
   test.skip(process.env.LOOP_L4_DELETE_PHASE !== "1", "run phase only");
-  if (!scenario) throw new Error("L4 delete environment is incomplete");
+  if (scenario !== "dr1" && scenario !== "dr2") {
+    throw new Error(`invalid L4 delete scenario: ${scenario ?? "<missing>"}`);
+  }
   const pageErrors = collectPageErrors(page);
   await page.goto("/");
   await expect(page.getByRole("heading", { name: `l4-${scenario}` })).toBeVisible();
