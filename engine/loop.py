@@ -1980,7 +1980,10 @@ def main():
         task_summary = f"｜{task_id}：{cur_task['task']}" if cur_task else ""
         log(f"🔄 第 {rnd} 輪開始｜{phase_name}{task_summary}｜flag={state['flag']}｜done={state['done_count']}")
         log(f"🤖 啟動 Agent｜命令：{shlex.join(agent_cmd)}")
-        round_env = {**base_env, "LOOP_ROUND_TOKEN": round_token}
+        # LOOP_PROMPT_FILE 讓 agent 命令能自己開檔讀 prompt；stdin 管線繼續照送不變——
+        # 部分受限 CLI(如某些包了 sandbox 的 npm wrapper)不繼承/讀不了父行程開好轉交的
+        # stdin fd,但用自己的權限直接 open() 這個路徑就沒問題。
+        round_env = {**base_env, "LOOP_ROUND_TOKEN": round_token, "LOOP_PROMPT_FILE": str(prompt_path)}
         rc, secs, timed_out = run_agent(agent_cmd, prompt_path, repo, round_env,
                                         ws.dir / "logs" / f"round-{rnd:04d}.log",
                                         args.round_timeout * 60, on_started=mark_startup_ready)
