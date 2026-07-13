@@ -5,7 +5,7 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   build: {
-    // Production assets 跟著 engine package 安裝，`loop dashboard` 不依賴 checkout 的 ui/ 路徑。
+    // Production assets 固定輸出到專案內 engine/ui，供 Python Dashboard 離線提供。
     outDir: "../engine/ui",
     emptyOutDir: true
   },

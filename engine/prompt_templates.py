@@ -344,7 +344,7 @@ BUILTIN_PROMPT_TEMPLATES = [
 
 
 def _read_prompt_resource(filename):
-    """透過 importlib.resources 讀 package data，讓 wheel／editable install 使用同一路徑。"""
+    """透過 importlib.resources 從專案內 engine 資源目錄讀取固定模板。"""
     return (
         resources.files("engine").joinpath("prompts").joinpath(filename)
         .read_text(encoding="utf-8").strip()

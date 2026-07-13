@@ -23,7 +23,7 @@ build/
 venv/
 .DS_Store
 
-# React dashboard 開發依賴；engine/ui 是 production 產物，會隨 Python package 安裝
+# React dashboard 開發依賴；engine/ui 是專案內 production 產物
 ui/node_modules/
 ui/test-results/
 ui/playwright-report/

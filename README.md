@@ -13,7 +13,7 @@
   └─ goal.md + PLAN.md 已審核並 commit
           │
           ▼
-`loop dashboard` 啟動本機服務與 engine coordinator
+`python dashboard.py` 啟動本機服務與 engine coordinator
           │
           ├─ preflight：validate、工作樹、goal/PLAN commit 檢查
           │       └─ 失敗：保留舊 state，不啟動新工作
@@ -35,18 +35,20 @@ Loop 另以 OS 鎖維持單 writer：同一 workspace 或同一 Git worktree 不
 
 ## 安裝與啟動
 
-專案參考 v3 的 Python package／console-script 方式安裝；lite 版只公開 Dashboard：
+在專案根目錄建立 `.venv`、安裝 requirements，接著直接用該 Python 啟動 Dashboard：
 
 ```bash
-pipx install --editable .
-loop dashboard
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python dashboard.py
 ```
 
-`pipx` 會建立隔離環境並把 `loop` 放進使用者 PATH，不會修改 Homebrew 管理的 Python。
-若尚未安裝 pipx，可先執行 `brew install pipx`。
+之後回到專案時只需先執行 `source .venv/bin/activate`，再用 `python dashboard.py` 啟動。
+目前 runtime 只使用 Python 標準函式庫，因此 `requirements.txt` 暫無第三方套件；檔案仍是固定的依賴安裝入口。
 
 開啟終端顯示的本機網址（預設從 <http://127.0.0.1:8765/> 開始；port 被占用會自動往上找）。
-安裝後不需要直接操作任何 Python 檔案；`loop` 目前唯一公開子命令就是 `dashboard`。
+workspace 與個人設定預設固定保存在這份 loop-agent-lite 專案內，不會依安裝型態改放到使用者資料目錄。
 
 ### 1. 準備 target repo
 
@@ -55,9 +57,9 @@ loop dashboard
 ### 啟動選項
 
 ```bash
-loop dashboard --port 8766
-loop dashboard --name <workspace>
-loop dashboard --read-only
+python dashboard.py --port 8766
+python dashboard.py --name <workspace>
+python dashboard.py --read-only
 ```
 
 開啟 <http://127.0.0.1:8766/>，在「啟動／管理」設定：
@@ -68,9 +70,9 @@ loop dashboard --read-only
 
 找不到 CLI 時，點 Agent CLI 旁的齒輪，設定 CLI 命令及其 PATH 目錄；也可以直接填可執行檔的絕對路徑，再按「測試」。
 
-Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace log。每輪都有獨立 token，舊輪殘留命令不會被下一輪誤收；engine 主程序退出時也會清理同 process-group 的背景子行程。中斷後可直接在 Dashboard 按「▶ 運行」從 `state.json` 續跑。
+Agent prompt 會經由 stdin 傳入，stdout／stderr 會逐行寫入 workspace log。每輪都有獨立 token，舊輪殘留命令不會被下一輪誤收；engine 主程序退出時也會清理同 process-group 的背景子行程。中斷後可直接在 Dashboard 按「▶ 運行」從 `state.json` 續跑。Dashboard 的 SSE 變更最多每 3 秒整理推送一次；console 單次只保留最新 64 KiB，前端累積尾段也會按完整行截斷。
 
-若 Agent CLI 是包了一層 sandbox 的 wrapper（例如某些企業內網的 npm 包裝），可能不繼承／讀不到父行程轉交的 stdin fd。這種情況下 stdin 仍會照送，但命令也能改讀環境變數 `LOOP_PROMPT_FILE`（本輪 prompt 檔案的絕對路徑）自行 `open()` 讀取，不依賴 fd 繼承；另有 `LOOP_WS`（workspace 目錄）與 `LOOP_ROUND_TOKEN`（本輪 token，`work.py` 靠它核對呼叫來源）可用。
+Prompt 內容會由 engine 寫入 stdin pipe，Agent 不會取得 prompt 檔案路徑；workspace 內的 `prompts/` 僅保留稽核副本。另有 `LOOP_WS`（workspace 目錄）與 `LOOP_ROUND_TOKEN`（本輪 token，`work.py` 靠它核對呼叫來源）可用。
 
 Dashboard 也提供唯讀 `GET /api/health`，回傳 `schema_version: 1`、`status`（`ok`／`degraded`／`error`）與 workspace、執行中、需關注、state 錯誤、issues、Agent 異常、最近一輪逾時、state 復原、goal 變更及 stale PID 摘要；適合本機探針或外部監控。加上 `?strict=1` 時，`degraded`／`error` 會以 HTTP 503 回應，方便 readiness probe 直接判斷；預設仍維持 HTTP 200 並讓呼叫端讀取 status。瀏覽器頁首與即時 SSE 的 `health` event 使用同一份 projection，不會修復或改寫任何 workspace。
 `GET /api/round-metrics?ws=<name>&run=current&limit=100` 使用同一套 bounded/safe history reader，供 Dashboard 與外部觀測工具取得近期效能摘要、逐輪樣本，以及 Agent 結束但未送出 phase 完成回報的異常次數／異常率；Plan 以 `create-plan`／`plan-ok`、Exec 以 `done` 作為完成回報，即使本輪有 Git 變更，沒有回報仍算異常。人工立即中斷的未完成輪不寫入 history，因此不進入異常分子或總輪數；`run=previous` 可分析保留的上一個 run。
@@ -80,9 +82,9 @@ Dashboard 也提供唯讀 `GET /api/health`，回傳 `schema_version: 1`、`stat
 常用選項：
 
 ```text
-loop dashboard --name <workspace>  預選 workspace
-loop dashboard --port <port>       指定起始 port
-loop dashboard --read-only         啟動唯讀看板
+python dashboard.py --name <workspace>  預選 workspace
+python dashboard.py --port <port>       指定起始 port
+python dashboard.py --read-only         啟動唯讀看板
 ```
 
 Agent、Validate、收斂門檻、timeout、plan 匯入、state 重置與新 branch 都在 Dashboard
@@ -132,9 +134,9 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 
 ## 團隊設定與個人設定
 
-- `engine/dashboard.config.shared.json`：隨 package 安裝的團隊預設值；可用 `LOOP_AGENT_DASHBOARD_PROJECT_CONFIG` 指向另一份 shared config。
-- `dashboard.config.local.json`：editable checkout 的個人 CLI、PATH、repo roots 與通知設定，已加入 `.gitignore`。
-- 一般 wheel 安裝的個人設定與 workspace 預設放在 `~/.local/share/loop-agent-lite/`；可用 `LOOP_AGENT_HOME` 或既有環境變數覆寫。
+- `engine/dashboard.config.shared.json`：專案內的團隊預設值；可用 `LOOP_AGENT_DASHBOARD_PROJECT_CONFIG` 指向另一份 shared config。
+- `dashboard.config.local.json`：專案內的個人 CLI、PATH、repo roots 與通知設定，已加入 `.gitignore`。
+- `workspace/`：固定放在專案根目錄；隔離測試可顯式使用 `LOOP_AGENT_WORKSPACE_ROOT` 覆寫。
 
 第一次使用請在 Dashboard 的設定頁完成個人 CLI／PATH／repo roots 設定；不同電腦只需各自建立 local 設定，不會改動團隊檔案。
 
@@ -200,4 +202,4 @@ npm install
 npm run check
 ```
 
-`engine/ui/` 已包含 production 靜態檔並隨 wheel 安裝，只有 Python 的環境也能執行 `loop dashboard`。
+`engine/ui/` 已包含 production 靜態檔；只有 Python 的環境也能從專案根目錄執行 `python dashboard.py`。

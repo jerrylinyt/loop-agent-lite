@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getJson } from "../shared/api/client";
 import type { BootstrapResponse, FleetHealth, FleetHistoryEntry, FleetRoundMetrics, WorkspaceState, WorkspaceSummary } from "../shared/api/types";
+import { appendConsoleText } from "../features/console/consoleText";
 
 const CONSOLE_LIMIT = 300_000;
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting";
@@ -102,7 +103,7 @@ export default function useDashboardData() {
     });
     source.addEventListener("console", (event) => {
       const { data } = JSON.parse(event.data) as { data: string };
-      setConsoleText((text) => (text + data).slice(-CONSOLE_LIMIT));
+      setConsoleText((text) => appendConsoleText(text, data, CONSOLE_LIMIT));
     });
     return () => source.close();
   }, [applyWorkspaces, initialized, selected]);

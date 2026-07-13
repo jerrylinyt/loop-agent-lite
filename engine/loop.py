@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from engine.paths import default_workspace_root, expose_checkout_package
+from engine.paths import default_workspace_root, expose_project_package
 
 HERE = Path(__file__).resolve().parent
 WORKSPACE_ROOT = default_workspace_root()
@@ -1176,22 +1176,22 @@ class Workspace:
                 target.write_bytes(snap)
 
 
-def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs, on_started=None):
-    """跑一輪 agent:prompt 從檔案餵 stdin(避免大 payload 塞管線),
+def run_agent(cmd, prompt, repo, env, log_path, timeout_secs, on_started=None):
+    """跑一輪 agent：prompt 由 stdin pipe 注入，不把 prompt 檔案交給子程序，
     stdout/stderr 逐行同步印上 console 並落 log 檔。
     逾時 SIGKILL 整個 process group(start_new_session 保證殺得到子孫)。
     回傳 (rc, 秒數, 是否逾時)。"""
     t0 = time.monotonic()
     timed_out = False
     log_fd = _open_regular(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-    prompt_fd = _open_regular(prompt_path, os.O_RDONLY)
-    with os.fdopen(log_fd, "w", encoding="utf-8", closefd=True) as lf, \
-            os.fdopen(prompt_fd, "rb", closefd=True) as pin:
-        p = subprocess.Popen(cmd, cwd=str(repo), env=env, stdin=pin,
+    prompt_bytes = prompt.encode("utf-8")
+    with os.fdopen(log_fd, "w", encoding="utf-8", closefd=True) as lf:
+        p = subprocess.Popen(cmd, cwd=str(repo), env=env, stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              start_new_session=True)
         process_group = p.pid  # start_new_session=True → pgid 固定等於 child pid
         reader_errors = []
+        writer_errors = []
         escaped_pipe = False
 
         def _kill_group():
@@ -1212,10 +1212,28 @@ def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs, on_started=No
             except Exception as e:  # noqa: BLE001 — 主執行緒清理 process group 後再轉拋
                 reader_errors.append(e)
 
+        def _write_prompt():
+            """在獨立 thread 寫 stdin，避免 Agent 先輸出再讀取時和 stdout pipe 互鎖。"""
+            try:
+                p.stdin.write(prompt_bytes)
+                p.stdin.flush()
+            except BrokenPipeError:
+                # CLI 可在讀完前主動退出；與 subprocess.communicate 的行為一致，不另判失敗。
+                pass
+            except Exception as e:  # noqa: BLE001 — 主執行緒完成 process-group 清理後再轉拋
+                writer_errors.append(e)
+            finally:
+                try:
+                    p.stdin.close()
+                except (OSError, ValueError):
+                    pass
+
         # stdout 由 reader thread 處理，主執行緒直接等 CLI 主程序。否則 CLI 已退出、
         # 背景孫行程仍握著 stdout pipe 時，`for raw in stdout` 會把 round 卡到孫行程結束。
         reader = threading.Thread(target=_stream_output, name="agent-output", daemon=True)
+        writer = threading.Thread(target=_write_prompt, name="agent-prompt", daemon=True)
         reader.start()
+        writer.start()
         try:
             if on_started:
                 on_started(p.pid)
@@ -1235,17 +1253,20 @@ def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs, on_started=No
             _kill_group()
             if p.poll() is None:
                 p.wait()
+            writer.join(timeout=5)
             reader.join(timeout=5)
-            if reader.is_alive():
+            if writer.is_alive() or reader.is_alive():
                 # 有子行程刻意 setsid 逃離 process group 且仍握著 pipe；不能讓它反過來
                 # 卡死 loop，也不能帶著未知 writer 繼續下一輪。不要在此直接 close BufferedReader：
                 # reader thread 可能正持有其 lock，close 本身反而會永久阻塞。
                 escaped_pipe = True
-                log("⛔ Agent 有逃離 process group 的背景程序仍持有 stdout；為避免跨輪競寫，loop 停止")
+                log("⛔ Agent 有逃離 process group 的背景程序仍持有 stdin/stdout；為避免跨輪競寫，loop 停止")
             else:
                 p.stdout.close()
         if escaped_pipe:
             raise RuntimeError("Agent 背景程序逃離 process group，無法安全進入下一輪")
+        if writer_errors:
+            raise writer_errors[0]
         if reader_errors:
             raise reader_errors[0]
     return p.returncode, time.monotonic() - t0, timed_out
@@ -1337,6 +1358,12 @@ def build_prompt(tpl_path, mapping):
     for k, v in mapping.items():
         text = text.replace(f"<<{k}>>", v)
     return text
+
+
+def coordinator_command(action, *args, python_executable=None):
+    """建立給 Agent 的 coordinator 指令，固定帶目前 Python executable 的完整路徑。"""
+    executable = Path(python_executable or sys.executable).expanduser().resolve()
+    return shlex.join([str(executable), "-m", "engine.work", action, *args])
 
 
 def fenced_block(text):
@@ -1867,14 +1894,12 @@ def main():
         startup_marked = True
         log("🟢 啟動完成｜preflight、Validate 與 Agent spawn 均成功")
 
-    # Prompt 中的 coordinator 命令會交給另一個 CLI agent 執行；使用絕對路徑，
-    # 避免不同使用者、IDE 或非互動 shell 的 PATH 指到另一套 Python。
-    py = shlex.quote(str(Path(sys.executable).expanduser().resolve()))
-    work_module = f"{py} -m engine.work"
-    create_cmd = f"{work_module} create-plan"
-    planok_cmd = f"{work_module} plan-ok"
-    issue_cmd = f"{work_module} issue"
-    base_env = expose_checkout_package({**os.environ, "LOOP_WS": str(ws.dir)})
+    # Prompt 中的 coordinator 命令會交給另一個 CLI agent 執行；一律使用目前
+    # Python executable 的絕對路徑，避免 PATH 指到另一套 Python。
+    create_cmd = coordinator_command("create-plan")
+    planok_cmd = coordinator_command("plan-ok")
+    issue_cmd = coordinator_command("issue")
+    base_env = expose_project_package({**os.environ, "LOOP_WS": str(ws.dir)})
 
     phase_name = "規劃期" if state["phase"] == "plan" else "執行期"
     log(f"📍 恢復進度｜階段：{phase_name}｜已完成 round {state['round']}")
@@ -1949,7 +1974,7 @@ def main():
                 "NOTES": notes_text,
             })
         else:
-            done_cmd = f"{work_module} done {task_id}"
+            done_cmd = coordinator_command("done", task_id)
             prompt = build_prompt(HERE / "prompts" / "exec.md", {
                 "GOAL": goal_text.strip(),
                 "PLAN_DOC": plan_doc_display,
@@ -1980,11 +2005,9 @@ def main():
         task_summary = f"｜{task_id}：{cur_task['task']}" if cur_task else ""
         log(f"🔄 第 {rnd} 輪開始｜{phase_name}{task_summary}｜flag={state['flag']}｜done={state['done_count']}")
         log(f"🤖 啟動 Agent｜命令：{shlex.join(agent_cmd)}")
-        # LOOP_PROMPT_FILE 讓 agent 命令能自己開檔讀 prompt；stdin 管線繼續照送不變——
-        # 部分受限 CLI(如某些包了 sandbox 的 npm wrapper)不繼承/讀不了父行程開好轉交的
-        # stdin fd,但用自己的權限直接 open() 這個路徑就沒問題。
-        round_env = {**base_env, "LOOP_ROUND_TOKEN": round_token, "LOOP_PROMPT_FILE": str(prompt_path)}
-        rc, secs, timed_out = run_agent(agent_cmd, prompt_path, repo, round_env,
+        round_env = {**base_env, "LOOP_ROUND_TOKEN": round_token}
+        round_env.pop("LOOP_PROMPT_FILE", None)
+        rc, secs, timed_out = run_agent(agent_cmd, prompt, repo, round_env,
                                         ws.dir / "logs" / f"round-{rnd:04d}.log",
                                         args.round_timeout * 60, on_started=mark_startup_ready)
         # Agent process 已結束的當下先保存是否送出該 phase 的完成回報；Plan 的

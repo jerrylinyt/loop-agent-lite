@@ -306,7 +306,7 @@ class TestAgentProcessIsolation(unittest.TestCase):
             started = time.monotonic()
 
             rc, _secs, timed_out = L.run_agent(
-                [sys.executable, "-c", parent], prompt, root, os.environ.copy(),
+                [sys.executable, "-c", parent], prompt.read_text(), root, os.environ.copy(),
                 root / "agent.log", 0,
             )
 
@@ -314,6 +314,57 @@ class TestAgentProcessIsolation(unittest.TestCase):
             self.assertFalse(timed_out)
             self.assertLess(time.monotonic() - started, 2,
                             "背景 child 繼承 stdout 也不得把 round 卡到 child 自行結束")
+
+    def test_prompt_is_injected_through_stdin_pipe(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            log_path = root / "agent.log"
+            expected = "pipe prompt 測試\nsecond line\n"
+            agent = (
+                "import json, os, stat, sys; "
+                "print(json.dumps({'pipe': stat.S_ISFIFO(os.fstat(0).st_mode), "
+                "'prompt': sys.stdin.read(), 'prompt_file': os.environ.get('LOOP_PROMPT_FILE')}))"
+            )
+            env = os.environ.copy()
+            env.pop("LOOP_PROMPT_FILE", None)
+
+            rc, _secs, timed_out = L.run_agent(
+                [sys.executable, "-c", agent], expected, root, env, log_path, 5,
+            )
+
+            payload = json.loads(log_path.read_text())
+            self.assertEqual(rc, 0)
+            self.assertFalse(timed_out)
+            self.assertTrue(payload["pipe"], "Agent stdin 必須是 pipe，不能是開啟的 prompt 檔案")
+            self.assertEqual(payload["prompt"], expected)
+            self.assertIsNone(payload["prompt_file"])
+
+
+class TestAgentCoordinatorCommands(unittest.TestCase):
+    """送進 prompt 的 coordinator 指令必須鎖定啟動 loop 的同一套 Python。"""
+
+    def test_all_commands_include_absolute_python_executable(self):
+        expected = str(Path(sys.executable).expanduser().resolve())
+        commands = (
+            L.coordinator_command("create-plan"),
+            L.coordinator_command("plan-ok"),
+            L.coordinator_command("issue"),
+            L.coordinator_command("done", "task-7"),
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                parts = shlex.split(command)
+                self.assertEqual(parts[0], expected)
+                self.assertTrue(Path(parts[0]).is_absolute())
+                self.assertEqual(parts[1:3], ["-m", "engine.work"])
+
+    def test_python_path_with_spaces_is_shell_quoted(self):
+        executable = Path("/tmp/Python Runtime/bin/python3").resolve()
+        command = L.coordinator_command("plan-ok", python_executable=str(executable))
+        self.assertEqual(
+            shlex.split(command),
+            [str(executable), "-m", "engine.work", "plan-ok"],
+        )
 
 
 class TestRoundTelemetry(unittest.TestCase):
@@ -2086,6 +2137,42 @@ class TestHistoryRetention(unittest.TestCase):
                 D.TAIL_INIT = old_tail
             self.assertTrue(projection["truncated"])
             self.assertIn("new-line", projection["data"])
+
+    def test_sse_incremental_backlog_keeps_only_latest_complete_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "console.log"
+            path.write_text("old-" + "x" * 40 + "\nlatest-1\nlatest-2\n", encoding="utf-8")
+
+            projection = D.read_incremental(
+                path, 0, max_bytes=24, tail_if_oversized=True,
+            )
+
+            self.assertTrue(projection["truncated"])
+            self.assertEqual(projection["size"], path.stat().st_size)
+            self.assertNotIn("old-", projection["data"])
+            self.assertEqual(projection["data"], "latest-1\nlatest-2\n")
+
+    def test_sse_incremental_drops_one_oversized_partial_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "console.log"
+            path.write_text("[time] 🤖 Agent｜" + "x" * 100, encoding="utf-8")
+
+            projection = D.read_incremental(
+                path, 0, max_bytes=24, tail_if_oversized=True,
+            )
+
+            self.assertTrue(projection["truncated"])
+            self.assertEqual(projection["size"], path.stat().st_size)
+            self.assertEqual(projection["data"], "")
+
+            initial = D.read_incremental(path, -1, max_bytes=24, tail_if_oversized=True)
+            self.assertTrue(initial["truncated"])
+            self.assertEqual(initial["size"], path.stat().st_size)
+            self.assertEqual(initial["data"], "")
+
+    def test_sse_push_interval_is_three_seconds(self):
+        self.assertEqual(D.SSE_PUSH_INTERVAL, 3.0)
+        self.assertEqual(D.FLEET_HISTORY_SSE_INTERVAL, 3.0)
 
 
 class TestIssueRetention(unittest.TestCase):

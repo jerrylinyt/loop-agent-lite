@@ -38,7 +38,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from engine import loop as loop_mod  # 共用 Workspace/fresh_state,匯入計畫時建 state 不自己發明 schema
-from engine.paths import (default_personal_config, default_workspace_root, expose_checkout_package,
+from engine.paths import (default_personal_config, default_workspace_root, expose_project_package,
                           legacy_config_path)
 from engine.prompt_templates import prompt_template_bundle, prompt_template_projection
 from engine.work import validate_plan  # 計畫校驗單一來源(create-plan / 匯入共用)
@@ -120,7 +120,7 @@ def command_env(cfg):
     _, extra = configured_path_dirs(cfg)
     existing = [value for value in env.get("PATH", "").split(os.pathsep) if value]
     env["PATH"] = os.pathsep.join(dict.fromkeys(extra + existing))
-    return expose_checkout_package(env)
+    return expose_project_package(env)
 
 
 def command_not_found(label, executable, cfg):
@@ -757,7 +757,9 @@ FLEET_HISTORY_TAIL = 16 * 1024  # 每個 workspace 事件流尾段上限
 FLEET_METRICS_TAIL = 512 * 1024  # 足以 bounded 掃描單 workspace 近期 500 輪
 FLEET_METRICS_LIMIT = 100
 FLEET_AGGREGATE_LIMIT = 500      # 全 workspace 合併後只取時間最新 500 筆
-FLEET_HISTORY_SSE_INTERVAL = 2.0  # 事件流只在歷史有變時推送，避免每圈重送整段尾端
+SSE_PUSH_INTERVAL = 3.0          # 內網環境最多每三秒整理／推送一批變更
+SSE_CONSOLE_MAX_BYTES = 64 * 1024  # console 單次只送最新 64 KiB，避免慢連線累積 backlog
+FLEET_HISTORY_SSE_INTERVAL = SSE_PUSH_INTERVAL
 ANOMALY_ID_RE = loop_mod.ANOMALY_ID_RE
 
 
@@ -1381,30 +1383,49 @@ def fleet_health_projection(workspaces=None):
 TAIL_INIT = 64 * 1024  # offset<0(首抓)時只回檔案尾段,超長 log 秒開
 
 
-def read_incremental(path: Path, offset: int):
-    """依 byte offset bounded 讀取 log；首抓只取完整尾段，輪替/縮檔時從頭重讀。"""
+def read_incremental(path: Path, offset: int, *, max_bytes=MAX_CHUNK, tail_if_oversized=False):
+    """依 byte offset bounded 讀取 log；可在 backlog 過大時只保留最新完整行。"""
     try:
         path = loop_mod.workspace_file(path, "workspace log")
         fd = loop_mod._open_regular(path, os.O_RDONLY)
         with os.fdopen(fd, "rb", closefd=True) as f:
             size = os.fstat(f.fileno()).st_size
             if offset < 0:  # 首抓:直接跳到尾段,從下一個完整行開始
-                offset = max(0, size - TAIL_INIT)
+                offset = max(0, size - min(TAIL_INIT, max_bytes))
                 truncated = offset > 0
                 f.seek(offset)
-                data = f.read(MAX_CHUNK)
+                data = f.read(max_bytes)
                 if offset > 0:
                     nl = data.find(b"\n")
                     if nl != -1:
                         offset += nl + 1
                         data = data[nl + 1:]
+                    else:
+                        # 整個初始 tail 都是一條被截斷的超長行；沒有來源 marker 就不送，
+                        # 否則前端會把 Agent 殘行誤歸類到「其他」。
+                        offset = size
+                        data = b""
                 return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace"),
                         "truncated": truncated}
             if offset > size:
                 offset = 0
+            truncated = tail_if_oversized and size - offset > max_bytes
+            if truncated:
+                offset = size - max_bytes
             f.seek(offset)
-            data = f.read(MAX_CHUNK)
-        return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace")}
+            data = f.read(max_bytes)
+            if truncated:
+                # tail 起點通常落在舊行中間；只從下一個完整行送出。若整段是一條
+                # 超長行則整條略過，避免失去來源 marker 後被前端分錯 console。
+                nl = data.find(b"\n")
+                if nl == -1:
+                    offset = size
+                    data = b""
+                else:
+                    offset += nl + 1
+                    data = data[nl + 1:]
+        return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace"),
+                "truncated": truncated}
     except FileNotFoundError:
         return {"size": 0, "data": ""}
     except (OSError, ValueError) as e:
@@ -1649,7 +1670,7 @@ class Handler(BaseHTTPRequestHandler):
                         fleet_sig = sig
                     # dashboard 自己啟動的 job 可能在 preflight 立刻退出；快速同步避免
                     # UI 還顯示「停止」數秒，使用者再點後才發現程序早已結束。
-                    fleet_at = now + 0.6
+                    fleet_at = now + SSE_PUSH_INTERVAL
 
                 if include_fleet_history and now >= fleet_history_at:
                     fleet_observability = read_fleet_observability()
@@ -1673,7 +1694,10 @@ class Handler(BaseHTTPRequestHandler):
                     identity_before = file_identity(console_path)
                     if console_identity is not None and identity_before != console_identity:
                         console_offset = 0  # rotation 後從新 console.log 開頭接續
-                    console = read_incremental(console_path, console_offset)
+                    console = read_incremental(
+                        console_path, console_offset,
+                        max_bytes=SSE_CONSOLE_MAX_BYTES, tail_if_oversized=True,
+                    )
                     identity_after = file_identity(console_path)
                     if identity_before != identity_after:
                         # 剛好撞上 rename/create；下一圈重新讀穩定的新檔，不冒險漏掉開頭。
@@ -1688,7 +1712,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
                     keepalive_at = now + 15
-                time.sleep(0.6)
+                time.sleep(SSE_PUSH_INTERVAL)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             self.close_connection = True
 
@@ -2980,7 +3004,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run_dashboard(*, name="", port=8765, read_only=False) -> int:
-    """啟動 localhost Dashboard；供安裝後的 `loop dashboard` 與測試共用。"""
+    """啟動 localhost Dashboard；供根目錄 Python 啟動器與測試共用。"""
     Handler.readonly = read_only
     load_config()  # 不存在就先建預設檔,讓人有得改
     if name:
@@ -3023,7 +3047,7 @@ def run_dashboard(*, name="", port=8765, read_only=False) -> int:
 
 
 def main(argv=None) -> int:
-    """保留 `python -m engine.dashboard` 開發入口；正式使用建議 `loop dashboard`。"""
+    """解析 Dashboard 參數；根目錄 ``dashboard.py`` 與 module 執行共用。"""
     parser = argparse.ArgumentParser(description="loop-agent-lite dashboard(fleet + 直播 + launcher)")
     parser.add_argument("--name", default="", help="預選 workspace(可省;頁面內隨時可切)")
     parser.add_argument("--port", type=int, default=8765, help="被占用會自動往上找(最多 +20)")

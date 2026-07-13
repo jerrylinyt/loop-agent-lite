@@ -22,6 +22,8 @@
 
 ## 步驟(依序)
 
+以下 coordinator 指令已包含目前 runtime 的 Python 完整路徑；必須整串原樣執行，不得改成裸 `python`／`python3`。
+
 1. **收拾現場**:工作區若有未 commit 的殘留(前人 crash 留下的),先判斷:
    - 殘留改動對應得上本任務描述 → 是本任務做到一半,接手做完。
    - 對應不上本任務描述 → 是垃圾,`git reset --hard` + `git clean -fd` 清掉
