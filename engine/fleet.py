@@ -59,6 +59,13 @@ def mark_fleet_interrupted(state: dict) -> None:
     state["resume_phase"] = recoverable_phase(state)
     state["phase"] = "stopped"
     state.setdefault("loop", {})["pid"] = None
+    for track in state.get("tracks") or []:
+        if not isinstance(track, dict):
+            continue
+        if track.get("status") in {"running", "merging", "repairing"}:
+            track["status"] = "stopped"
+        if "pid" in track:
+            track["pid"] = None
 
 
 def parser() -> argparse.ArgumentParser:

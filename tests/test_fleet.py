@@ -1088,6 +1088,31 @@ class TestFleetHappyPath(unittest.TestCase):
             final = json.loads(fleet_path.read_text(encoding="utf-8"))
             self.assertEqual(final["phase"], "done")
 
+    def test_interrupt_stops_active_track_projection_and_clears_stale_pids(self):
+        state = {
+            "phase": "exec",
+            "loop": {"pid": 101},
+            "tracks": [
+                {"name": "running", "status": "running", "pid": 201},
+                {"name": "merging", "status": "merging", "pid": 202},
+                {"name": "repairing", "status": "repairing", "pid": 203},
+                {"name": "ready", "status": "merge-ready", "pid": 204},
+                {"name": "pending", "status": "pending"},
+                {"name": "cleaned", "status": "cleaned", "pid": None},
+            ],
+        }
+
+        F.mark_fleet_interrupted(state)
+
+        self.assertEqual((state["phase"], state["resume_phase"]), ("stopped", "exec"))
+        self.assertIsNone(state["loop"]["pid"])
+        statuses = {track["name"]: track["status"] for track in state["tracks"]}
+        self.assertEqual(statuses, {
+            "running": "stopped", "merging": "stopped", "repairing": "stopped",
+            "ready": "merge-ready", "pending": "pending", "cleaned": "cleaned",
+        })
+        self.assertTrue(all(track.get("pid") is None for track in state["tracks"]))
+
     def test_cas_rollback_crash_matrix_resumes_and_repairs(self):
         for crash_at in ("rollback-prepared", "rollback-ref", "rollback-reset", "rolled-back"):
             with self.subTest(crash_at=crash_at):

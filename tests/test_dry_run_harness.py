@@ -320,6 +320,17 @@ class TestDryRunEvidence(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "不再 deterministic"):
                 harness.assert_dr1_contract_absent(repo)
 
+    def test_dr1_ui_contract_is_checked_after_production_bundle_reload(self):
+        spec = (harness.ROOT / "ui" / "e2e" / "parallel-real-dry-run.spec.ts").read_text(
+            encoding="utf-8")
+        track_creation = spec.index('await screenshot(page, testInfo, "03-tracks-created")')
+        bundle_reload = spec.index("await page.reload();", track_creation)
+        assertion = ('"aria-label", `Parallel tracks '
+                     '${completedTrackCount}/${completedTrackCount} merged`')
+        self.assertEqual(spec.count(assertion), 1)
+        contract_assertion = spec.index(assertion)
+        self.assertGreater(contract_assertion, bundle_reload)
+
     def test_playwright_index_is_bounded_to_audit_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             artifacts = Path(directory)

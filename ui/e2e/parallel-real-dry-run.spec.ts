@@ -258,11 +258,6 @@ test("full-project parallel run through production UI", async ({ page }, testInf
   await waitForVisibleOrFleetFailure(
     page, group.locator(".parallel-track").first(), "track creation", 30 * 60 * 1000
   );
-  if (scenario === "dr1") {
-    await expect(group.locator(".parallel-run-head")).toHaveAttribute(
-      "aria-label", /^Parallel tracks \d+\/\d+ merged$/
-    );
-  }
   await screenshot(page, testInfo, "03-tracks-created");
 
   // child 活躍期間實際操作 parent/child 診斷視圖與 console；track tabs 也必須可收合後復原。
@@ -503,6 +498,15 @@ test("full-project parallel run through production UI", async ({ page }, testInf
   await page.reload();
   await expect(page.getByRole("heading", { name: `l4-${scenario}` })).toBeVisible();
   await expect(page.locator(".workspace-title").getByText("🏁 完成", { exact: true })).toBeVisible();
+  if (scenario === "dr1") {
+    // DR1 的 frontend track 才會新增這個 contract；必須等 CAS 合入後 reload
+    // production bundle 再驗，否則這裡會還在執行啟動時的舊 JavaScript。
+    const reloadedGroup = page.getByRole("region", { name: "Parallel run tracks" });
+    await expect(reloadedGroup.locator(".parallel-track")).toHaveCount(completedTrackCount);
+    await expect(reloadedGroup.locator(".parallel-run-head")).toHaveAttribute(
+      "aria-label", `Parallel tracks ${completedTrackCount}/${completedTrackCount} merged`
+    );
+  }
   await page.getByRole("button", { name: "📄 完成報告" }).click();
   await expect(page.getByRole("dialog", { name: "完成報告" })).toContainText("Parallel Run Report");
   await closeModal(page);
