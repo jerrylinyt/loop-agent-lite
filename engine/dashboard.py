@@ -623,7 +623,9 @@ def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout
 
 
 def run_command_check(cmd, cwd, prompt="", timeout=60, env=None):
-    """執行 UI 的命令確認；逾時時連同 CLI 衍生的子程序群組一起清掉。"""
+    """執行 UI 的命令確認；逾時時連同 CLI 衍生的子程序群組一起清掉。
+    killpg 只保證殺得死直接子行程；若有孫行程刻意 setsid 逃離 process group 仍握著
+    stdout，收尾讀取最多再等 5 秒，逾時就放棄剩餘輸出而非讓 HTTP 請求永久卡住。"""
     p = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, start_new_session=True, env=env)
@@ -635,8 +637,27 @@ def run_command_check(cmd, cwd, prompt="", timeout=60, env=None):
             os.killpg(os.getpgid(p.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-        output, _ = p.communicate()
-        return p.returncode, output or "", True
+        p.wait()  # SIGKILL 保證直接子行程終止；卡住的只會是下面等孫行程放開 stdout 的讀取
+        try:
+            p.stdin.close()
+        except (OSError, ValueError):
+            pass
+        drained = {}
+        def _drain():
+            try:
+                drained["out"] = p.stdout.read()
+            except Exception:  # noqa: BLE001 — 讀取失敗不影響「已逾時」判定，直接視為無收尾輸出
+                pass
+        drainer = threading.Thread(target=_drain, daemon=True)
+        drainer.start()
+        drainer.join(timeout=5)
+        output = drained.get("out") or ""
+        if drainer.is_alive():
+            # reader thread 可能仍持有 stdout 的鎖，這裡不能 close，否則反而永久阻塞。
+            output += "\n⚠️ 有孫行程逃離 process group 仍握著輸出管線，已放棄等待收尾。"
+        else:
+            p.stdout.close()
+        return p.returncode, output, True
 
 
 def job_startup_status(name, pid):

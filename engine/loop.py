@@ -1236,13 +1236,17 @@ def notify(cmd, status, name):
 
 
 def run_validate(cmd, repo, timeout_secs=VALIDATE_TIMEOUT_SEC):
-    """執行正式 validator；逾時或中斷時清掉整個 validator process group。"""
+    """執行正式 validator；逾時或中斷時清掉整個 validator process group。
+    killpg 只保證殺得死直接子行程；若有孫行程刻意 setsid 逃離 process group 仍握著
+    stdout，收尾讀取最多再等 5 秒，逾時就放棄剩餘輸出——否則啟動前的綠點驗證會被
+    卡死，dashboard 永遠等不到 startup handshake，workspace 也就一直沒有 state.json。"""
     try:
         p = subprocess.Popen(cmd, cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              text=True, start_new_session=True)
     except FileNotFoundError:
         return False, f"找不到 Validate 命令：{cmd[0]}", False
     timed_out = False
+    escaped = False
     try:
         out, _ = p.communicate(timeout=timeout_secs)
     except subprocess.TimeoutExpired:
@@ -1251,7 +1255,20 @@ def run_validate(cmd, repo, timeout_secs=VALIDATE_TIMEOUT_SEC):
             os.killpg(os.getpgid(p.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-        out, _ = p.communicate()
+        p.wait()  # SIGKILL 保證直接子行程終止；卡住的只會是下面等孫行程放開 stdout 的讀取
+        drained = {}
+        def _drain():
+            try:
+                drained["out"] = p.stdout.read()
+            except Exception:  # noqa: BLE001 — 讀取失敗不影響「已逾時」判定，直接視為無收尾輸出
+                pass
+        drainer = threading.Thread(target=_drain, daemon=True)
+        drainer.start()
+        drainer.join(timeout=5)
+        escaped = drainer.is_alive()
+        out = drained.get("out") or ""
+        if not escaped:
+            p.stdout.close()
     except KeyboardInterrupt:
         try:
             os.killpg(os.getpgid(p.pid), signal.SIGKILL)
@@ -1261,6 +1278,8 @@ def run_validate(cmd, repo, timeout_secs=VALIDATE_TIMEOUT_SEC):
         raise
     out = (out or "").strip()
     tail = "\n".join(out.splitlines()[-VALIDATE_TAIL:])
+    if escaped:
+        tail = (tail + "\n" if tail else "") + "⚠️ 有孫行程逃離 process group 仍握著輸出管線，已放棄等待收尾。"
     if timed_out:
         tail = (f"Validate 執行超過 {timeout_secs:g} 秒，已終止" + (f"\n{tail}" if tail else ""))
     return p.returncode == 0 and not timed_out, tail, timed_out
