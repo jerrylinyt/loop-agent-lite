@@ -987,6 +987,9 @@ L4 subprocess 也不得整包繼承宿主 credential/token/password/secret 類 e
 exact-value 防漏掃描，不把變數名稱或值寫入 manifest。敏感名稱按 `_` 分段判定；例如
 `SECRET_KEY_BASE`、`CLIENT_SECRET_JSON` 必須移除，但不得因一般名稱含相同字母片段而誤判
 `MONKEY`、`KEYBOARD_LAYOUT`。
+Harness 的每個外部命令都使用獨立 process group；timeout、正常 parent 提前退出與 runner
+收到 Ctrl-C 都必須先 SIGINT、必要時 SIGKILL，並驗證整個 group 已清空後才返回或重拋中斷，
+不得留下 Playwright worker、browser、ffmpeg、validator 或 agent 子程序。
 本 repo 的 production UI 產物 `engine/ui/` 受版控；frontend track 的 task/DoD 必須包含
 `npm run build` 後提交對應 assets。每次 validate 結束都再次執行 `git status --porcelain`，
 若 build 才產生未提交 asset，該輪不能算 done；不得把受版控 build output 誤當 ignored 產物。

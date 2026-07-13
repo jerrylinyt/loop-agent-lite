@@ -181,6 +181,23 @@ def run(command, *, cwd=None, env=None, log=None, check=True, input_text=None, t
     process_group = process.pid
     try:
         output, _ = process.communicate(input_text, timeout=timeout)
+    except KeyboardInterrupt:
+        cleanup = _terminate_process_group(process, process_group)
+        try:
+            output, _ = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired as final_error:
+            output = _timeout_output(final_error)
+        output = output or ""
+        output += "\nL4 harness cancelled by KeyboardInterrupt\n"
+        if not cleanup["group_empty"]:
+            output += f"L4 harness could not empty process group {process_group}\n"
+        if log:
+            Path(log).write_text(output, encoding="utf-8")
+        if not cleanup["group_empty"]:
+            raise RuntimeError(
+                f"L4 harness cancellation could not empty process group {process_group}"
+            )
+        raise
     except subprocess.TimeoutExpired as error:
         output = _timeout_output(error)
         cleanup = _terminate_process_group(process, process_group)

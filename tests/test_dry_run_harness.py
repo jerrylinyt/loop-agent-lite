@@ -71,6 +71,44 @@ class TestDryRunEvidence(unittest.TestCase):
             child_pid = int(pid_file.read_text())
             self.wait_process_gone(child_pid)
 
+    def test_keyboard_interrupt_kills_the_whole_isolated_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pid_file, log = root / "command-pids.json", root / "cancel.log"
+            command_script = root / "command.py"
+            command_script.write_text(
+                "import json,os,pathlib,signal,subprocess,sys,time\n"
+                "child=subprocess.Popen([sys.executable,'-c',"
+                "'import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(30)'])\n"
+                "pathlib.Path(sys.argv[1]).write_text(json.dumps({'parent':os.getpid(),'child':child.pid}))\n"
+                "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            driver = root / "driver.py"
+            driver.write_text(
+                "import sys\n"
+                "from tests.dry_run import run_full_project as harness\n"
+                "harness.run([sys.executable,sys.argv[1],sys.argv[2]],log=sys.argv[3])\n",
+                encoding="utf-8",
+            )
+            process = subprocess.Popen(
+                [sys.executable, str(driver), str(command_script), str(pid_file), str(log)],
+                cwd=harness.ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env={**os.environ, "PYTHONPATH": str(harness.ROOT)},
+            )
+            deadline = time.monotonic() + 5
+            while not pid_file.is_file() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(pid_file.is_file(), "isolated command did not start")
+            pids = json.loads(pid_file.read_text(encoding="utf-8"))
+            os.kill(process.pid, __import__("signal").SIGINT)
+            process.wait(timeout=10)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("cancelled by KeyboardInterrupt", log.read_text(encoding="utf-8"))
+            self.wait_process_gone(pids["parent"])
+            self.wait_process_gone(pids["child"])
+
     def test_successful_parent_with_live_child_fails_and_cleans_group(self):
         with tempfile.TemporaryDirectory() as directory:
             pid_file = Path(directory) / "child.pid"
