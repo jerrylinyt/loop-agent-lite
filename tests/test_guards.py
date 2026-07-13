@@ -3370,6 +3370,23 @@ class TestAgentPromptPolicy(unittest.TestCase):
         self.assertIn("不因命令名稱未知就設 human gate", plan)
         self.assertIn("不要為每個不相關候選產生 N/A", plan)
 
+    def test_runtime_planner_audits_fresh_worktree_execution_without_command_whitelist(self):
+        prompt = self.prompt("plan.md")
+        self.assertIn("fresh-worktree 可執行性稽核", prompt)
+        self.assertIn("不得發明 repo 未安裝、未定義的", prompt)
+        self.assertIn("本 task 規劃新建的交付 module/script 不需事前存在", prompt)
+        self.assertIn("capability check 證實可用的 runtime/tool/env", prompt)
+        self.assertIn("不得假設 integration checkout", prompt)
+        self.assertIn("`node_modules` 或本機 venv", prompt)
+        self.assertIn("只有 repo/環境已證實", prompt)
+        self.assertIn("需要真正整合實作的 `@final`", prompt)
+        self.assertIn("完成後 index/worktree 必須相對新 HEAD 乾淨", prompt)
+        self.assertIn("任務內明定 validation-only", prompt)
+        self.assertIn("純驗收 `@final`", prompt)
+        self.assertIn("status baseline", prompt)
+        self.assertIn("驗收後必須全部與該 baseline 一致", prompt)
+        self.assertIn("不新增測試框架白名單、命令字串 regex 或人工 gate", prompt)
+
     def test_exec_issue_is_next_agent_context_not_default_human_gate(self):
         prompt = self.prompt("exec.md")
         self.assertIn("context，不等於預設等待人工", prompt)

@@ -28,6 +28,23 @@
      它只看得到該條 task 的全文與同一軌道每行截 80 字的任務總覽;每條 task 都自足到能直接動工、
      逐條做完目標就達成,計畫才算完整。
    - 現有計畫沒寫、但你讀 code 後發現必要的工作,可以(也應該)補進計畫。
+   - `plan-ok` 前逐 task 做一次 **fresh-worktree 可執行性稽核**:
+     - DoD 引用的既有 runner、framework、第三方 module 或 pre-existing script,必須能由限定路徑內的
+       repo 設定、manifest/lockfile、現有測試慣例或輕量唯讀 capability check 證實可用;
+       本 task 規劃新建的交付 module/script 不需事前存在。不得發明 repo 未安裝、未定義的測試框架或命令;
+       命名命令無法證實時,改用 repo 已確認的入口,或依下方規則寫成可觀測結果。
+     - 隔離 child worktree 開始時只能依賴 tracked files,以及由 repo contract、Fleet 或輕量唯讀
+       capability check 證實可用的 runtime/tool/env;不得假設 integration checkout 未追蹤/忽略的依賴目錄
+       (例如 `node_modules` 或本機 venv)會被複製進 child。後續 build/test 需要依賴時,若 repo 有 tracked
+       manifest/lockfile,把既有 bootstrap/install 命令與執行目錄寫入同一 task;只有 repo/環境已證實
+       cache contract 時才寫 cache flags,不自行發明。
+     - build/test 命令若會重建 tracked 或 untracked 產物,必須依 task 類型分流:
+       implementation task(包含需要真正整合實作的 `@final`)允許並應要求將預期 source/build 產物
+       stage+commit,完成後 index/worktree 必須相對新 HEAD 乾淨。只有任務內明定 validation-only 的 task
+       (包含純驗收 `@final`)才禁止 patch/stage/commit;允許 validator 本身暫時重建,但要在驗收前記錄
+       HEAD、index 與 Git 可見的 tracked/untracked status baseline,驗收後必須全部與該 baseline 一致。
+       不得寫出與驗收命令必然副作用互相矛盾的限制。
+     這是 plan agent 的取證與判斷責任;不新增測試框架白名單、命令字串 regex 或人工 gate。
 2. 先確認 goal 可用：一般未指定實作細節由你依 ref、目標與 repo 慣例自行決定，不建立人工 gate。
    只有矛盾或缺失會實質改變需求意圖、安全／不可逆外部狀態或需要新外部權限，且限定證據無法裁定時，
    才依「禁區」執行 `<<ISSUE_CMD>>` 回報後結束。其餘情況二選一(互斥;一邊改計畫一邊宣告完整會被視為矛盾,宣告作廢):
@@ -79,7 +96,8 @@
 - 同一批檔案、同一模組或有直接前後依賴的任務優先同軌;不確定就同軌。
 - 軌內任務只能依賴 integration 起點與同軌前置任務,不得依賴其他尚未合入的 track。
 - 跨模組整合、端到端驗收或必須等全部成果的工作放 `@final`。
-- plan-ok 同時表示你已獨立檢查沒有明顯跨軌依賴;不需要等待人工確認。
+- plan-ok 同時表示你已獨立檢查沒有明顯跨軌依賴,並完成上述 fresh-worktree
+  可執行性稽核;不需要等待人工確認。
 
 ## 禁區
 
