@@ -4103,5 +4103,52 @@ class TestPreviousRunHistoryProjection(unittest.TestCase):
                 D.ROOT = old_root
 
 
+class TestSafeKillGuards(unittest.TestCase):
+    """safe_kill/safe_killpg:pid/pgid 被污染成 -1/0/1 或指向自己的 group 時,
+    絕不能把 signal 送出去(kernel 語意是殺自己整組甚至全機),只能記 log 放行流程。"""
+
+    def test_safe_kill_blocks_wildcard_pids(self):
+        for pid in (-1, 0, 1):
+            with self.subTest(pid=pid):
+                self.assertFalse(L.safe_kill(pid, signal.SIGKILL))
+
+    def test_safe_killpg_blocks_wildcard_and_own_group(self):
+        for pgid in (-1, 0, 1):
+            with self.subTest(pgid=pgid):
+                self.assertFalse(L.safe_killpg(pgid, signal.SIGKILL))
+        # 自己所在的 group = start_new_session 沒生效的災難場景,必須攔下
+        self.assertFalse(L.safe_killpg(os.getpgid(0), signal.SIGKILL))
+
+    def test_safe_kill_delivers_to_real_child(self):
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            self.assertTrue(L.safe_kill(p.pid, signal.SIGKILL))
+            self.assertEqual(p.wait(timeout=5), -signal.SIGKILL)
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
+    def test_safe_killpg_delivers_to_detached_group(self):
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                             start_new_session=True)
+        try:
+            self.assertTrue(L.safe_killpg(p.pid, signal.SIGKILL))
+            self.assertEqual(p.wait(timeout=5), -signal.SIGKILL)
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
+    def test_safe_kill_raises_lookup_error_like_os_kill(self):
+        """已死目標仍要丟 ProcessLookupError,呼叫端既有的 except 分支才接得住。"""
+        p = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        p.wait(timeout=10)
+        with self.assertRaises(ProcessLookupError):
+            L.safe_kill(p.pid, signal.SIGKILL)
+        with self.assertRaises(ProcessLookupError):
+            L.safe_killpg(p.pid, signal.SIGKILL)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

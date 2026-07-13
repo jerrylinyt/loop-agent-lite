@@ -572,6 +572,34 @@ def fail(msg: str):
     raise SystemExit(1)
 
 
+def safe_kill(pid, sig):
+    """送 signal 給單一 pid 前的最後防線。kernel 對 kill 的特殊語意:pid=0 殺自己
+    整個 process group、pid=-1 殺掉所有殺得動的程序——上游 pid 來源(state 檔、
+    型別轉換)一旦被污染,走到這裡就是全機屠殺。攔到只記 log 不送,回傳是否已送出。"""
+    pid = int(pid)
+    if pid <= 1:
+        log(f"⛔ 攔截 os.kill({pid}, {sig!r}):pid 為 -1/0/1 會波及整組甚至全機程序,拒絕送出")
+        return False
+    os.kill(pid, sig)
+    return True
+
+
+def safe_killpg(pgid, sig):
+    """送 signal 給整個 process group 前的最後防線。pgid<=1 等同 kill(0)/kill(-1);
+    pgid 等於自己所在 group 代表 start_new_session 沒生效或 pgid 來源被污染,
+    這一刀會把 coordinator 連同啟動它的 shell/同 session 程序一起帶走。
+    攔到只記 log 不送,回傳是否已送出。"""
+    pgid = int(pgid)
+    if pgid <= 1:
+        log(f"⛔ 攔截 os.killpg({pgid}, {sig!r}):pgid<=1 等同殺自己整組/全機程序,拒絕送出")
+        return False
+    if pgid == os.getpgid(0):
+        log(f"⛔ 攔截 os.killpg({pgid}, {sig!r}):目標是 coordinator 自己的 process group,拒絕送出")
+        return False
+    os.killpg(pgid, sig)
+    return True
+
+
 def release_run_locks() -> None:
     """正常退出時最後釋放；SIGKILL 時 kernel 也會自動釋放 flock。"""
     while _RUN_LOCKS:
@@ -1169,7 +1197,7 @@ def run_agent(cmd, prompt_path, repo, env, log_path, timeout_secs, on_started=No
         def _kill_group():
             """終止 Agent 的獨立 process group，避免背景子程序持續佔用 pipe。"""
             try:
-                os.killpg(process_group, signal.SIGKILL)
+                safe_killpg(process_group, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
 
@@ -1252,7 +1280,7 @@ def run_validate(cmd, repo, timeout_secs=VALIDATE_TIMEOUT_SEC):
     except subprocess.TimeoutExpired:
         timed_out = True
         try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            safe_killpg(os.getpgid(p.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
         p.wait()  # SIGKILL 保證直接子行程終止；卡住的只會是下面等孫行程放開 stdout 的讀取
@@ -1271,7 +1299,7 @@ def run_validate(cmd, repo, timeout_secs=VALIDATE_TIMEOUT_SEC):
             p.stdout.close()
     except KeyboardInterrupt:
         try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            safe_killpg(os.getpgid(p.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
         p.wait()

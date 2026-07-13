@@ -504,7 +504,7 @@ class Job:
             """SIGINT 寬限期後仍存活時終止整個 process group。"""
             if self.alive():
                 try:
-                    os.killpg(os.getpgid(self.popen.pid), signal.SIGKILL)
+                    loop_mod.safe_killpg(os.getpgid(self.popen.pid), signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
         t = threading.Timer(8, _force)
@@ -634,7 +634,7 @@ def run_command_check(cmd, cwd, prompt="", timeout=60, env=None):
         return p.returncode, output or "", False
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            loop_mod.safe_killpg(os.getpgid(p.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
         p.wait()  # SIGKILL 保證直接子行程終止；卡住的只會是下面等孫行程放開 stdout 的讀取
@@ -2951,13 +2951,16 @@ class Handler(BaseHTTPRequestHandler):
         pid = (st.get("loop") or {}).get("pid") if st else None
         if loop_pid_alive(pid):
             workspace_console_log(name, f"停止外部 loop｜pid={pid}")
-            os.kill(int(pid), signal.SIGINT)
+            # pid 來自 state.json(外部檔案,可能損壞):-1/0 會殺到全機/整組,交給防線把關
+            if not loop_mod.safe_kill(int(pid), signal.SIGINT):
+                self._err(f"{name} 記錄的 pid={pid} 不合法，拒絕送出停止信號", 500)
+                return
 
             def _force():
                 """外部 loop 在八秒寬限後仍存活時送 SIGKILL。"""
                 if loop_pid_alive(pid):
                     try:
-                        os.kill(int(pid), signal.SIGKILL)
+                        loop_mod.safe_kill(int(pid), signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
                         pass
             t = threading.Timer(8, _force)
