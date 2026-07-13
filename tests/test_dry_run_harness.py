@@ -220,6 +220,9 @@ class TestDryRunEvidence(unittest.TestCase):
     def test_full_project_validator_has_a_bounded_long_run_timeout(self):
         self.assertGreaterEqual(harness.L4_VALIDATE_TIMEOUT_SECONDS, 10 * 60)
         self.assertLess(harness.L4_VALIDATE_TIMEOUT_SECONDS, harness.PLAYWRIGHT_TOTAL_SECONDS)
+        self.assertGreaterEqual(harness.L4_PLANNING_TIMEOUT_SECONDS, 60 * 60)
+        self.assertLess(harness.L4_PLANNING_TIMEOUT_SECONDS,
+                        harness.PLAYWRIGHT_TOTAL_SECONDS - 60 * 60)
 
     def test_scoped_cleanup_runs_out_of_process_and_verifies_empty_remaining(self):
         with tempfile.TemporaryDirectory() as directory:

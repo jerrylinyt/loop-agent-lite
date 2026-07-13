@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_THRESHOLDS = {"flag": 10, "done": 3, "merge": 2, "max_parallel": 4}
 PLAYWRIGHT_TOTAL_SECONDS = 4 * 60 * 60
 PLAYWRIGHT_DELETE_MAX_SECONDS = 10 * 60
+L4_PLANNING_TIMEOUT_SECONDS = 2 * 60 * 60
 # The L4 validator runs the complete Python suite, a clean UI install/build, and
 # the immutable integration validator.  Keep this separate from the lightweight
 # Dashboard default: the complete suite already takes longer than 120 seconds on
@@ -1406,12 +1407,14 @@ def main(argv=None):
         port = port_reservation.port
         manifest.update(port=port, workspace=str(workspace), validator_sha256=validator_hash,
                         thresholds=dict(EXPECTED_THRESHOLDS),
+                        planning_timeout_seconds=L4_PLANNING_TIMEOUT_SECONDS,
                         port_reservation_lock=str(port_reservation.lock_path))
         env = {**base_env, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace),
                "LOOP_AGENT_HOME": str(home), "LOOP_AGENT_DASHBOARD_CONFIG": str(config),
                "LOOP_L4_BASE_URL": f"http://127.0.0.1:{port}", "LOOP_L4_REPO": str(clone),
                "LOOP_L4_SCENARIO": args.scenario, "LOOP_L4_VALIDATE": validate_cmd,
                "LOOP_L4_VALIDATE_TIMEOUT": str(L4_VALIDATE_TIMEOUT_SECONDS),
+               "LOOP_L4_PLANNING_TIMEOUT": str(L4_PLANNING_TIMEOUT_SECONDS),
                "LOOP_L4_PLAN": json.dumps(dr2_plan(), ensure_ascii=False),
                "LOOP_L4_ARTIFACTS": str(artifacts)}
         if args.prepare_only:

@@ -4,6 +4,7 @@ const scenario = process.env.LOOP_L4_SCENARIO;
 const repo = process.env.LOOP_L4_REPO ?? "";
 const validate = process.env.LOOP_L4_VALIDATE ?? "";
 const validateTimeout = process.env.LOOP_L4_VALIDATE_TIMEOUT ?? "";
+const planningTimeout = process.env.LOOP_L4_PLANNING_TIMEOUT ?? "";
 const importedPlan = process.env.LOOP_L4_PLAN ?? "";
 let lastFleetApiCheck = 0;
 let lastFleetApiFailure = "";
@@ -192,10 +193,16 @@ async function inspectChildPromptAndHistory(page: Page, firstRoundBudgetMs: numb
 
 test("full-project parallel run through production UI", async ({ page }, testInfo) => {
   test.skip(process.env.LOOP_L4_DELETE_PHASE === "1", "delete phase only");
-  if (!scenario || !repo || !validate || !validateTimeout) throw new Error("L4 environment is incomplete");
+  if (!scenario || !repo || !validate || !validateTimeout || !planningTimeout) {
+    throw new Error("L4 environment is incomplete");
+  }
   const validateTimeoutSeconds = Number(validateTimeout);
+  const planningTimeoutSeconds = Number(planningTimeout);
   if (!Number.isFinite(validateTimeoutSeconds) || validateTimeoutSeconds <= 0) {
     throw new Error(`invalid LOOP_L4_VALIDATE_TIMEOUT: ${validateTimeout}`);
+  }
+  if (!Number.isFinite(planningTimeoutSeconds) || planningTimeoutSeconds <= 0) {
+    throw new Error(`invalid LOOP_L4_PLANNING_TIMEOUT: ${planningTimeout}`);
   }
   const pageErrors = collectPageErrors(page);
 
@@ -231,7 +238,7 @@ test("full-project parallel run through production UI", async ({ page }, testInf
   if (scenario === "dr1") {
     await waitForVisibleOrFleetFailure(
       page, page.locator(".workspace-title").getByText("等待核准", { exact: true }),
-      "planning approval", 30 * 60 * 1000
+      "planning approval", planningTimeoutSeconds * 1000
     );
     await screenshot(page, testInfo, "02-awaiting-approval");
     await page.getByRole("button", { name: "✎ 編輯計畫" }).click();
