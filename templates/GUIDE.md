@@ -1,6 +1,6 @@
 # 初版計畫產出指引(在 loop 之外的一般 agent session 使用)
 
-Dashboard 的「啟動／管理」現在可直接產生並下載兩種外部 Agent Prompt：Goal 分析模板輸出
+Dashboard 的「啟動／管理」現在可直接產生並下載兩種外部 Agent Prompt：Goal 產生器 Prompt 輸出
 `goal.md`，Plan 拆分模板輸出可直接匯入的 `plan.json`。兩者共用下列盤點與 DoD 骨架，
 只在最後套用不同輸出契約；內建任務類型也涵蓋本目錄原有的 Java／EJB／JSP 模板。
 固定契約維護在 `engine/prompts/external-agent-*.md`，前端不保存另一份副本；團隊可在

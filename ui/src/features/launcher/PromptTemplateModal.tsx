@@ -5,17 +5,10 @@ import type { PromptTemplate, PromptTemplateBundle } from "../../shared/api/type
 import {
   buildExternalAgentPrompt,
   downloadPromptFile,
+  promptRequirementSeed,
   promptDownloadName,
   type PromptTemplateMode
 } from "./promptTemplateBuilder";
-
-/** 範例預填值：只有「例：」開頭的 placeholder 才視為可預填的範例（去前綴，因為預填內容會
- * 直接進入產生的 prompt）；「請貼上…」之類的指示語不是範例，回空字串、不預填。 */
-function placeholderSeed(item?: PromptTemplate): string {
-  const text = item?.requirement_placeholder?.trim() ?? "";
-  const match = /^例[:：]\s*/.exec(text);
-  return match ? text.slice(match[0].length) : "";
-}
 
 export default function PromptTemplateModal({
   templates,
@@ -34,7 +27,7 @@ export default function PromptTemplateModal({
 }) {
   const [mode, setMode] = useState<PromptTemplateMode>(initialMode);
   const [templateId, setTemplateId] = useState(templates[0]?.id ?? "");
-  const [requirement, setRequirement] = useState(() => placeholderSeed(templates[0]));
+  const [requirement, setRequirement] = useState(() => promptRequirementSeed(templates[0]));
   // 只要使用者親手改過需求欄就不再被切換模板覆蓋；用旗標而非字串比較，避免「手動輸入剛好
   // 等於範例文字」被誤判成未修改。
   const [requirementTouched, setRequirementTouched] = useState(false);
@@ -45,7 +38,7 @@ export default function PromptTemplateModal({
   const selectTemplate = (id: string) => {
     const next = templates.find((item) => item.id === id);
     if (!requirement.trim() || !requirementTouched) {
-      setRequirement(placeholderSeed(next));
+      setRequirement(promptRequirementSeed(next));
     }
     setTemplateId(id);
   };
@@ -82,7 +75,7 @@ export default function PromptTemplateModal({
 
   const footer = (
     <>
-      <button type="button" className="secondary-button" onClick={onClose}>關閉</button>
+      <button type="button" className="secondary-button" onClick={onClose}>← 上一頁</button>
       <button type="button" className="secondary-button" disabled={!template || !hasRequirement || !prompt} onClick={() => void copyPrompt()}>複製 Prompt</button>
       <button type="button" className="primary-button" disabled={!template || !hasRequirement || !prompt} onClick={downloadPrompt}>下載 .md</button>
       <span className="inline-message" role="status" aria-live="polite">
@@ -93,8 +86,8 @@ export default function PromptTemplateModal({
 
   return (
     <Modal
-      title="外部 Agent Prompt 模板"
-      description={`先分析需求，再產生可直接作為 ${outputName} 的內容；這裡不會修改 repo 或 workspace`}
+      title="外部 Agent 產生器 Prompt"
+      description={`複製後可直接交給 Agent 分析並產生 ${outputName}；這裡不會修改 repo 或 workspace`}
       onClose={onClose}
       extraWide
       footer={footer}
@@ -109,7 +102,7 @@ export default function PromptTemplateModal({
             onClick={() => { setMode("goal"); setMessage(""); }}
             data-autofocus
           >
-            Goal 分析模板
+            Goal 產生器 Prompt
           </button>
           <button
             type="button"
@@ -164,13 +157,13 @@ export default function PromptTemplateModal({
             />
           </label>
           <label htmlFor="prompt-project-context">
-            專案／補充上下文 <span className="label-help">選填，可貼 repo 路徑、既有 goal 或限制</span>
+            已知專案資訊／限制 <span className="label-help">選填；只填 Agent 無法從 repo 直接確認的背景</span>
             <textarea
               id="prompt-project-context"
               rows={5}
               value={projectContext}
               onChange={(event) => setProjectContext(event.target.value)}
-              placeholder="例：repo 位於 /path/to/project；不得更動公開 API；validate 為 npm test"
+              placeholder="例：必須相容尚未搬移的舊版 consumer；正式環境只能在指定維護窗口切換"
             />
           </label>
 

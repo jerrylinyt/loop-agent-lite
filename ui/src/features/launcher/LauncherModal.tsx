@@ -1,6 +1,7 @@
 /** Loop 啟動中心：彙整 repo/goal/plan/CLI/Validate 設定，先預覽差異與 preflight，再送交易式 launch。 */
 import { useEffect, useMemo, useRef, useState } from "react";
 import CliManagerModal from "../cli/CliManagerModal";
+import GoalTemplateModal from "./GoalTemplateModal";
 import Modal from "../../shared/components/Modal";
 import { getJson, postJson, waitForJobStartup } from "../../shared/api/client";
 import useStaleGuard from "../../shared/hooks/useStaleGuard";
@@ -84,6 +85,7 @@ export default function LauncherModal({
   const [preflightResult, setPreflightResult] = useState<{ ok: boolean; text: string; tail: string } | null>(null);
   const [managerModal, setManagerModal] = useState<"cli" | "repoRoots" | "notify" | null>(null);
   const [promptTemplateMode, setPromptTemplateMode] = useState<PromptTemplateMode | null>(null);
+  const [goalTemplateOpen, setGoalTemplateOpen] = useState(false);
   const hydratedRepo = useRef("");
   const appliedTemplate = useRef(false);
   const validateGuard = useStaleGuard();
@@ -359,7 +361,7 @@ export default function LauncherModal({
             {repoStatus.error ? `❌ ${repoStatus.error}` : <>goal.md {repoMark(repoStatus.goal)} · 工作樹 {repoStatus.tree_clean ? "✅ 乾淨" : "❌ 髒（preflight 會擋）"}{matchingWorkspace && ` · workspace「${matchingWorkspace.name}」已存在`}</>}
           </div>}
           <div className="form-field">
-            <div className="field-label-row"><label htmlFor="goal-file">goal.md <span className="label-help">留空＝沿用 repo 已 commit 的版本</span></label><button type="button" className="text-button" title={promptTemplateUnavailableReason || undefined} disabled={!promptTemplateAvailable} onClick={() => setPromptTemplateMode("goal")}>產生 Goal Prompt</button></div>
+            <div className="field-label-row"><label htmlFor="goal-file">goal.md <span className="label-help">留空＝沿用 repo 已 commit 的版本</span></label><span className="field-actions"><button type="button" className="text-button" title={promptTemplateUnavailableReason || undefined} disabled={!promptTemplateAvailable} onClick={() => setPromptTemplateMode("goal")}>Goal 產生器 Prompt</button><button type="button" className="text-button" title={promptTemplateUnavailableReason || undefined} disabled={!promptTemplateAvailable} onClick={() => setGoalTemplateOpen(true)}>Goal 成果模板</button></span></div>
             <input id="goal-file" type="file" accept=".md,.markdown,.txt" onChange={(event) => setGoalFile(event.target.files?.[0] ?? null)} />
           </div>
           <PlanImportField value={planJson} onChange={setPlanJson} startPhase={startPhase} onStartPhaseChange={setStartPhase} onOpenPromptTemplate={() => setPromptTemplateMode("plan")} promptTemplateAvailable={promptTemplateAvailable} />
@@ -409,6 +411,12 @@ export default function LauncherModal({
         projectConfigPath={config.project_config_path}
         initialMode={promptTemplateMode}
         onClose={() => setPromptTemplateMode(null)}
+      />}
+      {goalTemplateOpen && isPromptTemplateBundleSupported(config?.prompt_template_bundle) && <GoalTemplateModal
+        templates={config?.prompt_templates ?? []}
+        bundle={config.prompt_template_bundle}
+        warnings={config?.prompt_template_warnings}
+        onClose={() => setGoalTemplateOpen(false)}
       />}
     </Modal>
   );

@@ -226,12 +226,12 @@ export interface PromptTemplate {
 }
 
 export interface PromptTemplateBundle {
-  schema_version: 1;
+  schema_version: 3;
   base: string;
   goal: string;
+  goal_template: string;
   plan: string;
   missing_requirement: string;
-  default_context: string;
   team_template_example: string;
 }
 

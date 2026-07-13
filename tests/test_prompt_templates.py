@@ -35,13 +35,38 @@ class TestPromptTemplateResources(unittest.TestCase):
         self.assertEqual(
             set(bundle),
             {
-                "schema_version", "base", "goal", "plan", "missing_requirement",
-                "default_context", "team_template_example",
+                "schema_version", "base", "goal", "goal_template", "plan", "missing_requirement",
+                "team_template_example",
             },
         )
         self.assertTrue(bundle["base"].endswith("<<MODE_CONTRACT>>"))
+        self.assertNotIn("_json", bundle["base"])
         self.assertIn("最終輸出契約：goal.md", bundle["goal"])
         self.assertIn("最終輸出契約：plan.json", bundle["plan"])
+
+    def test_goal_template_is_an_eight_section_artifact_skeleton_for_every_task_type(self):
+        bundle, error = P.prompt_template_bundle()
+        self.assertIsNone(error)
+        template = bundle["goal_template"]
+        lines = template.splitlines()
+        self.assertEqual([line for line in lines if line.startswith("# ")], ["# Goal"])
+        self.assertEqual(
+            [line for line in lines if line.startswith("## ")],
+            P.GOAL_TEMPLATE_HEADINGS,
+        )
+        for placeholder in (
+            "<<TEMPLATE_LABEL>>", "<<TEMPLATE_DESCRIPTION>>",
+            "<<REQUIREMENT_EXAMPLE>>", "<<TEMPLATE_FOCUS>>",
+        ):
+            self.assertIn(placeholder, template)
+        self.assertIn("SC-1", template)
+        self.assertIn("AC-1", template)
+        self.assertNotIn("<original_requirement_json>", template)
+        self.assertNotIn("<project_context_json>", template)
+        self.assertNotIn("外部 Agent 任務：", template)
+        templates, warnings = P.prompt_template_projection({})
+        self.assertFalse(warnings)
+        self.assertEqual(len(templates), len(P.BUILTIN_PROMPT_TEMPLATES))
 
     def test_invalid_resource_makes_entire_bundle_unavailable(self):
         originals = {
@@ -49,6 +74,7 @@ class TestPromptTemplateResources(unittest.TestCase):
             for filename, _, _ in P.PROMPT_RESOURCE_SPECS.values()
         }
         base_name = P.PROMPT_RESOURCE_SPECS["base"][0]
+        goal_template_name = P.PROMPT_RESOURCE_SPECS["goal_template"][0]
         cases = {
             "duplicate": (
                 {base_name: originals[base_name].replace(
@@ -64,6 +90,9 @@ class TestPromptTemplateResources(unittest.TestCase):
                 "marker",
             ),
             "contract-not-last": ({base_name: originals[base_name] + "\n後置文字"}, "結尾"),
+            "goal-template-heading": ({goal_template_name: originals[goal_template_name].replace(
+                "\n## 人工驗收\n", "\n## 手動驗收\n", 1
+            )}, "二級標題"),
         }
         for label, (overrides, expected) in cases.items():
             with self.subTest(case=label), mock.patch.object(
@@ -228,7 +257,7 @@ class TestPromptTemplateCatalog(unittest.TestCase):
         })
         self.assertEqual(len(projected["prompt_templates"]), len(P.BUILTIN_PROMPT_TEMPLATES))
         self.assertTrue(projected["prompt_template_warnings"])
-        self.assertEqual(projected["prompt_template_bundle"]["schema_version"], 1)
+        self.assertEqual(projected["prompt_template_bundle"]["schema_version"], 3)
         self.assertIsNone(projected["prompt_template_bundle_error"])
 
     def test_config_projection_keeps_dashboard_usable_when_fixed_bundle_fails(self):

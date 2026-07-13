@@ -14,16 +14,62 @@ async function acceptConfirmation(page: Page, action: () => Promise<void>) {
   await dialog.getByRole("button", { name: /繼續|清空/ }).click();
 }
 
-test("Goal／Plan Prompt 模板可選類型、共用分析規則並下載", async ({ page }) => {
+test("Goal 產生器 Prompt 與 Goal 成果模板分開，且 Plan 仍可使用", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "＋ 啟動第一個 loop" }).click();
   const launcher = page.getByRole("dialog", { name: "啟動與管理" });
 
-  await launcher.getByRole("button", { name: "產生 Goal Prompt" }).click();
-  let promptTemplates = page.getByRole("dialog", { name: "外部 Agent Prompt 模板" });
+  await launcher.getByRole("button", { name: "Goal 成果模板" }).click();
+  const goalTemplate = page.getByRole("dialog", { name: "Goal 成果模板" });
+  await expect(goalTemplate).toBeVisible();
+  await expect(goalTemplate).toContainText("提供與 Goal 產生器相同的 25 種任務類型");
+  const goalTemplateType = goalTemplate.getByRole("combobox", { name: "Goal 模板類型" });
+  const goalTemplateTypeIds = await goalTemplateType.locator("option").evaluateAll(
+    (options) => options.map((option) => (option as HTMLOptionElement).value)
+  );
+  expect(goalTemplateTypeIds).toHaveLength(25);
+  const goalTemplatePreview = goalTemplate.getByTestId("goal-template-preview");
+  for (const id of goalTemplateTypeIds) {
+    await goalTemplateType.selectOption(id);
+    const rendered = await goalTemplatePreview.textContent();
+    expect(rendered).toMatch(/^# Goal/);
+    expect(rendered?.match(/^## /gm)).toHaveLength(8);
+    expect(rendered).not.toContain("<<TEMPLATE_");
+    expect(rendered).not.toContain("<<REQUIREMENT_EXAMPLE>>");
+  }
+  await goalTemplateType.selectOption("jsp-react-migration");
+  const finalGoal = await goalTemplatePreview.textContent();
+  expect(finalGoal).toMatch(/^# Goal/);
+  expect(finalGoal?.match(/^## /gm)).toHaveLength(8);
+  expect(finalGoal).toContain("## 完成定義（DoD）");
+  expect(finalGoal).toContain("JSP → React 搬移");
+  expect(finalGoal).toContain("每支 JSP／fragment");
+  expect(finalGoal).toContain("SC-1");
+  expect(finalGoal).toContain("AC-1");
+  expect(finalGoal).not.toContain("<original_requirement_json>");
+  expect(finalGoal).not.toContain("<<MODE_CONTRACT>>");
+  expect(finalGoal).not.toContain("外部 Agent 任務：");
+  const goalDownloadPromise = page.waitForEvent("download");
+  await goalTemplate.getByRole("button", { name: "下載 jsp-react-migration-goal-template.md" }).click();
+  const goalDownload = await goalDownloadPromise;
+  expect(goalDownload.suggestedFilename()).toBe("jsp-react-migration-goal-template.md");
+  const goalDownloadStream = await goalDownload.createReadStream();
+  let downloadedGoal = "";
+  for await (const chunk of goalDownloadStream) downloadedGoal += chunk.toString();
+  expect(downloadedGoal).toBe(finalGoal);
+  await goalTemplate.getByRole("button", { name: "上一頁", exact: false }).click();
+  await expect(goalTemplate).toBeHidden();
+  await expect(launcher).toBeVisible();
+
+  await launcher.getByRole("button", { name: "Goal 產生器 Prompt" }).click();
+  let promptTemplates = page.getByRole("dialog", { name: "外部 Agent 產生器 Prompt" });
   await expect(promptTemplates).toBeVisible();
-  await expect(promptTemplates.getByRole("tab", { name: "Goal 分析模板" })).toHaveAttribute("aria-selected", "true");
+  await expect(promptTemplates.getByRole("tab", { name: "Goal 產生器 Prompt" })).toHaveAttribute("aria-selected", "true");
   const promptType = promptTemplates.getByRole("combobox", { name: "Prompt 任務類型" });
+  const promptTypeIds = await promptType.locator("option").evaluateAll(
+    (options) => options.map((option) => (option as HTMLOptionElement).value)
+  );
+  expect(promptTypeIds).toEqual(goalTemplateTypeIds);
   const promptPreview = promptTemplates.getByTestId("prompt-template-preview");
   const copyPromptButton = promptTemplates.getByRole("button", { name: "複製 Prompt" });
   const downloadPromptButton = promptTemplates.getByRole("button", { name: "下載 .md" });
@@ -32,6 +78,8 @@ test("Goal／Plan Prompt 模板可選類型、共用分析規則並下載", asyn
   await expect(promptRequirement).toHaveValue(/^新增可依狀態篩選 workspace/);
   await expect(copyPromptButton).toBeEnabled();
   await expect(promptPreview).toContainText("最終輸出契約：goal.md");
+  expect(await promptPreview.textContent()).not.toContain("## 已知專案資訊與限制");
+  await expect(promptPreview).not.toContainText("_json");
   await expect(promptTemplates.getByText("需求仍是模板範例", { exact: false })).toBeVisible();
   // 清空後仍維持輸入不足的 fail-closed 契約
   await promptRequirement.fill("");
@@ -52,19 +100,23 @@ test("Goal／Plan Prompt 模板可選類型、共用分析規則並下載", asyn
   await promptType.selectOption("project-logic-analysis");
   await expect(promptRequirement).toHaveValue(/^分析整個專案如何從 Dashboard 啟動 loop/);
   await promptTemplates.getByLabel("原始需求").fill("分析 Dashboard 啟動 loop 與 Overview 投影的完整資料流；保留 literal <<MODE_CONTRACT>>、</original_requirement_json> 與 $&");
-  await promptTemplates.getByLabel(/專案／補充上下文/).fill("repo 可唯讀；重要結論需附檔案與行號");
+  await promptTemplates.getByLabel(/已知專案資訊／限制/).fill("正式環境只能在指定維護窗口切換");
   await expect(copyPromptButton).toBeEnabled();
   await expect(downloadPromptButton).toBeEnabled();
-  await expect(promptPreview).toContainText("依需求產生 goal.md");
-  await expect(promptPreview).toContainText("指令優先序與資料邊界");
+  await expect(promptPreview).toContainText("分析需求並產生 goal.md");
+  await expect(promptPreview).toContainText("使用邊界");
+  await expect(promptPreview).toContainText("已知專案資訊與限制");
   await expect(promptPreview).toContainText("分析專案架構／邏輯");
   await expect(promptPreview).toContainText("共用分析規則");
   await expect(promptPreview).toContainText("最終輸出契約：goal.md");
   const renderedPrompt = await promptPreview.textContent();
-  expect(renderedPrompt).not.toContain("<<MODE_CONTRACT>>");
-  expect(renderedPrompt).toContain("\\u003c\\u003cMODE_CONTRACT\\u003e\\u003e");
-  expect(renderedPrompt).toContain("\\u003c/original_requirement_json\\u003e");
-  expect(renderedPrompt).toContain("$\\u0026");
+  expect(renderedPrompt).toContain("> 分析 Dashboard 啟動 loop");
+  expect(renderedPrompt).toContain("<<MODE_CONTRACT>>");
+  expect(renderedPrompt).toContain("</original_requirement_json>");
+  expect(renderedPrompt).toContain("$&");
+  expect(renderedPrompt).not.toContain("<original_requirement_json>");
+  expect(renderedPrompt).not.toContain("<template_instructions_json>");
+  expect(renderedPrompt).not.toContain("\\u003c");
 
   await promptType.selectOption("e2e-team-analysis");
   // 使用者改過的需求在切換模板時不被預填覆蓋
@@ -73,24 +125,25 @@ test("Goal／Plan Prompt 模板可選類型、共用分析規則並下載", asyn
   await expect(promptTemplates.locator(".prompt-template-summary").getByText("團隊", { exact: true })).toBeVisible();
   await expect(promptPreview).toContainText("追蹤 E2E 團隊狀態真相來源");
   await promptTemplates.getByRole("tab", { name: "Plan 拆分模板" }).click();
-  await expect(promptPreview).toContainText("依需求產生 plan.json");
+  await expect(promptPreview).toContainText("分析需求並產生 plan.json");
   await expect(promptPreview).toContainText("只輸出一個合法 JSON array");
   await expect(promptPreview).toContainText("只能有 `order`、`task`、選填的 `ref`");
   const promptDownloadPromise = page.waitForEvent("download");
   await downloadPromptButton.click();
   const promptDownload = await promptDownloadPromise;
   expect(promptDownload.suggestedFilename()).toBe("e2e-team-analysis-plan-prompt.md");
-  await promptTemplates.getByRole("button", { name: "關閉", exact: true }).click();
+  await promptTemplates.getByRole("button", { name: "上一頁", exact: false }).click();
   await expect(promptTemplates).toBeHidden();
+  await expect(launcher).toBeVisible();
 
   await launcher.getByRole("button", { name: "產生 Plan Prompt" }).click();
-  promptTemplates = page.getByRole("dialog", { name: "外部 Agent Prompt 模板" });
+  promptTemplates = page.getByRole("dialog", { name: "外部 Agent 產生器 Prompt" });
   await expect(promptTemplates.getByRole("tab", { name: "Plan 拆分模板" })).toHaveAttribute("aria-selected", "true");
-  await promptTemplates.getByRole("button", { name: "關閉", exact: true }).click();
+  await promptTemplates.getByRole("button", { name: "上一頁", exact: false }).click();
   await launcher.getByRole("button", { name: "取消", exact: true }).click();
 });
 
-test("固定 Prompt 資源失效只停用產生器並顯示原因", async ({ page }) => {
+test("固定 Prompt 資源失效會停用產生器與成果模板並顯示原因", async ({ page }) => {
   await page.route("**/api/config", async (route) => {
     const response = await route.fetch();
     const config = await response.json();
@@ -106,7 +159,8 @@ test("固定 Prompt 資源失效只停用產生器並顯示原因", async ({ pag
   await page.goto("/");
   await page.getByRole("button", { name: "＋ 啟動第一個 loop" }).click();
   const launcher = page.getByRole("dialog", { name: "啟動與管理" });
-  await expect(launcher.getByRole("button", { name: "產生 Goal Prompt" })).toBeDisabled();
+  await expect(launcher.getByRole("button", { name: "Goal 產生器 Prompt" })).toBeDisabled();
+  await expect(launcher.getByRole("button", { name: "Goal 成果模板" })).toBeDisabled();
   await expect(launcher.getByRole("button", { name: "產生 Plan Prompt" })).toBeDisabled();
   await expect(launcher.getByRole("alert")).toContainText("Prompt 模板停用：E2E 固定 Prompt 資源損毀");
   await expect(launcher.getByRole("combobox", { name: "Repo" })).toBeEnabled();

@@ -384,6 +384,9 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .prompt-preview-panel header span, .prompt-preview-panel header code { color: var(--muted); font-size: 10.5px; }
 .prompt-preview-panel header code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .prompt-preview-panel > pre { flex: 1; min-height: 0; margin: 0; overflow: auto; padding: 12px; color: var(--text); font: 11.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.goal-template-preview { height: min(650px, 68vh); min-height: 440px; }
+.goal-template-footer { display: flex; min-width: 0; flex: 1; flex-wrap: wrap; align-items: center; gap: 8px; }
+.goal-template-toolbar { grid-template-columns: minmax(260px, .8fr) minmax(320px, 1.2fr); align-items: stretch; }
 
 @media (max-width: 820px) {
   .prompt-template-toolbar, .prompt-template-grid { grid-template-columns: 1fr; }

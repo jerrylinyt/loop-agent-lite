@@ -14,25 +14,44 @@ TEMPLATE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 PROMPT_PLACEHOLDER_RE = re.compile(r"<<[A-Z][A-Z0-9_]*>>")
 PROMPT_MARKER_RE = re.compile(r"<<[^\r\n]*?>>")
 MAX_PROMPT_RESOURCE_CHARS = 100_000
-PROMPT_TEMPLATE_BUNDLE_SCHEMA_VERSION = 1
+PROMPT_TEMPLATE_BUNDLE_SCHEMA_VERSION = 3
+GOAL_TEMPLATE_HEADINGS = [
+    "## 目標",
+    "## 背景與現況",
+    "## 範圍",
+    "## 非目標",
+    "## 限制與相容性",
+    "## 完成定義（DoD）",
+    "## 人工驗收",
+    "## 待確認事項",
+]
 PROMPT_RESOURCE_SPECS = {
     "base": (
         "external-agent-base.md",
         {
             "<<OUTPUT_NAME>>": 1,
-            "<<ORIGINAL_REQUIREMENT_JSON>>": 1,
-            "<<PROJECT_CONTEXT_JSON>>": 1,
-            "<<TEMPLATE_LABEL_JSON>>": 1,
-            "<<TEMPLATE_DESCRIPTION_JSON>>": 1,
-            "<<TEMPLATE_INSTRUCTIONS_JSON>>": 1,
+            "<<ORIGINAL_REQUIREMENT_BLOCK>>": 1,
+            "<<PROJECT_CONTEXT_SECTION>>": 1,
+            "<<TEMPLATE_LABEL>>": 1,
+            "<<TEMPLATE_DESCRIPTION>>": 1,
+            "<<TEMPLATE_INSTRUCTIONS>>": 1,
             "<<MODE_CONTRACT>>": 1,
         },
         True,
     ),
     "goal": ("external-agent-goal.md", {}, False),
+    "goal_template": (
+        "external-agent-goal-template.md",
+        {
+            "<<TEMPLATE_LABEL>>": 1,
+            "<<TEMPLATE_DESCRIPTION>>": 1,
+            "<<REQUIREMENT_EXAMPLE>>": 1,
+            "<<TEMPLATE_FOCUS>>": 1,
+        },
+        False,
+    ),
     "plan": ("external-agent-plan.md", {}, False),
     "missing_requirement": ("external-agent-missing.md", {"<<OUTPUT_NAME>>": 2}, False),
-    "default_context": ("external-agent-default-context.md", {}, False),
     "team_template_example": ("external-agent-team-template-example.md", {}, False),
 }
 TEAM_TEMPLATE_KEYS = {
@@ -351,6 +370,26 @@ def _read_prompt_resource(filename):
     )
 
 
+def _validate_goal_template(value):
+    """成果模板骨架必須符合 goal.md 八段契約，且不可混入舊版資料邊界。"""
+    lines = value.splitlines()
+    h1 = [line for line in lines if line.startswith("# ")]
+    headings = [line for line in lines if line.startswith("## ")]
+    if h1 != ["# Goal"]:
+        return "必須且只能包含一個 # Goal"
+    if headings != GOAL_TEMPLATE_HEADINGS:
+        return "八個二級標題名稱或順序不符合 Goal 契約"
+    for index, heading in enumerate(GOAL_TEMPLATE_HEADINGS):
+        start = lines.index(heading) + 1
+        end = lines.index(GOAL_TEMPLATE_HEADINGS[index + 1]) if index + 1 < len(headings) else len(lines)
+        if not any(line.strip() for line in lines[start:end]):
+            return f"{heading} 不可為空"
+    forbidden = ("original_requirement_json", "project_context_json", "外部 Agent 任務")
+    if any(token in value for token in forbidden):
+        return "不可包含外部 Agent 產生器指令或 JSON 資料邊界"
+    return None
+
+
 @lru_cache(maxsize=1)
 def prompt_template_bundle():
     """載入 package 內的固定 prompt 資源；缺檔或 placeholder 漂移時整包 fail-closed。"""
@@ -401,6 +440,11 @@ def prompt_template_bundle():
         if contract_last and not value.endswith("<<MODE_CONTRACT>>"):
             errors.append(f"固定 Prompt 資源 {filename} 必須以 <<MODE_CONTRACT>> 結尾")
             continue
+        if key == "goal_template":
+            template_error = _validate_goal_template(value)
+            if template_error:
+                errors.append(f"固定 Prompt 資源 {filename} 格式不合法：{template_error}")
+                continue
         bundle[key] = value
     if errors or len(bundle) != len(PROMPT_RESOURCE_SPECS):
         return None, "；".join(errors) or "固定 Prompt 資源不完整"

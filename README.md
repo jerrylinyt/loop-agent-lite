@@ -121,7 +121,7 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 - 停止狀態可「🗄 封存」workspace：整個目錄以 UUID 封存 ID 移到 `workspace/.archive/`，target repo 不受影響；工具列的「🗃 已封存」可列出、安全還原或在雙重確認後永久刪除，還原不會自動啟動 loop。執行中、鎖定中、symlink 或目標名稱已存在時一律拒絕；永久刪除只作用於封存目錄，不會碰 target repo。
 - 啟動表單進階設定內的「🔔 管理終態通知」可編輯、儲存並以 `status=test` 實測 `notify_cmd`（佔位符 `{status}`、`{name}`）。
 - 啟動表單的「完整健檢」會檢查目前已 commit repo 的 git／鎖／乾淨工作樹／goal 與 Validate，不建 state、不啟動 Agent；待匯入 goal、plan、reset 或新 branch 時會停用，實際啟動仍會再驗一次。
-- 啟動表單在 `goal.md` 與 `plan.json` 旁提供「產生 Goal Prompt／Plan Prompt」：選任務類型後需求欄會預填該模板範例（已輸入的內容不會被切換模板覆蓋，清空則維持輸入不足的擋下行為），改成實際需求並選填上下文後，可即時預覽、複製或下載 `.md` 給外部 Agent。兩種模式共用盤點、證據、範圍與 DoD 規則；Goal 模式只接受可存成 `goal.md` 的 Markdown，Plan 模式只接受可直接匯入且欄位限於 `order/task/ref` 的 JSON array。產生與下載都只在瀏覽器進行，不會改動 repo 或 workspace。
+- 啟動表單在 `goal.md` 旁將「Goal 產生器 Prompt」與「Goal 成果模板」分成兩個入口：前者把需求、選填的專案限制與任務類型編譯成可直接貼給 Agent 的自然 Markdown，不再外露 `_json` 標籤，空白補充資訊也不會產生佔位段落；後者沿用 Goal 產生器的完整任務類型清單，逐類提供符合現行八段契約、具 SC／AC 追溯與 DoD 骨架的 `goal.md` 參考模板。兩個子視窗都可由「上一頁」回到啟動表單。`plan.json` 旁仍提供 Plan 產生器 Prompt，輸出只接受欄位限於 `order/task/ref` 的 JSON array。以上操作都只在瀏覽器進行，不會改動 repo 或 workspace。
 - 正常要停時用「本輪後停止」：目前 Agent、Validate 與 state/history 落盤完成後才停，不會啟動下一輪。
 - 本輪尚未結束前按「↩ 繼續運行」可撤銷平順停止；如果 loop 已取走請求，會明確告知這一輪仍會收尾停止。
 - Agent CLI 卡死或明顯失控時用「立即停止」；它會中斷目前 round，state 可在下次運行時續用。
