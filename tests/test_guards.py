@@ -784,6 +784,113 @@ class TestCompletionSignalControlsRound(unittest.TestCase):
             self.assertIn("signal=done", history)
             self.assertIn("agent_ok=True", history)
 
+    def test_missing_plan_signal_with_clean_repo_preserves_flag(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            plan = root / "plan.json"
+            plan.write_text('[{"order": 1, "task": "only task"}]')
+            agent = root / "agent.py"
+            agent.write_text(
+                "import os, subprocess, sys\n"
+                "from pathlib import Path\n"
+                "sys.stdin.read()\n"
+                "marker = Path(__file__).with_suffix('.once')\n"
+                "if not marker.exists():\n"
+                "    subprocess.run([sys.executable, '-m', 'engine.work', 'plan-ok'], "
+                "env=dict(os.environ), check=True)\n"
+                "    marker.write_text('done')\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+
+            result = subprocess.run(
+                [*LOOP_CMD, "--repo", str(repo), "--name", "clean-plan-missing",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--import-plan", str(plan),
+                 "--start-phase", "plan", "--max-rounds", "2"],
+                capture_output=True, text=True, env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            state = json.loads((workspace_root / "clean-plan-missing" / "state.json").read_text())
+            self.assertEqual(state["flag"], 1)
+            self.assertEqual(state["agent_failure_streak"], 1)
+            self.assertFalse(L.is_dirty(repo))
+            self.assertIn("repo 無異動，保留既有規劃共識", result.stdout)
+
+    def test_missing_done_with_clean_repo_preserves_done_consensus(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            plan = root / "plan.json"
+            plan.write_text('[{"order": 1, "task": "only task"}]')
+            agent = root / "agent.py"
+            agent.write_text(
+                "import os, subprocess, sys\n"
+                "from pathlib import Path\n"
+                "sys.stdin.read()\n"
+                "marker = Path(__file__).with_suffix('.once')\n"
+                "if not marker.exists():\n"
+                "    subprocess.run([sys.executable, '-m', 'engine.work', 'done', 'task-1'], "
+                "env=dict(os.environ), check=True)\n"
+                "    marker.write_text('done')\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+
+            result = subprocess.run(
+                [*LOOP_CMD, "--repo", str(repo), "--name", "clean-done-missing",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--import-plan", str(plan),
+                 "--start-phase", "exec", "--done-threshold", "2", "--max-rounds", "2"],
+                capture_output=True, text=True, env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            state = json.loads((workspace_root / "clean-done-missing" / "state.json").read_text())
+            self.assertEqual(state["done_count"], 1)
+            self.assertEqual(state["agent_failure_streak"], 1)
+            self.assertFalse(L.is_dirty(repo))
+            self.assertIn("repo 無異動且驗證通過，保留 done 共識 1", result.stdout)
+
+    def test_missing_done_with_dirty_worktree_resets_done_consensus(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            plan = root / "plan.json"
+            plan.write_text('[{"order": 1, "task": "only task"}]')
+            agent = root / "agent.py"
+            agent.write_text(
+                "import os, subprocess, sys\n"
+                "from pathlib import Path\n"
+                "sys.stdin.read()\n"
+                "marker = Path(__file__).with_suffix('.once')\n"
+                "if not marker.exists():\n"
+                "    subprocess.run([sys.executable, '-m', 'engine.work', 'done', 'task-1'], "
+                "env=dict(os.environ), check=True)\n"
+                "    marker.write_text('done')\n"
+                "else:\n"
+                "    Path('dirty.txt').write_text('changed')\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+
+            result = subprocess.run(
+                [*LOOP_CMD, "--repo", str(repo), "--name", "dirty-done-missing",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--import-plan", str(plan),
+                 "--start-phase", "exec", "--done-threshold", "2", "--max-rounds", "2"],
+                capture_output=True, text=True, env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            state = json.loads((workspace_root / "dirty-done-missing" / "state.json").read_text())
+            self.assertEqual(state["done_count"], 0)
+            self.assertEqual(state["agent_failure_streak"], 1)
+            self.assertTrue(L.is_dirty(repo))
+            self.assertIn("偵測到程式碼或 commit 變更", result.stdout)
+
 
 class TestPauseAfterPlan(unittest.TestCase):
     """規劃收斂後暫停:loop 停在執行期起點,人工按「▶ 運行」才開始執行輪。"""

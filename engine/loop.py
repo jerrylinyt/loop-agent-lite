@@ -9,9 +9,10 @@
 
 收斂機制(共識 AND gate):
 - 規劃期:agent call plan-ok 且該輪無任何異動 → flag+1;call create-plan(不論成敗)
-  或有任何異動/未回完成訊號 → flag 歸零;flag > 10 → 執行期。
+  或有任何異動 → flag 歸零;未回完成訊號但 repo 無異動時保留 flag;flag > 10 → 執行期。
 - 執行期:per-task 內圈——agent call done(task id 正確)且 HEAD 沒動、工作樹乾淨、
-  驗證綠、Agent 未逾時 → done+1;有異動/驗證紅/未回 done/逾時 → done 歸零;
+  驗證綠、Agent 未逾時 → done+1;有異動/驗證紅 → done 歸零;未回 done 但 repo
+  無異動時視為 Agent 異常並保留 done;
   done ≥ threshold(預設 3)→ 派下一個任務。
 
 防線(全部機械、可關可調):
@@ -1601,7 +1602,8 @@ def reset_run_artifacts(workspace) -> None:
 
 
 def process_plan_round(state, workspace, round_token: str, *, tampered, changed,
-                       agent_failed: bool, flag_threshold: int) -> str:
+                       agent_failed: bool, completion_missing: bool,
+                       flag_threshold: int) -> str:
     """套用規劃期訊號與共識規則，必要時切換到執行期，回傳本輪事件摘要。"""
     event = ""
     if workspace.signal("called_create_plan", round_token):
@@ -1616,7 +1618,7 @@ def process_plan_round(state, workspace, round_token: str, *, tampered, changed,
         else:
             event = "❌ create-plan 校驗未通過｜保留原計畫"
             log(event)
-    elif tampered or changed or agent_failed:
+    elif tampered or changed or (agent_failed and not completion_missing):
         state["flag"] = 0
     elif workspace.signal("signal_plan_ok", round_token):
         log("📨 Agent 指令｜plan-ok（確認目前計畫）")
@@ -1627,7 +1629,7 @@ def process_plan_round(state, workspace, round_token: str, *, tampered, changed,
             state["notes"].append("plan 仍為空,plan-ok 不計數。請先 create-plan。")
             log("⚠️ plan-ok 未計數｜目前計畫為空，請先 create-plan")
     elif not tampered:
-        log("ℹ️ Agent 本輪未送出 create-plan 或 plan-ok｜規劃共識不增加")
+        log("ℹ️ Agent 本輪未送出 create-plan 或 plan-ok｜repo 無異動，保留既有規劃共識")
 
     if state["flag"] > flag_threshold:
         state["phase"] = "exec"
@@ -1647,7 +1649,7 @@ def process_plan_round(state, workspace, round_token: str, *, tampered, changed,
 def process_exec_round(state, workspace, round_token: str, *, task_id: str,
                        round_number: int, repo: Path, protected, validate_cmd,
                        args, head_after: str, dirty: bool, tampered, changed,
-                       agent_failed: bool):
+                       agent_failed: bool, completion_missing: bool):
     """套用執行期 done/Validate/reset 狀態機，回傳事件摘要與驗證結果。"""
     event = ""
     done_signaled = workspace.signal("signal_done", round_token)
@@ -1677,16 +1679,20 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
             f"還是前一個 agent 沒做完,把它修好讓驗證過了再繼續。輸出尾段:\n{fenced_block(tail)}")
     if create_signaled:
         state["notes"].append("執行期計畫已凍結,create-plan 被忽略。任務本身有問題請在 log/commit 說明,交人處理。")
-    if tampered or changed or agent_failed or create_signaled:
+    reset_consensus = (tampered or changed or create_signaled or
+                       (agent_failed and not completion_missing))
+    if reset_consensus:
         state["done_count"] = 0
         reason = ("本輪被判定作廢" if tampered else
-                  "Agent round 未正常結束" if agent_failed else
                   "執行期誤打 create-plan，不能同時算完成票" if create_signaled else
-                  "偵測到程式碼或 commit 變更，等待下一輪確認")
+                  "偵測到程式碼或 commit 變更，等待下一輪確認" if changed else
+                  "Agent round 未正常結束")
         log(f"↩️ done 共識歸零｜{reason}")
-    elif done_signaled and ok:
+    elif done_signaled and ok and not agent_failed:
         state["done_count"] += 1
         log(f"✅ done 共識累計｜{state['done_count']} / {args.done_threshold}")
+    elif completion_missing and ok:
+        log(f"ℹ️ Agent 本輪未送出 done｜repo 無異動且驗證通過，保留 done 共識 {state['done_count']}")
 
     if state["done_count"] >= args.done_threshold:
         state["completed"].append({"order": state["current_order"], "sha": head_after,
@@ -2095,14 +2101,15 @@ def main():
         if phase == "plan":
             event = process_plan_round(
                 state, ws, round_token, tampered=tampered, changed=changed,
-                agent_failed=agent_failed, flag_threshold=args.flag_threshold)
+                agent_failed=agent_failed, completion_missing=missing_done,
+                flag_threshold=args.flag_threshold)
             validate_note = "-"
         else:
             event, validate_note = process_exec_round(
                 state, ws, round_token, task_id=task_id, round_number=rnd, repo=repo,
                 protected=protected, validate_cmd=validate_cmd, args=args,
                 head_after=head_after, dirty=dirty, tampered=tampered, changed=changed,
-                agent_failed=agent_failed)
+                agent_failed=agent_failed, completion_missing=missing_done)
 
         ingest_pending_issues(ws, state, round_token, rnd, task_id, phase)
 
