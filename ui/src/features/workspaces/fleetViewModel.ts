@@ -3,14 +3,6 @@ import type { WorkspaceSummary } from "../../shared/api/types";
 
 export type FleetFilter = "all" | "attention" | "running" | "done";
 export type FleetSort = "name" | "attention" | "running" | "progress";
-export interface SavedFleetView {
-  id: string;
-  name: string;
-  filter: FleetFilter;
-  search: string;
-  sort: FleetSort;
-  compact: boolean;
-}
 
 const FLEET_FILTERS: FleetFilter[] = ["all", "attention", "running", "done"];
 const FLEET_SORTS: FleetSort[] = ["name", "attention", "running", "progress"];
@@ -42,20 +34,6 @@ export function initialFleetFilter(): FleetFilter {
 export function initialFleetSort(): FleetSort {
   const saved = localStorage.getItem("fleet-sort") as FleetSort | null;
   return saved && FLEET_SORTS.includes(saved) ? saved : "name";
-}
-
-export function loadSavedViews(): SavedFleetView[] {
-  // 個人視圖不是 coordinator truth；解析失敗直接回空，且最多載入 20 組。
-  try {
-    const value = JSON.parse(localStorage.getItem("fleet-saved-views") ?? "[]") as unknown;
-    if (!Array.isArray(value)) return [];
-    return value.filter((item): item is SavedFleetView => !!item && typeof item === "object" &&
-      typeof (item as SavedFleetView).id === "string" && typeof (item as SavedFleetView).name === "string" &&
-      FLEET_FILTERS.includes((item as SavedFleetView).filter) && FLEET_SORTS.includes((item as SavedFleetView).sort) &&
-      typeof (item as SavedFleetView).search === "string" && typeof (item as SavedFleetView).compact === "boolean").slice(0, 20);
-  } catch {
-    return [];
-  }
 }
 
 export function formatMetric(seconds: number | null): string {

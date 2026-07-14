@@ -569,9 +569,6 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .fleet-sort { min-width: 126px; }
 .compact-toggle { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; white-space: nowrap; }
 .compact-toggle input { width: auto; min-height: auto; }
-.saved-view-row { display: flex; align-items: center; gap: 8px; margin: -4px 0 12px; }
-.saved-view-row select { min-width: 170px; }
-.saved-view-row input { min-height: 30px; max-width: 220px; }
 .fleet-overview.compact-cards .fleet-card-analysis,
 .fleet-overview.compact-cards .fleet-card-analysis-empty,
 .fleet-overview.compact-cards .fleet-card-repo { display: none; }

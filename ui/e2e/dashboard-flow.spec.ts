@@ -453,15 +453,6 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await fleetSearch.fill("");
   await overview.getByLabel("Workspace 排序").selectOption("progress");
   await overview.getByLabel("精簡卡片").check();
-  await overview.getByRole("button", { name: "儲存目前視圖" }).click();
-  await overview.getByLabel("監控視圖名稱").fill("E2E 值班牆");
-  await overview.getByRole("button", { name: "儲存", exact: true }).click();
-  await expect(overview.getByLabel("已儲存監控視圖")).toHaveValue(/view-/);
-  await overview.getByLabel("Workspace 排序").selectOption("name");
-  await overview.getByLabel("精簡卡片").uncheck();
-  await overview.getByLabel("已儲存監控視圖").selectOption({ label: "E2E 值班牆" });
-  await expect(overview.getByLabel("Workspace 排序")).toHaveValue("progress");
-  await expect(overview.getByLabel("精簡卡片")).toBeChecked();
   await overview.getByLabel("精簡卡片").uncheck();
   const fleetCard = overview.locator(".fleet-card", { hasText: "e2e-workspace" });
   await expect(fleetCard).toBeVisible();

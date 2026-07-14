@@ -1,4 +1,4 @@
-/** Fleet 監控總覽：聚合工作區、效能與事件，並處理本機視圖、篩選、排序及有條件的批次操作。 */
+/** Fleet 監控總覽：聚合工作區、效能與事件，並處理篩選、排序及有條件的批次操作。 */
 import { useEffect, useMemo, useState } from "react";
 import type { FleetHistoryEntry, FleetRoundMetrics, WorkspaceSummary } from "../../shared/api/types";
 import AnomalyLogModal from "./AnomalyLogModal";
@@ -8,10 +8,10 @@ import { postJson } from "../../shared/api/client";
 import ActionDialog from "../../shared/components/ActionDialog";
 import FleetWorkspaceCard from "./FleetWorkspaceCard";
 import {
-  formatMetric, initialFleetFilter, initialFleetSort, loadSavedViews,
+  formatMetric, initialFleetFilter, initialFleetSort,
   visibleFleetWorkspaces, workspaceNeedsAttention,
 } from "./fleetViewModel";
-import type { FleetFilter, FleetSort, SavedFleetView } from "./fleetViewModel";
+import type { FleetFilter, FleetSort } from "./fleetViewModel";
 
 /** 監控電視牆:聚合統計 + 全 fleet 即時卡片 + 事件推播。
  * 卡片與歷史事件都走同一條 SSE；事件流仍由前端從 history 尾段推導。 */
@@ -35,11 +35,6 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
   const [search, setSearch] = useState(() => localStorage.getItem("fleet-search") ?? "");
   const [sort, setSort] = useState<FleetSort>(initialFleetSort);
   const [compact, setCompact] = useState(() => localStorage.getItem("fleet-compact") === "1");
-  const [savedViews, setSavedViews] = useState<SavedFleetView[]>(loadSavedViews);
-  const [selectedView, setSelectedView] = useState("");
-  const [savingView, setSavingView] = useState(false);
-  const [viewName, setViewName] = useState("");
-  const [viewMessage, setViewMessage] = useState("");
   const [anomaliesOpen, setAnomaliesOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [selectedNames, setSelectedNames] = useState<string[]>([]);
@@ -76,65 +71,19 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
 
   const changeFilter = (next: FleetFilter) => {
     setFilter(next);
-    setSelectedView("");
     localStorage.setItem("fleet-filter", next);
   };
   const changeSearch = (next: string) => {
     setSearch(next);
-    setSelectedView("");
     localStorage.setItem("fleet-search", next);
   };
   const changeSort = (next: FleetSort) => {
     setSort(next);
-    setSelectedView("");
     localStorage.setItem("fleet-sort", next);
   };
   const changeCompact = (next: boolean) => {
     setCompact(next);
-    setSelectedView("");
     localStorage.setItem("fleet-compact", next ? "1" : "0");
-  };
-  const persistViews = (views: SavedFleetView[]) => {
-    setSavedViews(views);
-    localStorage.setItem("fleet-saved-views", JSON.stringify(views));
-  };
-  const saveView = () => {
-    const name = viewName.trim();
-    if (!name) return setViewMessage("請輸入視圖名稱");
-    if (name.length > 40) return setViewMessage("視圖名稱不可超過 40 字");
-    const existing = savedViews.find((item) => item.name === name);
-    const next: SavedFleetView = {
-      id: existing?.id ?? `view-${Date.now().toString(36)}`,
-      name, filter, search, sort, compact
-    };
-    const views = existing ? savedViews.map((item) => item.id === existing.id ? next : item)
-      : [...savedViews, next].slice(-20);
-    persistViews(views);
-    setSelectedView(next.id);
-    setSavingView(false);
-    setViewName("");
-    setViewMessage(`已儲存「${name}」`);
-  };
-  const applyView = (id: string) => {
-    setSelectedView(id);
-    const view = savedViews.find((item) => item.id === id);
-    if (!view) return;
-    setFilter(view.filter);
-    setSearch(view.search);
-    setSort(view.sort);
-    setCompact(view.compact);
-    localStorage.setItem("fleet-filter", view.filter);
-    localStorage.setItem("fleet-search", view.search);
-    localStorage.setItem("fleet-sort", view.sort);
-    localStorage.setItem("fleet-compact", view.compact ? "1" : "0");
-    setViewMessage(`已套用「${view.name}」`);
-  };
-  const deleteView = () => {
-    const selected = savedViews.find((item) => item.id === selectedView);
-    if (!selected) return;
-    persistViews(savedViews.filter((item) => item.id !== selected.id));
-    setSelectedView("");
-    setViewMessage(`已刪除「${selected.name}」`);
   };
 
   const running = workspaces.filter((workspace) => workspace.running).length;
@@ -204,16 +153,6 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
         </select>
         <label className="compact-toggle"><input type="checkbox" checked={compact} onChange={(event) => changeCompact(event.target.checked)} /> 精簡卡片</label>
         <span className="muted">顯示 {visibleWorkspaces.length} / {workspaces.length}</span>
-      </div>
-      <div className="saved-view-row">
-        <select aria-label="已儲存監控視圖" value={selectedView} onChange={(event) => applyView(event.target.value)}>
-          <option value="">已儲存視圖…</option>
-          {savedViews.map((view) => <option key={view.id} value={view.id}>{view.name}</option>)}
-        </select>
-        {!savingView && <button type="button" className="secondary-button compact-button" onClick={() => { setSavingView(true); setViewMessage(""); }}>儲存目前視圖</button>}
-        {savingView && <><input aria-label="監控視圖名稱" placeholder="例如：值班問題牆" value={viewName} onChange={(event) => setViewName(event.target.value)} maxLength={40} /><button type="button" className="primary-button compact-button" onClick={saveView}>儲存</button><button type="button" className="secondary-button compact-button" onClick={() => setSavingView(false)}>取消</button></>}
-        <button type="button" className="danger-button compact-button" disabled={!selectedView} onClick={deleteView}>刪除視圖</button>
-        <span className="muted" role="status">{viewMessage || `${savedViews.length}/20 個個人視圖`}</span>
       </div>
       {!readonly && <div className="bulk-toolbar">
         <button type="button" className="secondary-button compact-button" aria-expanded={bulkOpen} onClick={() => setBulkOpen((value) => !value)}>批次操作</button>
