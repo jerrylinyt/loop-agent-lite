@@ -22,6 +22,7 @@ const PHASE_NAMES = { plan: "規劃期", exec: "執行期", done: "完成" };
 type WorkspaceModal = "config" | "goal" | "history" | "issues" | "report" | "prompt" | "timeline" | "runCompare";
 const WORKSPACE_MUTATIONS = {
   run: { url: "/api/run", busy: "run" },
+  resume: { url: "/api/resume", busy: "resume" },
   drain: { url: "/api/drain", busy: "drain" },
   cancelDrain: { url: "/api/cancel-drain", busy: "cancelDrain" },
   stop: { url: "/api/stop", busy: "stop" },
@@ -52,7 +53,7 @@ export default function WorkspaceView({
   const [activeModal, setActiveModal] = useState<WorkspaceModal | null>(null);
   const [statusHeight, setStatusHeight] = useState(() => +(localStorage.getItem("status-console-height") || 220));
   const [statusCollapsed, setStatusCollapsed] = useState(() => localStorage.getItem("status-console-collapsed") === "1");
-  const [busyAction, setBusyAction] = useState<"run" | "drain" | "cancelDrain" | "stop" | null>(null);
+  const [busyAction, setBusyAction] = useState<"run" | "resume" | "drain" | "cancelDrain" | "stop" | null>(null);
   const [dialog, setDialog] = useState<{
     title: string;
     message: string;
@@ -208,6 +209,7 @@ export default function WorkspaceView({
                 : <button type="button" className="secondary-button" disabled={busyAction !== null} onClick={() => void mutate("cancelDrain", { name: workspace.name })}>{busyAction === "cancelDrain" ? "撤銷中…" : "繼續運行"}</button>
               : <button type="button" className="secondary-button" disabled={busyAction !== null} onClick={() => void mutate("drain", { name: workspace.name })}>{busyAction === "drain" ? "要求中…" : "本輪後停止"}</button>)}
             <button type="button" className={workspace.running ? "danger-button" : "success-button"} disabled={busyAction !== null} onClick={() => void mutate(workspace.running ? "stop" : "run", { name: workspace.name })}>{busyAction === "stop" ? "停止中…" : busyAction === "run" ? "啟動中…" : workspace.running ? "立即停止" : "運行"}</button>
+            {!workspace.running && workspace.resume_available && <button type="button" className="primary-button" disabled={busyAction !== null} title="保留中斷輪的工作區變更，沿用既有綠點並略過啟動 Validate" onClick={() => void mutate("resume", { name: workspace.name })}>{busyAction === "resume" ? "Resume 中…" : "Resume"}</button>}
             {canChange && state.phase === "plan" && total > 0 && <button type="button" className="secondary-button" onClick={() => changePhase("exec")}>進執行期</button>}
             {canChange && (state.phase === "exec" || state.phase === "done") && <button type="button" className="secondary-button" onClick={() => changePhase("plan")}>回規劃期</button>}
             {canChange && <button type="button" className="secondary-button" onClick={() => setActiveModal("config")}>設定</button>}

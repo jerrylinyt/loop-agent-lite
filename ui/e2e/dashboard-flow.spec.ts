@@ -166,6 +166,52 @@ test("固定 Prompt 資源失效會停用產生器與成果模板並顯示原因
   await expect(launcher.getByRole("combobox", { name: "Repo" })).toBeEnabled();
 });
 
+test("符合中斷續跑條件時顯示 Resume 並呼叫獨立 endpoint", async ({ page }) => {
+  const workspace = {
+    name: "resume-ready", phase: "exec", running: false, round: 3,
+    completed: 0, plan_len: 1, done_count: 0, resume_available: true,
+  };
+  const state = {
+    phase: "exec", round: 3, flag: 0, done_count: 0, red_streak: 0, stall_rounds: 0,
+    plan_version: 1, current_order: 1, completed: [], issues: [],
+    round_started_at: "2026-07-14T10:00:00+08:00",
+    round_deadline_at: "2026-07-14T10:30:00+08:00",
+    round_interrupted_at: "2026-07-14T10:05:00+08:00",
+    plan: [{ order: 1, task: "接手 Agent 未完成變更", ref: null }],
+    config: { flag_threshold: 10, done_threshold: 3, red_limit: 20, stall_limit: 300 },
+  };
+  let resumeCalled = false;
+  await page.route("**/api/workspaces", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify([workspace]) });
+  });
+  await page.route("**/api/health", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({
+      schema_version: 1, status: "ok", workspace_count: 1, running: 0, attention: 0,
+      error_count: 0, issues: 0, unread_issues: 0, agent_failures: 0,
+      round_timeouts: 0, state_recoveries: 0, goal_changes: 0, stale_loop_pids: 0,
+      generated_at: "2026-07-14T10:05:00+08:00",
+    }) });
+  });
+  await page.route("**/api/events?**", async (route) => {
+    await route.fulfill({
+      contentType: "text/event-stream",
+      body: `event: workspaces\ndata: ${JSON.stringify([workspace])}\n\nevent: state\ndata: ${JSON.stringify(state)}\n\n`,
+    });
+  });
+  await page.route("**/api/resume", async (route) => {
+    resumeCalled = true;
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true }) });
+  });
+
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "resume-ready" })).toBeVisible();
+  const resume = page.getByRole("button", { name: "Resume", exact: true });
+  await expect(resume).toBeVisible();
+  await expect(resume).toHaveAttribute("title", /略過啟動 Validate/);
+  await resume.click();
+  expect(resumeCalled).toBeTruthy();
+});
+
 test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、phase 與進度", async ({ page }) => {
   test.setTimeout(90_000);
   await page.goto("/");

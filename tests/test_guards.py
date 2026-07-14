@@ -602,6 +602,189 @@ class TestLiveRoundTiming(unittest.TestCase):
                     process.wait()
 
 
+class TestInterruptedResume(unittest.TestCase):
+    """只有執行期中斷、dirty 且綠點合法時，才可略過啟動 Validate 接手現場。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_resume_skips_only_startup_validate_and_keeps_interrupted_worktree(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            plan = root / "plan.json"
+            plan.write_text('[{"order": 1, "task": "finish interrupted work"}]')
+            counter = root / "validate-count"
+            validator = root / "validator.py"
+            validator.write_text(
+                "from pathlib import Path\n"
+                f"p = Path({str(counter)!r})\n"
+                "p.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')\n"
+            )
+            agent = root / "resume_agent.py"
+            agent.write_text(
+                "import os, subprocess, sys, time\n"
+                "from pathlib import Path\n"
+                "sys.stdin.read()\n"
+                "wip = Path('agent-wip.txt')\n"
+                "if not wip.exists():\n"
+                "    wip.write_text('unfinished\\n')\n"
+                "    time.sleep(30)\n"
+                "else:\n"
+                "    wip.write_text(wip.read_text() + 'resumed\\n')\n"
+                "    subprocess.run(['git', 'add', 'agent-wip.txt'], check=True)\n"
+                "    subprocess.run(['git', 'commit', '-qm', 'finish resumed work'], check=True)\n"
+                "    subprocess.run([sys.executable, '-m', 'engine.work', 'done', 'task-1'], env=os.environ, check=True)\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            common = [
+                *LOOP_CMD, "--repo", str(repo), "--name", "interrupted-resume",
+                "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                "--validate-cmd", shlex.join([sys.executable, str(validator)]),
+                "--done-threshold", "1", "--agent-backoff-max", "0",
+            ]
+            process = subprocess.Popen(
+                common + ["--import-plan", str(plan), "--start-phase", "exec", "--max-rounds", "3"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+            )
+            state_path = workspace_root / "interrupted-resume" / "state.json"
+            try:
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    try:
+                        state = json.loads(state_path.read_text())
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        state = {}
+                    if (repo / "agent-wip.txt").exists() and state.get("round_started_at"):
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail("第一輪 Agent 未留下可 Resume 的中斷現場")
+
+                process.send_signal(signal.SIGINT)
+                first_output, _ = process.communicate(timeout=8)
+                self.assertEqual(process.returncode, 130, first_output)
+                interrupted = json.loads(state_path.read_text())
+                self.assertEqual(interrupted["phase"], "exec")
+                self.assertTrue(interrupted["last_green_sha"])
+                self.assertTrue(interrupted["round_started_at"])
+                self.assertTrue(interrupted["round_interrupted_at"])
+                self.assertTrue(L.is_dirty(repo))
+                self.assertEqual(counter.read_text(), "1")
+                self.assertIsNone(L.interrupted_resume_block_reason(
+                    repo, workspace_root / "interrupted-resume", interrupted, ["goal.md"]))
+
+                ordinary = subprocess.run(
+                    common + ["--max-rounds", "2"], capture_output=True, text=True, env=env,
+                )
+                self.assertNotEqual(ordinary.returncode, 0)
+                self.assertIn("工作樹不乾淨", ordinary.stdout + ordinary.stderr)
+                self.assertEqual(counter.read_text(), "1")
+
+                resumed = subprocess.run(
+                    common + ["--resume-interrupted", "--max-rounds", "2"],
+                    capture_output=True, text=True, env=env, timeout=15,
+                )
+                self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+                self.assertIn("略過啟動 Validate", resumed.stdout)
+                self.assertIn("Agent 已接手中斷現場", resumed.stdout)
+                self.assertEqual(counter.read_text(), "2",
+                                 "Resume 應略過啟動 Validate，但輪末 Validate 仍必須執行")
+                self.assertIn("resumed", (repo / "agent-wip.txt").read_text())
+                self.assertEqual(json.loads(state_path.read_text())["round"], 2)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+    def test_eligibility_rejects_non_exec_clean_or_protected_changes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace = root / "workspace" / "eligibility"
+            snapshots = workspace / "snapshots"
+            snapshots.mkdir(parents=True)
+            (snapshots / "goal.md").write_bytes((repo / "goal.md").read_bytes())
+            state = {
+                "phase": "exec",
+                "round_started_at": "2026-07-14T10:00:00+08:00",
+                "round_interrupted_at": "2026-07-14T10:01:00+08:00",
+                "last_green_sha": git(repo, "rev-parse", "HEAD").stdout.strip(),
+            }
+            self.assertIn("工作樹沒有", L.interrupted_resume_block_reason(
+                repo, workspace, state, ["goal.md"]))
+            (repo / "wip.txt").write_text("dirty\n")
+            self.assertIsNone(L.interrupted_resume_block_reason(
+                repo, workspace, state, ["goal.md"]))
+            state["phase"] = "plan"
+            self.assertIn("執行期", L.interrupted_resume_block_reason(
+                repo, workspace, state, ["goal.md"]))
+            state["phase"] = "exec"
+            (repo / "goal.md").write_text("changed protected\n")
+            self.assertIn("受保護檔案", L.interrupted_resume_block_reason(
+                repo, workspace, state, ["goal.md"]))
+
+    def test_dashboard_projects_button_eligibility_and_resume_uses_dedicated_flag(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            old_values = L.WORKSPACE_ROOT, D.ROOT, D.load_config, D.spawn_loop
+            captured = {}
+
+            def fake_spawn(*_args, **kwargs):
+                captured.update(kwargs)
+                return type("Process", (), {"pid": 43210})()
+
+            try:
+                L.WORKSPACE_ROOT = D.ROOT = workspace_root
+                D.load_config = lambda: {
+                    "agent_cmds": [{"label": "true", "cmd": "true"}],
+                    "defaults": {}, "notify_cmd": "",
+                }
+                D.spawn_loop = fake_spawn
+                ws = L.Workspace("resume-api")
+                state = ws.fresh_state()
+                state.update({
+                    "phase": "exec", "round": 1, "current_order": 1,
+                    "plan": [{"order": 1, "task": "resume me", "ref": None}],
+                    "round_started_at": "2026-07-14T10:00:00+08:00",
+                    "round_interrupted_at": "2026-07-14T10:01:00+08:00",
+                    "last_green_sha": git(repo, "rev-parse", "HEAD").stdout.strip(),
+                    "config": {"repo": str(repo), "agent_cmd": "true", "validate_cmd": "true",
+                               "goal": "goal.md", "plan_doc": ""},
+                })
+                ws.snapshot_protected(repo, ["goal.md"])
+                ws.save_state(state)
+                (repo / "agent-wip.txt").write_text("unfinished\n")
+
+                projection = D.list_workspaces()
+                self.assertEqual(len(projection), 1)
+                self.assertTrue(projection[0]["resume_available"])
+
+                handler = self.ResponseCapture()
+                D.Handler.api_resume(handler, {"name": "resume-api"})
+                self.assertEqual(handler.response[0], 200, handler.response)
+                self.assertTrue(captured["resume_interrupted"])
+
+                state["round_interrupted_at"] = None
+                ws.save_state(state)
+                handler = self.ResponseCapture()
+                D.Handler.api_resume(handler, {"name": "resume-api"})
+                self.assertEqual(handler.response[0], 400)
+                self.assertIn("不符合條件", handler.response[1]["error"])
+            finally:
+                D.JOBS.pop("resume-api", None)
+                L.WORKSPACE_ROOT, D.ROOT, D.load_config, D.spawn_loop = old_values
+
+
 class TestRoundMetrics(unittest.TestCase):
     """history metrics 只聚合有效近期樣本，並維持 bounded/safe read。"""
 
@@ -2955,7 +3138,7 @@ class TestDashboardStateLockCoverage(unittest.TestCase):
     """#3 run/launch 必須和 edit/phase 共用 workspace lock,不能在 stopped check 後競態。"""
 
     def test_all_workspace_mutations_are_decorated(self):
-        for method in ("api_launch", "api_run", "api_drain", "api_cancel_drain", "api_edit_state", "api_edit_config", "api_validate", "api_preflight", "api_test_agent", "api_phase", "api_set_task"):
+        for method in ("api_launch", "api_run", "api_resume", "api_drain", "api_cancel_drain", "api_edit_state", "api_edit_config", "api_validate", "api_preflight", "api_test_agent", "api_phase", "api_set_task"):
             self.assertTrue(hasattr(getattr(D.Handler, method), "__wrapped__"), f"{method} 必須套 workspace lock")
 
     def test_launch_blank_name_locks_repo_basename(self):

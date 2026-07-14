@@ -34,6 +34,7 @@ export interface WorkspaceSummary {
   stale_loop_pid?: boolean;
   current_order?: number | null;
   current_task?: string;
+  resume_available?: boolean;
 }
 
 export interface FleetHealth {

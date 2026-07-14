@@ -1429,6 +1429,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preflight-only", action="store_true",
                         help="只跑啟動前健檢(git/鎖/乾淨樹/goal 已 commit/validate)就退出;"
                              "不建 state、不動 snapshots、不啟動 agent")
+    parser.add_argument("--resume-interrupted", action="store_true",
+                        help="僅限有合法綠點的執行期中斷輪：保留 dirty worktree 並略過啟動 Validate")
     return parser
 
 
@@ -1452,6 +1454,8 @@ def parse_runtime_options(argv=None) -> RuntimeOptions:
         value = getattr(args, attr)
         if not math.isfinite(value) or value < 0 or (positive and value == 0):
             parser.error(f"{option} 必須是{' > 0' if positive else ' ≥ 0'} 的有限數字")
+    if args.resume_interrupted and (args.preflight_only or args.reset_state or args.import_plan):
+        parser.error("--resume-interrupted 不可搭配 --preflight-only、--reset-state 或 --import-plan")
 
     repo = Path(args.repo).resolve()
     workspace_name = args.name or repo.name
@@ -1479,7 +1483,7 @@ def parse_runtime_options(argv=None) -> RuntimeOptions:
     )
 
 
-def guard_repository_baseline(repo: Path, protected) -> None:
+def guard_repository_baseline(repo: Path, protected, *, allow_dirty=False) -> None:
     """取得 worktree 單 writer 鎖，並確認 Git、乾淨樹與受保護檔案可作為起點。"""
     if git(repo, "rev-parse", "--is-inside-work-tree", check=False).returncode != 0:
         fail(f"preflight：{repo} 不是 git repo")
@@ -1489,7 +1493,7 @@ def guard_repository_baseline(repo: Path, protected) -> None:
     if not git_dir.is_absolute():
         git_dir = (repo / git_dir).resolve()
     acquire_run_lock(git_dir / "loop-agent-lite.run.lock", f"Git worktree {repo}")
-    if is_dirty(repo):
+    if is_dirty(repo) and not allow_dirty:
         fail("preflight：工作樹不乾淨。之後的 reset --hard 會吃掉你的 WIP，先 commit 或 stash 再來")
     for relative_path in protected:
         if not tracked_in_head(repo, relative_path):
@@ -1539,6 +1543,29 @@ def establish_startup_green_anchor(repo: Path, workspace, state, protected,
     timeout_note = f"（逾時 {timeout_seconds:g} 秒）" if timed_out else ""
     fail(f"啟動驗證 `{shlex.join(validate_cmd)}` 失敗{timeout_note}，{why}——"
          f"起點必須是可信綠點。先把工作樹修到 validate 綠再 resume。輸出尾段:\n{tail}")
+
+
+def interrupted_resume_block_reason(repo: Path, workspace_dir: Path, state, protected):
+    """判斷是否可保留中斷輪的 dirty worktree，略過啟動 Validate 直接交給下一輪 Agent。"""
+    if state.get("phase") != "exec":
+        return "只有執行期 workspace 可以 Resume"
+    if not state.get("round_started_at") or not state.get("round_interrupted_at"):
+        return "沒有執行到一半且已中斷的輪次紀錄"
+    if not is_dirty(repo):
+        return "工作樹沒有 Agent 留下的未完成變更，請使用一般運行"
+    green = state.get("last_green_sha")
+    snapshots = Path(workspace_dir) / "snapshots"
+    if not green_anchor_valid(repo, green, snapshots, protected):
+        return "既有綠點不存在、不是目前 HEAD 的祖先，或受保護快照不一致"
+    for rel in protected:
+        try:
+            target = repo_relative_path(repo, rel)
+            snap = workspace_file(snapshots / rel.replace("/", "__"), "protected snapshot")
+            if not target.is_file() or target.read_bytes() != snap.read_bytes():
+                return f"受保護檔案 {rel} 已被修改，不能略過啟動檢查"
+        except (FileNotFoundError, OSError, ValueError):
+            return f"受保護檔案 {rel} 或其快照無法安全讀取"
+    return None
 
 
 def ingest_pending_issues(workspace, state, round_token: str, round_number: int,
@@ -1771,7 +1798,7 @@ def main():
     if not args.preflight_only:  # 健檢模式不得動到既有啟動 handshake 檔
         startup_ready.unlink(missing_ok=True)
 
-    guard_repository_baseline(repo, protected)
+    guard_repository_baseline(repo, protected, allow_dirty=args.resume_interrupted)
     if args.preflight_only:
         run_preflight_check(repo, validate_cmd, args.validate_timeout)
         return
@@ -1801,6 +1828,16 @@ def main():
         fail(f"workspace '{ws.dir.name}' 綁定的是 {bound_repo},但這次 --repo 是 {repo}。"
              f"同名 workspace 指到不同 repo 會用錯 plan/SHA——換個 --name,或加 --reset-state 重來。")
 
+    if args.resume_interrupted:
+        blocked = interrupted_resume_block_reason(repo, ws.dir, state, protected)
+        if blocked:
+            fail(f"Resume 不符合條件：{blocked}")
+        green = state["last_green_sha"]
+        log(f"Resume 中斷現場｜沿用綠點 {green[:8]}，保留工作樹並略過啟動 Validate")
+        state.setdefault("notes", []).append(
+            f"上一輪執行途中停止；已沿用綠點 {green[:8]} 保留現場直接 Resume。"
+            "先檢查並完成既有變更，再執行本輪 Validate。")
+
     # 選配:CLI 匯入 plan.json(重置 state,選起跑階段)——dashboard 匯入的 CLI 等價
     if args.import_plan:
         from engine.work import validate_plan
@@ -1822,11 +1859,12 @@ def main():
     fresh_start = bool(args.reset_state or args.import_plan)
     # 一般 resume 要先拍快照供舊綠點驗證；reset/import 延後到 Validate 綠後，
     # 失敗的 staged 啟動就不會改掉舊 state 對應的 protected snapshot。
-    if not fresh_start:
+    if not fresh_start and not args.resume_interrupted:
         ws.snapshot_protected(repo, protected)
 
-    establish_startup_green_anchor(
-        repo, ws, state, protected, validate_cmd, args.validate_timeout)
+    if not args.resume_interrupted:
+        establish_startup_green_anchor(
+            repo, ws, state, protected, validate_cmd, args.validate_timeout)
 
     if fresh_start:
         ws.snapshot_protected(repo, protected)
@@ -1903,7 +1941,10 @@ def main():
             return
         atomic_write_bytes(startup_ready, json.dumps({"pid": os.getpid()}).encode("utf-8"))
         startup_marked = True
-        log("🟢 啟動完成｜preflight、Validate 與 Agent spawn 均成功")
+        if args.resume_interrupted:
+            log("Resume 啟動完成｜已略過啟動 Validate，Agent 已接手中斷現場")
+        else:
+            log("🟢 啟動完成｜preflight、Validate 與 Agent spawn 均成功")
 
     # Prompt 中的 coordinator 命令會交給另一個 CLI agent 執行；一律使用目前
     # Python executable 的絕對路徑，避免 PATH 指到另一套 Python。

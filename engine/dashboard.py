@@ -451,7 +451,7 @@ def repo_status_projection(repo: Path):
 def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout=120,
                reset=False, import_plan=None, start_phase="plan", notify_cmd="",
                red_limit=20, stall_limit=300, stuck_stop=False, stuck_count=100,
-               agent_backoff_max=60, pause_after_plan=False, env=None):
+               agent_backoff_max=60, pause_after_plan=False, resume_interrupted=False, env=None):
     """spawn loop.py 並登記進 JOBS(呼叫方需持 JOBS_LOCK)。"""
     loop_mod.require_workspace_name(name)
     workspace_dir = safe_workspace_dir(name)
@@ -465,6 +465,8 @@ def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout
         cmd += ["--stuck-stop", "--stuck-stop-count", str(stuck_count)]
     if pause_after_plan:
         cmd.append("--pause-after-plan")
+    if resume_interrupted:
+        cmd.append("--resume-interrupted")
     if reset:
         cmd.append("--reset-state")
     if import_plan:
@@ -595,6 +597,27 @@ def _load_state_or_err(handler, name, *, repair=True):
         handler._err(err)
         return None
     return st
+
+
+def interrupted_resume_block_reason(name, st):
+    """Dashboard 與 POST /api/resume 共用的只讀資格判斷；真正啟動時 loop 會再驗一次。"""
+    if loop_pid_alive((st.get("loop") or {}).get("pid")):
+        return "workspace 仍在執行中"
+    config = st.get("config") or {}
+    repo_value = config.get("repo")
+    if not repo_value:
+        return "state 缺少 repo 設定"
+    repo = Path(repo_value).resolve()
+    if not (repo / ".git").exists():
+        return f"{repo} 不是 git repo"
+    protected = [config.get("goal") or "goal.md"]
+    if config.get("plan_doc"):
+        protected.append(config["plan_doc"])
+    try:
+        return loop_mod.interrupted_resume_block_reason(
+            repo, safe_workspace_dir(name), st, protected)
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return f"Resume 資格檢查失敗：{e}"
 
 
 def read_report(name):
@@ -1146,6 +1169,7 @@ def list_workspaces():
             "loop_pid": None,
             "loop_started_at": None,
             "stale_loop_pid": False,
+            "resume_available": False,
         }
         st, err = read_state(d.name, repair=False)
         if err:
@@ -1190,6 +1214,8 @@ def list_workspaces():
                         draining=drain_claimed or (running and loop_mod.stop_after_round_requested(
                             d, loop_state.get("pid"), loop_state.get("session_id"))),
                         drain_claimed=drain_claimed)
+            if not running:
+                info["resume_available"] = interrupted_resume_block_reason(d.name, st) is None
         out.append(info)
     return out
 
@@ -1394,6 +1420,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/cancel-drain": "api_cancel_drain",
         "/api/stop": "api_stop",
         "/api/run": "api_run",
+        "/api/resume": "api_resume",
         "/api/edit-state": "api_edit_state",
         "/api/import-plan": "api_import_plan",
         "/api/edit-config": "api_edit_config",
@@ -1924,7 +1951,16 @@ class Handler(BaseHTTPRequestHandler):
 
     @with_state_lock
     def api_run(self, body):
-        """一鍵重跑既有 workspace:設定全部從 state.json 拿,agent 命令先過 config 白名單。"""
+        """一般重跑既有 workspace：保留原本完整 preflight 與啟動 Validate。"""
+        return Handler._start_existing_workspace(self, body, resume_interrupted=False)
+
+    @with_state_lock
+    def api_resume(self, body):
+        """受限 Resume：只讓有合法綠點的執行期中斷現場略過啟動 Validate。"""
+        return Handler._start_existing_workspace(self, body, resume_interrupted=True)
+
+    def _start_existing_workspace(self, body, *, resume_interrupted):
+        """run/resume 共用設定白名單、單 writer 與 spawn 流程。"""
         name = str(body.get("name") or "")
         st = _load_state_or_err(self, name)
         if st is None:
@@ -1957,6 +1993,11 @@ class Handler(BaseHTTPRequestHandler):
         if loop_pid_alive((st.get("loop") or {}).get("pid")):
             self._err(f"{name} 已在執行中")
             return
+        if resume_interrupted:
+            blocked = interrupted_resume_block_reason(name, st)
+            if blocked:
+                self._err(f"Resume 不符合條件：{blocked}")
+                return
         d = cfg.get("defaults") or {}
         try:
             ft = parse_numeric_setting(c.get("flag_threshold", 10), integer=True, minimum=1)
@@ -1994,8 +2035,10 @@ class Handler(BaseHTTPRequestHandler):
                            stuck_stop=bool(d.get("stuck_stop")),
                            stuck_count=int(d.get("stuck_stop_count", 100)),
                            pause_after_plan=bool(c.get("pause_after_plan")),
+                           resume_interrupted=resume_interrupted,
                            env=command_env(cfg))
-        workspace_console_log(name, f"繼續運行 loop｜pid={p.pid}")
+        action = "Resume 中斷現場" if resume_interrupted else "繼續運行 loop"
+        workspace_console_log(name, f"{action}｜pid={p.pid}")
         startup_timeout = vt + 15
         self._out(200, json.dumps({"ok": True, "starting": True, "name": name, "pid": p.pid,
                                    "startup_timeout": startup_timeout}, ensure_ascii=False))
