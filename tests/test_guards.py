@@ -716,10 +716,11 @@ class TestInterruptedResume(unittest.TestCase):
             snapshots = workspace / "snapshots"
             snapshots.mkdir(parents=True)
             (snapshots / "goal.md").write_bytes((repo / "goal.md").read_bytes())
+            started_at = (datetime.now().astimezone() - timedelta(minutes=5)).isoformat(timespec="seconds")
             state = {
                 "phase": "exec",
-                "round_started_at": "2026-07-14T10:00:00+08:00",
-                "round_interrupted_at": "2026-07-14T10:01:00+08:00",
+                "round_started_at": started_at,
+                "round_interrupted_at": (datetime.now().astimezone() - timedelta(minutes=4)).isoformat(timespec="seconds"),
                 "last_green_sha": git(repo, "rev-parse", "HEAD").stdout.strip(),
             }
             self.assertIsNone(L.interrupted_resume_block_reason(
@@ -728,7 +729,7 @@ class TestInterruptedResume(unittest.TestCase):
             self.assertIsNone(L.interrupted_resume_block_reason(
                 repo, workspace, state, ["goal.md"]))
             state["phase"] = "plan"
-            self.assertIn("執行期", L.interrupted_resume_block_reason(
+            self.assertIsNone(L.interrupted_resume_block_reason(
                 repo, workspace, state, ["goal.md"]))
             state["phase"] = "exec"
             (repo / "goal.md").write_text("changed protected\n")
@@ -739,14 +740,17 @@ class TestInterruptedResume(unittest.TestCase):
             self.assertIsNone(L.interrupted_resume_block_reason(
                 repo, workspace, state, ["goal.md"]))
             state["last_green_sha"] = None
-            self.assertIn("綠點", L.interrupted_resume_block_reason(
+            self.assertIn("SHA", L.interrupted_resume_block_reason(
                 repo, workspace, state, ["goal.md"]))
             state["last_green_sha"] = "0" * 40
-            self.assertIn("綠點", L.interrupted_resume_block_reason(
+            self.assertIn("SHA", L.interrupted_resume_block_reason(
                 repo, workspace, state, ["goal.md"]))
             state["last_green_sha"] = git(repo, "rev-parse", "HEAD").stdout.strip()
             state["round_started_at"] = None
-            self.assertIn("執行到一半", L.interrupted_resume_block_reason(
+            self.assertIn("開始時間", L.interrupted_resume_block_reason(
+                repo, workspace, state, ["goal.md"]))
+            state["round_started_at"] = (datetime.now().astimezone() + timedelta(minutes=1)).isoformat()
+            self.assertIn("早於現在", L.interrupted_resume_block_reason(
                 repo, workspace, state, ["goal.md"]))
 
     def test_dashboard_projects_button_eligibility_and_resume_uses_dedicated_flag(self):
@@ -773,8 +777,8 @@ class TestInterruptedResume(unittest.TestCase):
                 state.update({
                     "phase": "exec", "round": 1, "current_order": 1,
                     "plan": [{"order": 1, "task": "resume me", "ref": None}],
-                    "round_started_at": "2026-07-14T10:00:00+08:00",
-                    "round_interrupted_at": "2026-07-14T10:01:00+08:00",
+                    "round_started_at": (datetime.now().astimezone() - timedelta(minutes=5)).isoformat(timespec="seconds"),
+                    "round_interrupted_at": (datetime.now().astimezone() - timedelta(minutes=4)).isoformat(timespec="seconds"),
                     "last_green_sha": git(repo, "rev-parse", "HEAD").stdout.strip(),
                     "config": {"repo": str(repo), "agent_cmd": "true", "validate_cmd": "true",
                                "goal": "goal.md", "plan_doc": ""},
@@ -804,6 +808,25 @@ class TestInterruptedResume(unittest.TestCase):
                 D.Handler.api_resume(handler, {"name": "resume-api"})
                 self.assertEqual(handler.response[0], 400)
                 self.assertIn("不符合條件", handler.response[1]["error"])
+
+                supplied_started_at = (datetime.now().astimezone() - timedelta(minutes=2)).isoformat()
+                handler = self.ResponseCapture()
+                D.Handler.api_resume(handler, {
+                    "name": "resume-api",
+                    "round_started_at": supplied_started_at,
+                    "last_green_sha": git(repo, "rev-parse", "--short", "HEAD").stdout.strip(),
+                })
+                self.assertEqual(handler.response[0], 200, handler.response)
+                saved = ws.load_state()
+                self.assertEqual(saved["last_green_sha"], git(repo, "rev-parse", "HEAD").stdout.strip())
+                self.assertLess(datetime.fromisoformat(saved["round_started_at"]), datetime.now().astimezone())
+
+                state["round_started_at"] = (datetime.now().astimezone() + timedelta(minutes=5)).isoformat()
+                ws.save_state(state)
+                handler = self.ResponseCapture()
+                D.Handler.api_resume(handler, {"name": "resume-api"})
+                self.assertEqual(handler.response[0], 400)
+                self.assertIn("早於現在", handler.response[1]["error"])
             finally:
                 D.JOBS.pop("resume-api", None)
                 L.WORKSPACE_ROOT, D.ROOT, D.load_config, D.spawn_loop = old_values

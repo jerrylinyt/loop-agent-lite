@@ -1546,22 +1546,34 @@ def establish_startup_green_anchor(repo: Path, workspace, state, protected,
 
 
 def interrupted_resume_block_reason(repo: Path, workspace_dir: Path, state, protected):
-    """判斷是否有足夠紀錄略過啟動 Validate，直接把中斷現場交給下一輪 Agent。
+    """Resume 最小資格：開始時間早於現在，且 SHA 是 code repo 內存在的 commit。"""
+    _started_at, _green, reason = normalize_interrupted_resume_metadata(repo, state)
+    return reason
 
-    Resume 是人工確認後的復原捷徑，只要求執行輪確實已開始，且先前 Validate 留下的
-    綠點仍是 repo 裡的 commit。工作樹可能乾淨、dirty、已產生新 commit，甚至因程序被
-    強制終止而來不及寫 round_interrupted_at；這些都不應讓按鈕消失。repo identity、
-    Git/單 writer lock 仍由外層啟動流程負責。
-    """
-    if state.get("phase") != "exec":
-        return "只有執行期 workspace 可以 Resume"
-    if not state.get("round_started_at"):
-        return "沒有執行到一半的輪次紀錄"
-    green = state.get("last_green_sha")
-    if not green or git(repo, "rev-parse", "--verify", "--quiet",
-                        f"{green}^{{commit}}", check=False).returncode != 0:
-        return "沒有可用的既有綠點（先前 Preflight／Validate 綠點紀錄不存在）"
-    return None
+
+def normalize_interrupted_resume_metadata(repo: Path, state):
+    """驗證並正規化可由人工補登的 Resume 時間與綠點 SHA。"""
+    raw_started_at = state.get("round_started_at")
+    if not isinstance(raw_started_at, str) or not raw_started_at.strip():
+        return None, None, "請補上執行開始時間"
+    try:
+        parsed = datetime.fromisoformat(raw_started_at.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None, None, "執行開始時間格式不正確"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    if parsed >= datetime.now(parsed.tzinfo):
+        return None, None, "執行開始時間必須早於現在"
+
+    raw_green = state.get("last_green_sha")
+    if not isinstance(raw_green, str) or not re.fullmatch(r"[0-9a-fA-F]{4,64}", raw_green.strip()):
+        return None, None, "請補上 code repo 內存在的 commit SHA"
+    # 前面已限制為純 hex，不需依賴較新版 Git 才支援的 --end-of-options；內網舊 Linux Git 也可用。
+    resolved = git(repo, "rev-parse", "--verify", "--quiet",
+                   f"{raw_green.strip()}^{{commit}}", check=False)
+    if resolved.returncode != 0:
+        return None, None, "指定的 SHA 不存在於此 code repo"
+    return parsed.isoformat(timespec="seconds"), resolved.stdout.strip(), None
 
 
 def ingest_pending_issues(workspace, state, round_token: str, round_number: int,

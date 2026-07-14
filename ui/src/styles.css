@@ -284,6 +284,17 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .modal-body { min-height: 0; overflow: auto; padding: 14px 16px; }
 .modal-footer { display: flex; flex: none; min-height: 54px; align-items: center; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border); background: var(--surface); }
 .dialog-message { margin: 0; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+.run-choice-grid { display: grid; gap: 12px; }
+.run-choice-card { padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.run-choice-card h3, .run-choice-card p { margin: 0; }
+.run-choice-card h3 { font-size: 14px; }
+.run-choice-card > p { margin-top: 5px; color: var(--muted); font-size: 12px; }
+.run-choice-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.resume-readiness { padding: 2px 7px; border-radius: 999px; font-size: 11px; }
+.resume-readiness.ready { background: var(--success-soft); color: var(--success); }
+.resume-readiness.needs-data { background: var(--warning-soft); color: var(--warning); }
+.resume-metadata-form { margin-top: 10px; }
+.resume-metadata-form .field-error { margin-top: -6px; }
 .segmented-tabs { display: inline-flex; gap: 2px; margin-bottom: 14px; padding: 3px; border-radius: 8px; background: var(--surface-subtle); }
 .segmented-tabs button { min-height: 30px; padding: 4px 12px; border: 0; border-radius: 6px; background: transparent; }
 .segmented-tabs button.active { background: var(--surface-raised); color: var(--accent); box-shadow: 0 1px 3px rgba(0, 0, 0, .15); }

@@ -126,7 +126,7 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 - 啟動表單在 `goal.md` 旁將「Goal 產生器 Prompt」與「Goal 成果模板」分成兩個入口：前者把需求、選填的專案限制與任務類型編譯成可直接貼給 Agent 的自然 Markdown，不再外露 `_json` 標籤，空白補充資訊也不會產生佔位段落；後者沿用 Goal 產生器的完整任務類型清單，逐類提供符合現行八段契約、具 SC／AC 追溯與 DoD 骨架的 `goal.md` 參考模板。兩個子視窗都可由「上一頁」回到啟動表單。`plan.json` 旁仍提供 Plan 產生器 Prompt，輸出只接受欄位限於 `order/task/ref` 的 JSON array。以上操作都只在瀏覽器進行，不會改動 repo 或 workspace。
 - 正常要停時用「本輪後停止」：目前 Agent、Validate 與 state/history 落盤完成後才停，不會啟動下一輪。
 - 本輪尚未結束前按「繼續運行」可撤銷平順停止；如果 loop 已取走請求，會明確告知這一輪仍會收尾停止。
-- 執行期只要已有輪次開始紀錄，且先前 Preflight／Validate 留下的綠點 commit 仍存在，loop 停止後詳細頁就會顯示「Resume」。此操作會保留目前現場並略過啟動時的 dirty-tree、Validate、HEAD 祖先與 protected snapshot 比對，直接交給下一輪 Agent；即使程序被強制終止而來不及寫中斷時間、工作樹已乾淨或已有新 commit，也可以人工確認後接續。目前的 protected 檔案會在 Resume 時成為後續輪次的新防竄改基準。Git／單 writer lock 與 workspace identity 仍保留，下一輪結束後也仍須照常 Validate。一般「運行」維持完整 preflight。
+- 停止狀態下按「運行」會先開啟選擇視窗：可選一般執行（完整 Preflight／啟動 Validate），或保留目前現場的 Resume。Resume 只要求執行開始時間早於現在，且綠點 SHA 是 target code repo 內存在的 commit；舊 state 缺少任一資料時可直接在視窗補填，通過後會寫回 state。Resume 會略過啟動時的 dirty-tree、Validate、HEAD 祖先與 protected snapshot 比對，目前的 protected 檔案會成為後續輪次的新防竄改基準；Git／單 writer lock 與 workspace identity 仍保留，下一輪結束後也仍須照常 Validate。
 - Agent CLI 卡死或明顯失控時用「立即停止」；它會中斷目前 round，state 可在下次運行時續用。
 - 停止後可編輯計畫、切換階段或修改 agent／validate 設定，再按「運行」。
 - 「重置 workspace state」會保留舊 state，直到新流程通過 preflight。

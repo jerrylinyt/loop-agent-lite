@@ -13,13 +13,14 @@ import PlanTable from "./PlanTable";
 import PromptModal from "./PromptModal";
 import ReportModal from "./ReportModal";
 import RoundSparkline from "./RoundSparkline";
+import RunChoiceModal from "./RunChoiceModal";
 import RunCompareModal from "./RunCompareModal";
 import TimelineModal from "./TimelineModal";
 import { deriveRoundTiming, useRoundNow } from "./roundTiming";
 import useStatusPulse from "./useStatusPulse";
 
 const PHASE_NAMES = { plan: "規劃期", exec: "執行期", done: "完成" };
-type WorkspaceModal = "config" | "goal" | "history" | "issues" | "report" | "prompt" | "timeline" | "runCompare";
+type WorkspaceModal = "config" | "goal" | "history" | "issues" | "report" | "prompt" | "timeline" | "runCompare" | "runChoice";
 const WORKSPACE_MUTATIONS = {
   run: { url: "/api/run", busy: "run" },
   resume: { url: "/api/resume", busy: "resume" },
@@ -208,8 +209,7 @@ export default function WorkspaceView({
                 ? <button type="button" className="secondary-button" disabled title="loop 已接手停止請求，會在本輪完整收尾後停止">本輪收尾中</button>
                 : <button type="button" className="secondary-button" disabled={busyAction !== null} onClick={() => void mutate("cancelDrain", { name: workspace.name })}>{busyAction === "cancelDrain" ? "撤銷中…" : "繼續運行"}</button>
               : <button type="button" className="secondary-button" disabled={busyAction !== null} onClick={() => void mutate("drain", { name: workspace.name })}>{busyAction === "drain" ? "要求中…" : "本輪後停止"}</button>)}
-            <button type="button" className={workspace.running ? "danger-button" : "success-button"} disabled={busyAction !== null} onClick={() => void mutate(workspace.running ? "stop" : "run", { name: workspace.name })}>{busyAction === "stop" ? "停止中…" : busyAction === "run" ? "啟動中…" : workspace.running ? "立即停止" : "運行"}</button>
-            {!workspace.running && workspace.resume_available && <button type="button" className="primary-button" disabled={busyAction !== null} title="保留目前工作區，沿用既有綠點並略過啟動 Preflight／Validate" onClick={() => void mutate("resume", { name: workspace.name })}>{busyAction === "resume" ? "Resume 中…" : "Resume"}</button>}
+            <button type="button" className={workspace.running ? "danger-button" : "success-button"} disabled={busyAction !== null} onClick={() => workspace.running ? void mutate("stop", { name: workspace.name }) : setActiveModal("runChoice")}>{busyAction === "stop" ? "停止中…" : busyAction === "run" ? "啟動中…" : busyAction === "resume" ? "Resume 中…" : workspace.running ? "立即停止" : "運行"}</button>
             {canChange && state.phase === "plan" && total > 0 && <button type="button" className="secondary-button" onClick={() => changePhase("exec")}>進執行期</button>}
             {canChange && (state.phase === "exec" || state.phase === "done") && <button type="button" className="secondary-button" onClick={() => changePhase("plan")}>回規劃期</button>}
             {canChange && <button type="button" className="secondary-button" onClick={() => setActiveModal("config")}>設定</button>}
@@ -271,6 +271,14 @@ export default function WorkspaceView({
       {activeModal === "prompt" && workspace && <PromptModal workspace={workspace.name} onClose={() => setActiveModal(null)} />}
       {activeModal === "report" && workspace && <ReportModal workspace={workspace.name} onClose={() => setActiveModal(null)} />}
       {activeModal === "config" && workspace && <ConfigModal workspace={workspace.name} config={state.config ?? {}} plan={state.plan ?? []} onClose={() => setActiveModal(null)} onChanged={onRefresh} />}
+      {activeModal === "runChoice" && workspace && <RunChoiceModal
+        initialStartedAt={state.round_started_at}
+        initialGreenSha={state.last_green_sha}
+        resumeAvailable={!!workspace.resume_available}
+        onClose={() => setActiveModal(null)}
+        onRun={() => { setActiveModal(null); void mutate("run", { name: workspace.name }); }}
+        onResume={(metadata) => { setActiveModal(null); void mutate("resume", { name: workspace.name, ...metadata }); }}
+      />}
       {dialog && <ActionDialog title={dialog.title} message={dialog.message} confirmLabel={dialog.confirmLabel} danger={dialog.danger} preview={dialog.preview} onClose={() => setDialog(null)} onConfirm={dialog.onConfirm} />}
     </section>
   );

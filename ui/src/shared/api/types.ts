@@ -26,6 +26,7 @@ export interface WorkspaceSummary {
   round_started_at?: string | null;
   round_deadline_at?: string | null;
   round_interrupted_at?: string | null;
+  last_green_sha?: string | null;
   state_recovery_count?: number;
   state_recovery_pending?: boolean;
   goal_changed?: boolean;
@@ -197,6 +198,7 @@ export interface WorkspaceState {
   round_started_at?: string | null;
   round_deadline_at?: string | null;
   round_interrupted_at?: string | null;
+  last_green_sha?: string | null;
   state_recovery_count?: number;
   last_state_recovery?: string | null;
   state_recovery_pending?: boolean;

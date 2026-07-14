@@ -14,6 +14,13 @@ async function acceptConfirmation(page: Page, action: () => Promise<void>) {
   await dialog.getByRole("button", { name: /繼續|清空/ }).click();
 }
 
+async function runNormally(page: Page) {
+  await page.getByRole("button", { name: "運行", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "選擇啟動方式" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "一般執行", exact: true }).click();
+}
+
 test("Goal 產生器 Prompt 與 Goal 成果模板分開，且 Plan 仍可使用", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "＋ 啟動第一個 loop" }).click();
@@ -166,21 +173,22 @@ test("固定 Prompt 資源失效會停用產生器與成果模板並顯示原因
   await expect(launcher.getByRole("combobox", { name: "Repo" })).toBeEnabled();
 });
 
-test("符合中斷續跑條件時顯示 Resume 並呼叫獨立 endpoint", async ({ page }) => {
+test("運行先選擇啟動方式，缺少 Resume 資料時可補填後呼叫獨立 endpoint", async ({ page }) => {
   const workspace = {
     name: "resume-ready", phase: "exec", running: false, round: 3,
-    completed: 0, plan_len: 1, done_count: 0, resume_available: true,
+    completed: 0, plan_len: 1, done_count: 0, resume_available: false,
   };
   const state = {
     phase: "exec", round: 3, flag: 0, done_count: 0, red_streak: 0, stall_rounds: 0,
     plan_version: 1, current_order: 1, completed: [], issues: [],
-    round_started_at: "2026-07-14T10:00:00+08:00",
-    round_deadline_at: "2026-07-14T10:30:00+08:00",
-    round_interrupted_at: "2026-07-14T10:05:00+08:00",
+    round_started_at: null,
+    round_deadline_at: null,
+    round_interrupted_at: null,
+    last_green_sha: null,
     plan: [{ order: 1, task: "接手 Agent 未完成變更", ref: null }],
     config: { flag_threshold: 10, done_threshold: 3, red_limit: 20, stall_limit: 300 },
   };
-  let resumeCalled = false;
+  let resumeBody: Record<string, string> | null = null;
   await page.route("**/api/workspaces", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify([workspace]) });
   });
@@ -199,17 +207,23 @@ test("符合中斷續跑條件時顯示 Resume 並呼叫獨立 endpoint", async 
     });
   });
   await page.route("**/api/resume", async (route) => {
-    resumeCalled = true;
+    resumeBody = route.request().postDataJSON() as Record<string, string>;
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true }) });
   });
 
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "resume-ready" })).toBeVisible();
-  const resume = page.getByRole("button", { name: "Resume", exact: true });
-  await expect(resume).toBeVisible();
-  await expect(resume).toHaveAttribute("title", /略過啟動 Preflight／Validate/);
+  await page.getByRole("button", { name: "運行", exact: true }).click();
+  const launchChoice = page.getByRole("dialog", { name: "選擇啟動方式" });
+  await expect(launchChoice).toContainText("可補資料後啟動");
+  const resume = launchChoice.getByRole("button", { name: "Resume", exact: true });
+  await expect(resume).toBeDisabled();
+  await launchChoice.getByLabel("Resume 執行開始時間").fill("2020-01-02T03:04:05");
+  await launchChoice.getByLabel("Resume 綠點 commit SHA").fill("73a9be0");
+  await expect(resume).toBeEnabled();
   await resume.click();
-  expect(resumeCalled).toBeTruthy();
+  expect(resumeBody).toMatchObject({ name: "resume-ready", last_green_sha: "73a9be0" });
+  expect(Date.parse(resumeBody?.round_started_at ?? "")).toBeLessThan(Date.now());
 });
 
 test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、phase 與進度", async ({ page }) => {
@@ -683,7 +697,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(operationDialog.locator(".action-preview > div", { hasText: "保留" })).toContainText("target repo");
   await operationDialog.getByRole("button", { name: "繼續" }).click();
   await expect(page.getByText("規劃期", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "運行" }).click();
+  await runNormally(page);
   await expect(page.getByRole("button", { name: "立即停止" })).toBeVisible();
   await expect(page.getByRole("status", { name: "計畫已更新 v3" })).toBeVisible();
   await expect(page.locator('tr[data-order="2"]')).toHaveClass(/flash/);
@@ -724,7 +738,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page.getByRole("button", { name: "展開Agent 執行輸出" })).toBeVisible();
   await page.getByRole("button", { name: "展開Agent 執行輸出" }).click();
 
-  await page.getByRole("button", { name: "運行" }).click();
+  await runNormally(page);
   await expect(page.getByRole("button", { name: "立即停止" })).toBeVisible();
   await expect(page.getByRole("region", { name: "Agent 執行輸出", exact: true })).toContainText("E2E fake agent started");
   await expect(page.locator(".chip.status-pulse").filter({ hasText: /^done / })).toBeVisible();
@@ -737,7 +751,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await settings.getByRole("button", { name: "儲存設定" }).click();
   await expect(settings).toBeHidden();
 
-  await page.getByRole("button", { name: "運行" }).click();
+  await runNormally(page);
   await expect(page.locator("#main-content .phase-badge", { hasText: "完成" })).toBeVisible({ timeout: 30_000 });
   await expect(page.getByRole("button", { name: "運行" })).toBeVisible();
   await expect(page).toHaveTitle(/^完成 e2e-workspace/);

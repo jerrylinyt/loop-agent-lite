@@ -1956,7 +1956,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @with_state_lock
     def api_resume(self, body):
-        """受限 Resume：讓已開始且有既有綠點的執行期現場略過啟動 Validate。"""
+        """可補登開始時間/SHA 的 Resume；通過最小驗證後略過啟動 Validate。"""
         return Handler._start_existing_workspace(self, body, resume_interrupted=True)
 
     def _start_existing_workspace(self, body, *, resume_interrupted):
@@ -1993,11 +1993,19 @@ class Handler(BaseHTTPRequestHandler):
         if loop_pid_alive((st.get("loop") or {}).get("pid")):
             self._err(f"{name} 已在執行中")
             return
+        resume_metadata = None
         if resume_interrupted:
-            blocked = interrupted_resume_block_reason(name, st)
+            candidate = dict(st)
+            if "round_started_at" in body:
+                candidate["round_started_at"] = body.get("round_started_at")
+            if "last_green_sha" in body:
+                candidate["last_green_sha"] = body.get("last_green_sha")
+            started_at, green, blocked = loop_mod.normalize_interrupted_resume_metadata(
+                Path(repo).resolve(), candidate)
             if blocked:
                 self._err(f"Resume 不符合條件：{blocked}")
                 return
+            resume_metadata = started_at, green
         d = cfg.get("defaults") or {}
         try:
             ft = parse_numeric_setting(c.get("flag_threshold", 10), integer=True, minimum=1)
@@ -2025,6 +2033,10 @@ class Handler(BaseHTTPRequestHandler):
                 if jj.alive() and Path(jj.repo) == Path(repo):
                     self._err(f"repo {repo} 已有 loop 在跑({jj.name})")
                     return
+            if resume_metadata:
+                # 補登資料只有在所有同步啟動檢查都通過後才寫入；loop CLI 啟動時仍會重驗。
+                st["round_started_at"], st["last_green_sha"] = resume_metadata
+                write_state(name, st)
             p = spawn_loop(name, repo, agent_cmd, validate_cmd,
                            ft, dt, rt,
                            validate_timeout=vt,
