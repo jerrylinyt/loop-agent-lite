@@ -708,6 +708,45 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page.getByText("進行中", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: /已完成 1 條/ }).click();
   await expect(page.getByRole("row", { name: /已由 E2E 更新的第一項功能.*完成 人工/ })).toBeVisible();
+  const taskDiffBase = "1111111111111111111111111111111111111111";
+  const taskDiffHead = "2222222222222222222222222222222222222222";
+  const taskDiffSummary = {
+    workspace: "e2e-workspace",
+    task: { order: 1, title: "已由 E2E 更新的第一項功能", human: true, round: 0 },
+    comparison: { mode: "task_range", base_sha: taskDiffBase, head_sha: taskDiffHead, base_source: "recorded", warning: null },
+    commits: [
+      { sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short_sha: "aaaaaaaa", author: "E2E", date: "2026-07-14T10:00:00+08:00", subject: "first task commit" },
+      { sha: taskDiffHead, short_sha: "22222222", author: "E2E", date: "2026-07-14T10:01:00+08:00", subject: "finish task" },
+    ],
+    files: [
+      { path: "src/demo.ts", old_path: null, status: "modified", status_code: "M", similarity: null, additions: 1, deletions: 1, binary: false },
+      { path: "assets/logo.bin", old_path: null, status: "added", status_code: "A", similarity: null, additions: null, deletions: null, binary: true },
+    ],
+    stats: { files: 2, additions: 1, deletions: 1, binary_files: 1 },
+  };
+  await page.route("**/api/task-diff?**", async (route) => {
+    const file = new URL(route.request().url()).searchParams.get("file");
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(file ? {
+      ...taskDiffSummary,
+      selected_file: taskDiffSummary.files.find((entry) => entry.path === file),
+      patch: "diff --git a/src/demo.ts b/src/demo.ts\nindex 1111111..2222222 100644\n--- a/src/demo.ts\n+++ b/src/demo.ts\n@@ -1 +1 @@\n-export const value = 'old';\n+export const value = 'new';\n",
+      patch_too_large: false,
+    } : taskDiffSummary) });
+  });
+  await page.getByRole("button", { name: /查看 task-1 Git 變更/ }).click();
+  const taskDiffModal = page.getByRole("dialog", { name: "task-1｜Git 變更" });
+  await expect(taskDiffModal).toBeVisible();
+  await expect(taskDiffModal).toContainText("2 commits");
+  await expect(taskDiffModal.getByRole("complementary", { name: "變更檔案" })).toContainText("demo.ts");
+  await expect(taskDiffModal.locator('[data-component="git-diff-view"]')).toBeVisible();
+  await expect(taskDiffModal.locator('[data-component="git-diff-view"]')).toContainText("export const value");
+  await taskDiffModal.getByRole("tab", { name: "單欄" }).click();
+  await expect(taskDiffModal.getByRole("tab", { name: "單欄" })).toHaveAttribute("aria-selected", "true");
+  await taskDiffModal.getByLabel("搜尋變更檔案").fill("logo");
+  await taskDiffModal.getByRole("button", { name: /assets\/logo.bin/ }).click();
+  await expect(taskDiffModal).toContainText("Binary 檔案不提供文字 diff");
+  await taskDiffModal.getByRole("button", { name: "關閉對話框" }).click();
+  await page.unroute("**/api/task-diff?**");
   await acceptConfirmation(page, () => page.getByRole("button", { name: "把進度設到 task-1" }).click());
 
   const splitter = page.getByRole("separator", { name: "調整任務與 console 欄寬" });
@@ -746,6 +785,9 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page.locator("#main-content .phase-badge", { hasText: "完成" })).toBeVisible({ timeout: 30_000 });
   await expect(page.getByRole("button", { name: "運行" })).toBeVisible();
   await expect(page).toHaveTitle(/^完成 e2e-workspace/);
+  const completedState = await (await page.request.get("/api/state?ws=e2e-workspace")).json();
+  expect(completedState.completed).toHaveLength(2);
+  expect(completedState.completed.every((entry: { base_sha?: string }) => /^[0-9a-f]{40}$/.test(entry.base_sha ?? ""))).toBeTruthy();
 
   await page.getByRole("button", { name: "完成報告" }).click();
   const reportModal = page.getByRole("dialog", { name: "完成報告" });

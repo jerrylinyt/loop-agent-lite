@@ -669,6 +669,38 @@ def is_ancestor(repo, sha, of_sha) -> bool:
     return git(repo, "merge-base", "--is-ancestor", sha, of_sha, check=False).returncode == 0
 
 
+def ensure_current_task_base_sha(state, repo, current_head=None) -> str | None:
+    """確保執行中 task 有不可變的 Git 起點。
+
+    新 state 會在 task 啟動時直接記下 HEAD；舊 state 則優先沿用前一個完成 task 的 SHA。
+    舊版第一個 task 無法可靠回推起點，因此不補寫。候選必須真的是目前 HEAD 的祖先，
+    避免損壞或跨 branch 的 state 讓之後的 task diff 形成無意義範圍。
+    """
+    if state.get("phase") != "exec" or not state.get("current_order"):
+        return None
+    current_head = current_head or head_sha(repo)
+    legacy_without_base_field = "current_task_base_sha" not in state
+    candidates = [state.get("current_task_base_sha")]
+    previous = sorted(
+        (entry for entry in state.get("completed", [])
+         if entry.get("order", 0) < state["current_order"]),
+        key=lambda entry: entry["order"], reverse=True,
+    )
+    candidates.extend(entry.get("sha") for entry in previous)
+    for candidate in candidates:
+        if (isinstance(candidate, str) and
+                re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", candidate) and
+                is_ancestor(repo, candidate, current_head)):
+            state["current_task_base_sha"] = candidate
+            return candidate
+    # 舊版第一個 task 若已進行一段時間，現在的 HEAD 不是可靠起點；保持缺欄位，讓完成
+    # 紀錄依契約退回單一 commit。新版 fresh_state 一開始就帶 null，因此會走下方真正記錄。
+    if legacy_without_base_field:
+        return None
+    state["current_task_base_sha"] = current_head
+    return current_head
+
+
 def green_anchor_valid(repo, green, snap_dir, rel_paths) -> bool:
     """resume 時綠點錨定的 fail-closed 驗證(#1):綠點必須同時滿足
     (1) 是 repo 裡真實存在的 commit;(2) 是目前 HEAD 的祖先;
@@ -817,6 +849,11 @@ def validate_state_shape(state, label: str):
         value = state["current_order"]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise StateLoadError(f"{label} current_order 必須是非負整數或 null")
+    if "current_task_base_sha" in state and state["current_task_base_sha"] is not None:
+        value = state["current_task_base_sha"]
+        if (not isinstance(value, str) or
+                re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None):
+            raise StateLoadError(f"{label} current_task_base_sha 必須是完整 SHA 或 null")
     for field in ("plan", "completed", "notes", "issues"):
         if field in state and not isinstance(state[field], list):
             raise StateLoadError(f"{label} {field} 必須是陣列")
@@ -841,6 +878,9 @@ def validate_state_shape(state, label: str):
                     entry["order"] < 1 or
                     not isinstance(entry.get("sha"), str) or
                     re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", entry["sha"]) is None or
+                    ("base_sha" in entry and
+                     (not isinstance(entry["base_sha"], str) or
+                      re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", entry["base_sha"]) is None)) or
                     not isinstance(entry.get("round"), int) or isinstance(entry.get("round"), bool) or
                     entry["round"] < 0 or
                     ("human" in entry and not isinstance(entry["human"], bool))):
@@ -1037,7 +1077,8 @@ class Workspace:
             "phase": "plan", "round": 0, "flag": 0,
             "plan": [], "plan_version": 0,
             "current_order": 0, "done_count": 0,
-            "completed": [],            # [{order, sha, round}]
+            "completed": [],            # [{order, base_sha, sha, round}]
+            "current_task_base_sha": None,
             "last_green_sha": None,
             "red_streak": 0, "stall_rounds": 0,
             "agent_failure_streak": 0, "agent_backoff_seconds": 0,
@@ -1730,8 +1771,12 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
         log(f"ℹ️ Agent 本輪未送出 done｜repo 無異動且驗證通過，保留 done 共識 {state['done_count']}")
 
     if state["done_count"] >= args.done_threshold:
-        state["completed"].append({"order": state["current_order"], "sha": head_after,
-                                   "round": round_number})
+        task_base_sha = ensure_current_task_base_sha(state, repo, head_after)
+        completed_entry = {"order": state["current_order"], "sha": head_after,
+                           "round": round_number}
+        if task_base_sha:
+            completed_entry["base_sha"] = task_base_sha
+        state["completed"].append(completed_entry)
         event = f"✅ {task_id} 完成(sha {head_after[:8]},{state['done_count']} 輪共識)"
         log(event)
         state["done_count"] = 0
@@ -1739,10 +1784,13 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
                            if task["order"] > state["current_order"]), None)
         if next_order is None:
             state["phase"] = "done"
+            state["current_task_base_sha"] = None
             state["red_streak"] = 0
             state["stall_rounds"] = 0
         else:
             state["current_order"] = next_order
+            # 下一個 task 的起點就是上一個 task 收斂完成的 HEAD；後續多輪不得更新。
+            state["current_task_base_sha"] = head_after
 
     reset_reason = ""
     if state["phase"] == "exec":
@@ -1763,10 +1811,16 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
         fail(f"reset 回綠點 {green[:8]} 後工作樹不符預期"
              f"（HEAD={head_sha(repo)[:8]}、dirty={is_dirty(repo)}）——"
              f"綠點錨定不可信，停機交由人員確認。詳見 {workspace.history}")
+    previous_order = state["current_order"]
+    previous_base = state.get("current_task_base_sha")
     state["completed"] = [entry for entry in state["completed"]
                           if is_ancestor(repo, entry["sha"], green)]
     state["current_order"] = ((state["completed"][-1]["order"] + 1) if state["completed"] else
                               (state["plan"][0]["order"] if state["plan"] else 1))
+    if (state["current_order"] != previous_order or not previous_base or
+            not is_ancestor(repo, previous_base, green)):
+        state["current_task_base_sha"] = (state["completed"][-1]["sha"]
+                                           if state["completed"] else green)
     key = str(state["current_order"])
     state["task_reset_counts"][key] = state["task_reset_counts"].get(key, 0) + 1
     state["done_count"] = state["red_streak"] = state["stall_rounds"] = 0
@@ -1924,6 +1978,7 @@ def main():
     session_id = uuid.uuid4().hex
     state["loop"] = {"pid": os.getpid(), "session_id": session_id,
                      "started_at": datetime.now().isoformat(timespec="seconds")}
+    ensure_current_task_base_sha(state, repo)
 
     def _mark_stopped():
         """正常退出時清 session 控制檔、凍結未完成輪時間並清除 state pid。"""
@@ -2166,6 +2221,13 @@ def main():
                 protected=protected, validate_cmd=validate_cmd, args=args,
                 head_after=head_after, dirty=dirty, tampered=tampered, changed=changed,
                 agent_failed=agent_failed, completion_missing=missing_done)
+
+        # 規劃期可能在本輪剛切入 exec；在 state 落盤前建立 task-1 的不可變起點。
+        # 一般 exec 輪也用同一 helper 為舊版缺欄位 state 做向下相容補記。
+        if phase == "plan" and state["phase"] == "exec":
+            # 即使是舊版 plan state，這一刻也是明確的 task-1 啟動點，可以開始新 schema 紀錄。
+            state["current_task_base_sha"] = None
+        ensure_current_task_base_sha(state, repo, head_after)
 
         ingest_pending_issues(ws, state, round_token, rnd, task_id, phase)
 

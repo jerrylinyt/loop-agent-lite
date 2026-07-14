@@ -12,6 +12,7 @@ export interface ModalProps {
   extraWide?: boolean;
   compact?: boolean;
   fullScreen?: boolean;
+  bodyClassName?: string;
 }
 
 const FOCUSABLE = [
@@ -25,7 +26,7 @@ const FOCUSABLE = [
 
 const modalStack: symbol[] = [];
 
-export default function Modal({ title, description, onClose, children, footer, wide, extraWide, compact, fullScreen }: ModalProps) {
+export default function Modal({ title, description, onClose, children, footer, wide, extraWide, compact, fullScreen, bodyClassName }: ModalProps) {
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
@@ -97,7 +98,7 @@ export default function Modal({ title, description, onClose, children, footer, w
           </div>
           <button type="button" className="text-button" onClick={onClose} aria-label="關閉對話框">關閉</button>
         </header>
-        <div className="modal-body">{children}</div>
+        <div className={`modal-body${bodyClassName ? ` ${bodyClassName}` : ""}`}>{children}</div>
         {footer && <footer className="modal-footer">{footer}</footer>}
       </div>
     </div>,

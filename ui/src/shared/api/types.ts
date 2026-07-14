@@ -139,8 +139,49 @@ export interface PlanEditTask {
 
 export interface CompletedTask {
   order: number;
+  base_sha?: string;
   sha: string;
+  round?: number;
   human?: boolean;
+}
+
+export interface TaskDiffCommit {
+  sha: string;
+  short_sha: string;
+  author: string;
+  date: string;
+  subject: string;
+}
+
+export interface TaskDiffFile {
+  path: string;
+  old_path?: string | null;
+  status: "added" | "deleted" | "modified" | "renamed" | "copied" | "type_changed" | "unmerged" | "unknown";
+  status_code: string;
+  similarity?: number | null;
+  additions: number | null;
+  deletions: number | null;
+  binary: boolean;
+}
+
+export interface TaskDiffResponse {
+  workspace?: string;
+  task?: { order: number; title: string; human: boolean; round: number };
+  comparison?: {
+    mode: "task_range" | "previous_task" | "single_commit";
+    base_sha: string | null;
+    head_sha: string;
+    base_source: "recorded" | "previous_task" | "single_commit";
+    warning?: string | null;
+  };
+  commits?: TaskDiffCommit[];
+  files?: TaskDiffFile[];
+  stats?: { files: number; additions: number; deletions: number; binary_files: number };
+  selected_file?: TaskDiffFile;
+  patch?: string;
+  patch_too_large?: boolean;
+  patch_limit_bytes?: number;
+  error?: string;
 }
 
 export interface Issue {
@@ -204,6 +245,7 @@ export interface WorkspaceState {
   state_recovery_pending?: boolean;
   plan_version: number;
   current_order?: number;
+  current_task_base_sha?: string | null;
   goal_changed?: boolean;
   plan?: PlanTask[];
   completed?: CompletedTask[];

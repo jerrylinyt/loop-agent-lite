@@ -1486,6 +1486,10 @@ class TestStateSchemaGuard(unittest.TestCase):
             {"phase": "exec", "completed": [{
                 "order": 1, "sha": "a" * 40, "round": "1",
             }]},
+            {"phase": "exec", "current_task_base_sha": "short"},
+            {"phase": "exec", "completed": [{
+                "order": 1, "base_sha": "not-a-full-sha", "sha": "a" * 40, "round": 1,
+            }]},
             {"phase": "exec", "completed": [
                 {"order": 1, "sha": "a" * 40, "round": 1},
                 {"order": 1, "sha": "b" * 40, "round": 2},
@@ -4025,6 +4029,121 @@ class TestNotifyEndpoints(unittest.TestCase):
                 self.assertEqual(json.loads(personal.read_text(encoding="utf-8"))["notify_cmd"], "")
             finally:
                 D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE = old
+
+
+class TestTaskDiffProjection(unittest.TestCase):
+    """Completed task 應以固化 base 重建多 commit 淨變更，舊 state 有明確降級路徑。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.repo = make_repo(root)
+        self.workspace_root = root / "workspace"
+        self.old_roots = D.ROOT, L.WORKSPACE_ROOT
+        D.ROOT = L.WORKSPACE_ROOT = self.workspace_root
+        self.base = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        (self.repo / "src.txt").write_text("one\n", encoding="utf-8")
+        git(self.repo, "add", "src.txt")
+        git(self.repo, "commit", "-qm", "task one part one")
+        (self.repo / "src.txt").write_text("one\ntwo\n", encoding="utf-8")
+        (self.repo / "docs.txt").write_text("docs\n", encoding="utf-8")
+        git(self.repo, "add", "src.txt", "docs.txt")
+        git(self.repo, "commit", "-qm", "task one part two")
+        self.task_one_head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        git(self.repo, "mv", "docs.txt", "guide.txt")
+        git(self.repo, "commit", "-qm", "task two rename")
+        (self.repo / "asset.bin").write_bytes(b"\x00\x01\x02")
+        git(self.repo, "add", "asset.bin")
+        git(self.repo, "commit", "-qm", "task two binary")
+        self.task_two_head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        self.workspace = L.Workspace("demo")
+        state = self.workspace.fresh_state()
+        state.update(
+            phase="done", current_order=2,
+            plan=[{"order": 1, "task": "multi commit task"},
+                  {"order": 2, "task": "legacy task"}],
+            completed=[
+                {"order": 1, "base_sha": self.base, "sha": self.task_one_head, "round": 3},
+                {"order": 2, "sha": self.task_two_head, "round": 5},
+            ],
+            config={"repo": str(self.repo)},
+        )
+        self.workspace.save_state(state)
+
+    def tearDown(self):
+        D.ROOT, L.WORKSPACE_ROOT = self.old_roots
+        self.temp.cleanup()
+
+    def test_recorded_range_combines_all_commits_and_loads_selected_patch(self):
+        projection = D.task_diff_projection("demo", 1)
+        self.assertEqual(projection["comparison"]["mode"], "task_range")
+        self.assertEqual(projection["comparison"]["base_sha"], self.base)
+        self.assertEqual([commit["subject"] for commit in projection["commits"]],
+                         ["task one part one", "task one part two"])
+        self.assertEqual(projection["stats"]["files"], 2)
+        self.assertEqual(projection["stats"]["additions"], 3)
+        selected = D.task_diff_projection("demo", 1, "src.txt")
+        self.assertIn("diff --git a/src.txt b/src.txt", selected["patch"])
+        self.assertIn("+two", selected["patch"])
+        with self.assertRaisesRegex(ValueError, "不在此 task"):
+            D.task_diff_projection("demo", 1, "../secret")
+
+    def test_selected_patch_is_bounded_before_returning_to_browser(self):
+        old_limit = D.TASK_DIFF_MAX_BYTES
+        D.TASK_DIFF_MAX_BYTES = 32
+        try:
+            projection = D.task_diff_projection("demo", 1, "src.txt")
+        finally:
+            D.TASK_DIFF_MAX_BYTES = old_limit
+        self.assertTrue(projection["patch_too_large"])
+        self.assertEqual(projection["patch"], "")
+        self.assertEqual(projection["patch_limit_bytes"], 32)
+
+    def test_legacy_range_uses_previous_task_and_reports_rename_and_binary(self):
+        projection = D.task_diff_projection("demo", 2)
+        self.assertEqual(projection["comparison"]["mode"], "previous_task")
+        self.assertEqual(projection["comparison"]["base_sha"], self.task_one_head)
+        self.assertEqual(len(projection["commits"]), 2)
+        renamed = next(file for file in projection["files"] if file["status"] == "renamed")
+        self.assertEqual(renamed["old_path"], "docs.txt")
+        self.assertEqual(renamed["path"], "guide.txt")
+        binary = next(file for file in projection["files"] if file["path"] == "asset.bin")
+        self.assertTrue(binary["binary"])
+
+    def test_first_legacy_task_falls_back_to_single_completion_commit(self):
+        state, error = D.read_state("demo", repair=False)
+        self.assertIsNone(error)
+        state["completed"] = [{"order": 1, "sha": self.task_one_head, "round": 3}]
+        self.workspace.save_state(state)
+        projection = D.task_diff_projection("demo", 1)
+        self.assertEqual(projection["comparison"]["mode"], "single_commit")
+        self.assertIsNone(projection["comparison"]["base_sha"])
+        self.assertEqual([commit["subject"] for commit in projection["commits"]],
+                         ["task one part two"])
+
+    def test_current_task_base_stays_fixed_across_later_commits(self):
+        state = self.workspace.fresh_state()
+        state.update(phase="exec", current_order=1,
+                     plan=[{"order": 1, "task": "fixed base"}])
+        original = L.ensure_current_task_base_sha(state, self.repo)
+        (self.repo / "later.txt").write_text("later\n", encoding="utf-8")
+        git(self.repo, "add", "later.txt")
+        git(self.repo, "commit", "-qm", "later task commit")
+        self.assertEqual(L.ensure_current_task_base_sha(state, self.repo), original)
+        self.assertNotEqual(original, git(self.repo, "rev-parse", "HEAD").stdout.strip())
+
+    def test_legacy_first_active_task_does_not_invent_a_late_base(self):
+        state = {
+            "phase": "exec",
+            "current_order": 1,
+            "plan": [{"order": 1, "task": "already running on old state"}],
+            "completed": [],
+        }
+        self.assertIsNone(L.ensure_current_task_base_sha(state, self.repo))
+        self.assertNotIn("current_task_base_sha", state)
 
 
 class TestFleetHistoryProjection(unittest.TestCase):

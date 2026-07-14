@@ -1,15 +1,19 @@
 /** Plan 主視圖：投影完成/目前狀態、追蹤版本更新閃爍，停止時才開啟獨立編輯器。 */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import type { PlanEditTask, WorkspaceState } from "../../shared/api/types";
 import PlanEditorModal from "./PlanEditorModal";
 
+const TaskDiffModal = lazy(() => import("./TaskDiffModal"));
+
 export default function PlanTable({
   state,
+  workspace,
   canEdit,
   onSave,
   onGoto
 }: {
   state: WorkspaceState;
+  workspace: string;
   canEdit: boolean;
   onSave: (tasks: PlanEditTask[], doneCount: number) => Promise<string>;
   onGoto: (order: number) => void;
@@ -17,6 +21,7 @@ export default function PlanTable({
   const [showDone, setShowDone] = useState(() => localStorage.getItem("showdone") === "1");
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [editorOpen, setEditorOpen] = useState(false);
+  const [diffTask, setDiffTask] = useState<{ order: number; title: string; sha: string } | null>(null);
   const [currentOffscreen, setCurrentOffscreen] = useState(false);
   const [flashOrders, setFlashOrders] = useState<Set<number>>(new Set());
   const [updatedVersion, setUpdatedVersion] = useState<number | null>(null);
@@ -123,7 +128,14 @@ export default function PlanTable({
                     {task.ref && <div className="task-ref">ref: {task.ref}</div>}
                   </td>
                   <td className="task-status">
-                    {done ? `完成 ${done.human ? "人工" : done.sha.slice(0, 8)}` : current ? "進行中" : "等待"}
+                    {done ? <span className="task-completion">
+                      <span>完成{done.human ? " 人工" : ""}</span>
+                      <button type="button" className="commit-sha-button" title={`查看 task-${task.order} 的完整 Git 變更`}
+                        aria-label={`查看 task-${task.order} Git 變更 ${done.sha.slice(0, 8)}`}
+                        onClick={() => setDiffTask({ order: task.order, title: task.task, sha: done.sha })}>
+                        {done.sha.slice(0, 8)}
+                      </button>
+                    </span> : current ? "進行中" : "等待"}
                     {resetCount ? ` 重置 ${resetCount}` : ""}
                     {canEdit && (state.phase === "exec" || state.phase === "done") && task.order !== state.current_order && (
                       <button type="button" className="goto-button" onClick={() => onGoto(task.order)} aria-label={`把進度設到 task-${task.order}`}>前往</button>
@@ -143,5 +155,7 @@ export default function PlanTable({
       )}
     </section>
     {editorOpen && <PlanEditorModal state={state} onClose={() => setEditorOpen(false)} onSave={onSave} />}
+    {diffTask && <Suspense fallback={null}><TaskDiffModal workspace={workspace} order={diffTask.order} fallbackTitle={diffTask.title}
+      fallbackSha={diffTask.sha} onClose={() => setDiffTask(null)} /></Suspense>}
   </>);
 }

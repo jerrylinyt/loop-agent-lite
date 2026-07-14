@@ -246,7 +246,7 @@ export default function WorkspaceView({
         {state.goal_changed && <div className="goal-warning">警告：goal 已變更；點「Goal」查看差異，建議回規劃期重新收斂</div>}
       </header>
       <div className="workspace-main">
-        <PlanTable state={state} canEdit={canChange} onSave={savePlan} onGoto={gotoTask} />
+        <PlanTable state={state} workspace={workspace?.name ?? ""} canEdit={canChange} onSave={savePlan} onGoto={gotoTask} />
         {!statusCollapsed && <HorizontalSplitter onResize={resizeStatus} />}
         <div className={`status-console-wrap${statusCollapsed ? " collapsed" : ""}`} style={{ height: statusCollapsed ? 40 : statusHeight }}>
           <ConsolePane

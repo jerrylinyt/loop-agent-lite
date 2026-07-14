@@ -229,6 +229,9 @@ th { position: sticky; z-index: 1; top: 0; background: var(--surface); font-weig
 .task-toggle.expanded { display: block; -webkit-line-clamp: unset; }
 .task-ref { margin-top: 2px; color: var(--muted); font-size: 12px; }
 .task-status { white-space: nowrap; }
+.task-completion { display: inline-flex; align-items: center; gap: 5px; }
+.commit-sha-button { min-height: 23px; padding: 1px 6px; border: 1px solid color-mix(in srgb, var(--success) 45%, var(--border)); border-radius: 5px; background: var(--success-soft); color: var(--success); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.commit-sha-button:hover { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 tr.completed td { color: var(--success); }
 tr.current td { color: var(--warning); background: color-mix(in srgb, var(--warning-soft) 45%, transparent); }
 .completed-summary td { padding: 0; background: var(--success-soft); }
@@ -540,6 +543,66 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .anomaly-record .log-missing { background: var(--surface-subtle); color: var(--muted); }
 .anomaly-log-viewer pre { flex: 1; min-height: 0; margin: 0; overflow: auto; padding: 10px; color: var(--text); font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
 @media (max-width: 760px) { .anomaly-explorer { grid-template-columns: 1fr; } .anomaly-list { max-height: 34vh; } }
+
+/* Completed task Git browser：摘要與 commits 固定在上方，檔案清單／單檔 patch 各自捲動。 */
+.task-diff-modal-body { display: flex; overflow: hidden; padding: 0; }
+.task-diff-browser { display: flex; width: 100%; min-width: 0; min-height: 0; flex: 1; flex-direction: column; background: var(--bg); }
+.task-diff-loading { display: grid; min-height: 120px; flex: 1; place-items: center; padding: 24px; color: var(--muted); text-align: center; }
+.task-diff-loading.error { color: var(--danger); }
+.task-diff-summary { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 9px 18px; min-height: 48px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--surface); }
+.task-diff-range, .task-diff-totals, .task-diff-controls { display: flex; align-items: center; gap: 8px; }
+.task-diff-range code, .task-commit-list code { padding: 2px 5px; border-radius: 5px; background: var(--surface-subtle); color: var(--accent); font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.task-diff-mode { padding: 2px 7px; border-radius: 999px; background: var(--success-soft); color: var(--success); font-size: 11px; }
+.task-diff-mode.mode-previous_task { background: var(--accent-soft); color: var(--accent); }
+.task-diff-mode.mode-single_commit { background: var(--warning-soft); color: var(--warning); }
+.task-diff-totals { font-size: 12px; font-variant-numeric: tabular-nums; }
+.diff-add, .task-file-stats b { color: var(--success); }
+.diff-delete, .task-file-stats em { color: var(--danger); }
+.task-diff-controls { margin-left: auto; color: var(--muted); font-size: 12px; }
+.task-diff-controls label { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.task-diff-tabs { margin: 0; }
+.task-diff-tabs button { min-height: 26px; padding: 2px 9px; font-size: 11px; }
+.task-diff-warning { flex: none; padding: 6px 12px; border-bottom: 1px solid color-mix(in srgb, var(--warning) 35%, var(--border)); background: var(--warning-soft); color: var(--warning); font-size: 11px; }
+.task-commit-list { flex: none; border-bottom: 1px solid var(--border); background: var(--surface); }
+.task-commit-list summary { cursor: pointer; padding: 6px 12px; color: var(--muted); font-size: 11px; }
+.task-commit-list ol { display: grid; max-height: 150px; gap: 4px; margin: 0; overflow: auto; padding: 4px 14px 10px 38px; }
+.task-commit-list li { padding-left: 2px; font-size: 12px; }
+.task-commit-list li code { margin-right: 8px; }
+.task-commit-list li small { margin-left: 9px; color: var(--muted); }
+.task-diff-main { display: grid; min-width: 0; min-height: 0; flex: 1; grid-template-columns: minmax(250px, 22vw) minmax(0, 1fr); }
+.task-diff-files { display: flex; min-width: 0; min-height: 0; flex-direction: column; border-right: 1px solid var(--border); background: var(--surface); }
+.task-diff-file-search { display: flex; flex: none; align-items: center; gap: 7px; padding: 8px; border-bottom: 1px solid var(--border-soft); }
+.task-diff-file-search input { width: 100%; min-width: 0; min-height: 29px; padding: 3px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); }
+.task-diff-file-search span { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.task-diff-file-list { min-height: 0; overflow: auto; }
+.task-diff-file-list > button { display: grid; width: 100%; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: 6px; padding: 7px 8px; border: 0; border-bottom: 1px solid var(--border-soft); background: transparent; color: var(--text); text-align: left; }
+.task-diff-file-list > button:hover { background: var(--surface-subtle); }
+.task-diff-file-list > button.active { box-shadow: inset 3px 0 var(--accent); background: var(--accent-soft); }
+.task-file-status { display: grid; width: 20px; height: 20px; place-items: center; border-radius: 5px; background: var(--surface-subtle); color: var(--muted); font-size: 10px; font-weight: 750; }
+.task-file-status.status-added, .task-file-status.status-copied { background: var(--success-soft); color: var(--success); }
+.task-file-status.status-deleted { background: var(--danger-soft); color: var(--danger); }
+.task-file-status.status-renamed, .task-file-status.status-modified { background: var(--accent-soft); color: var(--accent); }
+.task-file-path { min-width: 0; overflow: hidden; }
+.task-file-path > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-file-path small { color: var(--muted); font-size: 10px; font-weight: normal; }
+.task-file-path strong { font-size: 11px; }
+.task-file-path > em { display: block; overflow: hidden; color: var(--muted); font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.task-file-stats { display: flex; gap: 4px; font-size: 9px; font-style: normal; font-variant-numeric: tabular-nums; }
+.task-file-stats b, .task-file-stats em, .task-file-stats i { font-style: normal; font-weight: 650; }
+.task-file-stats i { color: var(--warning); }
+.task-diff-viewer { display: flex; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; background: var(--bg); }
+.task-diff-viewer > header { display: flex; min-height: 38px; flex: none; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 10px; border-bottom: 1px solid var(--border); background: var(--surface); }
+.task-diff-viewer > header > div { display: flex; min-width: 0; align-items: baseline; gap: 8px; }
+.task-diff-viewer > header strong { overflow: hidden; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.task-diff-viewer > header span { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.task-patch-view { min-width: 0; min-height: 0; flex: 1; overflow: auto; background: var(--bg); }
+.task-patch-view > * { min-width: 100%; }
+.task-patch-view.wrap { overflow-x: hidden; }
+@media (max-width: 1050px) {
+  .task-diff-main { grid-template-columns: 245px minmax(0, 1fr); }
+  .task-diff-summary { gap: 7px 12px; }
+  .task-diff-controls { margin-left: 0; }
+}
 .active-toggle { outline: 2px solid var(--accent); }
 
 /* Health strip:紅連跳/停滯逼近 reset 防線時由綠轉紅 */

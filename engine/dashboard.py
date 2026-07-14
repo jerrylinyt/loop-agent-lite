@@ -27,6 +27,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -54,6 +55,9 @@ LEGACY_CONFIG_PATH = legacy_config_path()
 CONFIG_PATH = PERSONAL_CONFIG_PATH  # 舊程式/錯誤訊息相容名稱；UI 會分別顯示團隊版與個人版
 MAX_CHUNK = 512 * 1024  # 單次 tail 最多回傳量
 MAX_REQUEST_BYTES = 8 * 1024 * 1024  # POST JSON 上限，避免 goal/plan 或惡意 body 吃光 dashboard 記憶體
+TASK_DIFF_MAX_BYTES = 8 * 1024 * 1024  # 單一檔案 patch 上限；多檔採逐檔載入，不一次吞完整 repo diff
+TASK_DIFF_METADATA_MAX_BYTES = 8 * 1024 * 1024  # 檔案清單/commit metadata 超限直接拒絕，不解析截斷資料
+TASK_DIFF_TIMEOUT = 15
 HEALTH_SCHEMA_VERSION = 1
 DEFAULT_CONFIG = {
     "agent_cmds": [
@@ -597,6 +601,234 @@ def _load_state_or_err(handler, name, *, repair=True):
         handler._err(err)
         return None
     return st
+
+
+def _run_git_projection(repo: Path, *args, max_bytes=None) -> tuple[str, bool]:
+    """唯讀執行 Git 並以 timeout/大小上限保護 Dashboard。
+
+    呼叫端只傳 state 內已驗證的完整 SHA，path 則必須先從 Git 自己產生的 changed-file
+    清單反查；所有 diff 都停用 external diff/textconv，避免唯讀頁面觸發 repo 自訂程式。
+    """
+    env = {**os.environ, "GIT_PAGER": "cat", "GIT_OPTIONAL_LOCKS": "0"}
+    limit = TASK_DIFF_METADATA_MAX_BYTES if max_bytes is None else max_bytes
+    try:
+        # stdout 先落到匿名暫存檔，避免 capture_output 在判斷大小前就把超大 patch
+        # 完整塞進 Dashboard 記憶體。只有 stderr（錯誤訊息）保留在記憶體。
+        with tempfile.TemporaryFile() as stdout_file:
+            result = subprocess.run(
+                ["git", "-C", str(repo), *args], stdout=stdout_file,
+                stderr=subprocess.PIPE, timeout=TASK_DIFF_TIMEOUT, env=env,
+            )
+            output_size = stdout_file.tell()
+            oversized = output_size > limit
+            stdout_file.seek(0)
+            data = stdout_file.read(limit)
+    except subprocess.TimeoutExpired as e:
+        raise ValueError(f"Git diff 執行超過 {TASK_DIFF_TIMEOUT} 秒") from e
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()[-800:]
+        raise ValueError(f"Git 查詢失敗{f'：{detail}' if detail else ''}")
+    if oversized and max_bytes is None:
+        raise ValueError(
+            f"Git diff 檔案清單或 commit metadata 超過 {limit // 1024 // 1024} MiB 安全上限")
+    return data.decode("utf-8", errors="replace"), oversized
+
+
+def _task_diff_repo(state) -> Path:
+    """只採用 coordinator state 綁定的 repo，不接受瀏覽器傳入任意本機路徑。"""
+    raw_repo = (state.get("config") or {}).get("repo")
+    if not isinstance(raw_repo, str) or not raw_repo.strip():
+        raise ValueError("state 缺少 code repo 設定")
+    repo = Path(raw_repo).expanduser().resolve()
+    if not repo.is_dir() or not (repo / ".git").exists():
+        raise ValueError(f"code repo 不存在或不是 Git repository：{repo}")
+    top, _ = _run_git_projection(repo, "rev-parse", "--show-toplevel")
+    if Path(top.strip()).resolve() != repo:
+        raise ValueError("state 的 repo 必須指向 Git repository 根目錄")
+    return repo
+
+
+def _resolve_task_commit(repo: Path, sha) -> str | None:
+    """只解析 state schema 允許的完整 SHA；不存在時回 None。"""
+    if not isinstance(sha, str) or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha) is None:
+        return None
+    try:
+        value, _ = _run_git_projection(
+            repo, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}")
+    except ValueError:
+        return None
+    return value.strip()
+
+
+def _parse_git_name_status(value: str):
+    """解析 `git --name-status -z`，保留 rename/copy 的新舊 path 與 similarity。"""
+    tokens = value.split("\0")
+    files = []
+    index = 0
+    status_names = {
+        "A": "added", "D": "deleted", "M": "modified", "R": "renamed",
+        "C": "copied", "T": "type_changed", "U": "unmerged", "X": "unknown",
+    }
+    while index < len(tokens) and tokens[index]:
+        raw_status = tokens[index]
+        index += 1
+        code = raw_status[:1]
+        if index >= len(tokens):
+            break
+        first_path = tokens[index]
+        index += 1
+        old_path = None
+        path = first_path
+        if code in ("R", "C"):
+            if index >= len(tokens):
+                break
+            old_path, path = first_path, tokens[index]
+            index += 1
+        files.append({
+            "path": path,
+            "old_path": old_path,
+            "status": status_names.get(code, "unknown"),
+            "status_code": code,
+            "similarity": int(raw_status[1:]) if raw_status[1:].isdigit() else None,
+        })
+    return files
+
+
+def _parse_git_numstat(value: str):
+    """解析 `git --numstat -z`；rename 會以空 path header 加兩個 NUL path 表示。"""
+    tokens = value.split("\0")
+    stats = {}
+    index = 0
+    while index < len(tokens) and tokens[index]:
+        header = tokens[index]
+        index += 1
+        parts = header.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        added, deleted, path = parts
+        old_path = None
+        if not path:
+            if index + 1 >= len(tokens):
+                break
+            old_path, path = tokens[index], tokens[index + 1]
+            index += 2
+        stats[path] = {
+            "additions": None if added == "-" else int(added),
+            "deletions": None if deleted == "-" else int(deleted),
+            "binary": added == "-" or deleted == "-",
+            "old_path": old_path,
+        }
+    return stats
+
+
+def _parse_task_commits(value: str):
+    """解析固定分隔的唯讀 log metadata；commit subject 不作為命令輸入。"""
+    commits = []
+    for record in value.split("\x1e"):
+        fields = record.strip("\n\0").split("\x1f")
+        if len(fields) == 5:
+            commits.append({"sha": fields[0], "short_sha": fields[1], "author": fields[2],
+                            "date": fields[3], "subject": fields[4]})
+    return commits
+
+
+def task_diff_projection(name: str, order: int, selected_path: str | None = None):
+    """重建 completed task 的 commit 範圍、檔案統計，並選配回傳單一檔案 patch。
+
+    新 state 優先使用完成時固化的 base_sha；舊 state 退回前一 task SHA；兩者皆無時
+    才用單一完成 commit。這讓多 commit task 顯示完整淨變更，又不捏造舊資料的起點。
+    """
+    state, error = read_state(name, repair=False)
+    if error:
+        raise ValueError(error)
+    completed = state.get("completed") or []
+    entry = next((item for item in completed if item.get("order") == order), None)
+    if entry is None:
+        raise ValueError(f"task-{order} 沒有完成 SHA")
+    repo = _task_diff_repo(state)
+    head = _resolve_task_commit(repo, entry.get("sha"))
+    if head is None:
+        raise ValueError(f"task-{order} 的完成 SHA 不存在於目前 code repo")
+
+    warning = None
+    base = None
+    base_source = "single_commit"
+    candidates = [(entry.get("base_sha"), "recorded")]
+    previous = sorted(
+        (item for item in completed if item.get("order", 0) < order),
+        key=lambda item: item["order"], reverse=True,
+    )
+    candidates.extend((item.get("sha"), "previous_task") for item in previous)
+    for candidate, source in candidates:
+        resolved = _resolve_task_commit(repo, candidate)
+        if resolved and loop_mod.is_ancestor(repo, resolved, head):
+            base, base_source = resolved, source
+            break
+        if candidate and source == "recorded":
+            warning = "記錄的 task 起點已不在目前完成 SHA 的歷史上，已使用相容模式重建。"
+
+    range_mode = base is not None
+    diff_prefix = (["diff", "--no-ext-diff", "--no-textconv", "--find-renames", base, head]
+                   if range_mode else
+                   ["show", "--format=", "--no-ext-diff", "--no-textconv", "--find-renames", head])
+    name_status, _ = _run_git_projection(repo, *diff_prefix, "--name-status", "-z")
+    numstat, _ = _run_git_projection(repo, *diff_prefix, "--numstat", "-z")
+    files = _parse_git_name_status(name_status)
+    stats_by_path = _parse_git_numstat(numstat)
+    for file in files:
+        stats = stats_by_path.get(file["path"], {})
+        file.update({
+            "additions": stats.get("additions"),
+            "deletions": stats.get("deletions"),
+            "binary": bool(stats.get("binary")),
+        })
+
+    log_format = "%H%x1f%h%x1f%an%x1f%aI%x1f%s%x1e"
+    if range_mode:
+        log_text, _ = _run_git_projection(
+            repo, "log", "--reverse", f"--format={log_format}", f"{base}..{head}")
+    else:
+        log_text, _ = _run_git_projection(repo, "show", "-s", f"--format={log_format}", head)
+    commits = _parse_task_commits(log_text)
+    plan_entry = next((item for item in state.get("plan", []) if item.get("order") == order), {})
+    projection = {
+        "workspace": name,
+        "task": {"order": order, "title": plan_entry.get("task") or f"task-{order}",
+                 "human": bool(entry.get("human")), "round": entry.get("round", 0)},
+        "comparison": {
+            "mode": "task_range" if base_source == "recorded" else
+                    "previous_task" if base_source == "previous_task" else "single_commit",
+            "base_sha": base,
+            "head_sha": head,
+            "base_source": base_source,
+            "warning": warning,
+        },
+        "commits": commits,
+        "files": files,
+        "stats": {
+            "files": len(files),
+            "additions": sum(file["additions"] or 0 for file in files),
+            "deletions": sum(file["deletions"] or 0 for file in files),
+            "binary_files": sum(1 for file in files if file["binary"]),
+        },
+    }
+
+    if selected_path is not None:
+        selected = next((file for file in files if file["path"] == selected_path), None)
+        if selected is None:
+            raise ValueError("指定檔案不在此 task 的 Git diff 內")
+        pathspecs = [selected["path"]]
+        if selected.get("old_path") and selected["old_path"] != selected["path"]:
+            pathspecs.insert(0, selected["old_path"])
+        patch, oversized = _run_git_projection(
+            repo, *diff_prefix, "--patch", "--", *pathspecs,
+            max_bytes=TASK_DIFF_MAX_BYTES,
+        )
+        projection["selected_file"] = selected
+        projection["patch"] = patch if not oversized else ""
+        projection["patch_too_large"] = oversized
+        projection["patch_limit_bytes"] = TASK_DIFF_MAX_BYTES
+    return projection
 
 
 def interrupted_resume_block_reason(name, st):
@@ -1652,6 +1884,24 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 st, err = read_state(d.name, repair=False)
                 self._out(200, json.dumps({"error": err} if err else st, ensure_ascii=False))
+            elif u.path == "/api/task-diff":
+                d = self._ws_dir(q)
+                if d is None:
+                    return
+                try:
+                    order = int(q.get("order", [""])[0])
+                    if order < 1:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    self._err("task diff order 必須是正整數")
+                    return
+                selected_path = q.get("file", [None])[0]
+                try:
+                    projection = task_diff_projection(d.name, order, selected_path)
+                except ValueError as e:
+                    self._err(str(e))
+                    return
+                self._out(200, json.dumps(projection, ensure_ascii=False))
             elif u.path == "/api/tail":
                 d = self._ws_dir(q)
                 if d is None:
@@ -2599,7 +2849,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._err(f"目前是 {st.get('phase')},只有 exec/done 能回規劃期")
                 return
             st.update(phase="plan", flag=0, current_order=0, done_count=0, completed=[],
-                      red_streak=0, stall_rounds=0, task_reset_counts={}, goal_changed=False)
+                      current_task_base_sha=None, red_streak=0, stall_rounds=0,
+                      task_reset_counts={}, goal_changed=False)
             st.pop("goal_previous_hash", None)
         elif target == "exec":
             if st.get("phase") != "plan":
@@ -2608,7 +2859,13 @@ class Handler(BaseHTTPRequestHandler):
             if not st.get("plan"):
                 self._err("plan 為空,不能進執行期——先 create-plan 或匯入 plan.json")
                 return
+            try:
+                task_base_sha = loop_mod.head_sha(_task_diff_repo(st))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                # 舊 state 若缺 repo，仍保留既有 phase 操作；下次 loop 啟動會在 preflight 後補記。
+                task_base_sha = None
             st.update(phase="exec", flag=0, done_count=0, current_order=st["plan"][0]["order"],
+                      current_task_base_sha=task_base_sha,
                       stall_rounds=0, red_streak=0)  # 規劃期殘值不帶進執行期
         else:
             self._err("phase 只能是 plan 或 exec")
@@ -2642,6 +2899,7 @@ class Handler(BaseHTTPRequestHandler):
         completed = st.get("completed") or []
         done_orders = {e["order"] for e in completed}
         skipped = [o for o in plan_orders if o < order and o not in done_orders]
+        head = None
         if skipped:  # 往前跳:同 preflight 原則,validate 綠才放行
             c = st.get("config") or {}
             repo, vcmd = c.get("repo"), c.get("validate_cmd")
@@ -2671,14 +2929,30 @@ class Handler(BaseHTTPRequestHandler):
             if rc != 0:
                 self._err(f"validate 未過,不能往後跳(同 preflight 原則):\n{tail}")
                 return
-            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                                  capture_output=True, text=True).stdout.strip()
+            try:
+                head = loop_mod.head_sha(Path(repo))
+            except (OSError, RuntimeError) as e:
+                self._err(f"validate 已通過，但無法讀取目前 Git HEAD：{e}")
+                return
+            task_base = st.get("current_task_base_sha")
+            if (not isinstance(task_base, str) or
+                    not loop_mod.is_ancestor(repo, task_base, head)):
+                previous = sorted(completed, key=lambda entry: entry["order"])
+                task_base = previous[-1]["sha"] if previous else head
             for o in skipped:
-                completed.append({"order": o, "sha": head, "round": 0, "human": True})
+                completed.append({"order": o, "base_sha": task_base, "sha": head,
+                                  "round": 0, "human": True})
+                task_base = head
         # 目標(含)之後的完成紀錄清除 → 從 order 重新執行
         completed = sorted([e for e in completed if e["order"] < order], key=lambda e: e["order"])
+        if head is None:
+            try:
+                head = loop_mod.head_sha(_task_diff_repo(st))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                head = completed[-1]["sha"] if completed else st.get("current_task_base_sha")
         st["completed"] = completed
-        st.update(phase="exec", current_order=order, done_count=0, red_streak=0, stall_rounds=0)
+        st.update(phase="exec", current_order=order, current_task_base_sha=head,
+                  done_count=0, red_streak=0, stall_rounds=0)
         write_state(name, st)
         workspace_console_log(
             name,
