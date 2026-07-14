@@ -4,7 +4,7 @@ import type { WorkspaceSummary } from "../../shared/api/types";
 function workspaceMeta(workspace: WorkspaceSummary) {
   if (workspace.phase === "exec") return `${workspace.completed ?? 0}/${workspace.plan_len ?? 0}`;
   if (workspace.phase === "plan") return `f${workspace.flag ?? 0}`;
-  if (workspace.phase === "done") return "🏁";
+  if (workspace.phase === "done") return "完成";
   return "";
 }
 
@@ -29,7 +29,7 @@ export default function WorkspaceTabs({
           onClick={() => onSelect(workspace.name)}
         >
           <span className={`status-dot phase-${workspace.phase ?? "unknown"}`} aria-hidden="true" />
-          {workspace.running && <span aria-label="執行中">▶</span>}
+          {workspace.running && <span className="sr-only">執行中</span>}
           <span>{workspace.name}</span>
           {workspaceMeta(workspace) && <span className="tab-meta">{workspaceMeta(workspace)}</span>}
         </button>

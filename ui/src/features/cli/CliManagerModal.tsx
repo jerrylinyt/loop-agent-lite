@@ -38,13 +38,13 @@ export default function CliManagerModal({
       extra_path_dirs: paths
     });
     if (response.error) {
-      setTest({ loading: false, ok: false, text: `❌ ${response.error}`, output: "" });
+      setTest({ loading: false, ok: false, text: `錯誤：${response.error}`, output: "" });
       return;
     }
     setTest({
       loading: false,
       ok: !!response.ok,
-      text: response.timeout ? "❌ 執行逾時（60 秒）" : response.ok ? `✅ Agent CLI 完成（exit ${response.rc ?? 0}）` : `❌ Agent CLI 失敗（exit ${response.rc ?? "?"}）`,
+      text: response.timeout ? "錯誤：執行逾時（60 秒）" : response.ok ? `成功：Agent CLI 完成（exit ${response.rc ?? 0}）` : `錯誤：Agent CLI 失敗（exit ${response.rc ?? "?"}）`,
       output: response.output ?? ""
     });
   };
@@ -58,7 +58,7 @@ export default function CliManagerModal({
     });
     setSaving(false);
     if (response.error) {
-      setMessage(`❌ ${response.error}`);
+      setMessage(`錯誤：${response.error}`);
       return;
     }
     onSaved(response);

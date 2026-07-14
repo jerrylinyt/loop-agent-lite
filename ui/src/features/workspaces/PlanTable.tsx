@@ -77,7 +77,7 @@ export default function PlanTable({
           <span>{completed.size}/{plan.length} 已完成</span>
           {updatedVersion !== null && <span className="plan-update-badge" role="status" aria-label={`計畫已更新 v${updatedVersion}`}>計畫已更新 v{updatedVersion}</span>}
         </div>
-        {canEdit && plan.length > 0 && <button type="button" className="secondary-button" onClick={() => setEditorOpen(true)}>✎ 編輯計畫</button>}
+        {canEdit && plan.length > 0 && <button type="button" className="secondary-button" onClick={() => setEditorOpen(true)}>編輯計畫</button>}
       </header>
       <div className="table-scroll" ref={scrollRef} onScroll={checkCurrentVisibility}>
         <table>
@@ -94,7 +94,7 @@ export default function PlanTable({
                   }}
                   aria-expanded={showDone}
                 >
-                  {showDone ? "▾" : "▸"} 已完成 {completed.size} 條
+                  {showDone ? "隱藏" : "顯示"}已完成 {completed.size} 條
                 </button>
               </td></tr>
             )}
@@ -123,10 +123,10 @@ export default function PlanTable({
                     {task.ref && <div className="task-ref">ref: {task.ref}</div>}
                   </td>
                   <td className="task-status">
-                    {done ? `✔ ${done.human ? "人工" : done.sha.slice(0, 8)}` : current ? "→ 進行中" : "·"}
-                    {resetCount ? ` ⟲${resetCount}` : ""}
+                    {done ? `完成 ${done.human ? "人工" : done.sha.slice(0, 8)}` : current ? "進行中" : "等待"}
+                    {resetCount ? ` 重置 ${resetCount}` : ""}
                     {canEdit && (state.phase === "exec" || state.phase === "done") && task.order !== state.current_order && (
-                      <button type="button" className="goto-button" onClick={() => onGoto(task.order)} aria-label={`把進度設到 task-${task.order}`}>⏵</button>
+                      <button type="button" className="goto-button" onClick={() => onGoto(task.order)} aria-label={`把進度設到 task-${task.order}`}>前往</button>
                     )}
                   </td>
                 </tr>
@@ -139,7 +139,7 @@ export default function PlanTable({
       {currentOffscreen && (
         <button type="button" className="floating-button current-jump" onClick={() => {
           scrollRef.current?.querySelector<HTMLElement>("tr.current")?.scrollIntoView({ block: "center" });
-        }}>→ 回到執行中</button>
+        }}>回到執行中</button>
       )}
     </section>
     {editorOpen && <PlanEditorModal state={state} onClose={() => setEditorOpen(false)} onSave={onSave} />}

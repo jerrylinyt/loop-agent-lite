@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { getJson } from "../../shared/api/client";
 import type { IncrementalResponse } from "../../shared/api/types";
+import { withoutEmojiIcons } from "../console/consoleText";
 import { parseHistory, type HistoryRow } from "./historyParser";
 
 const MAX_BARS = 60;
@@ -45,7 +46,7 @@ export default function RoundSparkline({ workspace, round, onOpen }: {
           const barHeight = row.phaseRaw === "plan" ? 8 : 12;
           return (
             <rect key={`${row.round}-${index}`} className={barClass(row)} x={index * BAR_STEP} y={HEIGHT - barHeight} width={BAR_STEP - 1} height={barHeight} rx={1}>
-              <title>{`r${row.round} ${row.phase}${row.task ? ` ${row.task}` : ""}${row.validate !== "-" ? ` ${row.validate}` : ""}${row.event ? ` · ${row.event}` : ""}`}</title>
+              <title>{withoutEmojiIcons(`r${row.round} ${row.phase}${row.task ? ` ${row.task}` : ""}${row.validate !== "-" ? ` ${row.validate}` : ""}${row.event ? ` · ${row.event}` : ""}`)}</title>
             </rect>
           );
         })}

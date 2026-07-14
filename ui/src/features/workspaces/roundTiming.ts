@@ -53,14 +53,14 @@ export function deriveRoundTiming(
   const warning = !interrupted && remainingSeconds !== null && remainingSeconds <= 60;
   let label: string;
   if (interrupted) {
-    label = `⏸ round ${fields.round ?? "?"} 中斷 · ${uncertainEnd ? "至少 " : ""}${formatRoundClock(elapsedSeconds)}`;
+    label = `round ${fields.round ?? "?"} 中斷 · ${uncertainEnd ? "至少 " : ""}${formatRoundClock(elapsedSeconds)}`;
   } else {
     const deadlineLabel = remainingSeconds === null
       ? "無 timeout"
       : remainingSeconds < 0
         ? `已超時 ${formatRoundClock(-remainingSeconds)}`
         : `剩 ${formatRoundClock(remainingSeconds)}`;
-    label = `⏱ 本輪 ${formatRoundClock(elapsedSeconds)} · ${deadlineLabel}`;
+    label = `本輪 ${formatRoundClock(elapsedSeconds)} · ${deadlineLabel}`;
   }
   return { elapsedSeconds, remainingSeconds, interrupted, uncertainEnd, warning, label };
 }

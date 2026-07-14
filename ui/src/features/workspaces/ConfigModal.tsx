@@ -57,7 +57,7 @@ export default function ConfigModal({
     const body: Record<string, string | number | boolean> = { name: workspace, ...draft, pause_after_plan: pauseAfterPlan };
     if (agentIndex !== "") body.agent_idx = +agentIndex;
     const response = await postJson<{ changed?: string[] }>("/api/edit-config", body);
-    if (response.error) return setMessage(`❌ ${response.error}`);
+    if (response.error) return setMessage(`錯誤：${response.error}`);
     onChanged();
     onClose();
   };
@@ -78,16 +78,16 @@ export default function ConfigModal({
     if (!isCurrent()) return;
     setValidating(false);
     if (response.error) {
-      setValidateResult({ ok: false, text: `❌ ${response.error}`, tail: "" });
+      setValidateResult({ ok: false, text: `錯誤：${response.error}`, tail: "" });
       return;
     }
     if (response.timeout) {
-      setValidateResult({ ok: false, text: `❌ 執行逾時（${response.timeout_seconds ?? draft.validate_timeout} 秒）`, tail: response.tail ?? "" });
+      setValidateResult({ ok: false, text: `錯誤：執行逾時（${response.timeout_seconds ?? draft.validate_timeout} 秒）`, tail: response.tail ?? "" });
       return;
     }
     setValidateResult({
       ok: !!response.ok,
-      text: response.ok ? "✅ Validate 通過（exit 0）" : `❌ Validate 失敗（exit ${response.rc ?? "?"}）`,
+      text: response.ok ? "成功：Validate 通過（exit 0）" : `錯誤：Validate 失敗（exit ${response.rc ?? "?"}）`,
       tail: response.tail ?? ""
     });
   };
@@ -100,7 +100,7 @@ export default function ConfigModal({
     anchor.download = `${workspace}.plan.json`;
     anchor.click();
     URL.revokeObjectURL(url);
-    setMessage(`✅ 已匯出 ${plan.length} 條任務`);
+    setMessage(`成功：已匯出 ${plan.length} 條任務`);
   };
 
   const selectImport = async (file?: File) => {
@@ -109,13 +109,13 @@ export default function ConfigModal({
       const text = await file.text();
       const value: unknown = JSON.parse(text);
       if (!Array.isArray(value)) {
-        setMessage("❌ plan.json 頂層必須是任務陣列；不可匯入整份 state.json");
+        setMessage("錯誤：plan.json 頂層必須是任務陣列；不可匯入整份 state.json");
         return;
       }
       setPendingImport({ name: file.name, text, count: value.length });
       setMessage("");
     } catch (error) {
-      setMessage(`❌ plan.json 解析失敗：${error instanceof Error ? error.message : "未知錯誤"}`);
+      setMessage(`錯誤：plan.json 解析失敗：${error instanceof Error ? error.message : "未知錯誤"}`);
     } finally {
       if (importInput.current) importInput.current.value = "";
     }
@@ -131,7 +131,7 @@ export default function ConfigModal({
     setImporting(false);
     if (response.error) {
       setPendingImport(null);
-      setMessage(`❌ ${response.error}`);
+      setMessage(`錯誤：${response.error}`);
       return;
     }
     setPendingImport(null);
@@ -148,7 +148,7 @@ export default function ConfigModal({
           <div className="command-select-row"><select aria-label="Agent 命令" value={agentIndex} onChange={(event) => setAgentIndex(event.target.value)}>
               <option value="">保持不變：{config.agent_cmd ?? "?"}</option>
               {(available?.agent_cmds ?? []).map((agent, index) => <option key={agent.cmd} value={index}>{agent.label} — {agent.cmd}</option>)}
-            </select><button type="button" className="icon-button cli-gear-button" aria-label="管理 Agent CLI" disabled={!available} onClick={() => setCliManagerOpen(true)}>⚙</button></div>
+            </select><button type="button" className="text-button cli-gear-button" aria-label="管理 Agent CLI" disabled={!available} onClick={() => setCliManagerOpen(true)}>管理</button></div>
         </div>
         <div className="form-field validate-command-field">
           <span className="field-label-row"><span>Validate 命令</span><button type="button" className="secondary-button compact-button" disabled={validating || !draft.validate_cmd.trim()} onClick={() => void verifyValidate()}>{validating ? "執行中…" : "執行確認"}</button></span>
@@ -166,7 +166,7 @@ export default function ConfigModal({
           {numberField("red_limit", "紅燈連跳 reset", 1)}
           {numberField("stall_limit", "HEAD 停滯 reset", 1)}
         </div>
-        <label className="checkbox-row"><input type="checkbox" checked={pauseAfterPlan} onChange={(event) => setPauseAfterPlan(event.target.checked)} />規劃收斂後暫停：不自動進入執行期，需按「▶ 運行」開始執行</label>
+        <label className="checkbox-row"><input type="checkbox" checked={pauseAfterPlan} onChange={(event) => setPauseAfterPlan(event.target.checked)} />規劃收斂後暫停：不自動進入執行期，需按「運行」開始執行</label>
         <section className="plan-transfer" aria-labelledby="plan-transfer-title">
           <div><strong id="plan-transfer-title">plan.json</strong><span>只包含 order／task／ref，不包含完成進度</span></div>
           <div className="plan-transfer-actions">

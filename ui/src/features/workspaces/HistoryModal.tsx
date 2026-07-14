@@ -4,6 +4,7 @@ import { getJson } from "../../shared/api/client";
 import Modal from "../../shared/components/Modal";
 import useStaleGuard from "../../shared/hooks/useStaleGuard";
 import type { IncrementalResponse, RoundMetrics } from "../../shared/api/types";
+import { withoutEmojiIcons } from "../console/consoleText";
 import AnomalyLogModal from "./AnomalyLogModal";
 import { parseHistory, type HistoryRow } from "./historyParser";
 
@@ -34,7 +35,7 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
     if (!isCurrent()) return;
     setLoading(false);
     if (!response || response.error) {
-      setNote("❌ 讀取 history.log 失敗");
+      setNote("錯誤：讀取 history.log 失敗");
       return;
     }
     setMetrics(metricProjection && !metricProjection.error ? metricProjection : null);
@@ -86,10 +87,10 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
                 <td>{row.phase}</td>
                 <td>{row.task}</td>
                 <td>{row.signal}</td>
-                <td>{row.validate === "PASS" ? "✅" : row.validate === "FAIL" ? "❌" : "—"}</td>
+                <td>{row.validate === "PASS" ? "通過" : row.validate === "FAIL" ? "失敗" : "—"}</td>
                 <td>{row.flag}</td>
                 <td>{row.done}</td>
-                <td>{`${row.missingDone ? "⚠️ 未回 DONE " : ""}${row.tamper ? "⚠️ 竄改 " : ""}${row.agentOk ? "" : "⚠️ Agent 異常 "}${row.event}`}</td>
+                <td>{withoutEmojiIcons(`${row.missingDone ? "警告：未回 DONE " : ""}${row.tamper ? "警告：竄改 " : ""}${row.agentOk ? "" : "警告：Agent 異常 "}${row.event}`)}</td>
               </tr>
             ))}
             {!rows.length && !loading && <tr><td colSpan={10} className="table-empty">尚無輪次紀錄</td></tr>}

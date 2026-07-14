@@ -19,7 +19,7 @@ export default function RepoRootsModal({ config, onClose, onSaved }: {
     const response = await postJson<ConfigResponse>("/api/edit-repo-roots", { repo_roots: roots });
     setSaving(false);
     if (response.error) {
-      setMessage(`❌ ${response.error}`);
+      setMessage(`錯誤：${response.error}`);
       return;
     }
     onSaved(response);

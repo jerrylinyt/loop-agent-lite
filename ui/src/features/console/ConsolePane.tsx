@@ -1,7 +1,7 @@
 /** Console 顯示器：依來源與文字過濾長 log、保留捲動位置，並交給 ANSI parser 做受限上色。 */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { hasAnsi, renderAnsi } from "./ansi";
-import { filterConsoleText, searchConsoleText, type ConsoleFilter } from "./consoleText";
+import { filterConsoleText, searchConsoleText, withoutEmojiIcons, type ConsoleFilter } from "./consoleText";
 
 export default function ConsolePane({
   text,
@@ -35,7 +35,10 @@ export default function ConsolePane({
     [text, filter, showFilters, defaultFilter, search]
   );
   const renderedText = useMemo(
-    () => (hasAnsi(visibleText) ? renderAnsi(visibleText) : visibleText),
+    () => {
+      const displayText = withoutEmojiIcons(visibleText);
+      return hasAnsi(displayText) ? renderAnsi(displayText) : displayText;
+    },
     [visibleText]
   );
 
@@ -53,7 +56,7 @@ export default function ConsolePane({
     return (
       <section className="console-pane console-collapsed" aria-label={`${ariaLabel}（已收合）`}>
         <button type="button" className="console-expand-button" onClick={onToggleCollapse} aria-label={`展開${title}`} title={`展開${title}`}>
-          <span aria-hidden="true">‹</span><strong>{title}</strong>
+          <strong>{title}</strong>
         </button>
       </section>
     );
@@ -87,7 +90,7 @@ export default function ConsolePane({
           <span className={`live-status ${running ? "running" : "idle"}`}>
             <span aria-hidden="true" />{running ? "live" : "idle"}
           </span>
-          {onToggleCollapse && <button type="button" className="icon-button console-collapse-button" onClick={onToggleCollapse} aria-label={`收合${title}`} title={`收合${title}`}>›</button>}
+          {onToggleCollapse && <button type="button" className="text-button console-collapse-button" onClick={onToggleCollapse} aria-label={`收合${title}`} title={`收合${title}`}>收合</button>}
         </div>
       </header>
       <pre ref={consoleRef} className="console-output" onScroll={onScroll} tabIndex={0}>
@@ -96,7 +99,7 @@ export default function ConsolePane({
       </pre>
       {!follow && (
         <button type="button" className="floating-button" onClick={() => setFollow(true)}>
-          ⤓ 跟到最新
+          跟到最新
         </button>
       )}
     </section>

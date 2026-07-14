@@ -42,7 +42,7 @@ export default function GoalModal({ workspace, onClose }: { workspace: string; o
       {!goal ? <div className="loading-state">載入 goal…</div>
         : goal.error ? <div className="loading-state error">{goal.error}</div>
         : <>
-            {goal.goal_changed && <div className="goal-warning">⚠ goal 已變更，現有計畫是舊 goal 收斂的；請檢視差異後回規劃期重新收斂</div>}
+            {goal.goal_changed && <div className="goal-warning">警告：goal 已變更，現有計畫是舊 goal 收斂的；請檢視差異後回規劃期重新收斂</div>}
             {goal.goal_changed && <div className="segmented-tabs goal-view-tabs" role="tablist" aria-label="Goal 檢視">
               <button type="button" role="tab" aria-selected={view === "current"} className={view === "current" ? "active" : ""} onClick={() => setView("current")}>目前 goal</button>
               <button type="button" role="tab" aria-selected={view === "diff"} className={view === "diff" ? "active" : ""} onClick={() => setView("diff")}>變更差異</button>

@@ -5,7 +5,7 @@ import {
   currentActivity, formatMetric, taskProgress, workspaceNeedsAttention,
 } from "./fleetViewModel";
 
-const PHASE_NAMES: Record<string, string> = { plan: "規劃期", exec: "執行期", done: "🏁 完成" };
+const PHASE_NAMES: Record<string, string> = { plan: "規劃期", exec: "執行期", done: "完成" };
 
 export default function FleetWorkspaceCard({ workspace, metrics, roundNow, onSelect }: {
   workspace: WorkspaceSummary;
@@ -31,7 +31,7 @@ export default function FleetWorkspaceCard({ workspace, metrics, roundNow, onSel
         {workspace.phase === "plan" && <span className="muted">flag {workspace.flag ?? 0}</span>}
         {workspace.phase === "exec" && <span className="muted">done {workspace.done_count ?? 0}</span>}
         {roundTiming && <span className={`round-timer${roundTiming.warning || roundTiming.interrupted ? " warning" : ""}`}>{roundTiming.label}</span>}
-        {(workspace.last_round_seconds ?? 0) > 0 && <span className="muted">⏱ {workspace.last_round_seconds}s</span>}
+        {(workspace.last_round_seconds ?? 0) > 0 && <span className="muted">上輪 {workspace.last_round_seconds}s</span>}
       </div>
       {total > 0 && workspace.phase !== "plan" && (
         <div className="fleet-progress" aria-label={`任務 ${done}/${total}`}>
@@ -39,7 +39,7 @@ export default function FleetWorkspaceCard({ workspace, metrics, roundNow, onSel
           <span className="fleet-progress-text">{done}/{total}</span>
         </div>
       )}
-      {activity && <div className="fleet-card-task" title={activity}>{workspace.phase === "exec" ? "→ " : ""}{activity}</div>}
+      {activity && <div className="fleet-card-task" title={activity}>{workspace.phase === "exec" ? "目前：" : ""}{activity}</div>}
       {metrics && metrics.sample_count > 0 ? (
         <div className="fleet-card-analysis" aria-label={`近期 ${metrics.sample_count} 輪效能`}>
           <div className="fleet-card-analysis-head"><strong>近期 {metrics.sample_count} 輪</strong><span>效能</span></div>
@@ -62,12 +62,12 @@ export default function FleetWorkspaceCard({ workspace, metrics, roundNow, onSel
           {workspace.phase !== "done" && (workspace.stall_rounds ?? 0) > 0 && <span className="chip subdued">停滯 {workspace.stall_rounds}</span>}
           {unreadIssues > 0 && <span className="chip issue-chip">issues 未讀 {unreadIssues}</span>}
           {workspace.phase !== "done" && (workspace.agent_failure_streak ?? 0) > 0 && <span className="chip warning">Agent 異常 {workspace.agent_failure_streak}</span>}
-          {workspace.phase !== "done" && workspace.last_round_timed_out && <span className="chip warning">⏱ 上輪逾時</span>}
-          {workspace.phase !== "done" && (workspace.state_recovery_count ?? 0) > 0 && <span className="chip warning">🛟 state 復原 {workspace.state_recovery_count}</span>}
-          {workspace.state_recovery_pending && <span className="chip warning">🛟 checkpoint</span>}
+          {workspace.phase !== "done" && workspace.last_round_timed_out && <span className="chip warning">上輪逾時</span>}
+          {workspace.phase !== "done" && (workspace.state_recovery_count ?? 0) > 0 && <span className="chip warning">state 復原 {workspace.state_recovery_count}</span>}
+          {workspace.state_recovery_pending && <span className="chip warning">checkpoint</span>}
           {workspace.goal_changed && <span className="chip warning">goal 已變更</span>}
-          {workspace.stale_loop_pid && <span className="chip warning">⚠ PID 殘留</span>}
-          {workspace.error && <span className="chip warning">❌ state 錯誤</span>}
+          {workspace.stale_loop_pid && <span className="chip warning">警告：PID 殘留</span>}
+          {workspace.error && <span className="chip warning">錯誤：state 錯誤</span>}
         </div>
       )}
       {workspace.repo && <div className="fleet-card-repo" title={workspace.repo}>{workspace.repo}</div>}

@@ -29,10 +29,10 @@ export default function NotifyModal({ config, onClose, onSaved }: {
     const response = await postJson<TestResponse>("/api/test-notify", { notify_cmd: cmd.trim() });
     setBusy(false);
     if (response.error) {
-      setMessage(`❌ ${response.error}`);
+      setMessage(`錯誤：${response.error}`);
       return;
     }
-    setMessage(response.timeout ? "❌ 執行逾時（15 秒）" : response.ok ? "✅ 通知命令執行成功（exit 0）" : `❌ 執行失敗（exit ${response.rc ?? "?"}）`);
+    setMessage(response.timeout ? "錯誤：執行逾時（15 秒）" : response.ok ? "成功：通知命令執行成功（exit 0）" : `錯誤：執行失敗（exit ${response.rc ?? "?"}）`);
     setTestOutput(response.output ?? "");
   };
 
@@ -42,7 +42,7 @@ export default function NotifyModal({ config, onClose, onSaved }: {
     const response = await postJson<ConfigResponse>("/api/edit-notify", { notify_cmd: cmd.trim() });
     setBusy(false);
     if (response.error) {
-      setMessage(`❌ ${response.error}`);
+      setMessage(`錯誤：${response.error}`);
       return;
     }
     onSaved(response);

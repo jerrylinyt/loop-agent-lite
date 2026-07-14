@@ -1,5 +1,13 @@
 export type ConsoleFilter = "agent" | "other" | "all";
-const AGENT_MARKER = "🤖 Agent｜";
+const AGENT_MARKER = `${String.fromCodePoint(0x1f916)} Agent｜`;
+
+/** 顯示層移除 log protocol 中的 emoji；保留原始文字供來源分流與舊紀錄解析。 */
+export function withoutEmojiIcons(text: string) {
+  return text
+    .replace(/\p{Extended_Pictographic}\uFE0F?/gu, "")
+    .replace(/\uFE0F/gu, "")
+    .replace(/[ \t]{2,}/g, " ");
+}
 
 /** 依固定的 Agent 行標記分流；all 保留原文，其他模式仍保留換行順序。 */
 export function filterConsoleText(text: string, filter: ConsoleFilter) {

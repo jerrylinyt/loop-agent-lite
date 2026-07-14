@@ -32,16 +32,16 @@ export default function GoalTemplateModal({ templates, bundle, warnings, onClose
   const copyTemplate = async () => {
     try {
       await navigator.clipboard.writeText(content);
-      setMessage("✅ goal.md 成果模板已複製");
+      setMessage("成功：goal.md 成果模板已複製");
     } catch {
-      setMessage("❌ 無法寫入剪貼簿，請從預覽手動複製");
+      setMessage("錯誤：無法寫入剪貼簿，請從預覽手動複製");
     }
   };
 
   const downloadTemplate = () => {
     if (!content) return;
     downloadPromptFile(content, filename);
-    setMessage(`✅ 已下載 ${filename}`);
+    setMessage(`成功：已下載 ${filename}`);
   };
 
   return (

@@ -61,16 +61,16 @@ export default function PromptTemplateModal({
   const copyPrompt = async () => {
     try {
       await navigator.clipboard.writeText(prompt);
-      setMessage("✅ Prompt 已複製");
+      setMessage("成功：Prompt 已複製");
     } catch {
-      setMessage("❌ 無法寫入剪貼簿，請從右側預覽手動複製");
+      setMessage("錯誤：無法寫入剪貼簿，請從右側預覽手動複製");
     }
   };
 
   const downloadPrompt = () => {
     if (!template) return;
     downloadPromptFile(prompt, promptDownloadName(template, mode));
-    setMessage(`✅ 已下載 ${promptDownloadName(template, mode)}`);
+    setMessage(`成功：已下載 ${promptDownloadName(template, mode)}`);
   };
 
   const footer = (
@@ -79,7 +79,7 @@ export default function PromptTemplateModal({
       <button type="button" className="secondary-button" disabled={!template || !hasRequirement || !prompt} onClick={() => void copyPrompt()}>複製 Prompt</button>
       <button type="button" className="primary-button" disabled={!template || !hasRequirement || !prompt} onClick={downloadPrompt}>下載 .md</button>
       <span className="inline-message" role="status" aria-live="polite">
-        {message || (requirementIsUntouchedSeed ? "⚠ 需求仍是模板範例，下載前請改成實際需求" : "")}
+        {message || (requirementIsUntouchedSeed ? "警告：需求仍是模板範例，下載前請改成實際需求" : "")}
       </span>
     </>
   );

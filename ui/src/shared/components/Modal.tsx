@@ -95,7 +95,7 @@ export default function Modal({ title, description, onClose, children, footer, w
             <h2 id={titleId}>{title}</h2>
             {description && <p id={`${titleId}-description`}>{description}</p>}
           </div>
-          <button type="button" className="icon-button" onClick={onClose} aria-label="關閉對話框">✕</button>
+          <button type="button" className="text-button" onClick={onClose} aria-label="關閉對話框">關閉</button>
         </header>
         <div className="modal-body">{children}</div>
         {footer && <footer className="modal-footer">{footer}</footer>}

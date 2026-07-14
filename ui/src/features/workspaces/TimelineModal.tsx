@@ -4,6 +4,7 @@ import { getJson } from "../../shared/api/client";
 import Modal from "../../shared/components/Modal";
 import type { AnomalyListResponse, IncrementalResponse } from "../../shared/api/types";
 import { parseHistory } from "./historyParser";
+import { withoutEmojiIcons } from "../console/consoleText";
 
 type TimelineKind = "round" | "operator" | "anomaly";
 interface TimelineItem {
@@ -19,8 +20,9 @@ interface TimelineItem {
 function dashboardActions(consoleText: string, datePrefix?: string): TimelineItem[] {
   // console 只有本機時間沒有日期；以最近 history 日期排序只是顯示推定，label 必須明確揭露。
   const items: TimelineItem[] = [];
+  const dashboardMarker = `${String.fromCodePoint(0x1f5a5, 0xfe0f)} Dashboard｜`;
   for (const [index, line] of consoleText.split("\n").entries()) {
-    const matched = line.match(/^\[(\d{2}:\d{2}:\d{2})\] 🖥️ Dashboard｜(.+)$/);
+    const matched = line.match(new RegExp(`^\\[(\\d{2}:\\d{2}:\\d{2})\\] ${dashboardMarker}(.+)$`, "u"));
     if (!matched) continue;
     items.push({
       id: `operator-${index}-${matched[1]}`,
@@ -81,7 +83,7 @@ export default function TimelineModal({ workspace, consoleText, onClose }: {
         sortKey: Date.parse(row.ts) || 1_000_000 - index,
         time: row.ts.replace("T", " "),
         title: anomaly ? `round ${row.round} · 未回 DONE` : `round ${row.round} · ${row.phase}`,
-        detail: `${signals}${anomaly?.log_id ? " · 有保留 Agent log" : anomaly ? " · 無歷史 Agent log" : ""}`,
+        detail: withoutEmojiIcons(`${signals}${anomaly?.log_id ? " · 有保留 Agent log" : anomaly ? " · 無歷史 Agent log" : ""}`),
         tone: row.timedOut || row.validate === "FAIL" ? "error" : anomaly || row.tamper || !row.agentOk ? "warning" : undefined
       } satisfies TimelineItem;
     });

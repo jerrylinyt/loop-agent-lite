@@ -29,7 +29,7 @@ export default function LauncherJobs() {
   return (
     <div className="jobs-list">
       {jobs.map((job) => <article className="job-card" key={job.name}>
-        <div className="job-title"><div><strong>{job.name}</strong><span>pid {job.pid} · {job.alive ? "🟢 執行中" : `⚪ 已結束 rc=${job.rc}`}</span></div>{job.alive && <button type="button" className="danger-button" onClick={() => void stopJob(job)}>⏹ 停止</button>}</div>
+        <div className="job-title"><div><strong>{job.name}</strong><span>pid {job.pid} · {job.alive ? "執行中" : `已結束 rc=${job.rc}`}</span></div>{job.alive && <button type="button" className="danger-button" onClick={() => void stopJob(job)}>停止</button>}</div>
         <div className="job-repo">{job.repo}</div><pre>{job.tail || "尚無輸出"}</pre>
       </article>)}
       {!jobs.length && <div className="empty-inline">沒有由這個 dashboard 啟動的 job</div>}

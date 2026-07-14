@@ -72,17 +72,17 @@ export default function PlanEditorModal({ state, onClose, onSave }: {
   const requestClose = () => dirty ? setConfirmClose(true) : onClose();
   const save = async () => {
     // UI 在送出前先做完整性檢查；後端仍會在 workspace lock 內重做非空、版本與鎖定前綴校驗。
-    if (!drafts.length) return setMessage("❌ plan 必須保留至少一項任務");
-    if (drafts.some((task) => !task.task.trim())) return setMessage("❌ 每項任務都必須有內容");
+    if (!drafts.length) return setMessage("錯誤：plan 必須保留至少一項任務");
+    if (drafts.some((task) => !task.task.trim())) return setMessage("錯誤：每項任務都必須有內容");
     setSaving(true);
     const result = await onSave(drafts.map(({ order, task, ref }) => ({ order, task: task.trim(), ref: ref?.trim() || null })), doneCount);
     setSaving(false); setMessage(result);
-    if (result.startsWith("✅")) onClose();
+    if (result.startsWith("成功：")) onClose();
   };
   return <>
     <Modal title="Plan 編輯器" description={`plan v${state.plan_version} · 只有停止狀態下、尚未執行的任務可排序、刪除或插入`} onClose={requestClose} fullScreen footer={<>
       <button type="button" className="secondary-button" disabled={saving} onClick={requestClose}>取消</button>
-      <button type="button" className="primary-button" disabled={saving || !dirty || emptyTaskCount > 0} onClick={() => void save()}>{saving ? "儲存中…" : "💾 儲存變更"}</button>
+      <button type="button" className="primary-button" disabled={saving || !dirty || emptyTaskCount > 0} onClick={() => void save()}>{saving ? "儲存中…" : "儲存變更"}</button>
       <span className="inline-message" role="status">{message}</span>
     </>}>
       <div className="plan-editor-layout">

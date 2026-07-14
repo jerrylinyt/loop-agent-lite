@@ -12,10 +12,10 @@ const DOT_COLORS: Record<Exclude<Status, "none">, string> = {
 };
 
 const TITLE_MARKS: Record<Exclude<Status, "none">, string> = {
-  running: "🟢",
-  warning: "🔴",
-  done: "🏁",
-  idle: "⚪"
+  running: "執行中",
+  warning: "警告",
+  done: "完成",
+  idle: "已停止"
 };
 
 function deriveStatus(workspace: WorkspaceSummary | undefined, state: WorkspaceState | null): Status {

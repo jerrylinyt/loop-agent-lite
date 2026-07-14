@@ -27,7 +27,7 @@ export default function IssuesModal({
     setUpdating(true);
     try {
       const response = await postJson<Record<string, never>>("/api/edit-state", { name: workspace, ack_issues: true });
-      setMessage(response.error ? `❌ ${response.error}` : "✅ 已標記為已讀，稽核紀錄仍保留");
+      setMessage(response.error ? `錯誤：${response.error}` : "成功：已標記為已讀，稽核紀錄仍保留");
       if (!response.error) onChanged();
     } finally {
       setUpdating(false);
@@ -38,7 +38,7 @@ export default function IssuesModal({
     setUpdating(true);
     try {
       const response = await postJson<Record<string, never>>("/api/edit-state", { name: workspace, clear_issues: true });
-      setMessage(response.error ? `❌ ${response.error}` : "✅ 已清空");
+      setMessage(response.error ? `錯誤：${response.error}` : "成功：已清空");
       if (!response.error) onChanged();
     } finally {
       setUpdating(false);

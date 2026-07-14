@@ -102,8 +102,8 @@ export default function LauncherModal({
   useEffect(() => {
     void getJson<ConfigResponse>("/api/config").then((response) => {
       setConfig(response);
-      if (!response) return setMessage("❌ 設定載入失敗");
-      if (response.error) return setMessage(`❌ ${response.error}`);
+      if (!response) return setMessage("錯誤：設定載入失敗");
+      if (response.error) return setMessage(`錯誤：${response.error}`);
       // 範本模式 fail-closed：repo 只由範本 hydration 決定；範本缺 repo 就留空，不落回預設 repo。
       if (!templateConfig) setRepoChoice(response.repos[0] ?? "__custom__");
       setSettings({
@@ -232,7 +232,7 @@ export default function LauncherModal({
   const launch = async () => {
     // 前端先擋明顯格式錯誤以提供即時回饋；後端仍會重新校驗 plan、路徑、Git 與數值。
     const planError = validatePlan(planJson);
-    if (planError) return setMessage(`❌ plan.json 格式不對：${planError}`);
+    if (planError) return setMessage(`錯誤：plan.json 格式不對：${planError}`);
     setLaunching(true);
     setMessage("啟動中…");
     const body: Record<string, unknown> = {
@@ -256,7 +256,7 @@ export default function LauncherModal({
     const response = await postJson<StartupResponse>("/api/launch", body);
     if (response.error || !response.name || !response.pid) {
       setLaunching(false);
-      return setMessage(`❌ ${response.error ?? "啟動失敗"}`);
+      return setMessage(`錯誤：${response.error ?? "啟動失敗"}`);
     }
     if (response.starting) {
       // 收到 pid 只代表 process 已 spawn；必須等待 startup handshake 才能關閉表單。
@@ -264,11 +264,11 @@ export default function LauncherModal({
       const startup = await waitForJobStartup(response.name, response.pid, response.startup_timeout ?? settings.validateTimeout + 15);
       if (startup.error) {
         setLaunching(false);
-        return setMessage(`❌ ${startup.error}`);
+        return setMessage(`錯誤：${startup.error}`);
       }
     }
     setLaunching(false);
-    setMessage(`✅ 已啟動 ${response.name}（pid ${response.pid}）`);
+    setMessage(`成功：已啟動 ${response.name}（pid ${response.pid}）`);
     onLaunched(response.name);
   };
 
@@ -283,12 +283,12 @@ export default function LauncherModal({
     if (!isCurrent()) return;
     setValidating(false);
     if (response.error) {
-      setValidateResult({ ok: false, text: `❌ ${response.error}`, tail: "" });
+      setValidateResult({ ok: false, text: `錯誤：${response.error}`, tail: "" });
       return;
     }
     setValidateResult({
       ok: !!response.ok,
-      text: response.timeout ? `❌ 執行逾時（${response.timeout_seconds ?? settings.validateTimeout} 秒）` : response.ok ? "✅ Validate 通過（exit 0）" : `❌ Validate 失敗（exit ${response.rc ?? "?"}）`,
+      text: response.timeout ? `錯誤：執行逾時（${response.timeout_seconds ?? settings.validateTimeout} 秒）` : response.ok ? "成功：Validate 通過（exit 0）" : `錯誤：Validate 失敗（exit ${response.rc ?? "?"}）`,
       tail: response.tail ?? ""
     });
   };
@@ -314,17 +314,17 @@ export default function LauncherModal({
     if (!isCurrent()) return;
     setPreflighting(false);
     if (response.error) {
-      setPreflightResult({ ok: false, text: `❌ ${response.error}`, tail: "" });
+      setPreflightResult({ ok: false, text: `錯誤：${response.error}`, tail: "" });
       return;
     }
     setPreflightResult({
       ok: !!response.ok,
-      text: response.timeout ? `❌ 完整健檢逾時（${response.timeout_seconds ?? settings.validateTimeout + 15} 秒）` : response.ok ? "✅ 完整啟動前健檢通過" : `❌ 完整健檢未通過（exit ${response.rc ?? "?"}）`,
+      text: response.timeout ? `錯誤：完整健檢逾時（${response.timeout_seconds ?? settings.validateTimeout + 15} 秒）` : response.ok ? "成功：完整啟動前健檢通過" : `錯誤：完整健檢未通過（exit ${response.rc ?? "?"}）`,
       tail: response.tail ?? ""
     });
   };
 
-  const repoMark = (value?: string) => value === "committed" ? "✅ 已 commit" : value === "modified" ? "⚠ 已修改未 commit" : value === "untracked" ? "⚠ 尚未 commit" : "❌ 缺少";
+  const repoMark = (value?: string) => value === "committed" ? "已 commit" : value === "modified" ? "警告：已修改未 commit" : value === "untracked" ? "警告：尚未 commit" : "錯誤：缺少";
   const selectedAgent = config?.agent_cmds[+agentIndex]?.cmd ?? "";
   const selectedValidate = validateChoice === "__custom__" ? customValidate.trim() : config?.validate_cmds[+validateChoice]?.cmd ?? "";
   const importedPlanCount = (() => { try { const value = JSON.parse(planJson); return Array.isArray(value) ? value.length : 0; } catch { return 0; } })();
@@ -339,7 +339,7 @@ export default function LauncherModal({
   const footer = tab === "launch" ? (
     <>
       <button type="button" className="secondary-button" onClick={onClose}>取消</button>
-      <button type="button" className="primary-button" onClick={launch} disabled={launching || !repo}>▶ 啟動</button>
+      <button type="button" className="primary-button" onClick={launch} disabled={launching || !repo}>啟動</button>
       <span className="inline-message" role="status">{message}</span>
     </>
   ) : <button type="button" className="secondary-button" onClick={onClose}>關閉</button>;
@@ -355,10 +355,10 @@ export default function LauncherModal({
           <div className="form-field repo-select-field"><span>Repo</span><div className="command-select-row"><select aria-label="Repo" value={repoChoice} onChange={(event) => setRepoChoice(event.target.value)}>
                 {(config?.repos ?? []).map((item) => <option key={item} value={item}>{item}</option>)}
                 <option value="__custom__">手動輸入…</option>
-              </select><button type="button" className="icon-button cli-gear-button" aria-label="管理 Code Repo Roots" disabled={!config} onClick={() => setManagerModal("repoRoots")}>⚙</button></div></div>
+              </select><button type="button" className="text-button cli-gear-button" aria-label="管理 Code Repo Roots" disabled={!config} onClick={() => setManagerModal("repoRoots")}>管理</button></div></div>
           {repoChoice === "__custom__" && <input value={customRepo} onChange={(event) => setCustomRepo(event.target.value)} placeholder="/path/to/repo" aria-label="Repo 路徑" />}
           {repoStatus && <div className={`repo-status${repoStatus.error || !repoStatus.tree_clean ? " warning" : ""}`}>
-            {repoStatus.error ? `❌ ${repoStatus.error}` : <>goal.md {repoMark(repoStatus.goal)} · 工作樹 {repoStatus.tree_clean ? "✅ 乾淨" : "❌ 髒（preflight 會擋）"}{matchingWorkspace && ` · workspace「${matchingWorkspace.name}」已存在`}</>}
+            {repoStatus.error ? `錯誤：${repoStatus.error}` : <>goal.md {repoMark(repoStatus.goal)} · 工作樹 {repoStatus.tree_clean ? "乾淨" : "錯誤：髒（preflight 會擋）"}{matchingWorkspace && ` · workspace「${matchingWorkspace.name}」已存在`}</>}
           </div>}
           <div className="form-field">
             <div className="field-label-row"><label htmlFor="goal-file">goal.md <span className="label-help">留空＝沿用 repo 已 commit 的版本</span></label><span className="field-actions"><button type="button" className="text-button" title={promptTemplateUnavailableReason || undefined} disabled={!promptTemplateAvailable} onClick={() => setPromptTemplateMode("goal")}>Goal 產生器 Prompt</button><button type="button" className="text-button" title={promptTemplateUnavailableReason || undefined} disabled={!promptTemplateAvailable} onClick={() => setGoalTemplateOpen(true)}>Goal 成果模板</button></span></div>
@@ -368,7 +368,7 @@ export default function LauncherModal({
           {promptTemplateUnavailableReason && <p className="field-error" role="alert">Prompt 模板停用：{promptTemplateUnavailableReason}</p>}
           <label>Workspace 名稱 <span className="label-help">留空＝repo 目錄名</span><input value={name} onChange={(event) => setName(event.target.value)} /></label>
           <div className="form-columns command-columns">
-            <div className="form-field agent-command-field"><span className="field-label-row"><span>Agent 命令</span></span><div className="command-select-row"><select aria-label="Agent 命令" value={agentIndex} onChange={(event) => setAgentIndex(event.target.value)}>{(config?.agent_cmds ?? []).map((agent, index) => <option key={agent.cmd} value={index}>{agent.label} — {agent.cmd}</option>)}</select><button type="button" className="icon-button cli-gear-button" aria-label="管理 Agent CLI" disabled={!config || !repo || !!repoStatus?.error} onClick={() => setManagerModal("cli")}>⚙</button></div></div>
+            <div className="form-field agent-command-field"><span className="field-label-row"><span>Agent 命令</span></span><div className="command-select-row"><select aria-label="Agent 命令" value={agentIndex} onChange={(event) => setAgentIndex(event.target.value)}>{(config?.agent_cmds ?? []).map((agent, index) => <option key={agent.cmd} value={index}>{agent.label} — {agent.cmd}</option>)}</select><button type="button" className="text-button cli-gear-button" aria-label="管理 Agent CLI" disabled={!config || !repo || !!repoStatus?.error} onClick={() => setManagerModal("cli")}>管理</button></div></div>
             <div className="form-field validate-command-field"><span className="field-label-row"><span>Validate 命令</span><span className="field-actions"><button type="button" className="secondary-button compact-button" disabled={validating || !repo || !!repoStatus?.error || (validateChoice === "__custom__" && !customValidate.trim())} onClick={() => void verifyValidate()}>{validating ? "執行中…" : "執行確認"}</button><button type="button" className="secondary-button compact-button" title={preflightHint} disabled={!canPreflight} onClick={() => void runPreflight()}>{preflighting ? "健檢中…" : "完整健檢"}</button></span></span><select aria-label="Validate 命令" value={validateChoice} onChange={(event) => { setValidateChoice(event.target.value); setValidateResult(null); }}>{(config?.validate_cmds ?? []).map((command, index) => <option key={command.cmd} value={index}>{command.label} — {command.cmd}</option>)}<option value="__custom__">手寫…</option></select></div>
           </div>
           {validateChoice === "__custom__" && <input value={customValidate} onChange={(event) => { setCustomValidate(event.target.value); setValidateResult(null); }} placeholder="mvn -q test" aria-label="自訂 Validate 命令" />}
@@ -379,10 +379,10 @@ export default function LauncherModal({
             <summary>進階設定</summary>
             <ExecutionSettingsFields value={settings}
               onChange={(patch) => setSettings((value) => ({ ...value, ...patch }))} />
-            <label className="checkbox-row"><input type="checkbox" checked={settings.pauseAfterPlan} onChange={(event) => setSettings((value) => ({ ...value, pauseAfterPlan: event.target.checked }))} />規劃收斂後暫停：不自動進入執行期，需回 Dashboard 按「▶ 運行」開始執行</label>
+            <label className="checkbox-row"><input type="checkbox" checked={settings.pauseAfterPlan} onChange={(event) => setSettings((value) => ({ ...value, pauseAfterPlan: event.target.checked }))} />規劃收斂後暫停：不自動進入執行期，需回 Dashboard 按「運行」開始執行</label>
             <label className="checkbox-row"><input type="checkbox" checked={resetState} onChange={(event) => setResetState(event.target.checked)} />重置 workspace state（清除舊進度）</label>
             <label className="checkbox-row"><input type="checkbox" checked={newBranch} onChange={(event) => setNewBranch(event.target.checked)} />在新 branch 跑（loop/&lt;workspace 名&gt;）</label>
-            <div className="notify-entry-row"><button type="button" className="secondary-button" disabled={!config} onClick={() => setManagerModal("notify")}>🔔 管理終態通知</button><span className="label-help">{config?.notify_cmd ? `目前：${config.notify_cmd}` : "目前未設定通知"}</span></div>
+            <div className="notify-entry-row"><button type="button" className="secondary-button" disabled={!config} onClick={() => setManagerModal("notify")}>管理終態通知</button><span className="label-help">{config?.notify_cmd ? `目前：${config.notify_cmd}` : "目前未設定通知"}</span></div>
           </details>
           <details className="launch-diff" open={hasPendingLaunchMutation}>
             <summary>執行前變更 Diff <span className="label-help">送出前核對本次與既有狀態差異</span></summary>
