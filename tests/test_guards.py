@@ -603,7 +603,7 @@ class TestLiveRoundTiming(unittest.TestCase):
 
 
 class TestInterruptedResume(unittest.TestCase):
-    """只有執行期中斷、dirty 且綠點合法時，才可略過啟動 Validate 接手現場。"""
+    """執行輪已開始且有既有綠點時，可略過啟動 Validate 接手現場。"""
 
     class ResponseCapture:
         response = None
@@ -678,6 +678,8 @@ class TestInterruptedResume(unittest.TestCase):
                 self.assertTrue(interrupted["round_interrupted_at"])
                 self.assertTrue(L.is_dirty(repo))
                 self.assertEqual(counter.read_text(), "1")
+                protected_snapshot = workspace_root / "interrupted-resume" / "snapshots" / "goal.md"
+                protected_snapshot.unlink()
                 self.assertIsNone(L.interrupted_resume_block_reason(
                     repo, workspace_root / "interrupted-resume", interrupted, ["goal.md"]))
 
@@ -695,6 +697,8 @@ class TestInterruptedResume(unittest.TestCase):
                 self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
                 self.assertIn("略過啟動 Validate", resumed.stdout)
                 self.assertIn("Agent 已接手中斷現場", resumed.stdout)
+                self.assertEqual(protected_snapshot.read_bytes(), (repo / "goal.md").read_bytes(),
+                                 "Resume 應以人工確認過的目前 protected 檔案重建基準")
                 self.assertEqual(counter.read_text(), "2",
                                  "Resume 應略過啟動 Validate，但輪末 Validate 仍必須執行")
                 self.assertIn("resumed", (repo / "agent-wip.txt").read_text())
@@ -704,7 +708,7 @@ class TestInterruptedResume(unittest.TestCase):
                     process.kill()
                     process.wait()
 
-    def test_eligibility_rejects_non_exec_clean_or_protected_changes(self):
+    def test_eligibility_allows_forced_stop_clean_tree_and_changed_protected_files(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             repo = make_repo(root)
@@ -718,7 +722,7 @@ class TestInterruptedResume(unittest.TestCase):
                 "round_interrupted_at": "2026-07-14T10:01:00+08:00",
                 "last_green_sha": git(repo, "rev-parse", "HEAD").stdout.strip(),
             }
-            self.assertIn("工作樹沒有", L.interrupted_resume_block_reason(
+            self.assertIsNone(L.interrupted_resume_block_reason(
                 repo, workspace, state, ["goal.md"]))
             (repo / "wip.txt").write_text("dirty\n")
             self.assertIsNone(L.interrupted_resume_block_reason(
@@ -728,7 +732,21 @@ class TestInterruptedResume(unittest.TestCase):
                 repo, workspace, state, ["goal.md"]))
             state["phase"] = "exec"
             (repo / "goal.md").write_text("changed protected\n")
-            self.assertIn("受保護檔案", L.interrupted_resume_block_reason(
+            self.assertIsNone(L.interrupted_resume_block_reason(
+                repo, workspace, state, ["goal.md"]))
+
+            state["round_interrupted_at"] = None
+            self.assertIsNone(L.interrupted_resume_block_reason(
+                repo, workspace, state, ["goal.md"]))
+            state["last_green_sha"] = None
+            self.assertIn("綠點", L.interrupted_resume_block_reason(
+                repo, workspace, state, ["goal.md"]))
+            state["last_green_sha"] = "0" * 40
+            self.assertIn("綠點", L.interrupted_resume_block_reason(
+                repo, workspace, state, ["goal.md"]))
+            state["last_green_sha"] = git(repo, "rev-parse", "HEAD").stdout.strip()
+            state["round_started_at"] = None
+            self.assertIn("執行到一半", L.interrupted_resume_block_reason(
                 repo, workspace, state, ["goal.md"]))
 
     def test_dashboard_projects_button_eligibility_and_resume_uses_dedicated_flag(self):
@@ -775,6 +793,12 @@ class TestInterruptedResume(unittest.TestCase):
                 self.assertTrue(captured["resume_interrupted"])
 
                 state["round_interrupted_at"] = None
+                ws.save_state(state)
+                handler = self.ResponseCapture()
+                D.Handler.api_resume(handler, {"name": "resume-api"})
+                self.assertEqual(handler.response[0], 200, handler.response)
+
+                state["round_started_at"] = None
                 ws.save_state(state)
                 handler = self.ResponseCapture()
                 D.Handler.api_resume(handler, {"name": "resume-api"})

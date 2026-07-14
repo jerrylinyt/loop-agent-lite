@@ -1430,7 +1430,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
                         help="只跑啟動前健檢(git/鎖/乾淨樹/goal 已 commit/validate)就退出;"
                              "不建 state、不動 snapshots、不啟動 agent")
     parser.add_argument("--resume-interrupted", action="store_true",
-                        help="僅限有合法綠點的執行期中斷輪：保留 dirty worktree 並略過啟動 Validate")
+                        help="僅限已開始且有既有綠點的執行期輪次：保留現場並略過啟動 Validate")
     return parser
 
 
@@ -1546,25 +1546,21 @@ def establish_startup_green_anchor(repo: Path, workspace, state, protected,
 
 
 def interrupted_resume_block_reason(repo: Path, workspace_dir: Path, state, protected):
-    """判斷是否可保留中斷輪的 dirty worktree，略過啟動 Validate 直接交給下一輪 Agent。"""
+    """判斷是否有足夠紀錄略過啟動 Validate，直接把中斷現場交給下一輪 Agent。
+
+    Resume 是人工確認後的復原捷徑，只要求執行輪確實已開始，且先前 Validate 留下的
+    綠點仍是 repo 裡的 commit。工作樹可能乾淨、dirty、已產生新 commit，甚至因程序被
+    強制終止而來不及寫 round_interrupted_at；這些都不應讓按鈕消失。repo identity、
+    Git/單 writer lock 仍由外層啟動流程負責。
+    """
     if state.get("phase") != "exec":
         return "只有執行期 workspace 可以 Resume"
-    if not state.get("round_started_at") or not state.get("round_interrupted_at"):
-        return "沒有執行到一半且已中斷的輪次紀錄"
-    if not is_dirty(repo):
-        return "工作樹沒有 Agent 留下的未完成變更，請使用一般運行"
+    if not state.get("round_started_at"):
+        return "沒有執行到一半的輪次紀錄"
     green = state.get("last_green_sha")
-    snapshots = Path(workspace_dir) / "snapshots"
-    if not green_anchor_valid(repo, green, snapshots, protected):
-        return "既有綠點不存在、不是目前 HEAD 的祖先，或受保護快照不一致"
-    for rel in protected:
-        try:
-            target = repo_relative_path(repo, rel)
-            snap = workspace_file(snapshots / rel.replace("/", "__"), "protected snapshot")
-            if not target.is_file() or target.read_bytes() != snap.read_bytes():
-                return f"受保護檔案 {rel} 已被修改，不能略過啟動檢查"
-        except (FileNotFoundError, OSError, ValueError):
-            return f"受保護檔案 {rel} 或其快照無法安全讀取"
+    if not green or git(repo, "rev-parse", "--verify", "--quiet",
+                        f"{green}^{{commit}}", check=False).returncode != 0:
+        return "沒有可用的既有綠點（先前 Preflight／Validate 綠點紀錄不存在）"
     return None
 
 
@@ -1833,6 +1829,12 @@ def main():
         if blocked:
             fail(f"Resume 不符合條件：{blocked}")
         green = state["last_green_sha"]
+        # Resume 代表人員已確認目前現場可接手；以當下 protected 內容重建本輪防竄改
+        # 基準，讓舊版 workspace 的缺失快照或停機後的人工調整不會在 Agent 結束時才炸掉。
+        try:
+            ws.snapshot_protected(repo, protected)
+        except (FileNotFoundError, OSError, ValueError) as e:
+            fail(f"Resume 無法建立目前受保護檔案基準：{e}")
         log(f"Resume 中斷現場｜沿用綠點 {green[:8]}，保留工作樹並略過啟動 Validate")
         state.setdefault("notes", []).append(
             f"上一輪執行途中停止；已沿用綠點 {green[:8]} 保留現場直接 Resume。"
@@ -1857,7 +1859,8 @@ def main():
         log(f"📝 匯入計畫｜{len(normalized)} 條｜從 {'規劃期' if args.start_phase == 'plan' else '執行期'} 開始")
 
     fresh_start = bool(args.reset_state or args.import_plan)
-    # 一般 resume 要先拍快照供舊綠點驗證；reset/import 延後到 Validate 綠後，
+    # 一般 run 要先拍快照供舊綠點驗證；Resume 已在人工確認資格後重建當前基準；
+    # reset/import 延後到 Validate 綠後，
     # 失敗的 staged 啟動就不會改掉舊 state 對應的 protected snapshot。
     if not fresh_start and not args.resume_interrupted:
         ws.snapshot_protected(repo, protected)

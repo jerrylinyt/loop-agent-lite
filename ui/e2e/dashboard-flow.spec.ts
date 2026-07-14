@@ -207,7 +207,7 @@ test("符合中斷續跑條件時顯示 Resume 並呼叫獨立 endpoint", async 
   await expect(page.getByRole("heading", { name: "resume-ready" })).toBeVisible();
   const resume = page.getByRole("button", { name: "Resume", exact: true });
   await expect(resume).toBeVisible();
-  await expect(resume).toHaveAttribute("title", /略過啟動 Validate/);
+  await expect(resume).toHaveAttribute("title", /略過啟動 Preflight／Validate/);
   await resume.click();
   expect(resumeCalled).toBeTruthy();
 });

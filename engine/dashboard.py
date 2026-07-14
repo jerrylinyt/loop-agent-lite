@@ -1956,7 +1956,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @with_state_lock
     def api_resume(self, body):
-        """受限 Resume：只讓有合法綠點的執行期中斷現場略過啟動 Validate。"""
+        """受限 Resume：讓已開始且有既有綠點的執行期現場略過啟動 Validate。"""
         return Handler._start_existing_workspace(self, body, resume_interrupted=True)
 
     def _start_existing_workspace(self, body, *, resume_interrupted):
