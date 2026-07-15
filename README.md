@@ -2,6 +2,8 @@
 
 用 Python 協調 agent 的規劃／執行迴圈，並提供一個可在瀏覽器操作的 Dashboard。
 
+第一次使用請看：[Dashboard 完整操作圖解](docs/dashboard-guide/README.md)；逐欄查詢請看：[欄位與控制項完整說明](docs/dashboard-guide/fields-reference.md)。
+
 ![Dashboard 執行中展示](docs/dashboard-running.jpg)
 
 展示圖以 mock fleet 呈現執行中、規劃中、驗收中與已完成等 workspace 狀態；實際資料會由 `workspace/*/state.json` 提供。左側顯示 Loop 狀態與驗證紀錄，右側顯示 Agent 輸出；兩側可拖曳調整寬度或收合。

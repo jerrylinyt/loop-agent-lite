@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1280, initial-scale=1">
+  <title>Dashboard 圖解標註</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 1280px; background: #111827; color: #f8fafc; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", sans-serif; }
+    .stage { position: relative; width: 1280px; height: 720px; overflow: hidden; background: #e5e7eb; }
+    .stage > img { display: block; width: 1280px; height: 720px; object-fit: cover; }
+    .line-layer { position: absolute; inset: 0; width: 1280px; height: 720px; pointer-events: none; }
+    .line-layer line { stroke: #f59e0b; stroke-width: 3; paint-order: stroke; filter: drop-shadow(0 1px 1px #000); }
+    .marker {
+      position: absolute; width: 30px; height: 30px; margin: -15px 0 0 -15px;
+      display: grid; place-items: center; border-radius: 999px; border: 3px solid #fff;
+      background: #d97706; color: #fff; font: 800 16px/1 sans-serif;
+      box-shadow: 0 2px 7px rgba(0,0,0,.65); z-index: 3;
+    }
+    .callout {
+      position: absolute; max-width: 230px; min-height: 34px; padding: 7px 10px;
+      border: 2px solid #fbbf24; border-radius: 8px; background: rgba(17,24,39,.94);
+      color: #fff; font-size: 15px; font-weight: 750; line-height: 1.25;
+      box-shadow: 0 3px 10px rgba(0,0,0,.45); z-index: 2;
+    }
+    .callout b { color: #fcd34d; margin-right: 5px; }
+    .legend { min-height: 210px; padding: 18px 24px 22px; background: #111827; border-top: 4px solid #f59e0b; }
+    .legend h1 { margin: 0 0 12px; color: #fff; font-size: 24px; line-height: 1.25; }
+    .legend h1 small { margin-left: 10px; color: #94a3b8; font-size: 14px; font-weight: 500; }
+    .legend-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 24px; }
+    .legend-item { display: grid; grid-template-columns: 28px 1fr; gap: 8px; align-items: start; font-size: 14px; line-height: 1.4; }
+    .legend-item strong { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: #d97706; color: white; }
+    .legend-item span { color: #e5e7eb; }
+    .legend-note { margin: 12px 0 0; color: #94a3b8; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <main id="root"></main>
+  <script>
+    const screens = {
+      overview: {
+        title: "Fleet 總覽：先判斷整體是否健康",
+        image: "raw/overview.jpg",
+        points: [
+          [1, 78, 22, 18, 52, "工作區頁籤", "切換已載入的 workspace；名稱右側是任務完成數。"],
+          [2, 1110, 22, 970, 52, "全域工具列", "切換主題、開快捷指令、回總覽或開啟啟動管理。"],
+          [3, 340, 126, 224, 202, "Fleet 健康摘要", "顯示 workspace 數、執行中數、階段分布、需關注數與總任務進度。"],
+          [4, 900, 126, 760, 202, "跨工作區效能", "彙整最近輪次的平均、P50、P95、最慢、逾時及未回 DONE。"],
+          [5, 150, 252, 20, 282, "狀態篩選", "只看全部、需關注、執行中或已完成的 workspace。"],
+          [6, 650, 252, 520, 282, "搜尋／排序", "依名稱搜尋，並按名稱、關注程度、執行狀態或完成度排序。"],
+          [7, 160, 430, 330, 340, "工作區卡片", "查看單一 workspace 摘要；點卡片進入詳細頁。"],
+          [8, 1100, 450, 860, 340, "事件推播", "依時間列出任務開始、完成、轉紅等近期事件。"]
+        ]
+      },
+      workspace: {
+        title: "Workspace 詳細頁：操作與觀測集中處",
+        image: "raw/workspace-main.jpg",
+        points: [
+          [1, 145, 40, 18, 82, "Workspace／進度", "頁籤顯示目前 workspace 與已完成任務數。"],
+          [2, 590, 145, 465, 55, "生命週期操作", "運行、切回規劃期、設定與刪除；停止時才可修改高風險狀態。"],
+          [3, 470, 220, 300, 258, "以此為範本啟動", "沿用 repo、Agent、Validate、門檻與 timeout 建立另一個 workspace。"],
+          [4, 155, 352, 18, 438, "核心狀態 chips", "讀取 Goal、round、任務進度，以及目前 flag／done 共識。"],
+          [5, 665, 290, 505, 358, "健康度與輪次趨勢", "色帶越紅越接近 reset；趨勢顏色代表各輪判定。"],
+          [6, 930, 352, 870, 425, "歷程觀測入口", "開啟輪次紀錄、統一時間軸、Run 對比與最近 Prompt。"],
+          [7, 1010, 500, 830, 552, "編輯計畫", "停止狀態下修改尚未執行的 pending tasks。"],
+          [8, 520, 650, 285, 552, "任務表", "目前任務反白；完成列可從 SHA 開啟 Git 變更。"],
+          [9, 1190, 145, 1010, 230, "Agent 輸出", "右側是 Agent 原始輸出；可篩選 Agent／其他／全部。"]
+        ]
+      },
+      launcher_basic: {
+        title: "啟動新 loop：基本資料（表單上半部）",
+        image: "raw/launcher-basic.jpg",
+        points: [
+          [1, 655, 292, 300, 112, "啟動新 loop", "建立或重建 workspace；另一分頁用來稽核 Dashboard 啟動的 jobs。"],
+          [2, 875, 292, 1020, 245, "執行中的 jobs", "查看活躍與最近完成的啟動工作及 log 尾段。"],
+          [3, 890, 430, 1015, 380, "Repo", "選擇 target Git repo；可由管理入口設定可掃描的根目錄。"],
+          [4, 895, 520, 1015, 485, "Repo 狀態", "啟動前確認 goal 是否已 commit、工作樹是否乾淨及 workspace 是否已存在。"],
+          [5, 800, 676, 300, 615, "goal.md", "留空沿用已 commit 版本；選檔時改用要匯入的新 Goal。"]
+        ]
+      },
+      launcher_advanced: {
+        title: "啟動新 loop：命令、門檻與安全選項",
+        image: "raw/launcher-advanced-visible.jpg",
+        points: [
+          [1, 650, 130, 20, 92, "Workspace 名稱", "留空使用 repo 目錄名；同名 workspace 會進入重啟／重建語意。"],
+          [2, 445, 202, 18, 180, "Agent 命令", "選擇每輪實際執行的 Agent CLI；管理入口只寫個人設定。"],
+          [3, 820, 202, 1025, 180, "Validate 命令", "選擇測試／驗收命令；可先執行確認或完整健檢。"],
+          [4, 520, 304, 18, 280, "收斂門檻", "flag > 門檻後離開規劃期；done ≥ 門檻後確認任務完成。"],
+          [5, 710, 368, 1025, 330, "Timeout／退避", "限制單輪、Validate 與 Agent 異常重試的等待時間。"],
+          [6, 510, 410, 18, 395, "規劃後暫停", "計畫收斂後先停住，待人工核對後再按運行。"],
+          [7, 420, 452, 18, 448, "重置 state", "清除舊進度並重建；新流程未通過前仍保留舊 state。"],
+          [8, 425, 490, 18, 505, "建立新 branch", "以 loop/<workspace 名> 建立並切換分支。"],
+          [9, 355, 532, 1025, 492, "終態通知", "設定 completed、停機等終態發生時要執行的個人通知命令。"],
+          [10, 520, 588, 1025, 560, "執行前變更 Diff", "送出前逐項核對 goal、plan、命令、門檻與 branch 的前後差異。"],
+          [11, 365, 650, 18, 635, "啟動", "只有核對無誤後才送出；視窗會等到啟動成功才關閉。"]
+        ]
+      },
+      cli_manager: {
+        title: "Agent CLI 管理：第一次使用最重要的個人設定",
+        image: "raw/cli-manager.jpg",
+        points: [
+          [1, 350, 230, 18, 125, "CLI 顯示名稱", "只供下拉選單辨識，例如 codex、claude。"],
+          [2, 650, 230, 18, 210, "Command", "實際執行命令；prompt 由 stdin 傳入。"],
+          [3, 890, 230, 1025, 185, "執行測試", "以固定 prompt test 在選定 repo 內測試，最長 60 秒。"],
+          [4, 955, 145, 1030, 110, "新增 CLI", "可保留多套 Agent 命令，啟動時再選。"],
+          [5, 600, 440, 18, 395, "額外 PATH", "GUI 未載入 shell profile 時，把 CLI 所在目錄加進來。"],
+          [6, 950, 390, 1030, 355, "新增 PATH", "支援 ~ 與 $HOME；請填目錄，不要填執行檔本身。"],
+          [7, 390, 568, 18, 610, "儲存 CLI 設定", "寫入 dashboard.config.local.json，不會修改團隊共用設定。"],
+          [8, 650, 94, 1030, 545, "個人設定位置", "標題下方明示實際寫入檔案，方便確認電腦間不共用。"]
+        ]
+      },
+      workspace_settings: {
+        title: "Workspace 設定：停止後調整下次運行參數",
+        image: "raw/workspace-settings.jpg",
+        points: [
+          [1, 600, 170, 18, 105, "Agent 命令", "選擇新命令；保持不變可避免誤覆寫既有設定。"],
+          [2, 610, 240, 18, 210, "Validate 命令", "修改後先按執行確認，確定在 target repo 可通過。"],
+          [3, 535, 305, 18, 300, "flag／done／單輪", "調整兩階段的共識門檻與每輪時間上限。"],
+          [4, 650, 370, 18, 390, "退避／Validate 上限", "限制 Agent 連續異常的退避與驗證執行時間。"],
+          [5, 650, 430, 1020, 365, "reset 防線", "紅燈連跳或 HEAD 無進展達門檻時回復最近綠點。"],
+          [6, 500, 475, 1020, 445, "規劃後暫停", "讓人先審核計畫，再人工開始執行期。"],
+          [7, 630, 555, 1020, 525, "plan.json 轉移", "匯出純計畫；匯入會完整重置進度並停在規劃期。"],
+          [8, 460, 650, 18, 625, "儲存設定", "只在停止時可用，儲存後從下一次運行生效。"]
+        ]
+      },
+      plan_editor: {
+        title: "Plan 編輯器：只修改尚未執行的任務",
+        image: "raw/plan-editor.jpg",
+        points: [
+          [1, 190, 160, 18, 72, "鎖定任務", "已完成與目前任務不能改動，避免重寫歷史。"],
+          [2, 570, 220, 1025, 115, "任務內容", "寫清楚產出、限制、驗證方式與完成條件。"],
+          [3, 520, 280, 1025, 215, "Ref（選填）", "連回 goal.md 的章節或其他唯讀參考。"],
+          [4, 500, 503, 18, 455, "插入新任務", "在相鄰任務之間加入 pending task。"],
+          [5, 70, 550, 18, 590, "拖曳／上下移", "只有 pending 區段可排序；儲存後會依畫面順序重新編號。"],
+          [6, 1110, 245, 1025, 395, "變更摘要", "送出前核對鎖定、新增、刪除、移動與文字變更數。"],
+          [7, 1110, 360, 1025, 490, "done 計數", "人工校正共識計數；不等同於完成任務數。"],
+          [8, 150, 704, 500, 654, "儲存變更", "後端以 plan version 原子驗證，避免覆蓋更新後的 state。"]
+        ]
+      },
+      run_choice: {
+        title: "運行選擇：一般執行與 Resume 不同",
+        image: "raw/run-choice.jpg",
+        points: [
+          [1, 600, 165, 18, 115, "一般執行", "跑完整 Preflight 與啟動 Validate；乾淨且可驗證時優先使用。"],
+          [2, 600, 235, 1000, 110, "Resume 現場", "保留目前工作樹，略過啟動 Preflight／Validate；只用於中斷續接。"],
+          [3, 650, 320, 18, 290, "執行開始時間", "必須早於現在；用來補回中斷輪次的時間基準。"],
+          [4, 650, 383, 18, 380, "綠點 commit SHA", "必須是 target repo 已存在的 commit，作為中斷前合法基準。"],
+          [5, 505, 455, 1000, 435, "最後確認按鈕", "一般執行走安全檢查；Resume 只有兩個欄位合法時才可按。"]
+        ]
+      },
+      history: {
+        title: "輪次紀錄：用客觀指標找慢輪與異常",
+        image: "raw/round-history.jpg",
+        points: [
+          [1, 205, 150, 18, 112, "目前／上一個 run", "輪替後仍可切到上一個 run 查歷史。"],
+          [2, 620, 255, 18, 245, "效能摘要", "樣本數、平均、P50、P95、最慢與逾時率。"],
+          [3, 950, 255, 1040, 210, "未回 DONE／異常率", "Agent 結束但未送出階段完成訊號；人工中斷不計。"],
+          [4, 650, 420, 18, 420, "逐輪判定表", "依輪次查看時間、耗時、階段、任務、signal、驗證與事件。"],
+          [5, 180, 650, 1040, 610, "重新整理", "手動重新讀取 bounded history；不會修改 workspace。"]
+        ]
+      },
+      task_diff: {
+        title: "完成任務 Git Diff：核對實際交付",
+        image: "raw/task-diff.jpg",
+        points: [
+          [1, 280, 92, 18, 75, "任務脈絡", "標題與描述說明這份變更對應哪一個 task。"],
+          [2, 245, 160, 18, 175, "起點／完成 SHA", "新版 state 顯示 task 起點到完成的淨變更；舊版會明示相容模式。"],
+          [3, 1145, 160, 1040, 215, "Diff 顯示模式", "切換並排、單欄及自動換行。"],
+          [4, 150, 350, 18, 470, "變更檔案", "依新增、修改、刪除狀態列檔案與增刪行數。"],
+          [5, 150, 265, 18, 600, "搜尋檔案", "檔案多時用路徑快速縮小清單。"],
+          [6, 850, 450, 1020, 560, "程式碼差異", "綠色為新增、紅色為刪除；可逐檔核對實作與測試。"]
+        ]
+      },
+      phase_confirm: {
+        title: "階段切換確認：先讀『清除』與『保留』",
+        image: "raw/phase-confirm.jpg",
+        points: [
+          [1, 600, 125, 18, 90, "操作結果", "回到規劃期會清除執行進度與完成紀錄，但保留計畫。"],
+          [2, 610, 170, 18, 185, "清除進度", "明列完成紀錄數與目前 done 計數。"],
+          [3, 610, 215, 1015, 180, "重設暫態", "flag、紅連跳、停滯等執行期計數歸零。"],
+          [4, 610, 260, 1015, 265, "保留項目", "plan 與 target repo 程式碼不會被修改。"],
+          [5, 445, 322, 18, 315, "取消／繼續", "不確定影響時按取消；只有核對正確才繼續。"]
+        ]
+      },
+      delete_confirm: {
+        title: "永久刪除確認：Workspace 資料與 Repo 要分清楚",
+        image: "raw/delete-confirm.jpg",
+        points: [
+          [1, 610, 128, 18, 90, "不可復原", "整個 workspace 目錄會被刪除；這不是清除單一 log。"],
+          [2, 610, 190, 18, 185, "刪除路徑", "確認即將永久移除的 workspace 名稱與目錄。"],
+          [3, 610, 235, 1015, 180, "包含內容", "state、history、console、logs、prompts、snapshots、REPORT 都會刪除。"],
+          [4, 610, 326, 1015, 285, "Repo 不受影響", "target repo 及其程式碼保留；畫面明示實際路徑。"],
+          [5, 460, 390, 18, 380, "永久刪除", "只有確定不再需要稽核資料時才按紅色按鈕。"]
+        ]
+      },
+      anomalies: {
+        title: "異常輪：找出 Agent 結束但未正確回報的輪次",
+        image: "raw/anomalies.jpg",
+        points: [
+          [1, 340, 150, 18, 90, "異常輪清單", "最多最近 100 筆；人工中斷不列入異常。"],
+          [2, 300, 205, 18, 210, "Workspace／round", "每筆標出 workspace、輪次、階段與時間。"],
+          [3, 295, 235, 18, 335, "Signal／Git 狀態", "Git 有變更但未回完成訊號仍算異常。"],
+          [4, 820, 150, 1020, 100, "異常輪 Log", "點左側輪次後，在右側查看保留的 Agent log。"],
+          [5, 800, 245, 1020, 250, "無歷史 log", "舊紀錄或未保存時會明示缺少，不會推測內容。"]
+        ]
+      },
+      launch_diff: {
+        title: "執行前變更 Diff：啟動前最後一次核對",
+        image: "raw/launcher-diff-details.jpg",
+        points: [
+          [1, 360, 373, 18, 320, "比較項目", "依 goal、plan／phase、Agent、Validate、門檻與 Git branch 分組。"],
+          [2, 580, 375, 18, 430, "既有狀態（−）", "粉紅欄是 repo 或現有 workspace 目前值。"],
+          [3, 850, 375, 1020, 360, "本次送出（＋）", "綠色欄是按啟動後要採用的新值。"],
+          [4, 835, 545, 1020, 500, "收斂／timeout", "一次核對 flag、done、round 與 backoff。"],
+          [5, 840, 585, 1020, 590, "Git branch", "確認會建立新 branch 還是保持目前 branch。"],
+          [6, 365, 650, 18, 625, "啟動", "差異符合預期後才送出；有草稿時 Diff 會自動展開。"]
+        ]
+      }
+    };
+
+    const key = new URLSearchParams(location.search).get("screen") || "overview";
+    const screen = screens[key];
+    if (!screen) throw new Error(`unknown screen: ${key}`);
+    const root = document.getElementById("root");
+    const stage = document.createElement("section");
+    stage.className = "stage";
+    const img = document.createElement("img");
+    img.src = screen.image;
+    img.alt = screen.title;
+    stage.appendChild(img);
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "line-layer");
+    for (const [n, x, y, bx, by, short] of screen.points) {
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      line.setAttribute("x1", x); line.setAttribute("y1", y);
+      line.setAttribute("x2", bx + 88); line.setAttribute("y2", by + 18);
+      svg.appendChild(line);
+      const marker = document.createElement("span");
+      marker.className = "marker"; marker.textContent = n;
+      marker.style.left = `${x}px`; marker.style.top = `${y}px`;
+      stage.appendChild(marker);
+      const box = document.createElement("div");
+      box.className = "callout"; box.innerHTML = `<b>${n}</b>${short}`;
+      box.style.left = `${bx}px`; box.style.top = `${by}px`;
+      stage.appendChild(box);
+    }
+    stage.insertBefore(svg, stage.children[1]);
+    const legend = document.createElement("section");
+    legend.className = "legend";
+    legend.innerHTML = `<h1>${screen.title}<small>實際 Dashboard 畫面＋中文標註</small></h1><div class="legend-grid">${screen.points.map(([n,,,,,short,detail]) => `<div class="legend-item"><strong>${n}</strong><span><b>${short}：</b>${detail}</span></div>`).join("")}</div><p class="legend-note">標註只疊加說明層；底圖為本機實際 Dashboard，未重製或改寫介面內容。</p>`;
+    root.append(stage, legend);
+    img.addEventListener("load", () => document.body.dataset.ready = "true");
+  </script>
+</body>
+</html>
