@@ -1,8 +1,8 @@
 # loop-agent-lite
 
-用 Python 協調 agent 的規劃／執行迴圈，並提供一個可在瀏覽器操作的 Dashboard。
+用 Python 協調 agent 的規劃／執行迴圈；可從終端機管理單一 workspace，也可用瀏覽器 Dashboard 管理多個 workspace。
 
-第一次使用請看：[Dashboard 完整操作圖解](docs/dashboard-guide/README.md)；逐欄查詢請看：[欄位與控制項完整說明](docs/dashboard-guide/fields-reference.md)。
+終端機流程請看：[單一 Workspace CLI 完整圖解](docs/cli-guide/README.md)。Dashboard 第一次使用請看：[Dashboard 完整操作圖解](docs/dashboard-guide/README.md)；逐欄查詢請看：[欄位與控制項完整說明](docs/dashboard-guide/fields-reference.md)。
 
 ![Dashboard 執行中展示](docs/dashboard-running.jpg)
 
@@ -12,12 +12,15 @@
 
 ```text
 準備 target repo
-  └─ goal.md + PLAN.md 已審核並 commit
+  └─ goal.md（以及選配的 plan-doc）已審核並 commit
           │
           ▼
-`python dashboard.py` 啟動本機服務與 engine coordinator
+`python loop.py init ...` 或 Dashboard 建立 workspace
           │
-          ├─ preflight：validate、工作樹、goal/PLAN commit 檢查
+          ▼
+`python loop.py run <workspace>` 或 Dashboard 啟動 coordinator
+          │
+          ├─ preflight：validate、工作樹、goal/plan-doc commit 檢查
           │       └─ 失敗：保留舊 state，不啟動新工作
           │
           ▼
@@ -37,24 +40,93 @@ Loop 另以 OS 鎖維持單 writer：同一 workspace 或同一 Git worktree 不
 
 ## 安裝與啟動
 
-在專案根目錄建立 `.venv`、安裝 requirements，接著直接用該 Python 啟動 Dashboard：
+在專案根目錄建立 `.venv` 並安裝 requirements：
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python dashboard.py
 ```
 
-之後回到專案時只需先執行 `source .venv/bin/activate`，再用 `python dashboard.py` 啟動。
+之後回到專案時先執行 `source .venv/bin/activate`，再選擇下方的單 workspace CLI 或 Dashboard 流程。
 目前 runtime 只使用 Python 標準函式庫，因此 `requirements.txt` 暫無第三方套件；檔案仍是固定的依賴安裝入口。
-
-開啟終端顯示的本機網址（預設從 <http://127.0.0.1:8765/> 開始；port 被占用會自動往上找）。
 workspace 與個人設定預設固定保存在這份 loop-agent-lite 專案內，不會依安裝型態改放到使用者資料目錄。
+
+## 單一 Workspace CLI（快速開始）
+
+CLI 會把第一次設定保存在 `workspace/<name>/state.json` 的 `config`；之後 `run`／`restart` 只需 workspace 名稱，不會把 Agent、Validate 或門檻偷偷換回預設值。
+
+先在 target repo 建立並 commit `goal.md`，確認工作樹乾淨且 Validate 命令可成功，再從本專案根目錄執行：
+
+```bash
+# 1. 完整 preflight 後初始化；此步不啟動 Agent
+python loop.py init \
+  --name my-work \
+  --repo /absolute/path/to/target-repo \
+  --agent-cmd 'claude -p' \
+  --validate-cmd 'python3 -m unittest discover -s tests -t . -q'
+
+# 2. 可選：再確認保存的設定與 preflight
+python loop.py config my-work
+python loop.py check my-work
+
+# 3. 前景執行；Ctrl-C 會保存 state 後停止
+python loop.py run my-work
+```
+
+若已有人工審核過的 Plan，可在 init 時匯入並直接從執行期 task-1 開始；`--plan` 與 `--import-plan` 同義：
+
+```bash
+python loop.py init \
+  --name my-work \
+  --repo /absolute/path/to/target-repo \
+  --agent-cmd 'claude -p' \
+  --validate-cmd 'pytest -q' \
+  --plan /absolute/path/to/plan.json \
+  --start-phase exec
+```
+
+另一個終端機可觀察或要求平順停止：
+
+```bash
+python loop.py status my-work --watch --metrics 20
+python loop.py stop my-work          # 目前 round 完整落盤後停止
+python loop.py stop my-work --now    # Agent 失控時才立即中斷
+```
+
+正常停止後，下列兩條完全同義，都會用保存設定重新做 Preflight／啟動 Validate，並從原 state 接續：
+
+```bash
+python loop.py run my-work
+python loop.py restart my-work
+```
+
+明確要保留中斷中的 dirty 現場時才用 `--resume-interrupted`；要捨棄 coordinator 進度、交易式開始新 run 才用 `--reset-state`：
+
+```bash
+python loop.py run my-work --resume-interrupted
+python loop.py run my-work --reset-state
+```
+
+安全修改 `state.json` 內可設定參數時，不要直接開檔覆寫；先停 loop，再用 `config`，primary 與 checkpoint 會一起原子更新：
+
+```bash
+python loop.py config my-work \
+  --done-threshold 5 \
+  --round-timeout 45 \
+  --validate-timeout 300 \
+  --pause-after-plan
+```
+
+若要隔離 workspace root，全域選項必須放在子命令之前，例如 `python loop.py --workspace-root /tmp/loops status my-work`；也可設定 `LOOP_AGENT_WORKSPACE_ROOT`。完整 init、plan 匯入、參數表、state 欄位所有權、重啟決策與疑難排解都在 [CLI 完整圖解](docs/cli-guide/README.md)。
+
+## Dashboard 啟動
+
+執行 `python dashboard.py`，再開啟終端顯示的本機網址（預設從 <http://127.0.0.1:8765/> 開始；port 被占用會自動往上找）。
 
 ### 1. 準備 target repo
 
-在 target repo 建立並 commit `goal.md`、`PLAN.md`，確認驗證命令可在該 repo 執行。
+在 target repo 建立並 commit `goal.md`；若有傳入 `plan-doc`，該檔也必須 commit。Plan 可由規劃期 Agent 建立，或在啟動時匯入 JSON array。確認驗證命令可在該 repo 執行。
 
 ### 啟動選項
 
@@ -169,10 +241,12 @@ workspace/<name>/
 ├── state.json       目前進度與執行設定
 ├── state.last-good.json  最近一次合法 state 的復原副本（主檔不可讀時才使用）
 ├── stop-after-round.json  暫時的 session-scoped 平順停止請求（loop 消耗後刪除）
+├── .run.lock         單 writer flock 檔（檔案存在不等於正在執行）
 ├── console.log      完整流程紀錄（單檔上限 5 MiB，輪替保留 3 代）
 ├── history.log      逐輪判定（當前 run 上限 10 MiB，超出保留最新尾段）
 ├── logs/             每輪 Agent 原始輸出
 ├── prompts/          最近幾輪送出的 prompt
+├── snapshots/        goal／plan-doc 的防竄改基準
 └── REPORT.md        全部任務完成後的摘要
 ```
 
@@ -188,7 +262,7 @@ workspace/<name>/
 
 **workspace 顯示沒有 state.json**
 
-若 `state.last-good.json` 存在，Dashboard／loop 會自動復原主檔並留下 state 復原紀錄；兩份都不存在時，請從 Dashboard 的啟動表單重新啟動或使用 `--reset-state`。不要在 loop 執行中手動刪除 workspace 檔案。
+若 `state.last-good.json` 存在，Dashboard／loop 會自動復原主檔並留下 state 復原紀錄；兩份都不存在時，請執行 `python loop.py init ...`，或從 Dashboard 啟動表單重新建立。不要在 loop 執行中手動刪除 workspace 檔案。
 state 若是合法 JSON 但核心欄位型別、phase、loop PID/session 或退避／復原時間 metadata 不合法，也會依同一套 checkpoint 防線復原；primary 與 checkpoint 都不符合 schema 時會 fail-closed，避免半合法資料讓 loop 晚發崩潰。
 
 ## 開發與測試

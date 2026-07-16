@@ -83,7 +83,14 @@ def project_status(name: str, metrics_limit=0):
     state, _data, recovered = loop.load_checkpointed_state(directory / "state.json", repair=False)
     loop_state = state.get("loop") if isinstance(state.get("loop"), dict) else {}
     pid = loop_state.get("pid")
-    running = pid_is_loop_alive(pid)
+    state_running = pid_is_loop_alive(pid)
+    # run 在 preflight/Validate 完成後才把 session PID 交易式寫進 state；這段期間仍可
+    # 由 kernel flock 與 owner record 誠實辨識為 starting/busy，避免錯顯示「已停止」。
+    lock_owner = loop.active_run_lock_owner(directory / ".run.lock")
+    owner_pid = lock_owner.get("pid") if isinstance(lock_owner, dict) else None
+    starting = bool(not state_running and owner_pid and pid_is_loop_alive(owner_pid))
+    running = state_running or starting
+    effective_pid = pid if state_running else owner_pid if starting else pid
     plan = state.get("plan") if isinstance(state.get("plan"), list) else []
     completed = state.get("completed") if isinstance(state.get("completed"), list) else []
     issues = state.get("issues") if isinstance(state.get("issues"), list) else []
@@ -117,8 +124,8 @@ def project_status(name: str, metrics_limit=0):
         "round_started_at": round_started_at,
         "round_deadline_at": round_deadline_at,
         "round_interrupted_at": round_interrupted_at,
-        "round_active": bool(round_started_at and running),
-        "round_interrupted": bool(round_started_at and not running),
+        "round_active": bool(round_started_at and state_running),
+        "round_interrupted": bool(round_started_at and not state_running),
         **round_timing,
         "state_recovery_count": state.get("state_recovery_count", 0),
         "last_state_recovery": state.get("last_state_recovery"),
@@ -127,11 +134,13 @@ def project_status(name: str, metrics_limit=0):
         "issues": len(issues),
         "unread_issues": loop.unread_issue_count(state),
         "last_green_sha": state.get("last_green_sha"),
-        "loop_pid": pid,
-        "loop_session_id": loop_state.get("session_id"),
-        "loop_started_at": loop_state.get("started_at"),
+        "loop_pid": effective_pid,
+        "loop_session_id": loop_state.get("session_id") if state_running else None,
+        "loop_started_at": (lock_owner.get("started_at") if starting
+                            else loop_state.get("started_at")),
+        "starting": starting,
         "running": running,
-        "stale_loop_pid": pid is not None and not running,
+        "stale_loop_pid": pid is not None and not state_running and not starting,
         "state_recovery_pending": recovered,
     }
     if metrics_limit:
@@ -267,7 +276,8 @@ def filter_status_results(results, mode: str):
 def render_human(result, *, timestamp=False) -> None:
     """將單 workspace projection 轉成終端可掃讀摘要，不改變任何 state。"""
     phase = {"plan": "規劃期", "exec": "執行期", "done": "完成"}.get(result["phase"], result["phase"] or "未知")
-    running = "執行中" if result["running"] else "⚠ PID 殘留" if result.get("stale_loop_pid") else "已停止"
+    running = ("啟動檢查中" if result.get("starting") else "執行中" if result["running"]
+               else "⚠ PID 殘留" if result.get("stale_loop_pid") else "已停止")
     prefix = f"[{time.strftime('%H:%M:%S')}] " if timestamp else ""
     task = f"｜task-{result['current_order']}：{result['current_task']}" if result.get("current_task") else ""
     issue_note = (f"issues {result['issues']}（未讀 {result['unread_issues']}）"

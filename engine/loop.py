@@ -636,6 +636,31 @@ def acquire_run_lock(path: Path, label: str) -> None:
     _RUN_LOCKS.append(lock_file)  # 強引用持有到 atexit；只留下 lock file，不靠檔案存在與否判斷
 
 
+def active_run_lock_owner(path: Path):
+    """若 run lock 正由另一 process 持有，安全讀回 owner；未鎖定則回 None。"""
+    path = workspace_file(Path(path), "run lock")
+    try:
+        fd = _open_regular(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb", closefd=True) as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_file.seek(0)
+            try:
+                owner = json.loads(lock_file.read().decode("utf-8"))
+                pid = owner.get("pid") if isinstance(owner, dict) else None
+                if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+                    return None
+                return owner
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+        else:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            return None
+
+
 # 此 handler 比 main 內稍後註冊的 state stopped handler 更早註冊；atexit 為 LIFO，
 # 因此會先把 state.pid 清掉並存檔，最後才釋放單 writer 鎖。
 atexit.register(release_run_locks)
@@ -943,6 +968,9 @@ def validate_state_shape(state, label: str):
         if field in state and value is not None and (
                 not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None):
             raise StateLoadError(f"{label} {field} 必須是 64 字元小寫 SHA-256 或 null")
+    if "repo_binding" in state and state["repo_binding"] is not None and (
+            not isinstance(state["repo_binding"], str) or not state["repo_binding"].strip()):
+        raise StateLoadError(f"{label} repo_binding 必須是非空字串或 null")
     return state
 
 
@@ -1087,6 +1115,7 @@ class Workspace:
             "round_started_at": None, "round_deadline_at": None,
             "round_interrupted_at": None,
             "state_recovery_count": 0, "last_state_recovery": None,
+            "repo_binding": None,       # workspace identity；不可由 config 子命令變更
             "task_reset_counts": {},    # {order(str): 次數}
             "notes": [],
             "issues": [],               # agent 用 work.py issue 回報,給人類看,不影響計數
@@ -1470,6 +1499,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preflight-only", action="store_true",
                         help="只跑啟動前健檢(git/鎖/乾淨樹/goal 已 commit/validate)就退出;"
                              "不建 state、不動 snapshots、不啟動 agent")
+    parser.add_argument("--init-only", action="store_true",
+                        help="完成 preflight 並建立 stopped workspace/state 後退出，不啟動 agent")
     parser.add_argument("--resume-interrupted", action="store_true",
                         help="僅限已開始且有既有綠點的執行期輪次：保留現場並略過啟動 Validate")
     return parser
@@ -1495,8 +1526,12 @@ def parse_runtime_options(argv=None) -> RuntimeOptions:
         value = getattr(args, attr)
         if not math.isfinite(value) or value < 0 or (positive and value == 0):
             parser.error(f"{option} 必須是{' > 0' if positive else ' ≥ 0'} 的有限數字")
-    if args.resume_interrupted and (args.preflight_only or args.reset_state or args.import_plan):
-        parser.error("--resume-interrupted 不可搭配 --preflight-only、--reset-state 或 --import-plan")
+    if args.preflight_only and args.init_only:
+        parser.error("--preflight-only 不可搭配 --init-only")
+    if args.resume_interrupted and (args.preflight_only or args.init_only or
+                                    args.reset_state or args.import_plan):
+        parser.error("--resume-interrupted 不可搭配 --preflight-only、--init-only、"
+                     "--reset-state 或 --import-plan")
 
     repo = Path(args.repo).resolve()
     workspace_name = args.name or repo.name
@@ -1837,9 +1872,9 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
     return event, validate_note
 
 
-def main():
+def main(argv=None):
     """解析 CLI、執行 preflight，然後進入規劃/執行雙階段 coordinator loop。"""
-    options = parse_runtime_options()
+    options = parse_runtime_options(argv)
     args = options.args
     repo = options.repo
     workspace_name = options.workspace_name
@@ -1856,6 +1891,10 @@ def main():
         build_argument_parser().error(f"--name {e}")
     configure_console(ws.dir / "console.log")
     acquire_run_lock(ws.dir / ".run.lock", f"workspace '{ws.dir.name}'")
+    state_exists = ws.state_path.exists() or ws.checkpoint_path.exists()
+    if args.init_only and state_exists and not args.reset_state:
+        fail(f"workspace '{ws.dir.name}' 已初始化；請改用高階 CLI 的 run/restart，"
+             "或明確加 --reset-state 重新初始化")
     startup_ready = ws.dir / "startup_ready.json"
     if not args.preflight_only:  # 健檢模式不得動到既有啟動 handshake 檔
         startup_ready.unlink(missing_ok=True)
@@ -1885,7 +1924,9 @@ def main():
 
     # repo identity fail-closed:workspace 只按 name 載入,若既有 state 綁的是別的 repo,
     # 續跑會拿別人的 plan/completed/last_green_sha 去 reset --hard——寧可停也不帶病前進。
-    bound_repo = (state.get("config") or {}).get("repo")
+    # repo_binding 位於可調 config 之外；config 子命令不能把既有 plan/SHA 偷渡到另一 repo。
+    # 舊 state 首次啟動仍以歷史 config.repo 遷移，成功後立即固化 repo_binding。
+    bound_repo = state.get("repo_binding") or (state.get("config") or {}).get("repo")
     if bound_repo and Path(bound_repo).resolve() != repo and not (args.reset_state or args.import_plan):
         fail(f"workspace '{ws.dir.name}' 綁定的是 {bound_repo},但這次 --repo 是 {repo}。"
              f"同名 workspace 指到不同 repo 會用錯 plan/SHA——換個 --name,或加 --reset-state 重來。")
@@ -1963,18 +2004,34 @@ def main():
     # dashboard 靠 config 做 workspace 掃描與一鍵 run(agent_cmd 會再對 config 白名單驗過才准跑)
     state["config"] = {"flag_threshold": args.flag_threshold, "done_threshold": args.done_threshold,
                        "red_limit": args.red_limit, "stall_limit": args.stall_limit,
+                       "stuck_stop": bool(args.stuck_stop),
+                       "stuck_stop_count": args.stuck_stop_count,
                        "round_timeout": args.round_timeout,
                        "agent_backoff_max": args.agent_backoff_max,
                        "validate_timeout": args.validate_timeout,
                        "pause_after_plan": bool(args.pause_after_plan),
+                       "notify_cmd": args.notify_cmd,
                        "repo": str(repo), "agent_cmd": shlex.join(agent_cmd),
                        "validate_cmd": shlex.join(validate_cmd),
                        "goal": args.goal, "plan_doc": args.plan_doc}
+    state["repo_binding"] = str(repo)
     # 舊 session 的停止請求不可跨重啟生效；先清掉，再公開新 pid/session_id。
     ws.stop_after_round_path.unlink(missing_ok=True)
     ws.stop_after_round_claimed_path.unlink(missing_ok=True)
     for orphan in ws.dir.glob(f".{STOP_AFTER_ROUND_FILE}.consume.*"):
         orphan.unlink(missing_ok=True)
+    if args.init_only:
+        # init 是完整 preflight 後的交易提交點，但不公開暫時的 init process PID；
+        # 下一次高階 CLI run 會從 config 重建同一組 runtime flags 並建立真正 session。
+        state["loop"] = {"pid": None}
+        ws.save_state(state)
+        if fresh_start:
+            reset_run_artifacts(ws)
+        if args.import_plan and getattr(args, "consume_import_plan", False):
+            Path(args.import_plan).unlink(missing_ok=True)
+        log(f"✅ Workspace 初始化完成｜name={ws.dir.name}｜phase={state['phase']}｜"
+            f"state={ws.state_path}｜尚未啟動 Agent")
+        return
     session_id = uuid.uuid4().hex
     state["loop"] = {"pid": os.getpid(), "session_id": session_id,
                      "started_at": datetime.now().isoformat(timespec="seconds")}
