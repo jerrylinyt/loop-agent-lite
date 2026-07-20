@@ -503,7 +503,8 @@ def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout
 
 def spawn_ralph(name, repo, *, ralph_cmd, ralph_dir, iterations, tool, model, args_template,
                 prd_path="prd.json", notify_cmd="", usage_limit_action="restart",
-                fallback_models=None, auto_restart_max=20, usage_limit_patterns=None, env=None):
+                fallback_models=None, auto_restart_max=ralph_mod.DEFAULT_AUTO_RESTART_MAX,
+                usage_limit_patterns=None, env=None):
     """spawn engine.ralph 監督層並登記進 JOBS(呼叫方需持 JOBS_LOCK)。ralph 自成迴圈引擎,
     這支監督層只 spawn/監控/投影,與 loop coordinator 共用 Job 註冊表與停止流程。"""
     loop_mod.require_workspace_name(name)
@@ -1550,6 +1551,7 @@ def list_workspaces():
                     "stalled": bool(rb.get("stalled")),
                     "exit_reason": rb.get("exit_reason"),
                     "usage_limit_active": bool(rb.get("usage_limit")),
+                    "usage_limit_action": (rb.get("usage_limit") or {}).get("action"),
                     "active_model": rb.get("active_model", ""),
                     "restart_attempt": rb.get("restart_attempt", 0),
                     "prd_error": rb.get("prd_error"),
@@ -1579,7 +1581,8 @@ def _workspace_needs_attention(info):
         rb = info.get("ralph") or {}
         if rb.get("prd_error"):
             return True
-        if not completed and (rb.get("stalled") or rb.get("usage_limit_active")):
+        # 只在「目前正等待重啟」時提示;已降級但仍在正常執行的 run 不算需關注。
+        if not completed and (rb.get("stalled") or rb.get("usage_limit_action") == "waiting"):
             return True
         if rb.get("exit_reason") in ("failed", "usage_limit_giveup"):
             return True
@@ -2400,12 +2403,13 @@ class Handler(BaseHTTPRequestHandler):
             self._err(f"iterations 不可超過 {ralph_mod.ITERATIONS_MAX}")
             return
         tool = str(body.get("tool") or "").strip()
-        if not ralph_mod.TOOL_RE.fullmatch(tool):
-            self._err("tool 只能是英數與 . _ -（例：opencode / claude / amp）")
+        if not ralph_mod.TOOL_RE.fullmatch(tool) or tool.startswith("-"):
+            self._err("tool 只能是英數與 . _ -，且不可以 - 開頭（例：opencode / claude / amp）")
             return
         model = str(body.get("model") or "").strip()
-        if len(model) > ralph_mod.MODEL_MAX_CHARS or any(ord(ch) < 32 for ch in model):
-            self._err(f"model 需 ≤{ralph_mod.MODEL_MAX_CHARS} 字且不含控制字元")
+        if len(model) > ralph_mod.MODEL_MAX_CHARS or any(ord(ch) < 32 for ch in model) \
+                or model.startswith("-"):
+            self._err(f"model 需 ≤{ralph_mod.MODEL_MAX_CHARS} 字、不含控制字元且不可以 - 開頭")
             return
         args_style = str(body.get("args_style") or ralph_cfg.get("default_args_style")
                          or ralph_mod.DEFAULT_ARGS_STYLE)
@@ -2438,7 +2442,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             auto_restart_max = parse_numeric_setting(
                 body.get("auto_restart_max") if body.get("auto_restart_max") is not None
-                else ralph_cfg.get("default_auto_restart_max", 20), integer=True, minimum=0)
+                else ralph_cfg.get("default_auto_restart_max", ralph_mod.DEFAULT_AUTO_RESTART_MAX),
+                integer=True, minimum=0)
         except (TypeError, ValueError):
             self._err("auto_restart_max 必須是 ≥0 的整數")
             return
@@ -2465,6 +2470,17 @@ class Handler(BaseHTTPRequestHandler):
                 if j.alive() and Path(j.repo) == repo:
                     self._err(f"repo {repo} 已有 runner 在跑({j.name})，同一 repo 不能同時跑兩個")
                     return
+                # ralph 的 prd/progress 位於 ralph_dir；兩個 ralph 共用同一 ralph_dir+prd 會互相覆蓋
+                # （ralph.sh 依 SCRIPT_DIR 讀寫，預設 ralph_dir 就是 ralph.sh 所在目錄，容易共用）。
+                if j.alive():
+                    other_state, _ = read_state(j.name)
+                    other_cfg = (other_state or {}).get("config") or {}
+                    if ((other_state or {}).get("runner") == "ralph" and other_cfg.get("ralph_dir")
+                            and str(Path(other_cfg["ralph_dir"]).expanduser().resolve()) == str(ralph_dir)
+                            and (other_cfg.get("prd_path") or "prd.json") == prd_path):
+                        self._err(f"另一個 ralph run（{j.name}）正在使用相同的 ralph 目錄與 PRD"
+                                  f"（{ralph_dir}/{prd_path}），會互相覆蓋；請用不同的 ralph_dir")
+                        return
             if body.get("new_branch"):
                 br = f"ralph/{name}"
                 exists = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", br],

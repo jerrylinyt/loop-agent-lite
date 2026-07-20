@@ -270,10 +270,13 @@ Ralph 表單欄位：
 
 - **「本輪後停止」不提供。** ralph.sh 沒有輪間控制點，我們也不能改它。
   UI 只保留「立即停止」，確認視窗明示語意差異。
-- **立即停止**：SIGINT → 8 秒 → SIGKILL 整個 process group（既有 `Job.stop()`）。
-  中斷可能在 target repo 留下未 commit 殘留——這在 ralph 哲學裡是**可接受的**：
+- **立即停止**：Dashboard 的 `Job.stop()` 對監督層送 SIGINT，8 秒後 SIGKILL 監督層。
+  **關鍵**：ralph 與監督層各自 `start_new_session`（獨立 session），所以 SIGKILL 監督層殺不到
+  ralph；監督層的 signal handler 因此除了轉發 SIGINT 給 ralph，還獨立排一個 `KILL_GRACE_SEC`（5 秒，
+  刻意 < 8 秒）後 SIGKILL ralph 的 process group，確保 ralph 在監督層被 SIGKILL 前先死、不留孤兒
+  ralph 繼續 commit。中斷可能在 target repo 留下未 commit 殘留——這在 ralph 哲學裡是**可接受的**：
   下一次啟動的 fresh-context agent 本來就被要求先收拾現場。停止後 state 標記
-  `ralph.exit: "interrupted"`，卡片顯示「已中斷，可重啟續跑」。
+  `ralph.exit_reason: "interrupted"`，卡片顯示「已中斷，可重啟續跑」。
 - **重啟 = 重新 launch**：ralph 天然可續跑（PRD 未完成項就是 resume point），
   不需要 loop 模式那套 resume 檢查。`/api/run` 對 ralph workspace 的語意就是
   以保存的 config 重新 spawn。

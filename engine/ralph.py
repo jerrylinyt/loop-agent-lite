@@ -346,7 +346,9 @@ BACKOFF_BASE_SEC = 60
 BACKOFF_CAP_SEC = 3600
 MAX_TOTAL_WAIT_SEC = 24 * 3600
 SETTLE_DELAY_SEC = 15
-KILL_GRACE_SEC = 10
+# ralph 的 kill 寬限必須明顯短於 Dashboard Job.stop 的 8 秒 SIGKILL，否則 Dashboard 會先
+# SIGKILL 監督層、留下仍在 commit 的孤兒 ralph（監督層與 ralph 各自獨立 session）。
+KILL_GRACE_SEC = 5
 DEFAULT_AUTO_RESTART_MAX = 6
 
 
@@ -450,6 +452,7 @@ class RalphSupervisor:
         self._sentinel = False
         self._last_activity = time.monotonic()
         self._stopping = threading.Event()
+        self._project_lock = threading.Lock()   # 序列化 state 寫入,避免兩執行緒交錯拆分 primary/checkpoint
         self.state = None
         # usage-limit 偵測器
         self._patterns = compile_limit_patterns(args.usage_limit_patterns) \
@@ -457,7 +460,10 @@ class RalphSupervisor:
         self._limit_confirmed = threading.Event()
         self._limit_evidence = None
         self._det = None            # 目前 run 的逐輪偵測狀態
+        self._tier2_streak = 0
         self._run_made_progress = False
+        self._run_gen = 0           # run 世代;被殺 run 的殘留 reader thread 不得污染下一個 run
+        self._force_kill_timer = None
         self._last_exit_code = None
         # 跨 run 的持久投影欄位
         self._active_model = args.model or ""
@@ -526,17 +532,20 @@ class RalphSupervisor:
         stalled = (exit_reason is None and self.proc is not None and
                    self.proc.poll() is None and
                    time.monotonic() - last_activity > STALL_AFTER_SEC)
-        block = project_ralph_block(
-            self.repo, self.ralph_dir, self.prd_path, self.base_sha,
-            iteration=iteration, max_iterations=self.args.iterations,
-            sentinel_complete=sentinel, stalled=stalled,
-            exit_code=exit_code, exit_reason=exit_reason)
-        block["active_model"] = self._active_model
-        block["restart_attempt"] = self._restart_attempt
-        block["usage_limit"] = self._limit_block
-        self.state["ralph"] = block
-        self.ws.save_state(self.state)
-        return block
+        # _project 可能由 reader thread 與主執行緒同時呼叫;序列化「重算＋落盤」避免兩者交錯把
+        # primary 與 last-good checkpoint 寫成不同版本,或舊投影覆蓋新投影。
+        with self._project_lock:
+            block = project_ralph_block(
+                self.repo, self.ralph_dir, self.prd_path, self.base_sha,
+                iteration=iteration, max_iterations=self.args.iterations,
+                sentinel_complete=sentinel, stalled=stalled,
+                exit_code=exit_code, exit_reason=exit_reason)
+            block["active_model"] = self._active_model
+            block["restart_attempt"] = self._restart_attempt
+            block["usage_limit"] = self._limit_block
+            self.state["ralph"] = block
+            self.ws.save_state(self.state)
+            return block
 
     # ---- usage-limit 偵測(在 reader thread 逐輪判定) ----
     def _fingerprint(self):
@@ -563,9 +572,10 @@ class RalphSupervisor:
     def _evaluate_iteration(self, det):
         """依 no-progress gate 判定該輪是否為 limit iteration,必要時確認 usage limit。"""
         if not det["matches"]:
+            # 沒命中任何字樣的一輪打斷 tier-2 的「連續」性(即使該輪也無進展)。
+            self._tier2_streak = 0
             if self._progressed_since(det["start_fp"]):
                 self._run_made_progress = True
-                self._tier2_streak = 0
             return
         if self._progressed_since(det["start_fp"]):
             self._run_made_progress = True
@@ -575,7 +585,7 @@ class RalphSupervisor:
         if has_tier1:
             self._confirm_limit(det)
             return
-        self._tier2_streak = getattr(self, "_tier2_streak", 0) + 1
+        self._tier2_streak += 1
         if self._tier2_streak >= 2:
             self._confirm_limit(det)
 
@@ -590,35 +600,63 @@ class RalphSupervisor:
                      f"命中 {det['matches'][-1]['pattern']}｜將收掉 ralph 並處理")
 
     # ---- stdout reader ----
-    def _consume_output(self):
-        """逐行鏡射 ralph stdout 到 console 與 run log,抽取迭代/完成訊號並跑 usage-limit 偵測。"""
-        loop_mod.ensure_real_directory(self.run_log.parent, "ralph run log 目錄")
-        log_fd = loop_mod._open_regular(self.run_log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-        with os.fdopen(log_fd, "w", encoding="utf-8", closefd=True) as sink:
-            for raw in self.proc.stdout:
-                line = raw.rstrip("\n")
-                loop_mod.agent_log(line)
-                sink.write(raw)
-                sink.flush()
-                self._handle_line(line)
-        # ralph 自行結束:結算最後一輪(可能是收尾才冒出的 limit 訊息)。
-        with self._lock:
-            if self._det is not None:
-                try:
-                    self._evaluate_iteration(self._det)
-                except Exception:  # noqa: BLE001 — 收尾結算失敗不影響退出判定
-                    pass
-        try:
-            self.proc.stdout.close()
-        except (OSError, ValueError):
-            pass
+    def _consume_output(self, proc, gen):
+        """逐行鏡射 ralph stdout 到 console 與 run log,抽取迭代/完成訊號並跑 usage-limit 偵測。
 
-    def _handle_line(self, line):
-        """處理單行:迭代邊界、sentinel、usage-limit pattern。"""
+        - binary 讀取 + errors="replace":一個非 UTF-8 位元組不會殺掉 reader、害 pipe 塞滿讓 ralph 永久阻塞。
+        - 每行處理包 try/except:單行例外不中斷「排空 stdout」這件保命的事。
+        - gen 綁定本 run:被殺 run 殘留的 reader(grandchild 逃離 pgid 使 join 逾時)不得寫進下一個 run 的 state,
+          也只關自己那條 stdout(不是可能已換成新 run 的 self.proc)。
+        - run log 以 O_APPEND 保留跨重啟的紀錄,每個 run 前加分隔行。"""
+        sink = None
+        try:
+            loop_mod.ensure_real_directory(self.run_log.parent, "ralph run log 目錄")
+            log_fd = loop_mod._open_regular(self.run_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            sink = os.fdopen(log_fd, "ab", closefd=True)
+            sink.write(f"\n===== ralph run gen={gen} @ "
+                       f"{datetime.now().isoformat(timespec='seconds')} =====\n".encode("utf-8"))
+            sink.flush()
+        except (OSError, ValueError) as e:
+            loop_mod.log(f"⚠ ralph run log 無法開啟(不影響監控):{e}")
+            sink = None
+        try:
+            for raw in proc.stdout:
+                try:
+                    line = raw.decode("utf-8", errors="replace").rstrip("\n")
+                    loop_mod.agent_log(line)
+                    if sink is not None:
+                        sink.write(raw)
+                        sink.flush()
+                    self._handle_line(line, gen)
+                except Exception as e:  # noqa: BLE001 — 單行失敗仍要續讀,否則 pipe 塞滿 ralph 阻塞
+                    loop_mod.log(f"⚠ ralph 輸出處理失敗(續讀):{e}")
+        except Exception:  # noqa: BLE001 — 讀 pipe 本身的例外也不能讓 reader 靜默死掉
+            pass
+        finally:
+            if sink is not None:
+                try:
+                    sink.close()
+                except OSError:
+                    pass
+            with self._lock:
+                if gen == self._run_gen and self._det is not None:
+                    try:
+                        self._evaluate_iteration(self._det)   # 結算最後一輪(收尾才冒出的 limit)
+                    except Exception:  # noqa: BLE001 — 收尾結算失敗不影響退出判定
+                        pass
+            try:
+                proc.stdout.close()
+            except (OSError, ValueError):
+                pass
+
+    def _handle_line(self, line, gen):
+        """處理單行:迭代邊界、sentinel、usage-limit pattern。gen 過期的殘留 reader 直接略過。"""
         match = ITERATION_RE.search(line)
         changed = False
         confirm_now = False
         with self._lock:
+            if gen != self._run_gen:
+                return   # 殘留 reader:不得污染新 run 的偵測/迭代/完成狀態
             if match:
                 self._iteration = int(match.group(1))
                 self._begin_iteration(self._iteration)
@@ -647,11 +685,20 @@ class RalphSupervisor:
 
     # ---- 停止 / kill ----
     def _install_signal_handlers(self):
-        """把 Dashboard 送來的 SIGINT/SIGTERM 轉成優雅停止並轉發給 ralph process group。"""
+        """把 Dashboard 送來的 SIGINT/SIGTERM 轉成優雅停止並轉發給 ralph process group。
+
+        關鍵:Dashboard Job.stop 會在 8 秒後 SIGKILL 監督層(但 ralph 在獨立 session,殺不到),
+        因此這裡除了轉發 SIGINT,還獨立排一個 grace 後的 SIGKILL timer,保證 ralph 在監督層被
+        SIGKILL 前就先死,不留孤兒 ralph。"""
         def handler(signum, _frame):
             self._stopping.set()
-            loop_mod.log(f"⏹ 收到停止訊號({signum}),轉發給 ralph 並準備收尾")
+            loop_mod.log(f"⏹ 收到停止訊號({signum}),轉發給 ralph 並排定 {KILL_GRACE_SEC}s 後強制收掉")
             self._forward_signal(signal.SIGINT)
+            if self._force_kill_timer is None:
+                self._force_kill_timer = threading.Timer(KILL_GRACE_SEC,
+                                                         lambda: self._forward_signal(signal.SIGKILL))
+                self._force_kill_timer.daemon = True
+                self._force_kill_timer.start()
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
 
@@ -688,6 +735,8 @@ class RalphSupervisor:
     def _run_one_ralph(self, active_model):
         """spawn 一次 ralph 並監控直到結束/被停止/確認 usage limit。回傳終態字串。"""
         with self._lock:
+            self._run_gen += 1          # 新世代:上一個(可能還在排空)reader 的寫入自此作廢
+            gen = self._run_gen
             self._limit_confirmed.clear()
             self._limit_evidence = None
             self._det = None
@@ -696,6 +745,9 @@ class RalphSupervisor:
             self._iteration = 0
             self._sentinel = False
             self._last_activity = time.monotonic()
+            # 等待後恢復的新 run:清掉過期的「waiting」限制區塊,避免 state 一直顯示等待並卡住 attention。
+            if self._limit_block and self._limit_block.get("action") == "waiting":
+                self._limit_block = None
         argv = build_ralph_argv(
             self.args.ralph_cmd, self.args.args_template,
             iterations=self.args.iterations, tool=self.args.tool,
@@ -704,17 +756,19 @@ class RalphSupervisor:
                                       "RALPH_WS": str(self.ws.dir)})
         loop_mod.log(f"🚀 啟動 ralph｜model={active_model or '(預設)'}｜{shlex.join(argv)}")
         try:
+            # binary stdout(不用 text=True):reader 自行以 errors="replace" 解碼,壞位元組不會殺 reader。
             self.proc = subprocess.Popen(
                 argv, cwd=str(self.repo), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, start_new_session=True, env=env)
+                start_new_session=True, env=env)
         except OSError as e:
             loop_mod.fail(f"ralph 啟動失敗:{e}")
+        proc = self.proc
         loop_mod.atomic_write_bytes(
             self.ws.dir / "startup_ready.json",
             json.dumps({"pid": os.getpid()}).encode("utf-8"))
-        reader = threading.Thread(target=self._consume_output, daemon=True)
+        reader = threading.Thread(target=self._consume_output, args=(proc, gen), daemon=True)
         reader.start()
-        while self.proc.poll() is None:
+        while proc.poll() is None:
             if self._stopping.is_set() or self._limit_confirmed.is_set():
                 break
             self._limit_confirmed.wait(POLL_INTERVAL_SEC)
@@ -724,8 +778,9 @@ class RalphSupervisor:
                 loop_mod.log(f"⚠ ralph 進度投影失敗(不影響執行):{e}")
         if self._limit_confirmed.is_set() or self._stopping.is_set():
             self._kill_ralph()
+        # reader 可能因 grandchild 逃離 pgid 而卡住;gen 綁定確保它即使晚死也不會污染下一個 run。
         reader.join(timeout=5)
-        self._last_exit_code = self.proc.returncode
+        self._last_exit_code = proc.returncode
         if self._stopping.is_set():
             return "interrupted"
         if self._limit_confirmed.is_set():
@@ -742,10 +797,11 @@ class RalphSupervisor:
         done = block.get("stories_done", 0)
         if sentinel or (total > 0 and done == total):
             return "completed"
+        # 達迭代上限但未全部完成 → exhausted,即使 script 以 exit 0 收場(公司版可能不像 snarktank 回 1)。
+        if self.args.iterations > 0 and iteration >= self.args.iterations:
+            return "iterations_exhausted"
         if exit_code == 0:
             return "completed"
-        if iteration >= self.args.iterations and self.args.iterations > 0:
-            return "iterations_exhausted"
         return "failed"
 
     # ---- 外圈主流程 ----
@@ -964,10 +1020,11 @@ def main(argv=None):
         loop_mod.fail(f"workspace 名稱不合法:{loop_mod.WORKSPACE_NAME_RULE}")
     if not (0 < args.iterations <= ITERATIONS_MAX):
         loop_mod.fail(f"iterations 必須介於 1～{ITERATIONS_MAX}")
-    if not TOOL_RE.fullmatch(args.tool or ""):
-        loop_mod.fail("tool 只能是英數與 . _ -")
-    if len(args.model or "") > MODEL_MAX_CHARS or any(ord(ch) < 32 for ch in (args.model or "")):
-        loop_mod.fail(f"model 需 ≤{MODEL_MAX_CHARS} 字且不含控制字元")
+    if not TOOL_RE.fullmatch(args.tool or "") or (args.tool or "").startswith("-"):
+        loop_mod.fail("tool 只能是英數與 . _ -,且不可以 - 開頭")
+    model = args.model or ""
+    if len(model) > MODEL_MAX_CHARS or any(ord(ch) < 32 for ch in model) or model.startswith("-"):
+        loop_mod.fail(f"model 需 ≤{MODEL_MAX_CHARS} 字、不含控制字元且不可以 - 開頭")
     supervisor = RalphSupervisor(args)
     return supervisor.run()
 

@@ -195,5 +195,39 @@ class TestUsageLimitEndToEnd(unittest.TestCase):
             self.assertEqual(block["active_model"], "sonnet-normal")
 
 
+@unittest.skipUnless(_HAS_BASH_AND_GIT, _SKIP_REASON)
+class TestSupervisorRobustness(unittest.TestCase):
+    """回歸:reader binary 讀取(壞位元組不卡死)與 exit-0-達迭代 的終態判定。"""
+
+    def _state(self, workspace_root, name):
+        state = json.loads((workspace_root / name / "state.json").read_text(encoding="utf-8"))
+        loop_mod.validate_state_shape(dict(state), "state.json")
+        return state
+
+    def test_invalid_utf8_output_does_not_hang(self):
+        # 每輪都吐非 UTF-8 位元組;binary 讀取 + errors=replace 下仍應正常跑到完成。
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = _make_repo(root, "fake_ralph_badbyte.sh")
+            ws = root / "ws"
+            result = _run(repo, ws, "bb", model="", action="off", iterations=5, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            block = self._state(ws, "bb")["ralph"]
+            self.assertEqual(block["exit_reason"], "completed")
+            self.assertEqual(block["stories_done"], 2)
+
+    def test_exit0_at_max_is_iterations_exhausted(self):
+        # script 未完成卻以 exit 0 收場,達迭代上限應判定 exhausted 而非 completed。
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = _make_repo(root, "fake_ralph_exit0.sh")
+            ws = root / "ws"
+            result = _run(repo, ws, "e0", model="", action="off", iterations=2, timeout=60)
+            block = self._state(ws, "e0")["ralph"]
+            self.assertEqual(block["exit_reason"], "iterations_exhausted")
+            self.assertEqual(block["stories_done"], 0)
+            self.assertEqual(self._state(ws, "e0")["phase"], "done")
+
+
 if __name__ == "__main__":
     unittest.main()
