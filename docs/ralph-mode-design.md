@@ -2,6 +2,7 @@
 
 > 狀態：**已實作**（後端 `engine/ralph.py` 監督層、Dashboard 整合、前端 RalphView／Launcher、
 > 測試含真 clone snarktank/ralph 的端到端）。本文保留設計脈絡，實作細節見 §實作現況。
+> 操作圖解（如何用 Dashboard 跑 ralph）見 [Ralph runner 使用圖解](ralph-guide/README.md)。
 > 目標：讓 Dashboard 能以「Ralph 原生格式」啟動與監控公司內的 `ralph.sh`，
 > 與既有 loop coordinator 並存，互不干擾。
 
