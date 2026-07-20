@@ -2,7 +2,7 @@
 
 用 Python 協調 agent 的規劃／執行迴圈；可從終端機管理單一 workspace，也可用瀏覽器 Dashboard 管理多個 workspace。
 
-終端機流程請看：[單一 Workspace CLI 完整圖解](docs/cli-guide/README.md)。Dashboard 第一次使用請看：[Dashboard 完整操作圖解](docs/dashboard-guide/README.md)；逐欄查詢請看：[欄位與控制項完整說明](docs/dashboard-guide/fields-reference.md)。
+終端機流程請看：[單一 Workspace CLI 完整圖解](docs/cli-guide/README.md)。Dashboard 第一次使用請看：[Dashboard 完整操作圖解](docs/dashboard-guide/README.md)；逐欄查詢請看：[欄位與控制項完整說明](docs/dashboard-guide/fields-reference.md)。要用 Dashboard 操作 ralph 迴圈請看：[Ralph runner 使用圖解](docs/ralph-guide/README.md)。
 
 ![Dashboard 執行中展示](docs/dashboard-running.jpg)
 
@@ -215,7 +215,8 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 迴圈（`ralph.sh`）。ralph 自成完整迴圈引擎（每輪起新 agent、自己 commit、以 `prd.json`／`prd.md`
 與 `progress.txt` 為狀態），因此這是一種**唯讀投影＋監督**的 runner，與 loop coordinator 並存、
 互不干擾；`engine/ralph.py` 只負責 spawn／監控／把進度投影進 `state.json`，不套用 loop 的共識、
-validate 或防竄改機制。完整設計見 [Ralph 模式接入設計](docs/ralph-mode-design.md)。
+validate 或防竄改機制。**操作圖解見 [Ralph runner 使用圖解](docs/ralph-guide/README.md)**；架構與設計取捨見
+[Ralph 模式接入設計](docs/ralph-mode-design.md)。
 
 在啟動表單切到「Ralph」模式，只需填 ralph 需要的參數：target repo、`ralph.sh` 命令（可從團隊
 `ralph.scripts` 白名單選，或直接手填）、iterations、tool（如 `opencode`／`claude`）、model、
