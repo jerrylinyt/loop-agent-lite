@@ -209,6 +209,29 @@ Dashboard 匯入 `goal.md`、讀取團隊／個人設定與儲存設定時也會
 - 「執行中的 jobs」分頁會保留最近 50 個已結束 job 的尾段供稽核；更早的 job 會自動淘汰，活躍中的 job 不受限制，workspace state 與 history 不會被清除。
 - Dashboard 的 REST POST body 上限為 8 MiB；超過會在讀取 JSON 前回 413，避免過大的 goal/plan 或異常請求拖垮長跑服務。
 
+## Ralph runner 模式（可選）
+
+除了內建的 loop coordinator，Dashboard 也能直接操作公司內既有的 [ralph](https://github.com/snarktank/ralph)
+迴圈（`ralph.sh`）。ralph 自成完整迴圈引擎（每輪起新 agent、自己 commit、以 `prd.json`／`prd.md`
+與 `progress.txt` 為狀態），因此這是一種**唯讀投影＋監督**的 runner，與 loop coordinator 並存、
+互不干擾；`engine/ralph.py` 只負責 spawn／監控／把進度投影進 `state.json`，不套用 loop 的共識、
+validate 或防竄改機制。完整設計見 [Ralph 模式接入設計](docs/ralph-mode-design.md)。
+
+在啟動表單切到「Ralph」模式，只需填 ralph 需要的參數：target repo、`ralph.sh` 命令（可從團隊
+`ralph.scripts` 白名單選，或直接手填）、iterations、tool（如 `opencode`／`claude`）、model、
+參數風格（`positional` 公司版＝`<iters> <tool> <model>`；`snarktank` 原版＝`--tool <tool> <iters>`），
+以及選填的 PRD 匯入。啟動後 RalphView 以 PRD 檢核表、progress.txt 檢視器與共用 console 監控，
+可停止／重啟（重啟即從 PRD 未完成項續跑），不顯示 loop 專屬的計畫／階段／門檻等控制。
+
+**用量上限自動重啟／模型降級**：長跑 ralph 撞到 agent 用量上限時，`ralph.sh` 會空轉燒迭代。
+監督層以 heuristic 偵測 agent stdout 的用量上限訊號（且該輪無實質進展才算），殺掉空轉的 ralph，
+再依設定「等 reset 後重啟」或「沿 `fallback_models` 降級模型即刻重啟」，達安全上限（預設 6 次）則停在
+`usage_limit_giveup`。偵測 pattern 可在團隊 `ralph.usage_limit_patterns` 追加公司 opencode 專屬訊息；
+state 明確標示 `detection: "heuristic"` 與觸發的原始行供調參。細節見設計文件的 usage-limit 章節。
+
+團隊 ralph 設定（`ralph.scripts`／`tools`／`usage_limit_patterns` 等）放在 shared config，範例見
+`engine/dashboard.config.shared.json`。
+
 ## 團隊設定與個人設定
 
 - `engine/dashboard.config.shared.json`：專案內的團隊預設值；可用 `LOOP_AGENT_DASHBOARD_PROJECT_CONFIG` 指向另一份 shared config。

@@ -39,6 +39,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from engine import loop as loop_mod  # 共用 Workspace/fresh_state,匯入計畫時建 state 不自己發明 schema
+from engine import ralph as ralph_mod  # ralph runner 監督層:PRD 解析、argv 組裝與 spawn 引數
 from engine.paths import (default_personal_config, default_workspace_root, expose_project_package,
                           legacy_config_path)
 from engine.prompt_templates import prompt_template_bundle, prompt_template_projection
@@ -79,6 +80,19 @@ DEFAULT_CONFIG = {
         "validate_timeout": 120,
         "red_limit": 20, "stall_limit": 300, "stuck_stop": False, "stuck_stop_count": 100,
         "pause_after_plan": False,
+    },
+    # ralph runner:公司內既有的 ralph.sh 迴圈。scripts 是團隊白名單(方便選),
+    # 但 Launcher 也允許自訂 base command(ralph_custom),語意同 validate_custom。
+    "ralph": {
+        "scripts": [],                      # [{"label": "公司 ralph", "cmd": "sh /opt/tools/ralph.sh"}]
+        "tools": ["opencode", "claude", "amp"],
+        "default_iterations": 100,
+        "default_args_style": ralph_mod.DEFAULT_ARGS_STYLE,
+        "prd_filenames": ["prd.json", "prd.md"],
+        "default_usage_limit_action": "restart",
+        "default_fallback_models": [],
+        "default_auto_restart_max": 6,
+        "usage_limit_patterns": [],         # team 補 opencode 專屬訊息(regex)
     },
 }
 
@@ -383,14 +397,14 @@ class Job:
 
 
 def loop_pid_alive(pid):
-    """state.json 記的 pid 是否仍是 coordinator；同時支援舊檔案入口與 package module。"""
+    """state.json 記的 pid 是否仍是 runner(loop 或 ralph)；同時支援舊檔案入口與 package module。"""
     try:
         pid = int(pid)
         os.kill(pid, 0)
     except (TypeError, ValueError, ProcessLookupError, PermissionError):
         return False
     r = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
-    return "loop.py" in r.stdout or "engine.loop" in r.stdout
+    return any(marker in r.stdout for marker in ("loop.py", "engine.loop", "engine.ralph"))
 
 
 def norm_cmd(s):
@@ -480,6 +494,33 @@ def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout
     (workspace_dir / "startup_ready.json").unlink(missing_ok=True)
     if not import_plan:
         (workspace_dir / "import-plan.pending.json").unlink(missing_ok=True)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, bufsize=1, start_new_session=True, env=env)
+    _prune_finished_jobs_locked()
+    JOBS[name] = Job(name, str(repo), p)
+    return p
+
+
+def spawn_ralph(name, repo, *, ralph_cmd, ralph_dir, iterations, tool, model, args_template,
+                prd_path="prd.json", notify_cmd="", usage_limit_action="restart",
+                fallback_models=None, auto_restart_max=ralph_mod.DEFAULT_AUTO_RESTART_MAX,
+                usage_limit_patterns=None, env=None):
+    """spawn engine.ralph 監督層並登記進 JOBS(呼叫方需持 JOBS_LOCK)。ralph 自成迴圈引擎,
+    這支監督層只 spawn/監控/投影,與 loop coordinator 共用 Job 註冊表與停止流程。"""
+    loop_mod.require_workspace_name(name)
+    workspace_dir = safe_workspace_dir(name)
+    cmd = [sys.executable, "-m", "engine.ralph", "--repo", str(repo), "--name", name,
+           "--ralph-cmd", str(ralph_cmd), "--ralph-dir", str(ralph_dir),
+           "--iterations", str(iterations), "--tool", str(tool), "--model", str(model or ""),
+           "--prd-path", str(prd_path),
+           "--args-template", json.dumps(list(args_template)),
+           "--usage-limit-action", str(usage_limit_action),
+           "--auto-restart-max", str(auto_restart_max),
+           "--fallback-models", json.dumps(list(fallback_models or [])),
+           "--usage-limit-patterns", json.dumps(list(usage_limit_patterns or []))]
+    if notify_cmd:
+        cmd += ["--notify-cmd", notify_cmd]
+    (workspace_dir / "startup_ready.json").unlink(missing_ok=True)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, bufsize=1, start_new_session=True, env=env)
     _prune_finished_jobs_locked()
@@ -601,6 +642,56 @@ def _load_state_or_err(handler, name, *, repair=True):
         handler._err(err)
         return None
     return st
+
+
+RALPH_PRD_RAW_MAX = 512 * 1024   # /api/ralph/prd 原文投影上限
+
+
+def _ralph_config_or_error(name):
+    """回傳 (ralph_dir, prd_path, error)；非 ralph workspace 或缺設定時給可讀錯誤。"""
+    st, err = read_state(name, repair=False)
+    if err:
+        return None, None, err
+    if (st.get("runner") or "loop") != "ralph":
+        return None, None, f"workspace {name} 不是 ralph runner"
+    cfg = st.get("config") or {}
+    ralph_dir = cfg.get("ralph_dir")
+    prd_path = cfg.get("prd_path") or "prd.json"
+    if not ralph_dir:
+        return None, None, f"workspace {name} 的 state 缺 ralph_dir 設定"
+    return Path(ralph_dir), prd_path, None
+
+
+def ralph_prd_projection(name):
+    """投影 ralph 的 PRD:解析後的 story 清單 + 原文(bounded)。純唯讀,不改任何檔案。"""
+    ralph_dir, prd_path, err = _ralph_config_or_error(name)
+    if err:
+        return {"error": err}
+    projection = ralph_mod.load_prd(ralph_dir, prd_path)
+    raw = ""
+    try:
+        resolved = ralph_mod.safe_prd_path(ralph_dir, prd_path)
+        data = loop_mod.read_regular_bytes(resolved, "prd")[:RALPH_PRD_RAW_MAX]
+        raw = data.decode("utf-8", errors="replace")
+    except (FileNotFoundError, OSError, ValueError):
+        raw = ""
+    projection["raw"] = raw
+    return projection
+
+
+def ralph_progress_projection(name, offset):
+    """以 read_incremental 投影 ralph 的 progress.txt(append-only 學習紀錄)。"""
+    ralph_dir, prd_path, err = _ralph_config_or_error(name)
+    if err:
+        return {"error": err, "size": 0, "data": ""}
+    try:
+        progress_path = ralph_mod.safe_prd_path(ralph_dir, "progress.txt")
+    except (OSError, ValueError) as e:
+        return {"error": f"progress 路徑不安全:{e}", "size": 0, "data": ""}
+    try:
+        return read_incremental(progress_path, offset)
+    except FileNotFoundError:
+        return {"size": 0, "data": "", "truncated": False}
 
 
 def _run_git_projection(repo: Path, *args, max_bytes=None) -> tuple[str, bool]:
@@ -1306,6 +1397,7 @@ def config_projection(cfg):
             "notify_cmd": str(cfg.get("notify_cmd") or ""),
             "repo_roots": cfg.get("repo_roots", DEFAULT_CONFIG["repo_roots"]),
             "repos": scan_repos(cfg),
+            "ralph": cfg.get("ralph") or DEFAULT_CONFIG["ralph"],
             "prompt_templates": prompt_templates,
             "prompt_template_bundle": prompt_bundle,
             "prompt_template_bundle_error": prompt_bundle_error,
@@ -1446,8 +1538,33 @@ def list_workspaces():
                         draining=drain_claimed or (running and loop_mod.stop_after_round_requested(
                             d, loop_state.get("pid"), loop_state.get("session_id"))),
                         drain_claimed=drain_claimed)
+            runner = st.get("runner") or "loop"
+            info["runner"] = runner
+            if runner == "ralph":
+                rb = st.get("ralph") or {}
+                info["ralph"] = {
+                    "stories_done": rb.get("stories_done", 0),
+                    "stories_total": rb.get("stories_total", 0),
+                    "iteration": rb.get("iteration", 0),
+                    "max_iterations": rb.get("max_iterations", 0),
+                    "sentinel_complete": bool(rb.get("sentinel_complete")),
+                    "stalled": bool(rb.get("stalled")),
+                    "exit_reason": rb.get("exit_reason"),
+                    "usage_limit_active": bool(rb.get("usage_limit")),
+                    "usage_limit_action": (rb.get("usage_limit") or {}).get("action"),
+                    "active_model": rb.get("active_model", ""),
+                    "restart_attempt": rb.get("restart_attempt", 0),
+                    "prd_error": rb.get("prd_error"),
+                }
+                # ralph 沒有 loop 的 task 指標；以「下一個未完成 story」作為 fleet 顯示。
+                info["current_task"] = next(
+                    (s.get("title", "") for s in (rb.get("stories") or [])
+                     if not s.get("passes")), "")
             if not running:
-                info["resume_available"] = interrupted_resume_block_reason(d.name, st) is None
+                if runner == "ralph":
+                    info["resume_available"] = st.get("phase") != "done"
+                else:
+                    info["resume_available"] = interrupted_resume_block_reason(d.name, st) is None
         out.append(info)
     return out
 
@@ -1458,6 +1575,18 @@ def _workspace_needs_attention(info):
         return True
     unread_issues = info.get("unread_issues", info.get("issues", 0)) or 0
     completed = info.get("phase") == "done"
+    if info.get("runner") == "ralph":
+        # ralph 不套用 loop 的 red/stall/agent-failure 語意；只在 PRD 壞、停滯、
+        # 撞用量上限或以失敗/放棄收場時提示。
+        rb = info.get("ralph") or {}
+        if rb.get("prd_error"):
+            return True
+        # 只在「目前正等待重啟」時提示;已降級但仍在正常執行的 run 不算需關注。
+        if not completed and (rb.get("stalled") or rb.get("usage_limit_action") == "waiting"):
+            return True
+        if rb.get("exit_reason") in ("failed", "usage_limit_giveup"):
+            return True
+        return bool(unread_issues > 0 or info.get("stale_loop_pid"))
     return bool(
         unread_issues > 0 or
         info.get("state_recovery_pending") or
@@ -1667,6 +1796,12 @@ class Handler(BaseHTTPRequestHandler):
         "/api/phase": "api_phase",
         "/api/set-task": "api_set_task",
         "/api/delete-workspace": "api_delete_workspace",
+    }
+
+    # coordinator(loop)專屬操作;ralph runner 的計畫/流程由 ralph.sh 自管,一律拒絕。
+    LOOP_ONLY_ROUTES = {
+        "/api/drain", "/api/cancel-drain", "/api/edit-state", "/api/import-plan",
+        "/api/edit-config", "/api/phase", "/api/set-task",
     }
 
     def log_message(self, *a):
@@ -1962,6 +2097,17 @@ class Handler(BaseHTTPRequestHandler):
                 if d is None:
                     return
                 self._out(200, json.dumps(read_prompt(d.name), ensure_ascii=False))
+            elif u.path == "/api/ralph/prd":
+                d = self._ws_dir(q)
+                if d is None:
+                    return
+                self._out(200, json.dumps(ralph_prd_projection(d.name), ensure_ascii=False))
+            elif u.path == "/api/ralph/progress":
+                d = self._ws_dir(q)
+                if d is None:
+                    return
+                off = int(q.get("offset", ["0"])[0])
+                self._out(200, json.dumps(ralph_progress_projection(d.name, off), ensure_ascii=False))
             elif u.path == "/api/fleet-history":
                 self._out(200, json.dumps(read_fleet_history(), ensure_ascii=False))
             elif u.path == "/api/fleet-round-metrics":
@@ -2030,6 +2176,14 @@ class Handler(BaseHTTPRequestHandler):
             if handler_name is None:
                 self._err("not found", 404)
                 return
+            if u.path in Handler.LOOP_ONLY_ROUTES:
+                name = str(body.get("name") or "")
+                if loop_mod.valid_workspace_name(name):
+                    st, _ = read_state(name, repair=False)
+                    if st and (st.get("runner") or "loop") == "ralph":
+                        self._err(f"{u.path} 不適用於 ralph runner"
+                                  "（ralph 的計畫與流程由 ralph.sh 自行管理）")
+                        return
             # 以 Handler 取未綁定 method，測試可繼續用輕量 fake handler 驗證 request 邊界。
             getattr(Handler, handler_name)(self, body)
         except (BrokenPipeError, ConnectionResetError):
@@ -2038,6 +2192,9 @@ class Handler(BaseHTTPRequestHandler):
     @with_state_lock(repo_fallback=True)
     def api_launch(self, body):
         """交易式啟動/重置 loop：完成所有可失敗 preflight 後才提交 state 與 spawn。"""
+        if str(body.get("runner") or "loop") == "ralph":
+            # ralph runner 走獨立分支;沿用同一把 state lock(不另加 decorator 以免重入死鎖)。
+            return self.api_launch_ralph(body)
         cfg = load_config()
         if "error" in cfg:
             self._err(cfg["error"])
@@ -2199,6 +2356,176 @@ class Handler(BaseHTTPRequestHandler):
         self._out(200, json.dumps({"ok": True, "starting": True, "name": name, "pid": p.pid,
                                    "startup_timeout": vt + 15}, ensure_ascii=False))
 
+    def api_launch_ralph(self, body):
+        """交易式啟動 ralph runner：完成可失敗檢查後才 spawn 監督層。與 api_launch 共用 state lock。"""
+        cfg = load_config()
+        if "error" in cfg:
+            self._err(cfg["error"])
+            return
+        ralph_cfg = cfg.get("ralph") or {}
+        # base command：優先自訂(同 validate_custom 語意)，否則從團隊白名單 scripts 選 index
+        ralph_custom = (body.get("ralph_custom") or "").strip()
+        if ralph_custom:
+            ralph_cmd = ralph_custom
+        else:
+            scripts = ralph_cfg.get("scripts") or []
+            try:
+                ralph_cmd = scripts[int(body.get("ralph_idx"))]["cmd"]
+            except (TypeError, ValueError, IndexError, KeyError):
+                self._err(f"ralph_idx 不合法（合法值 0..{len(scripts) - 1}），"
+                          "或改用 ralph_custom 手填 ralph.sh 命令")
+                return
+        problem = command_error(ralph_cmd, "ralph 命令", cfg)
+        if problem:
+            self._err(problem)
+            return
+        repo = Path(str(body.get("repo") or "")).expanduser()
+        if not (repo / ".git").exists():
+            self._err(f"{repo} 不是 git repo")
+            return
+        name = (body.get("name") or "").strip() or repo.name
+        if not loop_mod.valid_workspace_name(name):
+            self._err(f"workspace 名稱 {name} 不合法：{loop_mod.WORKSPACE_NAME_RULE}")
+            return
+        try:
+            safe_workspace_dir(name)
+        except ValueError as e:
+            self._err(str(e))
+            return
+        try:
+            iterations = parse_numeric_setting(
+                body.get("iterations") if body.get("iterations") is not None
+                else ralph_cfg.get("default_iterations", 100), integer=True, minimum=1)
+        except (TypeError, ValueError):
+            self._err("iterations 必須是 ≥1 的整數")
+            return
+        if iterations > ralph_mod.ITERATIONS_MAX:
+            self._err(f"iterations 不可超過 {ralph_mod.ITERATIONS_MAX}")
+            return
+        tool = str(body.get("tool") or "").strip()
+        if not ralph_mod.TOOL_RE.fullmatch(tool) or tool.startswith("-"):
+            self._err("tool 只能是英數與 . _ -，且不可以 - 開頭（例：opencode / claude / amp）")
+            return
+        model = str(body.get("model") or "").strip()
+        if len(model) > ralph_mod.MODEL_MAX_CHARS or any(ord(ch) < 32 for ch in model) \
+                or model.startswith("-"):
+            self._err(f"model 需 ≤{ralph_mod.MODEL_MAX_CHARS} 字、不含控制字元且不可以 - 開頭")
+            return
+        args_style = str(body.get("args_style") or ralph_cfg.get("default_args_style")
+                         or ralph_mod.DEFAULT_ARGS_STYLE)
+        try:
+            args_template = ralph_mod.resolve_args_template(args_style, body.get("args_template"))
+        except ValueError as e:
+            self._err(str(e))
+            return
+        prd_path = (str(body.get("prd_path") or "").strip() or "prd.json")
+        ralph_dir_raw = str(body.get("ralph_dir") or "").strip()
+        if ralph_dir_raw:
+            ralph_dir = Path(ralph_dir_raw).expanduser().resolve()
+            if not ralph_dir.is_dir():
+                self._err(f"ralph_dir 不是目錄：{ralph_dir}")
+                return
+        else:
+            ralph_dir = Path(ralph_mod.default_ralph_dir(ralph_cmd, repo)).resolve()
+        ul_action = str(body.get("usage_limit_action")
+                        or ralph_cfg.get("default_usage_limit_action") or "restart")
+        if ul_action not in ("restart", "downgrade", "off"):
+            self._err("usage_limit_action 只能是 restart / downgrade / off")
+            return
+        fallback_models = body.get("fallback_models")
+        if fallback_models is None:
+            fallback_models = ralph_cfg.get("default_fallback_models") or []
+        if not isinstance(fallback_models, list) or not all(isinstance(m, str) for m in fallback_models):
+            self._err("fallback_models 必須是字串陣列")
+            return
+        fallback_models = [m.strip() for m in fallback_models if m.strip()][:10]
+        try:
+            auto_restart_max = parse_numeric_setting(
+                body.get("auto_restart_max") if body.get("auto_restart_max") is not None
+                else ralph_cfg.get("default_auto_restart_max", ralph_mod.DEFAULT_AUTO_RESTART_MAX),
+                integer=True, minimum=0)
+        except (TypeError, ValueError):
+            self._err("auto_restart_max 必須是 ≥0 的整數")
+            return
+        usage_limit_patterns = ralph_cfg.get("usage_limit_patterns")
+        if not isinstance(usage_limit_patterns, list):
+            usage_limit_patterns = []
+        prd_content = body.get("prd_content")
+        prd_target = None
+        if isinstance(prd_content, str) and prd_content.strip():
+            try:
+                prd_target = ralph_mod.safe_prd_path(ralph_dir, prd_path)
+            except (OSError, ValueError) as e:
+                self._err(f"PRD 路徑不安全：{e}")
+                return
+        with JOBS_LOCK:
+            st, _ = read_state(name)
+            if st and loop_pid_alive((st.get("loop") or {}).get("pid")):
+                self._err(f"workspace {name} 已有 runner 在跑，先停掉再啟動")
+                return
+            for j in JOBS.values():
+                if j.alive() and j.name == name:
+                    self._err(f"workspace {name} 已有 runner 在跑(pid {j.popen.pid})，先停掉再啟動")
+                    return
+                if j.alive() and Path(j.repo) == repo:
+                    self._err(f"repo {repo} 已有 runner 在跑({j.name})，同一 repo 不能同時跑兩個")
+                    return
+                # ralph 的 prd/progress 位於 ralph_dir；兩個 ralph 共用同一 ralph_dir+prd 會互相覆蓋
+                # （ralph.sh 依 SCRIPT_DIR 讀寫，預設 ralph_dir 就是 ralph.sh 所在目錄，容易共用）。
+                if j.alive():
+                    other_state, _ = read_state(j.name)
+                    other_cfg = (other_state or {}).get("config") or {}
+                    if ((other_state or {}).get("runner") == "ralph" and other_cfg.get("ralph_dir")
+                            and str(Path(other_cfg["ralph_dir"]).expanduser().resolve()) == str(ralph_dir)
+                            and (other_cfg.get("prd_path") or "prd.json") == prd_path):
+                        self._err(f"另一個 ralph run（{j.name}）正在使用相同的 ralph 目錄與 PRD"
+                                  f"（{ralph_dir}/{prd_path}），會互相覆蓋；請用不同的 ralph_dir")
+                        return
+            if body.get("new_branch"):
+                br = f"ralph/{name}"
+                exists = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", br],
+                                        capture_output=True, text=True).returncode == 0
+                r = subprocess.run(["git", "-C", str(repo), "checkout", "-q"] + ([br] if exists else ["-b", br]),
+                                   capture_output=True, text=True)
+                if r.returncode != 0:
+                    self._err(f"切換 branch {br} 失敗：" + (r.stdout + r.stderr).strip()[-300:])
+                    return
+                workspace_console_log(name, f"已切換 Git branch｜{br}")
+            if prd_target is not None:
+                try:
+                    prd_target.parent.mkdir(parents=True, exist_ok=True)
+                    loop_mod.atomic_write_bytes(prd_target, prd_content.encode("utf-8"))
+                except (OSError, ValueError) as e:
+                    self._err(f"PRD 寫入失敗：{e}")
+                    return
+                try:
+                    rel = prd_target.resolve().relative_to(repo.resolve())
+                    inside_repo = True
+                except ValueError:
+                    inside_repo = False
+                if inside_repo:
+                    subprocess.run(["git", "-C", str(repo), "add", "--", str(rel)],
+                                   capture_output=True, text=True)
+                    staged = subprocess.run(
+                        ["git", "-C", str(repo), "diff", "--cached", "--quiet", "--", str(rel)],
+                        capture_output=True, text=True)
+                    if staged.returncode != 0:
+                        subprocess.run(["git", "-C", str(repo), "commit", "-m",
+                                        f"ralph: 匯入 {rel}", "--", str(rel)],
+                                       capture_output=True, text=True)
+                        workspace_console_log(name, f"已匯入並 commit {rel}")
+            p = spawn_ralph(name, repo, ralph_cmd=ralph_cmd, ralph_dir=ralph_dir,
+                            iterations=iterations, tool=tool, model=model,
+                            args_template=args_template, prd_path=prd_path,
+                            notify_cmd=str(cfg.get("notify_cmd") or ""),
+                            usage_limit_action=ul_action, fallback_models=fallback_models,
+                            auto_restart_max=auto_restart_max,
+                            usage_limit_patterns=usage_limit_patterns,
+                            env=command_env(cfg))
+        workspace_console_log(name, f"啟動 ralph｜pid={p.pid}｜repo={repo}｜iterations={iterations}")
+        self._out(200, json.dumps({"ok": True, "starting": True, "name": name, "pid": p.pid,
+                                   "startup_timeout": 30}, ensure_ascii=False))
+
     @with_state_lock
     def api_run(self, body):
         """一般重跑既有 workspace：保留原本完整 preflight 與啟動 Validate。"""
@@ -2209,12 +2536,72 @@ class Handler(BaseHTTPRequestHandler):
         """可補登開始時間/SHA 的 Resume；通過最小驗證後略過啟動 Validate。"""
         return Handler._start_existing_workspace(self, body, resume_interrupted=True)
 
+    def _start_existing_ralph(self, name, st):
+        """依保存的 ralph config 重新 spawn 監督層（重跑＝續跑 PRD 未完成項）。"""
+        c = st.get("config") or {}
+        repo = c.get("repo")
+        ralph_cmd = c.get("ralph_cmd")
+        if not (repo and ralph_cmd):
+            self._err("state 缺 ralph 設定（舊版 state）——請用「啟動」表單重新啟動")
+            return
+        if st.get("phase") == "done":
+            self._err(f"{name} 已結束；請在啟動表單重新啟動一個 ralph run")
+            return
+        if not (Path(repo) / ".git").exists():
+            self._err(f"{repo} 不是 git repo（repo 被移走了?）")
+            return
+        cfg = load_config()
+        if "error" in cfg:
+            self._err(cfg["error"])
+            return
+        problem = command_error(ralph_cmd, "ralph 命令", cfg)
+        if problem:
+            self._err(problem)
+            return
+        if loop_pid_alive((st.get("loop") or {}).get("pid")):
+            self._err(f"{name} 已在執行中")
+            return
+        repo_path = Path(repo).expanduser()
+        try:
+            iterations = int(c.get("iterations", 100))
+            auto_restart_max = int(c.get("auto_restart_max", ralph_mod.DEFAULT_AUTO_RESTART_MAX))
+        except (TypeError, ValueError):
+            self._err("state 的 ralph 設定含非法數值，請用啟動表單重新啟動")
+            return
+        with JOBS_LOCK:
+            j = JOBS.get(name)
+            if j is not None and j.alive():
+                self._err(f"{name} 已在執行中(pid {j.popen.pid})")
+                return
+            for jj in JOBS.values():
+                if jj.alive() and Path(jj.repo) == repo_path:
+                    self._err(f"repo {repo} 已有 runner 在跑({jj.name})")
+                    return
+            p = spawn_ralph(
+                name, repo_path, ralph_cmd=ralph_cmd,
+                ralph_dir=c.get("ralph_dir") or str(ralph_mod.default_ralph_dir(ralph_cmd, repo)),
+                iterations=iterations, tool=c.get("tool", "claude"), model=c.get("model", ""),
+                args_template=(c.get("args_template")
+                               or list(ralph_mod.ARGS_STYLES[ralph_mod.DEFAULT_ARGS_STYLE])),
+                prd_path=c.get("prd_path", "prd.json"), notify_cmd=c.get("notify_cmd", ""),
+                usage_limit_action=c.get("usage_limit_action", "restart"),
+                fallback_models=c.get("fallback_models") or [],
+                auto_restart_max=auto_restart_max,
+                usage_limit_patterns=(cfg.get("ralph") or {}).get("usage_limit_patterns") or [],
+                env=command_env(cfg))
+        workspace_console_log(name, f"重新啟動 ralph｜pid={p.pid}")
+        self._out(200, json.dumps({"ok": True, "starting": True, "name": name, "pid": p.pid,
+                                   "startup_timeout": 30}, ensure_ascii=False))
+
     def _start_existing_workspace(self, body, *, resume_interrupted):
         """run/resume 共用設定白名單、單 writer 與 spawn 流程。"""
         name = str(body.get("name") or "")
         st = _load_state_or_err(self, name)
         if st is None:
             return
+        if (st.get("runner") or "loop") == "ralph":
+            # ralph 天然可續跑（未完成 story 即續跑點）；重跑＝依保存設定重新 spawn 監督層。
+            return Handler._start_existing_ralph(self, name, st)
         c = st.get("config") or {}
         repo, agent_cmd, validate_cmd = c.get("repo"), c.get("agent_cmd"), c.get("validate_cmd")
         if not (repo and agent_cmd and validate_cmd):

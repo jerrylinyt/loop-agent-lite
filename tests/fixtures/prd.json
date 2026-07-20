@@ -1,0 +1,25 @@
+{
+  "project": "FixtureApp",
+  "branchName": "ralph/fixture",
+  "description": "Ralph runner fixture PRD",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "First fixture story",
+      "description": "As a tester, I want the first story implemented.",
+      "acceptanceCriteria": ["Marked passes=true", "Progress appended"],
+      "priority": 1,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Second fixture story",
+      "description": "As a tester, I want the second story implemented.",
+      "acceptanceCriteria": ["Marked passes=true"],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}

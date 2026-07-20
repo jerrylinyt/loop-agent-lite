@@ -9,6 +9,7 @@ import type { ConfigResponse, DashboardConfig, StartupResponse, WorkspaceState, 
 import PlanImportField from "./PlanImportField";
 import NotifyModal from "./NotifyModal";
 import PromptTemplateModal from "./PromptTemplateModal";
+import RalphLaunchForm from "./RalphLaunchForm";
 import RepoRootsModal from "./RepoRootsModal";
 import { validatePlan } from "./planValidation";
 import { isPromptTemplateBundleSupported, type PromptTemplateMode } from "./promptTemplateBuilder";
@@ -62,6 +63,10 @@ export default function LauncherModal({
   onLaunched: (name: string) => void;
 }) {
   const [tab, setTab] = useState<"launch" | "jobs">("launch");
+  // runner 模式切換：loop coordinator 走既有表單；ralph 走 RalphLaunchForm，footer 以 signal 驅動送出。
+  const [runnerMode, setRunnerMode] = useState<"loop" | "ralph">("loop");
+  const [ralphLaunchSignal, setRalphLaunchSignal] = useState(0);
+  const [ralphStatus, setRalphStatus] = useState({ canLaunch: false, launching: false, message: "" });
   const [config, setConfig] = useState<ConfigResponse | null>(null);
   const [repoChoice, setRepoChoice] = useState("");
   const [customRepo, setCustomRepo] = useState("");
@@ -336,13 +341,21 @@ export default function LauncherModal({
     { label: "收斂 / timeout", before: matchingWorkspace ? "現有 workspace 設定" : "預設設定", after: `flag>${settings.flagThreshold} · done≥${settings.doneThreshold} · round ${settings.roundTimeout}m · backoff ${settings.agentBackoffMax}s${settings.pauseAfterPlan ? " · 規劃後暫停" : ""}` },
     { label: "Git branch", before: repoStatus?.branch || "detached / unknown", after: newBranch ? `建立 loop/${name.trim() || repo.split("/").filter(Boolean).slice(-1)[0] || "workspace"}` : "不切換" },
   ];
-  const footer = tab === "launch" ? (
-    <>
-      <button type="button" className="secondary-button" onClick={onClose}>取消</button>
-      <button type="button" className="primary-button" onClick={launch} disabled={launching || !repo}>啟動</button>
-      <span className="inline-message" role="status">{message}</span>
-    </>
-  ) : <button type="button" className="secondary-button" onClick={onClose}>關閉</button>;
+  const footer = tab !== "launch"
+    ? <button type="button" className="secondary-button" onClick={onClose}>關閉</button>
+    : runnerMode === "ralph" ? (
+      <>
+        <button type="button" className="secondary-button" onClick={onClose}>取消</button>
+        <button type="button" className="primary-button" onClick={() => setRalphLaunchSignal((value) => value + 1)} disabled={!ralphStatus.canLaunch}>啟動</button>
+        <span className="inline-message" role="status">{ralphStatus.message}</span>
+      </>
+    ) : (
+      <>
+        <button type="button" className="secondary-button" onClick={onClose}>取消</button>
+        <button type="button" className="primary-button" onClick={launch} disabled={launching || !repo}>啟動</button>
+        <span className="inline-message" role="status">{message}</span>
+      </>
+    );
 
   return (
     <Modal title="啟動與管理" description="建立新 loop，或查看由這個 dashboard 啟動的工作" onClose={onClose} wide footer={footer}>
@@ -351,6 +364,16 @@ export default function LauncherModal({
         <button type="button" role="tab" aria-selected={tab === "jobs"} className={tab === "jobs" ? "active" : ""} onClick={() => setTab("jobs")}>執行中的 jobs</button>
       </div>
       {tab === "launch" ? (
+        <>
+          <div className="segmented-tabs runner-mode-tabs" role="tablist" aria-label="Runner 模式">
+            <button type="button" role="tab" aria-selected={runnerMode === "loop"} className={runnerMode === "loop" ? "active" : ""} onClick={() => setRunnerMode("loop")}>Loop coordinator</button>
+            <button type="button" role="tab" aria-selected={runnerMode === "ralph"} className={runnerMode === "ralph" ? "active" : ""} onClick={() => setRunnerMode("ralph")}>Ralph</button>
+          </div>
+          {runnerMode === "ralph"
+            ? (config
+                ? <RalphLaunchForm config={config} launchSignal={ralphLaunchSignal} onLaunched={onLaunched} onStatus={setRalphStatus} />
+                : <div className="loading-state">載入設定…</div>)
+            : (
         <div className="form-grid launcher-form">
           <div className="form-field repo-select-field"><span>Repo</span><div className="command-select-row"><select aria-label="Repo" value={repoChoice} onChange={(event) => setRepoChoice(event.target.value)}>
                 {(config?.repos ?? []).map((item) => <option key={item} value={item}>{item}</option>)}
@@ -391,6 +414,8 @@ export default function LauncherModal({
             </div>
           </details>
         </div>
+            )}
+        </>
       ) : <LauncherJobs />}
       {managerModal === "cli" && config && <CliManagerModal config={config} repo={repo} onClose={() => setManagerModal(null)} onSaved={(next) => {
         const selectedCommand = config.agent_cmds[+agentIndex]?.cmd;

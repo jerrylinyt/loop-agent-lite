@@ -1,6 +1,7 @@
 /** 單一 workspace 的總覽卡片；只負責呈現，不持有 fleet 篩選或批次操作狀態。 */
 import type { FleetHistoryEntry, WorkspaceSummary } from "../../shared/api/types";
 import { deriveRoundTiming } from "./roundTiming";
+import { RALPH_EXIT, storyProgressPct } from "./ralphViewModel";
 import {
   currentActivity, formatMetric, taskProgress, workspaceNeedsAttention,
 } from "./fleetViewModel";
@@ -13,6 +14,37 @@ export default function FleetWorkspaceCard({ workspace, metrics, roundNow, onSel
   roundNow: number;
   onSelect: (name: string) => void;
 }) {
+  if (workspace.runner === "ralph") {
+    const ralph = workspace.ralph ?? {};
+    const storiesDone = ralph.stories_done ?? 0;
+    const storiesTotal = ralph.stories_total ?? 0;
+    const exit = ralph.exit_reason ? RALPH_EXIT[ralph.exit_reason] : null;
+    return (
+      <button type="button" className={`fleet-card fleet-card-ralph${workspace.running ? " running" : ""}`} onClick={() => onSelect(workspace.name)}>
+        <div className="fleet-card-head">
+          <strong>{workspace.name}</strong>
+          {workspace.running && <span className="breathing-dot" aria-label="執行中" />}
+        </div>
+        <div className="fleet-card-meta">
+          <span className="phase-badge ralph-runner-tag">Ralph</span>
+          <span className="muted">迭代 {ralph.iteration ?? 0}/{ralph.max_iterations ?? "?"}</span>
+          {ralph.usage_limit && <span className="chip warning" title="Agent 用量上限，監督層等待重啟中">⏳ 用量上限</span>}
+          {exit && <span className={`chip ralph-exit-${exit.tone}`}>{exit.label}</span>}
+          {ralph.stalled && !exit && <span className="chip warning">停滯</span>}
+          {ralph.sentinel_complete && !exit && <span className="muted">已見完成訊號</span>}
+        </div>
+        {storiesTotal > 0 && (
+          <div className="fleet-progress" aria-label={`Stories ${storiesDone}/${storiesTotal}`}>
+            <div className="fleet-progress-fill" style={{ width: `${storyProgressPct(storiesDone, storiesTotal)}%` }} />
+            <span className="fleet-progress-text">Stories {storiesDone}/{storiesTotal}</span>
+          </div>
+        )}
+        {workspace.error && <div className="fleet-card-alerts"><span className="chip warning">錯誤：state 錯誤</span></div>}
+        {workspace.repo && <div className="fleet-card-repo" title={workspace.repo}>{workspace.repo}</div>}
+      </button>
+    );
+  }
+
   const { done, total, pct } = taskProgress(workspace);
   const alert = workspaceNeedsAttention(workspace);
   const unreadIssues = workspace.unread_issues ?? workspace.issues ?? 0;

@@ -1,5 +1,5 @@
 /** Dashboard HTTP client：統一 JSON 錯誤處理，並輪詢 startup handshake，避免 UI 把「已 spawn」誤當成「已可用」。 */
-import type { StartupStatus } from "./types";
+import type { IncrementalResponse, RalphPrdResponse, StartupStatus } from "./types";
 
 export async function getJson<T>(url: string): Promise<T | null> {
   try {
@@ -8,6 +8,16 @@ export async function getJson<T>(url: string): Promise<T | null> {
   } catch {
     return null;
   }
+}
+
+/** Ralph runner：讀取 PRD 全文與 story 明細（RALPH_CONTRACT §E）。 */
+export async function getRalphPrd(ws: string): Promise<RalphPrdResponse | null> {
+  return getJson<RalphPrdResponse>(`/api/ralph/prd?ws=${encodeURIComponent(ws)}`);
+}
+
+/** Ralph runner：以 byte offset 增量讀取 progress.txt（沿用 read_incremental，RALPH_CONTRACT §E）。 */
+export async function getRalphProgress(ws: string, offset: number): Promise<IncrementalResponse | null> {
+  return getJson<IncrementalResponse>(`/api/ralph/progress?ws=${encodeURIComponent(ws)}&offset=${offset}`);
 }
 
 export async function postJson<T>(url: string, body: unknown): Promise<T & { error?: string }> {
