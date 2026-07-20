@@ -1,8 +1,27 @@
 # Ralph 模式接入設計
 
-> 狀態：設計提案（尚未實作）。
+> 狀態：**已實作**（後端 `engine/ralph.py` 監督層、Dashboard 整合、前端 RalphView／Launcher、
+> 測試含真 clone snarktank/ralph 的端到端）。本文保留設計脈絡，實作細節見 §實作現況。
 > 目標：讓 Dashboard 能以「Ralph 原生格式」啟動與監控公司內的 `ralph.sh`，
 > 與既有 loop coordinator 並存，互不干擾。
+
+## 實作現況（TL;DR）
+
+- **後端**：`engine/ralph.py`（監督層，`python -m engine.ralph`）——spawn `ralph.sh`、逐行鏡射 stdout
+  到共用 `console.log`、輪詢 PRD／progress.txt／git HEAD 投影進 `state.json` 的 `ralph` 區塊。
+  沿用 loop 的所有 workspace 安全原語（單 writer 鎖、O_NOFOLLOW、原子寫、名稱規則），
+  不啟用 loop 的共識／validate／防竄改。
+- **Dashboard**：`/api/launch` 加 `runner:"ralph"` 分支（`api_launch_ralph`）＋ `spawn_ralph`；
+  新增 `GET /api/ralph/prd`、`GET /api/ralph/progress`；fleet 摘要加 `runner`＋`ralph`；
+  `config_projection` 加 `ralph` 團隊設定；coordinator 專屬 POST（phase/set-task/import-plan/
+  edit-state/drain/cancel-drain/edit-config）對 ralph workspace 一律拒絕；`/api/run` 對 ralph
+  ＝依保存設定重新 spawn（重啟即續跑）。
+- **前端**：`state.runner==="ralph"` 時渲染 `RalphView`（PRD checklist＋progress viewer＋共用
+  ConsolePane＋usage-limit 橫幅），Launcher 加 Ralph 模式表單（只收 ralph 參數），fleet 卡片分流。
+- **usage-limit 自動重啟／模型降級**：見 §I。
+- **測試**：`tests/test_ralph.py`（純函式 25）、`tests/test_ralph_integration.py`（CLI 2）、
+  `tests/test_ralph_usage_limit.py`（偵測/降級/放棄/誤判防護 15）、`tests/test_ralph_e2e.py`
+  （真 clone snarktank/ralph＋真 Dashboard HTTP＋真 ralph.sh 2 項）。
 
 ## 1. 背景
 
@@ -263,6 +282,56 @@ Ralph 表單欄位：
   名稱規則）**全部保留**——那是 Dashboard 自身的完整性，與 runner 無關。
 - **信任邊界**：ralph.sh 與 tool 白名單由 shared config（team 檔案，進版控）
   控制；前端只能傳 index 與受驗證的純量參數，不能組任意命令。
+
+## I. Usage-limit 自動重啟／模型降級（監督層外圈）
+
+長跑 ralph 最痛的失敗模式：agent 撞到用量上限時，`ralph.sh` 因 `... || true` 會繼續空轉，
+把 N 次迭代在幾秒內燒光卻毫無進展。監督層攔 agent stdout 偵測 limit → 殺掉空轉 ralph →
+依設定「等 reset 後重啟」或「降級模型即刻重啟」，直到收斂或達安全上限。**偵測是 heuristic**，
+pattern 可由團隊設定擴充；state 明確標示 `detection:"heuristic"` 與觸發的原始行供調參。
+
+### 偵測（no-progress gate，防誤判核心）
+
+以「迭代邊界」為單位判定：某輪算 **limit iteration** 的條件是「本輪命中 pattern」**且**
+「本輪無任何進展（HEAD 未前進、story 完成數未增、progress.txt 未增長）」。
+
+- **tier-1**（明確機器錯誤字樣，命中 1 輪即確認）：如 `usage limit reached|<epoch>`、
+  `rate_limit_error`、`exceeded your current quota`、`credit balance is too low`、
+  `overloaded_error`、`(5-hour|weekly|session) limit reached` 等。
+- **tier-2**（`rate limit`／`429`／`too many requests`／泛 quota 字樣，需連續 2 輪才確認）——
+  因為 FP-prone，只在 no-progress gate 下才計。
+
+關鍵：agent 若正在「寫 rate-limit 相關程式碼」，該輪會 commit（有進展），gate 直接把它排除，
+不會誤判。這條規則有專門的 e2e 測試（`test_progress_gate_suppresses_false_positive`）。
+團隊可在 `ralph.usage_limit_patterns` 追加公司 opencode 的專屬字樣（視為 tier-2）。
+
+### 動作
+
+- **`downgrade`**：確認後殺 ralph，將模型沿 `fallback_models` 鏈降一級（primary→sonnet→haiku…），
+  即刻重啟；等到 reset 視窗（一次 wait 後）再升回 primary。設了降級鏈卻無 `{model}` placeholder
+  會 preflight fail（大聲勝過默默無效）。
+- **`restart`**：確認後殺 ralph，等到 reset 再以 primary 重啟。reset 時間從命中訊息解析
+  （epoch／ISO／am-pm／`try again in Nm`／`Retry-After`），夾在 [60s, 6h]；無法解析則指數退避
+  （base 60s、cap 1h）。
+- **`off`**：關閉整個偵測。
+
+### 安全上限
+
+連續（無實質進展的）重啟達 `auto_restart_max`（預設 6）或累計等待達 24h → 終態
+`exit_reason:"usage_limit_giveup"`（phase=done，需人工重啟）。任一 run 只要有一輪真的推進，
+連續計數歸零。非用量上限的失敗（auth 錯、缺 binary…）不匹配 pattern，照走既有
+`failed`／`iterations_exhausted`，偵測器不會遮蔽真正的壞掉。
+
+### 呈現（誠實）
+
+`state.ralph.usage_limit`（命中時）帶 `detection:"heuristic"`、`state`（waiting/downgraded/giveup）、
+`matched`（觸發的原始行）、`matches`（近 5 筆 tier/source/line/iteration）、`resume_at`、
+`reset_source`（parsed/backoff）、`parsed_reset_at`、`from_model`/`to_model`、`restart_attempt`。
+kill semantics 為 SIGINT→寬限→SIGKILL 整個 process group（沿用 loop 的 `safe_killpg`）。
+執行中的等待期間 `phase` 仍為 `exec`、`running` 仍 true（監督層在等待），RalphView 顯示倒數橫幅。
+
+> 設計參數（tier 規則、backoff、caps、downgrade-first）由一次 Fable supervisor 判斷定案，
+> 對照 loop 既有的 `agent_failure_backoff` 與 `ralph.sh` 實際行為校準。
 
 ## 7. 實作里程碑
 
