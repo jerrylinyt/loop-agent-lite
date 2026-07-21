@@ -280,11 +280,13 @@ export interface PromptTemplate {
 }
 
 export interface PromptTemplateBundle {
-  schema_version: 3;
+  schema_version: 4;
   base: string;
   goal: string;
   goal_template: string;
   plan: string;
+  /** Goal 模式勾選「同時產生初版 plan.json」時，插在 goal 與 plan 契約之間的合併輸出契約。 */
+  goal_plan_bridge: string;
   missing_requirement: string;
   team_template_example: string;
 }

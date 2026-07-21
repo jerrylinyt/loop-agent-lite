@@ -88,6 +88,10 @@ test("Goal 產生器 Prompt 與 Goal 成果模板分開，且 Plan 仍可使用"
   expect(await promptPreview.textContent()).not.toContain("## 已知專案資訊與限制");
   await expect(promptPreview).not.toContainText("_json");
   await expect(promptTemplates.getByText("需求仍是模板範例", { exact: false })).toBeVisible();
+  // Goal 模式提供「同時產生初版 plan.json」勾選；預設關閉，prompt 不含 plan 契約
+  const planDraftToggle = promptTemplates.getByLabel(/同時產生初版 plan\.json/);
+  await expect(planDraftToggle).not.toBeChecked();
+  await expect(promptPreview).not.toContainText("最終輸出契約：plan.json");
   // 清空後仍維持輸入不足的 fail-closed 契約
   await promptRequirement.fill("");
   await expect(promptPreview).toContainText("外部 Agent 任務：輸入不足");
@@ -125,6 +129,22 @@ test("Goal 產生器 Prompt 與 Goal 成果模板分開，且 Plan 仍可使用"
   expect(renderedPrompt).not.toContain("<template_instructions_json>");
   expect(renderedPrompt).not.toContain("\\u003c");
 
+  // 勾選後 prompt 依序帶出 goal 契約、合併輸出契約與 plan 拆分規則，下載檔名也標示合併模式
+  await planDraftToggle.check();
+  await expect(promptPreview).toContainText("分析需求並產生 goal.md 與初版 plan.json");
+  await expect(promptPreview).toContainText("最終輸出契約：goal.md");
+  await expect(promptPreview).toContainText("合併輸出契約：goal.md 加初版 plan.json");
+  await expect(promptPreview).toContainText("===== plan.json =====");
+  await expect(promptPreview).toContainText("最終輸出契約：plan.json");
+  await expect(promptPreview).toContainText("只能有 `order`、`task`、選填的 `ref`");
+  const goalPlanDownloadPromise = page.waitForEvent("download");
+  await downloadPromptButton.click();
+  const goalPlanDownload = await goalPlanDownloadPromise;
+  expect(goalPlanDownload.suggestedFilename()).toBe("project-logic-analysis-goal-plan-prompt.md");
+  await planDraftToggle.uncheck();
+  await expect(promptPreview).toContainText("分析需求並產生 goal.md");
+  await expect(promptPreview).not.toContainText("最終輸出契約：plan.json");
+
   await promptType.selectOption("e2e-team-analysis");
   // 使用者改過的需求在切換模板時不被預填覆蓋
   await expect(promptRequirement).toHaveValue(/保留 literal/);
@@ -135,6 +155,9 @@ test("Goal 產生器 Prompt 與 Goal 成果模板分開，且 Plan 仍可使用"
   await expect(promptPreview).toContainText("分析需求並產生 plan.json");
   await expect(promptPreview).toContainText("只輸出一個合法 JSON array");
   await expect(promptPreview).toContainText("只能有 `order`、`task`、選填的 `ref`");
+  // Plan 模式沒有合併勾選，也不得殘留合併契約
+  await expect(promptTemplates.getByLabel(/同時產生初版 plan\.json/)).toHaveCount(0);
+  await expect(promptPreview).not.toContainText("合併輸出契約");
   const promptDownloadPromise = page.waitForEvent("download");
   await downloadPromptButton.click();
   const promptDownload = await promptDownloadPromise;

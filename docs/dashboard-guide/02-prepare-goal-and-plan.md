@@ -61,8 +61,9 @@ git commit -m "docs: define loop goal"
 2. 選擇任務類型；不同類型會加入相應的分析要求。
 3. 填「需求」：說明真正要解決的問題與預期結果。
 4. 「專案限制」選填：語言、相容性、不可更動範圍、效能或安全限制。
-5. 產生並複製 prompt，交給適合的 Agent。
-6. 審查 Agent 產出的 `goal.md`，不要未讀就匯入。
+5. 選填：勾選「同時產生初版 plan.json」。prompt 會在 goal.md 契約後附上 plan.json 拆分規則，Agent 會先輸出 goal.md，再輸出一行 `===== plan.json =====` 分隔線與初版 plan.json，方便人工拆成兩個檔案。
+6. 產生並複製 prompt，交給適合的 Agent。
+7. 審查 Agent 產出的 `goal.md`（若有勾選，連同初版 `plan.json`），不要未讀就匯入。
 
 「Goal 成果模板」則是八段契約的參考骨架：
 

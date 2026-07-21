@@ -69,7 +69,7 @@
 | 手動輸入 Repo | 條件式 | 下拉沒有時填路徑 | 建議絕對路徑 |
 | Repo 狀態 | 唯讀 | 顯示 Goal Git 狀態、工作樹、branch、既有 workspace | dirty tree 會擋一般 preflight |
 | goal.md 檔案 | 否 | 上傳要取代／匯入的 Goal | 留空沿用 repo 已 commit 版本 |
-| Goal 產生器 Prompt | — | 建構交給外部 Agent 的 Goal 撰寫 prompt | 只在瀏覽器，不寫 repo |
+| Goal 產生器 Prompt | — | 建構交給外部 Agent 的 Goal 撰寫 prompt；可勾選同時產生初版 plan.json | 只在瀏覽器，不寫 repo |
 | Goal 成果模板 | — | 顯示符合契約的 Goal 骨架 | 仍需人工適配 |
 | 匯入 plan.json | 否 | 建立全新純 Plan state | 留空沿用或從零規劃 |
 | 產生 Plan Prompt | — | 產生要求外部 Agent 輸出 Plan JSON 的 prompt | 輸出仍需審查 |

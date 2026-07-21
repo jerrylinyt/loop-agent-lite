@@ -382,6 +382,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 
 .prompt-template-toolbar { display: grid; grid-template-columns: auto minmax(260px, 1fr); align-items: end; gap: 12px; margin-bottom: 12px; }
 .prompt-template-toolbar .segmented-tabs { margin: 0; }
+.prompt-template-toolbar .checkbox-row { grid-column: 1 / -1; }
 .prompt-template-toolbar label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
 .prompt-template-toolbar select { width: 100%; min-height: 32px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); }
 .prompt-template-warning { margin-bottom: 10px; padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent); border-radius: 8px; background: var(--warning-soft); color: var(--warning); font-size: 12px; }
