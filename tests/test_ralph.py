@@ -308,7 +308,7 @@ class TestProjectRalphBlock(unittest.TestCase):
             self.assertEqual(block["head_sha"], head_sha)
             self.assertEqual(block["commit_count"], 2)
             self.assertEqual(block["last_commit"], "feat: b")
-            self.assertEqual(block["progress_bytes"], len(progress_text.encode("utf-8")))
+            self.assertEqual(block["progress_bytes"], (ralph_dir / "progress.txt").stat().st_size)
             self.assertIs(block["sentinel_complete"], False)
             self.assertIs(block["stalled"], False)
             self.assertIsNone(block["exit_code"])

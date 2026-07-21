@@ -8,7 +8,7 @@
   "validate_cmds": [
     {
       "label": "python unittest",
-      "cmd": "python3 -m unittest discover -s tests -t . -q"
+      "cmd": "python -m unittest discover -s tests -t . -q"
     },
     {
       "label": "mvn compile",
@@ -20,7 +20,7 @@
     },
     {
       "label": "react build+test+e2e",
-      "cmd": "sh -c 'npm run build && npm test -- --run && npx playwright test'"
+      "cmd": "npm run check:all"
     }
   ],
   "repo_roots": [

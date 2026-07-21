@@ -54,7 +54,7 @@ export default function NotifyModal({ config, onClose, onSaved }: {
       <><button type="button" className="secondary-button" onClick={onClose}>取消</button><button type="button" className="primary-button" disabled={busy} onClick={() => void save()}>儲存通知設定</button><span role="status">{message}</span></>
     }>
       <label className="form-field">通知命令 <span className="label-help">留空＝不通知；佔位符 {"{status}"}（completed/stuck_stop/goal_missing…）與 {"{name}"}（workspace）</span>
-        <input aria-label="通知命令" value={cmd} onChange={(event) => { setCmd(event.target.value); setTestOutput(""); }} placeholder={'sh -c \'curl -s -X POST https://ntfy.example/loop -d "{name}: {status}"\''} />
+        <input aria-label="通知命令" value={cmd} onChange={(event) => { setCmd(event.target.value); setTestOutput(""); }} placeholder={'curl -s -X POST https://ntfy.example/loop -d "{name}: {status}"'} />
       </label>
       <div className="notify-test-row"><button type="button" className="secondary-button" disabled={busy || !cmd.trim()} onClick={() => void test()}>以 status=test 執行測試</button></div>
       {testOutput && <div className="agent-test-result"><pre>{testOutput}</pre></div>}

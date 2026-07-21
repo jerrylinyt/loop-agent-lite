@@ -12,6 +12,7 @@ fixture 準備：
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,11 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 RALPH_URL = "https://github.com/snarktank/ralph.git"
 
 
+def _command(*args):
+    values = [str(value) for value in args]
+    return subprocess.list2cmdline(values) if os.name == "nt" else shlex.join(values)
+
+
 def _run(*args, cwd=None, env=None, check=True, timeout=180):
     return subprocess.run(args, cwd=cwd and str(cwd), env=env, check=check,
                           capture_output=True, text=True, timeout=timeout)
@@ -33,10 +39,12 @@ def _prepare_ralph_repo(root: Path):
     """clone 真 ralph；失敗退回 fake_ralph.sh。回傳 (repo, ralph_script_cmd, args_style)。"""
     repo = root / "target"
     try:
+        if not shutil.which("bash"):
+            raise OSError("bash is unavailable")
         _run("git", "clone", "--depth", "1", RALPH_URL, str(repo), timeout=120)
         if (repo / "ralph.sh").is_file():
             # 真 snarktank ralph.sh：--tool <tool> <iters>
-            return repo, f"bash {repo / 'ralph.sh'}", "snarktank"
+            return repo, _command("bash", repo / "ralph.sh"), "snarktank"
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         pass
     # 退回本地 fake ralph（仍是真 ralph.sh 迴圈語意，位置參數）。
@@ -45,11 +53,16 @@ def _prepare_ralph_repo(root: Path):
     _run("git", "init", "-q", cwd=repo)
     _run("git", "config", "user.email", "e2e@example.test", cwd=repo)
     _run("git", "config", "user.name", "ralph e2e", cwd=repo)
-    shutil.copy(FIXTURES / "fake_ralph.sh", repo / "ralph.sh")
-    (repo / "ralph.sh").chmod(0o755)
+    if shutil.which("bash"):
+        shutil.copy(FIXTURES / "fake_ralph.sh", repo / "ralph.sh")
+        (repo / "ralph.sh").chmod(0o755)
+        ralph_cmd = _command("bash", repo / "ralph.sh")
+    else:
+        shutil.copy(FIXTURES / "fake_ralph.py", repo / "fake_ralph.py")
+        ralph_cmd = _command(sys.executable, repo / "fake_ralph.py")
     _run("git", "add", "-A", cwd=repo)
     _run("git", "commit", "-qm", "seed fake ralph", cwd=repo)
-    return repo, f"bash {repo / 'ralph.sh'}", "positional"
+    return repo, ralph_cmd, "positional"
 
 
 def prepare_fixture():
@@ -72,11 +85,15 @@ def prepare_fixture():
 
     bindir = fixture / "bin"
     bindir.mkdir()
-    claude = bindir / "claude"
-    claude.write_text(
-        "#!/usr/bin/env bash\n"
-        f'exec {shutil.which("python3") or sys.executable} "{FIXTURES / "fake_agent.py"}" "$@"\n',
-        encoding="utf-8")
+    claude = bindir / ("claude.cmd" if os.name == "nt" else "claude")
+    if os.name == "nt":
+        claude.write_text(
+            f'@echo off\n"{sys.executable}" "{FIXTURES / "fake_agent.py"}" %*\n', encoding="utf-8")
+    else:
+        claude.write_text(
+            "#!/usr/bin/env bash\n"
+            f'exec {shutil.which("python3") or sys.executable} "{FIXTURES / "fake_agent.py"}" "$@"\n',
+            encoding="utf-8")
     claude.chmod(0o755)
 
     env = {
@@ -92,7 +109,7 @@ def prepare_fixture():
          "--ralph-dir", str(repo), "--iterations", "6", "--tool", "claude",
          "--args-style", args_style, cwd=PROJECT_ROOT, env=env, check=False, timeout=120)
 
-    _write_usage_limit_workspace(workspace / "ralph-limit", repo)
+    _write_usage_limit_workspace(workspace / "ralph-limit", repo, ralph_cmd)
 
     config = {
         "agent_cmds": [{"label": "unused", "cmd": "true"}],
@@ -116,7 +133,7 @@ def prepare_fixture():
     return fixture, workspace, config_path
 
 
-def _write_usage_limit_workspace(ws_dir: Path, repo: Path):
+def _write_usage_limit_workspace(ws_dir: Path, repo: Path, ralph_cmd: str):
     """寫一份帶 usage_limit(waiting) 的合法 state，供 Playwright 驗證用量上限橫幅與倒數。"""
     ws_dir.mkdir(parents=True)
     (ws_dir / "logs").mkdir()
@@ -125,7 +142,7 @@ def _write_usage_limit_workspace(ws_dir: Path, repo: Path):
         "runner": "ralph", "phase": "exec",
         "loop": {"pid": None, "session_id": "e2e", "started_at": datetime.now().isoformat(timespec="seconds")},
         "repo_binding": str(repo),
-        "config": {"runner": "ralph", "repo": str(repo), "ralph_cmd": f"bash {repo/'ralph.sh'}",
+        "config": {"runner": "ralph", "repo": str(repo), "ralph_cmd": ralph_cmd,
                    "ralph_dir": str(repo), "iterations": 5000, "tool": "opencode", "model": "opus",
                    "args_template": ["{iterations}", "{tool}", "{model}"], "prd_path": "prd.json",
                    "notify_cmd": "", "usage_limit_action": "restart", "fallback_models": [],

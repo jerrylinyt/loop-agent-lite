@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 from engine import loop as loop_mod
+from engine import platform_compat as compat
 from engine import status as status_mod
 from engine.paths import default_workspace_root, expose_project_package
 
@@ -49,7 +50,7 @@ def normalize_runtime_config(state) -> dict:
             raise ValueError(f"state.config.{key} 必須是非空字串")
     for key in ("agent_cmd", "validate_cmd"):
         try:
-            command = shlex.split(config[key])
+            command = compat.split_command(config[key])
         except ValueError as e:
             raise ValueError(f"state.config.{key} 命令格式錯誤：{e}") from e
         if not command:
@@ -83,7 +84,7 @@ def normalize_runtime_config(state) -> dict:
         config[key] = value
     if config["notify_cmd"]:
         try:
-            shlex.split(config["notify_cmd"])
+            compat.split_command(config["notify_cmd"])
         except ValueError as e:
             raise ValueError(f"state.config.notify_cmd 命令格式錯誤：{e}") from e
     config["repo"] = str(Path(config["repo"]).expanduser().resolve())
@@ -149,6 +150,11 @@ def _engine_env() -> dict:
 
 def _exec_engine(args: list[str]):
     command = _engine_command(args)
+    if compat.IS_WINDOWS:
+        # Windows' CRT exec emulation can return before the replacement process
+        # has finished.  Waiting for the exact same argv preserves the CLI's
+        # synchronous exit-code and state-visibility contract.
+        raise SystemExit(subprocess.run(command, env=_engine_env(), check=False).returncode)
     os.execve(sys.executable, command, _engine_env())
 
 
@@ -285,6 +291,11 @@ def command_config(args) -> int:
 
 def _pid_matches_workspace(pid: int, name: str) -> bool:
     """送 signal 前確認 PID 仍是指定 workspace 的 engine.loop，降低 PID reuse 風險。"""
+    if compat.IS_WINDOWS:
+        # The caller already proved that this PID owns this workspace's locked
+        # .run.lock.  Windows has no stdlib ps-style argv query, so confirm the
+        # live Python image and rely on that kernel lock as the identity token.
+        return compat.process_looks_like_python(pid)
     try:
         command = subprocess.run(
             ["ps", "-p", str(int(pid)), "-o", "command="], capture_output=True,

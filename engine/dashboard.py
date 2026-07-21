@@ -13,7 +13,6 @@ stdlib only,綁 127.0.0.1。
 """
 import argparse
 import difflib
-import fcntl
 import functools
 import json
 import math
@@ -39,6 +38,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from engine import loop as loop_mod  # 共用 Workspace/fresh_state,匯入計畫時建 state 不自己發明 schema
+from engine import platform_compat as compat
 from engine import ralph as ralph_mod  # ralph runner 監督層:PRD 解析、argv 組裝與 spawn 引數
 from engine.paths import (default_personal_config, default_workspace_root, expose_project_package,
                           legacy_config_path)
@@ -65,10 +65,10 @@ DEFAULT_CONFIG = {
         {"label": "claude", "cmd": "claude -p"},
     ],
     "validate_cmds": [
-        {"label": "python unittest", "cmd": "python3 -m unittest discover -s tests -t . -q"},
+        {"label": "python unittest", "cmd": "python -m unittest discover -s tests -t . -q"},
         {"label": "mvn compile", "cmd": "mvn -q compile"},
         {"label": "mvn test", "cmd": "mvn -q test"},
-        {"label": "react build+test+e2e", "cmd": "sh -c 'npm run build && npm test -- --run && npx playwright test'"},
+        {"label": "react build+test+e2e", "cmd": "npm run check:all"},
     ],
     "repo_roots": ["~/IdeaProjects"],
     # GUI/IDE 啟動時通常不會載入 shell profile；用可攜式 home-relative 路徑補 CLI。
@@ -121,7 +121,16 @@ def configured_path_dirs(cfg):
     if not isinstance(raw_dirs, list):
         raw_dirs = DEFAULT_CONFIG["extra_path_dirs"]
     raw = [str(value).strip() for value in raw_dirs if str(value).strip()]
-    resolved = [os.path.expanduser(os.path.expandvars(value)) for value in raw]
+    resolved = []
+    for value in raw:
+        expanded = os.path.expandvars(value)
+        if compat.IS_WINDOWS and (expanded == "~" or expanded.startswith(("~/", "~\\"))):
+            configured_home = os.environ.get("HOME")
+            expanded = (str(Path(configured_home) / expanded[2:]) if configured_home else
+                        os.path.expanduser(expanded))
+        else:
+            expanded = os.path.expanduser(expanded)
+        resolved.append(expanded)
     return raw, resolved
 
 
@@ -139,20 +148,25 @@ def command_not_found(label, executable, cfg):
     raw, resolved = configured_path_dirs(cfg)
     shown = ", ".join(raw) or "（未設定）"
     resolved_shown = os.pathsep.join(resolved) or "（無）"
-    return (f"找不到 {label}：{executable}。請先在終端執行 `command -v {shlex.quote(Path(executable).name)}`，"
+    lookup = (f"Get-Command {subprocess.list2cmdline([Path(executable).name])}"
+              if compat.IS_WINDOWS else f"command -v {shlex.quote(Path(executable).name)}")
+    return (f"找不到 {label}：{executable}。請先在終端執行 `{lookup}`，"
             f"再用 Agent CLI 管理器把所在目錄加入個人設定 {PERSONAL_CONFIG_PATH.name} 的 "
-            f"`extra_path_dirs`（支援 ~ / $HOME）。"
+            f"`extra_path_dirs`（支援 ~、$HOME 與 Windows %USERPROFILE%）。"
             f"目前設定：{shown}；展開後：{resolved_shown}")
 
 
 def command_error(raw, label, cfg):
     """啟動前先給可操作的 CLI 路徑錯誤，避免 child 只留下 FileNotFoundError。"""
     try:
-        cmd = shlex.split(str(raw))
+        cmd = compat.split_command(str(raw))
     except ValueError as e:
         return f"{label} 格式錯誤：{e}"
     if not cmd:
         return f"{label} 不可為空"
+    if (Path(cmd[0]).name.casefold() in {"python", "python3", "python.exe", "python3.exe"}
+            and shutil.which(cmd[0], path=command_env(cfg).get("PATH")) is None):
+        cmd[0] = sys.executable
     if shutil.which(cmd[0], path=command_env(cfg).get("PATH")) is None:
         return command_not_found(label, cmd[0], cfg)
     return None
@@ -210,6 +224,28 @@ def directory_fd(path, label: str, *, dir_fd=None):
 @contextmanager
 def exclusive_file_lock(path, label: str, *, dir_fd=None):
     """以 descriptor-relative O_NOFOLLOW regular file + flock 取得跨 dashboard 鎖。"""
+    if compat.IS_WINDOWS:
+        if dir_fd is not None:
+            raise WorkspaceDeleteError("Windows 鎖定必須使用完整安全路徑", 409)
+        try:
+            fd = loop_mod._open_regular(Path(path), os.O_RDWR | os.O_CREAT)
+        except (OSError, ValueError) as e:
+            raise WorkspaceDeleteError(f"無法取得{label}:{e}", 409) from e
+        lock_file = os.fdopen(fd, "a+b")
+        try:
+            try:
+                compat.lock_file(lock_file, blocking=False)
+            except (BlockingIOError, PermissionError) as e:
+                raise WorkspaceDeleteError(f"{label}仍被持有，請稍後再試", 409) from e
+            yield lock_file
+        finally:
+            try:
+                compat.unlock_file(lock_file)
+            except OSError:
+                pass
+            lock_file.close()
+        return
+
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         raise WorkspaceDeleteError("此系統不支援安全的 O_NOFOLLOW 鎖定，已拒絕刪除 workspace")
@@ -225,13 +261,13 @@ def exclusive_file_lock(path, label: str, *, dir_fd=None):
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise WorkspaceDeleteError(f"{label}必須是單一 regular file", 409)
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as e:
+            compat.lock_file(lock_file, blocking=False)
+        except (BlockingIOError, PermissionError) as e:
             raise WorkspaceDeleteError(f"{label}仍被持有，請稍後再試", 409) from e
         yield lock_file
     finally:
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            compat.unlock_file(lock_file)
         except OSError:
             pass
         lock_file.close()
@@ -275,6 +311,75 @@ def _remove_tree_at(parent_fd, name: str, label: str):
         os.rmdir(name, dir_fd=parent_fd)
     except OSError as e:
         raise WorkspaceDeleteError(f"無法移除{label}:{e}", 409) from e
+
+
+def _remove_tree_path(path: Path, label: str):
+    """Windows path-based tree removal that never traverses reparse points."""
+    try:
+        entries = list(os.scandir(path))
+    except OSError as e:
+        raise WorkspaceDeleteError(f"無法讀取{label}:{e}", 409) from e
+    for entry in entries:
+        entry_path = path / entry.name
+        try:
+            info = entry.stat(follow_symlinks=False)
+            linked = stat.S_ISLNK(info.st_mode) or compat.is_reparse_point(info)
+            if stat.S_ISDIR(info.st_mode) and not linked:
+                _remove_tree_path(entry_path, f"{label}/{entry.name}")
+            else:
+                entry_path.unlink()
+        except OSError as e:
+            raise WorkspaceDeleteError(f"無法移除{label}/{entry.name}:{e}", 409) from e
+    try:
+        path.rmdir()
+    except OSError as e:
+        raise WorkspaceDeleteError(f"無法移除{label}:{e}", 409) from e
+
+
+def _delete_workspace_windows(root: Path, name: str) -> None:
+    """Windows equivalent of the descriptor-relative delete transaction."""
+    root = Path(root)
+    workspace = root / name
+    try:
+        root_info = root.lstat()
+        workspace_info = workspace.lstat()
+    except FileNotFoundError as e:
+        raise WorkspaceDeleteError(f"workspace {name} 不存在", 404) from e
+    if (not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode)
+            or compat.is_reparse_point(root_info)):
+        raise WorkspaceDeleteError("workspace 根目錄必須是實體目錄", 409)
+    if (not stat.S_ISDIR(workspace_info.st_mode) or stat.S_ISLNK(workspace_info.st_mode)
+            or compat.is_reparse_point(workspace_info)):
+        raise WorkspaceDeleteError(f"workspace {name} 必須是實體目錄", 409)
+
+    lock_path = workspace / ".run.lock"
+    with exclusive_file_lock(lock_path, f"{name} 的單 writer 鎖"):
+        current = workspace.lstat()
+        if (stat.S_ISLNK(current.st_mode) or compat.is_reparse_point(current)
+                or not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino)
+                != (workspace_info.st_dev, workspace_info.st_ino)):
+            raise WorkspaceDeleteError(f"workspace {name} 在操作期間變更，已拒絕刪除", 409)
+    # Windows 不允許 rename 含有任何已開啟子檔的目錄。root operation lock 仍持有；
+    # 若外部 loop 恰在此刻取得 .run.lock，其未共享 delete 的 handle 會使 rename 安全失敗。
+    current = workspace.lstat()
+    if (stat.S_ISLNK(current.st_mode) or compat.is_reparse_point(current)
+            or not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (workspace_info.st_dev, workspace_info.st_ino)):
+        raise WorkspaceDeleteError(f"workspace {name} 在鎖定後變更，已拒絕刪除", 409)
+    tombstone = root / f".delete-{name}-{uuid.uuid4().hex}"
+    if tombstone.exists() or tombstone.is_symlink():
+        raise WorkspaceDeleteError("workspace 刪除暫存項目已存在，已拒絕覆寫", 409)
+    try:
+        workspace.rename(tombstone)
+    except OSError as e:
+        raise WorkspaceDeleteError(f"準備刪除 workspace 失敗:{e}", 409) from e
+    moved = tombstone.lstat()
+    if (stat.S_ISLNK(moved.st_mode) or compat.is_reparse_point(moved)
+            or not stat.S_ISDIR(moved.st_mode)
+            or (moved.st_dev, moved.st_ino) != (workspace_info.st_dev, workspace_info.st_ino)):
+        raise WorkspaceDeleteError("workspace 刪除暫存項目身分不符，已停止移除", 409)
+    _remove_tree_path(tombstone, f"workspace 刪除暫存項目 {tombstone.name}")
 
 MAX_FINISHED_JOBS = 50  # 長跑 dashboard 只保留最近已結束 job；活躍 job 不受限制
 JOBS = {}          # name -> Job(由本 dashboard 啟動的 loop)
@@ -349,6 +454,14 @@ class Job:
         t = threading.Thread(target=self._reader, daemon=True)
         self.reader = t
         t.start()
+        reaper = threading.Thread(target=self._reap, daemon=True)
+        self.reaper = reaper
+        reaper.start()
+
+    def _reap(self):
+        """主程序結束即關閉 Windows Job Object，避免 handle／背景子孫殘留。"""
+        self.popen.wait()
+        compat.close_process_group(self.popen)
 
     def _reader(self):
         """持續讀取 stdout 到固定長度 deque，process 結束後關閉 pipe。"""
@@ -373,15 +486,15 @@ class Job:
         if not self.alive():
             return True
         try:
-            self.popen.send_signal(signal.SIGINT)
-        except ProcessLookupError:
+            compat.interrupt_process_group(self.popen)
+        except (ProcessLookupError, OSError):
             return True
 
         def _force():
             """SIGINT 寬限期後仍存活時終止整個 process group。"""
             if self.alive():
                 try:
-                    loop_mod.safe_killpg(os.getpgid(self.popen.pid), signal.SIGKILL)
+                    loop_mod.safe_killpg(self.popen, compat.FORCE_SIGNAL)
                 except (ProcessLookupError, PermissionError):
                     pass
         t = threading.Timer(8, _force)
@@ -400,9 +513,12 @@ def loop_pid_alive(pid):
     """state.json 記的 pid 是否仍是 runner(loop 或 ralph)；同時支援舊檔案入口與 package module。"""
     try:
         pid = int(pid)
-        os.kill(pid, 0)
+        if not compat.process_looks_like_python(pid):
+            return False
     except (TypeError, ValueError, ProcessLookupError, PermissionError):
         return False
+    if compat.IS_WINDOWS:
+        return True
     r = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
     return any(marker in r.stdout for marker in ("loop.py", "engine.loop", "engine.ralph"))
 
@@ -410,7 +526,7 @@ def loop_pid_alive(pid):
 def norm_cmd(s):
     """shlex 正規化,供命令白名單比對。"""
     try:
-        return shlex.join(shlex.split(str(s)))
+        return compat.join_command(compat.split_command(str(s)))
     except ValueError:
         return None
 
@@ -438,9 +554,9 @@ def suggested_validate_command(repo: Path):
     if (repo / "pom.xml").is_file():
         return "mvn -q compile"
     if (repo / "package.json").is_file():
-        return "sh -c 'npm run build && npm test -- --run && npx playwright test'"
+        return "npm run check:all"
     if (repo / "tests").is_dir():
-        return "python3 -m unittest discover -s tests -t . -q"
+        return "python -m unittest discover -s tests -t . -q"
     return None
 
 
@@ -495,7 +611,8 @@ def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout
     if not import_plan:
         (workspace_dir / "import-plan.pending.json").unlink(missing_ok=True)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, bufsize=1, start_new_session=True, env=env)
+                         text=True, bufsize=1, env=env, **compat.popen_group_kwargs())
+    compat.attach_process_group(p)
     _prune_finished_jobs_locked()
     JOBS[name] = Job(name, str(repo), p)
     return p
@@ -522,7 +639,8 @@ def spawn_ralph(name, repo, *, ralph_cmd, ralph_dir, iterations, tool, model, ar
         cmd += ["--notify-cmd", notify_cmd]
     (workspace_dir / "startup_ready.json").unlink(missing_ok=True)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, bufsize=1, start_new_session=True, env=env)
+                         text=True, bufsize=1, env=env, **compat.popen_group_kwargs())
+    compat.attach_process_group(p)
     _prune_finished_jobs_locked()
     JOBS[name] = Job(name, str(repo), p)
     return p
@@ -534,13 +652,14 @@ def run_command_check(cmd, cwd, prompt="", timeout=60, env=None):
     stdout，收尾讀取最多再等 5 秒，逾時就放棄剩餘輸出而非讓 HTTP 請求永久卡住。"""
     p = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, start_new_session=True, env=env)
+                         text=True, env=env, **compat.popen_group_kwargs())
+    compat.attach_process_group(p)
     try:
         output, _ = p.communicate(prompt, timeout=timeout)
         return p.returncode, output or "", False
     except subprocess.TimeoutExpired:
         try:
-            loop_mod.safe_killpg(os.getpgid(p.pid), signal.SIGKILL)
+            loop_mod.safe_killpg(p, compat.FORCE_SIGNAL)
         except (ProcessLookupError, PermissionError):
             pass
         p.wait()  # SIGKILL 保證直接子行程終止；卡住的只會是下面等孫行程放開 stdout 的讀取
@@ -564,6 +683,8 @@ def run_command_check(cmd, cwd, prompt="", timeout=60, env=None):
         else:
             p.stdout.close()
         return p.returncode, output, True
+    finally:
+        compat.close_process_group(p)
 
 
 def job_startup_status(name, pid):
@@ -1218,14 +1339,21 @@ def read_goal(name):
     previous_content = None
     for commit in history.stdout.splitlines():
         try:
-            shown = subprocess.run(
-                ["git", "-C", str(Path(repo).expanduser()), "show", f"{commit}:{goal_rel}"],
+            raw = subprocess.run(
+                ["git", "-C", str(Path(repo).expanduser()), "cat-file", "blob",
+                 f"{commit}:{goal_rel}"], capture_output=True, timeout=5)
+            filtered = subprocess.run(
+                ["git", "-C", str(Path(repo).expanduser()), "cat-file", "--filters",
+                 f"--path={goal_rel}", f"{commit}:{goal_rel}"],
                 capture_output=True, timeout=5)
         except (OSError, subprocess.TimeoutExpired):
             continue
-        if shown.returncode == 0 and loop_mod.sha256_bytes(shown.stdout) == previous_hash:
+        matching = next((candidate.stdout for candidate in (raw, filtered)
+                         if candidate.returncode == 0
+                         and loop_mod.sha256_bytes(candidate.stdout) == previous_hash), None)
+        if matching is not None:
             try:
-                previous_content = shown.stdout.decode("utf-8")
+                previous_content = matching.decode("utf-8")
             except UnicodeDecodeError:
                 projection["diff_error"] = "舊 goal 不是 UTF-8，無法顯示差異"
                 return projection
@@ -1651,7 +1779,7 @@ def read_incremental(path: Path, offset: int, *, max_bytes=MAX_CHUNK, tail_if_ov
                         # 否則前端會把 Agent 殘行誤歸類到「其他」。
                         offset = size
                         data = b""
-                return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace"),
+                return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace").replace("\r\n", "\n"),
                         "truncated": truncated}
             if offset > size:
                 offset = 0
@@ -1670,7 +1798,7 @@ def read_incremental(path: Path, offset: int, *, max_bytes=MAX_CHUNK, tail_if_ov
                 else:
                     offset += nl + 1
                     data = data[nl + 1:]
-        return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace"),
+        return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace").replace("\r\n", "\n"),
                 "truncated": truncated}
     except FileNotFoundError:
         return {"size": 0, "data": ""}
@@ -2896,7 +3024,7 @@ class Handler(BaseHTTPRequestHandler):
             self._err("Validate 命令不可為空")
             return
         try:
-            cmd = shlex.split(raw)
+            cmd = compat.split_command(raw)
         except ValueError as e:
             self._err(f"Validate 命令格式錯誤：{e}")
             return
@@ -3022,7 +3150,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             raw = match
         try:
-            cmd = shlex.split(raw)
+            cmd = compat.split_command(raw)
             command_problem = command_error(raw, "Agent CLI", cfg)
             if command_problem:
                 self._err(command_problem)
@@ -3077,7 +3205,7 @@ class Handler(BaseHTTPRequestHandler):
         if command_problem:
             self._err(command_problem)
             return
-        cmd = shlex.split(raw)
+        cmd = compat.split_command(raw)
         try:
             rc, output, timed_out = run_command_check(
                 cmd, repo, prompt="test\n", timeout=60, env=command_env(cfg)
@@ -3110,7 +3238,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._err(f"Agent CLI #{index} 內容過長")
                 return
             try:
-                shlex.split(cmd)
+                compat.split_command(cmd)
             except ValueError as e:
                 self._err(f"Agent CLI #{index} command 格式錯誤：{e}")
                 return
@@ -3182,7 +3310,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = raw.strip()
         if raw:
             try:
-                shlex.split(raw.replace("{status}", "test").replace("{name}", "test"))
+                compat.split_command(raw.replace("{status}", "test").replace("{name}", "test"))
             except ValueError as e:
                 self._err(f"通知命令格式錯誤:{e}")
                 return
@@ -3214,7 +3342,7 @@ class Handler(BaseHTTPRequestHandler):
         if command_problem:
             self._err(command_problem)
             return
-        rc, output, timed_out = run_command_check(shlex.split(rendered), HERE,
+        rc, output, timed_out = run_command_check(compat.split_command(rendered), HERE,
                                                   timeout=15, env=command_env(cfg))
         tail = "\n".join(output.strip().splitlines()[-20:])[-4000:]
         self._out(200, json.dumps({"ok": rc == 0 and not timed_out, "rc": rc,
@@ -3301,7 +3429,7 @@ class Handler(BaseHTTPRequestHandler):
                 timeout = float(c.get("validate_timeout", 120))
                 if not (0 < timeout < float("inf")):
                     raise ValueError
-                command = shlex.split(vcmd)
+                command = compat.split_command(vcmd)
                 if not command:
                     raise ValueError
                 rc, output, timed_out = run_command_check(
@@ -3366,25 +3494,28 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             with loop_mod.workspace_operation_lock(ROOT, name, blocking=False):
-                with directory_fd(ROOT, "workspace 根目錄") as root_fd:
-                    with directory_fd(name, f"workspace {name}", dir_fd=root_fd) as workspace_fd:
-                        current, current_error = read_state(name, repair=False)
-                        if current_error or ws_running(name, current):
-                            raise WorkspaceDeleteError(f"{name} 的停止狀態無法確認，不能刪除", 409)
-                        with JOBS_LOCK:
-                            job = JOBS.get(name)
-                            if job is not None and job.alive():
-                                raise WorkspaceDeleteError(f"{name} 仍有執行中的 job，不能刪除", 409)
-                        # pid 偵測可能失準；.run.lock 是 loop 單 writer 的機械真相。鎖檔本身也必須非 symlink。
-                        with exclusive_file_lock(".run.lock", f"{name} 的單 writer 鎖", dir_fd=workspace_fd):
-                            _require_same_directory_entry(root_fd, name, workspace_fd, f"workspace {name}")
-                            tombstone = f".delete-{name}-{uuid.uuid4().hex}"
-                            _require_absent_entry(root_fd, tombstone, "workspace 刪除暫存項目")
-                            try:
-                                os.rename(name, tombstone, src_dir_fd=root_fd, dst_dir_fd=root_fd)
-                            except OSError as e:
-                                raise WorkspaceDeleteError(f"準備刪除 workspace 失敗:{e}", 409) from e
-                    _remove_tree_at(root_fd, tombstone, f"workspace 刪除暫存項目 {tombstone}")
+                current, current_error = read_state(name, repair=False)
+                if current_error or ws_running(name, current):
+                    raise WorkspaceDeleteError(f"{name} 的停止狀態無法確認，不能刪除", 409)
+                with JOBS_LOCK:
+                    job = JOBS.get(name)
+                    if job is not None and job.alive():
+                        raise WorkspaceDeleteError(f"{name} 仍有執行中的 job，不能刪除", 409)
+                if compat.IS_WINDOWS:
+                    _delete_workspace_windows(ROOT, name)
+                else:
+                    with directory_fd(ROOT, "workspace 根目錄") as root_fd:
+                        with directory_fd(name, f"workspace {name}", dir_fd=root_fd) as workspace_fd:
+                            # pid 偵測可能失準；.run.lock 是 loop 單 writer 的機械真相。鎖檔本身也必須非 symlink。
+                            with exclusive_file_lock(".run.lock", f"{name} 的單 writer 鎖", dir_fd=workspace_fd):
+                                _require_same_directory_entry(root_fd, name, workspace_fd, f"workspace {name}")
+                                tombstone = f".delete-{name}-{uuid.uuid4().hex}"
+                                _require_absent_entry(root_fd, tombstone, "workspace 刪除暫存項目")
+                                try:
+                                    os.rename(name, tombstone, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+                                except OSError as e:
+                                    raise WorkspaceDeleteError(f"準備刪除 workspace 失敗:{e}", 409) from e
+                        _remove_tree_at(root_fd, tombstone, f"workspace 刪除暫存項目 {tombstone}")
         except WorkspaceDeleteError as e:
             self._err(str(e), e.status)
             return
@@ -3517,7 +3648,7 @@ class Handler(BaseHTTPRequestHandler):
                 """外部 loop 在八秒寬限後仍存活時送 SIGKILL。"""
                 if loop_pid_alive(pid):
                     try:
-                        loop_mod.safe_kill(int(pid), signal.SIGKILL)
+                        loop_mod.safe_kill(int(pid), compat.FORCE_SIGNAL)
                     except (ProcessLookupError, PermissionError):
                         pass
             t = threading.Timer(8, _force)
@@ -3554,6 +3685,7 @@ def run_dashboard(*, name="", port=8765, read_only=False) -> int:
         """將服務管理器 SIGTERM 轉成既有 KeyboardInterrupt 關閉流程。"""
         raise KeyboardInterrupt  # 走與 Ctrl-C 相同的優雅關閉路徑(stop_all_jobs)
     signal.signal(signal.SIGTERM, _sigterm)
+    compat.register_windows_break_handler(_sigterm)
 
     srv = None
     for _ in range(20):

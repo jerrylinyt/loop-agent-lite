@@ -34,6 +34,7 @@ from datetime import datetime
 from pathlib import Path
 
 from engine import loop as loop_mod
+from engine import platform_compat as compat
 from engine.paths import expose_project_package
 
 # ===== 常數 =====
@@ -213,7 +214,7 @@ def _safe_prd_path(ralph_dir: Path, prd_path: str) -> Path:
 def build_ralph_argv(base_cmd, args_template, *, iterations, tool, model, prd_path="") -> list:
     """組出直接 exec(不經 shell)的 argv;placeholder 以驗證過的純量取代,空值 token 丟棄。"""
     try:
-        base = shlex.split(str(base_cmd))
+        base = compat.split_command(str(base_cmd))
     except ValueError as e:
         raise ValueError(f"ralph 命令格式錯誤:{e}") from e
     if not base:
@@ -304,7 +305,7 @@ def _progress_size(ralph_dir: Path) -> int:
 def default_ralph_dir(ralph_cmd, repo):
     """未指定 ralph_dir 時:優先取 ralph.sh 所在目錄,否則落回 repo。"""
     try:
-        base = shlex.split(str(ralph_cmd))
+        base = compat.split_command(str(ralph_cmd))
     except ValueError:
         base = []
     for token in base:
@@ -476,7 +477,7 @@ class RalphSupervisor:
         if not (self.repo / ".git").exists():
             loop_mod.fail(f"preflight:{self.repo} 不是 git repo")
         try:
-            base = shlex.split(self.args.ralph_cmd)
+            base = compat.split_command(self.args.ralph_cmd)
         except ValueError as e:
             loop_mod.fail(f"preflight:ralph 命令格式錯誤:{e}")
         if not base:
@@ -696,18 +697,19 @@ class RalphSupervisor:
             self._forward_signal(signal.SIGINT)
             if self._force_kill_timer is None:
                 self._force_kill_timer = threading.Timer(KILL_GRACE_SEC,
-                                                         lambda: self._forward_signal(signal.SIGKILL))
+                                                         lambda: self._forward_signal(compat.FORCE_SIGNAL))
                 self._force_kill_timer.daemon = True
                 self._force_kill_timer.start()
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
+        compat.register_windows_break_handler(handler)
 
     def _forward_signal(self, sig):
         """對 ralph 的 process group 送訊號;pgid 防線沿用 loop 的 safe_killpg。"""
         if self.proc is None or self.proc.poll() is not None:
             return
         try:
-            loop_mod.safe_killpg(os.getpgid(self.proc.pid), sig)
+            loop_mod.safe_killpg(self.proc, sig)
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
@@ -721,7 +723,7 @@ class RalphSupervisor:
             self.proc.wait(timeout=grace)
             return
         except subprocess.TimeoutExpired:
-            self._forward_signal(signal.SIGKILL)
+            self._forward_signal(compat.FORCE_SIGNAL)
         try:
             self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -754,12 +756,16 @@ class RalphSupervisor:
             model=active_model, prd_path=self.prd_path)
         env = expose_project_package({**os.environ, "LOOP_WS": str(self.ws.dir),
                                       "RALPH_WS": str(self.ws.dir)})
-        loop_mod.log(f"🚀 啟動 ralph｜model={active_model or '(預設)'}｜{shlex.join(argv)}")
+        if compat.IS_WINDOWS:
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUTF8"] = "1"
+        loop_mod.log(f"🚀 啟動 ralph｜model={active_model or '(預設)'}｜{compat.join_command(argv)}")
         try:
             # binary stdout(不用 text=True):reader 自行以 errors="replace" 解碼,壞位元組不會殺 reader。
             self.proc = subprocess.Popen(
                 argv, cwd=str(self.repo), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                start_new_session=True, env=env)
+                env=env, **compat.popen_group_kwargs())
+            compat.attach_process_group(self.proc)
         except OSError as e:
             loop_mod.fail(f"ralph 啟動失敗:{e}")
         proc = self.proc
@@ -778,6 +784,8 @@ class RalphSupervisor:
                 loop_mod.log(f"⚠ ralph 進度投影失敗(不影響執行):{e}")
         if self._limit_confirmed.is_set() or self._stopping.is_set():
             self._kill_ralph()
+        # 正常結束也要釋放 Windows Job Object；同時封口任何仍存活的背景子孫。
+        compat.close_process_group(proc)
         # reader 可能因 grandchild 逃離 pgid 而卡住;gen 綁定確保它即使晚死也不會污染下一個 run。
         reader.join(timeout=5)
         self._last_exit_code = proc.returncode

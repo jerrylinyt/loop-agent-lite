@@ -80,7 +80,7 @@ def prepare_fixture():
         ],
         "validate_cmds": [
             {"label": "always green", "cmd": "true"},
-            {"label": "always green alt", "cmd": "sh -c true"},
+            {"label": "always green alt", "cmd": "python -c \"raise SystemExit(0)\""},
         ],
         "repo_roots": [str(repos)],
         "notify_cmd": "",
