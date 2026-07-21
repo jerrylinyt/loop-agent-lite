@@ -72,7 +72,11 @@ def normalize_runtime_config(state) -> dict:
         config.get("validate_timeout", loop_mod.VALIDATE_TIMEOUT_SEC), "validate_timeout",
         strictly_positive=True)
 
-    for key, default in (("pause_after_plan", False), ("stuck_stop", False)):
+    for key, default in (
+        ("pause_after_plan", False),
+        ("stuck_stop", False),
+        ("allow_serial_stack", False),
+    ):
         value = config.get(key, default)
         if not isinstance(value, bool):
             raise ValueError(f"state.config.{key} 必須是 boolean")
@@ -123,6 +127,8 @@ def config_to_loop_args(name: str, config: dict) -> list[str]:
         args.append("--stuck-stop")
     if config["pause_after_plan"]:
         args.append("--pause-after-plan")
+    if config["allow_serial_stack"]:
+        args.append("--allow-serial-stack")
     if config["notify_cmd"]:
         args += ["--notify-cmd", config["notify_cmd"]]
     return args
@@ -175,6 +181,8 @@ def _append_common_runtime_args(args: list[str], values) -> None:
         args.append("--stuck-stop")
     if values.pause_after_plan:
         args.append("--pause-after-plan")
+    if values.allow_serial_stack:
+        args.append("--allow-serial-stack")
     if values.notify_cmd:
         args += ["--notify-cmd", values.notify_cmd]
 
@@ -200,6 +208,7 @@ def command_init(args) -> int:
 
 def command_run(args):
     _directory, state, _recovered = _workspace_state(args.name, repair=False)
+    assert_workspace_cli_operation_allowed(state, "run/restart")
     if state.get("phase") == "done" and not args.reset_state:
         raise ValueError(
             f"workspace {args.name} 已完成；要建立全新 run 請明確加 --reset-state")
@@ -215,6 +224,7 @@ def command_run(args):
 
 def command_check(args) -> int:
     _directory, state, _recovered = _workspace_state(args.name, repair=False)
+    assert_workspace_cli_operation_allowed(state, "check")
     config = normalize_runtime_config(state)
     _exec_engine(config_to_loop_args(args.name, config) + ["--preflight-only"])
     return 0
@@ -260,8 +270,19 @@ def _print_config(name: str, config: dict) -> None:
     print(json.dumps({"name": name, "config": config}, ensure_ascii=False, indent=2))
 
 
+def assert_workspace_cli_operation_allowed(state: dict, operation: str) -> None:
+    """Reject every ordinary mutating/control route for managed workers."""
+    if (isinstance(state, dict)
+            and (state.get("runner") == "parallel-worker"
+                 or state.get("managed_readonly") is True)):
+        raise ValueError(
+            f"managed parallel worker 是 parent supervisor 的 readonly workspace；"
+            f"CLI {operation} 不可直接操作")
+
+
 def command_config(args) -> int:
     directory, state, _recovered = _workspace_state(args.name, repair=False)
+    assert_workspace_cli_operation_allowed(state, "config")
     updates = {key: getattr(args, option) for option, key in CONFIG_OPTION_TO_KEY.items()
                if getattr(args, option) is not None}
     config = normalize_runtime_config(state)
@@ -311,6 +332,7 @@ def _pid_matches_workspace(pid: int, name: str) -> bool:
 
 def command_stop(args) -> int:
     directory, state, _recovered = _workspace_state(args.name, repair=False)
+    assert_workspace_cli_operation_allowed(state, "stop")
     loop_state = state.get("loop") if isinstance(state.get("loop"), dict) else {}
     state_pid, session_id = loop_state.get("pid"), loop_state.get("session_id")
     owner = loop_mod.active_run_lock_owner(directory / ".run.lock")
@@ -397,6 +419,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
                       help="交易式覆寫既有 workspace 進度；未指定時 init 會拒絕既有 state")
     init.add_argument("--stuck-stop", action="store_true")
     init.add_argument("--pause-after-plan", action="store_true")
+    init.add_argument(
+        "--allow-serial-stack",
+        action="store_true",
+        help="明確允許普通 Loop 忽略 plan.stack 並以串行方式執行",
+    )
     init.add_argument("--notify-cmd", default="")
     _add_tuning_options(init)
 

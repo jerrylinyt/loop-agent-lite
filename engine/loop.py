@@ -44,6 +44,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from engine import parallel_contract
+from engine import parallel_worker
 from engine import platform_compat as compat
 from engine.paths import default_workspace_root, expose_project_package
 
@@ -64,6 +66,7 @@ ROUND_TIMEOUT_MIN = 30                 # 單輪 agent 上限(分鐘);0=不限
 AGENT_BACKOFF_MAX_SEC = 60             # CLI 連續異常退出:1,2,4...秒退避上限;0=關閉
 VALIDATE_TIMEOUT_SEC = 120             # 啟動前/每輪驗證上限(秒);避免 validator 永久卡住
 VALIDATE_TAIL = 50                     # 驗證失敗餵給下一輪的輸出尾行數
+GATE_DRAIN_TIMEOUT_SEC = 5             # gate timeout 後 pipe drain 上限；逃逸子孫不得卡死 worker
 TASK_LIST_TRUNC = 80                   # prompt 任務總覽單行截斷長度
 CONSOLE_MAX_BYTES = 5 * 1024 * 1024   # console.log 單檔 5 MiB
 CONSOLE_BACKUPS = 3                    # 保留 console.log.1～.3
@@ -770,9 +773,45 @@ def head_sha(repo) -> str:
     return git(repo, "rev-parse", "HEAD").stdout.strip()
 
 
+def managed_task_ref_error(repo, expected_ref: str) -> str | None:
+    """Return why a worker is not actually checked out on its immutable task ref."""
+    symbolic = git(repo, "symbolic-ref", "-q", "HEAD", check=False)
+    actual_ref = symbolic.stdout.strip() if symbolic.returncode == 0 else ""
+    if actual_ref != expected_ref:
+        shown = actual_ref or "detached/unborn HEAD"
+        return f"worker 必須 checkout {expected_ref}，目前為 {shown}"
+    tip = git(repo, "rev-parse", "--verify", expected_ref, check=False)
+    if tip.returncode != 0 or tip.stdout.strip() != head_sha(repo):
+        return f"worker task ref {expected_ref} tip 必須與 HEAD 完全一致"
+    return None
+
+
+@dataclass(frozen=True)
+class RepositorySnapshot:
+    """Validator 前後可比較的 exact Git snapshot。"""
+
+    head: str
+    head_ref: str | None
+    status: str
+
+    @property
+    def dirty(self) -> bool:
+        return bool(self.status.strip())
+
+
+def repository_snapshot(repo) -> RepositorySnapshot:
+    """讀取 HEAD/ref、index/worktree 與所有 untracked paths 的一致快照。"""
+    symbolic = git(repo, "symbolic-ref", "-q", "HEAD", check=False)
+    return RepositorySnapshot(
+        head=head_sha(repo),
+        head_ref=(symbolic.stdout.strip() if symbolic.returncode == 0 else None),
+        status=git(repo, "status", "--porcelain=v1", "--untracked-files=all").stdout,
+    )
+
+
 def is_dirty(repo) -> bool:
     """只要 porcelain status 有任何輸出就視為髒工作樹。"""
-    return bool(git(repo, "status", "--porcelain").stdout.strip())
+    return bool(git(repo, "status", "--porcelain=v1", "--untracked-files=all").stdout.strip())
 
 
 def is_ancestor(repo, sha, of_sha) -> bool:
@@ -1003,6 +1042,20 @@ def validate_state_shape(state, label: str):
             plan_orders.append(task["order"])
         if plan_orders and plan_orders != list(range(1, len(plan_orders) + 1)):
             raise StateLoadError(f"{label} plan.order 必須從 1 依序連續遞增")
+        if state["plan"]:
+            # Import/state/manifest loaders share the complete stack invariant.
+            # The local import avoids an import cycle because engine.work uses
+            # this module's guarded workspace artifact helpers.
+            from engine.work import validate_plan
+            _normalized_plan, plan_errors = validate_plan(state["plan"])
+            if plan_errors:
+                raise StateLoadError(
+                    f"{label} plan 不合法:" + "；".join(plan_errors))
+    if state.get("runner") == parallel_worker.WORKER_RUNNER:
+        try:
+            parallel_worker.validate_persisted_state(state)
+        except parallel_contract.ParallelContractError as exc:
+            raise StateLoadError(f"{label} managed worker state 不合法:{exc}") from exc
     if "completed" in state:
         completed_orders = []
         for index, entry in enumerate(state["completed"]):
@@ -1274,7 +1327,8 @@ class Workspace:
         訊號檔名帶 round token；就算舊 CLI 的背景子行程在 clear 後才醒來，
         它也只能重建舊 token 的檔案，下一輪不會誤收。
         """
-        names = ("called_create_plan", "pending_plan", "signal_plan_ok", "signal_done", "pending_issues")
+        names = ("called_create_plan", "pending_plan", "signal_plan_ok", "signal_done",
+                 "pending_issues", "pending_block")
         for name in names:
             (self.dir / name).unlink(missing_ok=True)  # 清理舊版固定檔名
             for path in self.dir.glob(f"{name}.*"):
@@ -1306,10 +1360,36 @@ class Workspace:
         """取得本輪 issue 暫存檔路徑；內容會在輪末集中併入 state。"""
         return self.dir / f"pending_issues.{round_token}"
 
-    def write_dispatch(self, phase, task_id, round_token):
+    def pending_block_reason(self, round_token, task_id):
+        """讀取 managed block terminal signal；存在但損壞時也 fail closed。"""
+        path = self.dir / f"pending_block.{round_token}.json"
+        try:
+            payload = json.loads(read_regular_text(path, "pending managed block"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return f"managed block signal 損壞或不安全:{exc}"
+        if (not isinstance(payload, dict)
+                or set(payload) != {"schema_version", "round_token", "task_id", "reason"}
+                or payload.get("schema_version") != 1
+                or payload.get("round_token") != round_token
+                or payload.get("task_id") != task_id
+                or not isinstance(payload.get("reason"), str)
+                or not payload["reason"].strip()
+                or len(payload["reason"]) > ISSUE_MAX_CHARS):
+            return "managed block signal schema/token/task 不符"
+        return payload["reason"].strip()
+
+    def write_dispatch(self, phase, task_id, round_token, *, runner="loop",
+                       allow_serial_stack=False):
         """dispatch 是 work.py 的原子真相；另保留舊唯讀檔供既有 wrapper 觀測。"""
-        payload = json.dumps({"phase": phase, "task_id": task_id, "round_token": round_token},
-                             ensure_ascii=False).encode("utf-8")
+        payload = json.dumps({
+            "phase": phase,
+            "task_id": task_id,
+            "round_token": round_token,
+            "runner": runner,
+            "allow_serial_stack": allow_serial_stack is True,
+        }, ensure_ascii=False).encode("utf-8")
         atomic_write_bytes(self.dir / "dispatch.json", payload)
         atomic_write_bytes(self.dir / "phase", phase.encode("utf-8"))
         atomic_write_bytes(self.dir / "current_task", task_id.encode("utf-8"))
@@ -1353,6 +1433,25 @@ class Workspace:
             if (not target.exists()) or target.read_bytes() != snap:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(snap)
+
+
+def workspace_has_managed_worker_identity(workspace) -> bool:
+    """Probe both durable copies before any reset/preflight side effect.
+
+    A managed worker is readonly to ordinary Loop entrypoints.  Looking at both
+    copies prevents ``--reset-state`` from erasing the runner field before the
+    guard and also fails closed while one copy is awaiting checkpoint recovery.
+    Malformed unrelated state is left to the existing loader/reset behavior.
+    """
+    for path in (workspace.state_path, workspace.checkpoint_path):
+        try:
+            payload = json.loads(read_regular_text(path, path.name))
+        except (FileNotFoundError, OSError, ValueError, UnicodeDecodeError,
+                json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload.get("runner") == parallel_worker.WORKER_RUNNER:
+            return True
+    return False
 
 
 def run_agent(cmd, prompt, repo, env, log_path, timeout_secs, on_started=None):
@@ -1524,6 +1623,261 @@ def run_validate(cmd, repo, timeout_secs=VALIDATE_TIMEOUT_SEC):
     return p.returncode == 0 and not timed_out, tail, timed_out
 
 
+def run_completion_gate(cmd, repo, env, timeout_secs):
+    """Run the supervisor-owned gate client and capture its strict JSON line.
+
+    The command itself is not allowed to mutate Git.  This helper only owns
+    process lifetime; response/schema and repository invariants are checked by
+    the caller.
+    """
+    child_env = dict(env)
+    if compat.IS_WINDOWS:
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["PYTHONUTF8"] = "1"
+    try:
+        process = subprocess.Popen(
+            cmd, cwd=str(repo), env=child_env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            **compat.popen_group_kwargs(),
+        )
+        compat.attach_process_group(process)
+    except (FileNotFoundError, OSError) as exc:
+        return 127, "", f"gate client 無法啟動:{exc}", False
+    timed_out = False
+    escaped = False
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_secs)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            safe_killpg(process, compat.FORCE_SIGNAL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        # 只等被直接 spawn 的 gate client；即使有逃逸子孫持有 pipe，也不可再用
+        # communicate() 無限等待 EOF。讀取工作交給 daemon threads 並設硬上限。
+        try:
+            process.wait(timeout=GATE_DRAIN_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                process.wait(timeout=GATE_DRAIN_TIMEOUT_SEC)
+            except subprocess.TimeoutExpired:
+                pass
+
+        drained = {"stdout": b"", "stderr": b""}
+
+        def _drain(name, stream):
+            try:
+                drained[name] = stream.read() or b""
+            except Exception:  # noqa: BLE001 - timeout cleanup must remain best effort
+                pass
+
+        drainers = []
+        for name in ("stdout", "stderr"):
+            stream = getattr(process, name, None)
+            if stream is None:
+                continue
+            thread = threading.Thread(target=_drain, args=(name, stream), daemon=True)
+            thread.start()
+            drainers.append(thread)
+        deadline = time.monotonic() + GATE_DRAIN_TIMEOUT_SEC
+        for thread in drainers:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        escaped = any(thread.is_alive() for thread in drainers)
+        stdout, stderr = drained["stdout"], drained["stderr"]
+    except KeyboardInterrupt:
+        try:
+            safe_killpg(process, compat.FORCE_SIGNAL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        process.wait()
+        raise
+    finally:
+        compat.close_process_group(process)
+    try:
+        stdout = (stdout if isinstance(stdout, str)
+                  else (stdout or b"").decode("utf-8", errors="strict"))
+        stderr = (stderr if isinstance(stderr, str)
+                  else (stderr or b"").decode("utf-8", errors="strict"))
+    except UnicodeError as exc:
+        return process.returncode, "", f"gate client 輸出不是合法 UTF-8:{exc}", timed_out
+    if escaped:
+        escape_note = "gate client timeout 後仍有程序持有 stdout/stderr pipe；輸出只取可安全讀到的部分"
+        stderr = (stderr.rstrip() + "\n" if stderr.strip() else "") + escape_note
+    return process.returncode, stdout or "", stderr or "", timed_out
+
+
+def apply_managed_completion_gate(state, repo, workspace, *, round_number, validated_sha,
+                                  timeout_seconds):
+    """Apply one exact-SHA gate result to a managed worker assignment."""
+    assignment = state["assignment"]
+    order = state["assigned_order"]
+    try:
+        gate_cmd = compat.split_command(state["complete_gate_cmd"])
+    except ValueError as exc:
+        gate_cmd = []
+        parse_error = f"gate command 格式錯誤:{exc}"
+    else:
+        parse_error = "" if gate_cmd else "gate command 不可為空"
+    if parse_error:
+        assignment.update({
+            "status": "blocked", "validated_sha": validated_sha,
+            "validated_round": round_number, "exit_reason": parse_error,
+            "gate_request": None,
+        })
+        state["done_count"] = 0
+        return f"⛔ task-{order} gate fatal｜{parse_error}"
+
+    before_gate = repository_snapshot(repo)
+    if (before_gate.dirty or before_gate.head != validated_sha
+            or before_gate.head_ref != state.get("task_ref")):
+        reason = (
+            "gate 前 worker snapshot 不再是剛驗證的乾淨 exact SHA"
+            f"（validated={validated_sha[:8]}、HEAD={before_gate.head[:8]}、"
+            f"ref={before_gate.head_ref or '(detached)'}、dirty={before_gate.dirty}）"
+        )
+        assignment.update({
+            "status": "blocked", "validated_sha": validated_sha,
+            "validated_round": round_number, "exit_reason": reason,
+            "gate_request": None,
+        })
+        state["done_count"] = 0
+        return f"⛔ task-{order} gate fatal｜{reason}"
+
+    request_id = uuid.uuid4().hex
+    gate_request = {
+        "request_id": request_id,
+        "validated_sha": validated_sha,
+        "validated_round": round_number,
+    }
+    assignment.update({
+        "status": "running", "validated_sha": validated_sha,
+        "validated_round": round_number, "exit_reason": None,
+        "gate_request": gate_request,
+    })
+    # 這是 request 的 durable commit point。若 worker 在 child claim 前後死亡，
+    # supervisor 會看到 durable gate_request 並 reconcile；worker 不可把同一完成票當新 request 重送。
+    workspace.save_state(state)
+    gate_env = expose_project_package({
+        **os.environ,
+        "RUN_ID": state["run_id"],
+        "TASK": str(order),
+        "REQUEST_ID": request_id,
+        "VALIDATED_SHA": validated_sha,
+        "VALIDATED_ROUND": str(round_number),
+        "RUN_CONFIG_HASH": state["run_config_hash"],
+        "LAUNCH_SPEC_HASH": state["launch_spec_hash"],
+        "MANIFEST_HASH": state["manifest_hash"],
+    })
+
+    returncode, stdout, stderr, timed_out = run_completion_gate(
+        gate_cmd, repo, gate_env, timeout_seconds)
+    after_gate = repository_snapshot(repo)
+    gate_mutated_repo = after_gate != before_gate
+    if timed_out:
+        reason = f"gate client 超過 {timeout_seconds:g} 秒；claim 狀態未知，必須 reconcile"
+        if gate_mutated_repo:
+            reason += "；且 gate client 違反唯讀契約並改變 worker Git snapshot"
+        assignment.update({
+            "status": "recovery-required", "validated_sha": validated_sha,
+            "validated_round": round_number, "exit_reason": reason,
+        })
+        state["done_count"] = 0
+        return f"⛔ task-{order} gate recovery-required｜{reason}"
+    if gate_mutated_repo:
+        reason = ("gate client 違反唯讀契約並改變 worker Git snapshot；"
+                  "claim 狀態不可再由 worker 推定，必須 reconcile")
+        assignment.update({
+            "status": "recovery-required", "validated_sha": validated_sha,
+            "validated_round": round_number, "exit_reason": reason,
+        })
+        state["done_count"] = 0
+        return f"⛔ task-{order} gate recovery-required｜{reason}"
+    try:
+        result = parallel_contract.parse_gate_response(
+            returncode, stdout,
+            run_id=state["run_id"], task=order, request_id=request_id,
+            validated_sha=validated_sha,
+        )
+    except parallel_contract.ParallelContractError as exc:
+        stderr_tail = "\n".join(stderr.strip().splitlines()[-10:])
+        reason = (f"gate protocol fatal:{exc}；claim 狀態未知，必須 reconcile"
+                  + (f"；stderr:{stderr_tail}" if stderr_tail else ""))
+        assignment.update({
+            "status": "recovery-required", "validated_sha": validated_sha,
+            "validated_round": round_number, "exit_reason": reason,
+        })
+        state["done_count"] = 0
+        return f"⛔ task-{order} gate recovery-required｜{reason}"
+
+    reason = result.reason
+    if result.status in {"merged", "already-merged"}:
+        assignment.update({
+            "status": "integrated", "validated_sha": validated_sha,
+            "validated_round": round_number, "exit_reason": None,
+            "gate_request": None,
+        })
+        state["done_count"] = 0
+        return f"✅ task-{order} 已由 supervisor gate 整合 @ {validated_sha[:8]}"
+    if result.status == "stale-integration":
+        state["done_count"] = 0
+        assignment.update({
+            "status": "running", "validated_sha": None,
+            "validated_round": None, "exit_reason": None,
+            "gate_request": None,
+        })
+        state["notes"].append(
+            "↪ integration 已前進；下一輪先同步 safe integration ref、完整 Validate，"
+            "再重新累計 done。")
+        return f"↪ task-{order} gate stale｜重新同步並收斂"
+    if result.status in {"busy", "supervisor-lost-before-claim"}:
+        assignment.update({
+            "status": "running", "validated_sha": None,
+            "validated_round": None, "exit_reason": None,
+            "gate_request": None,
+        })
+        state["notes"].append(
+            "⏳ gate 尚未 claim 且 client 已安全取消；保留 done 共識，下輪可重試。")
+        return f"⏳ task-{order} gate busy｜保留 done={state['done_count']}"
+
+    status_map = {
+        "paused": "paused",
+        "cancelled": "cancelled",
+        "fatal-invariant": "blocked",
+        "recovery-required-after-claim": "recovery-required",
+    }
+    assignment_status = status_map[result.status]
+    exit_reason = reason or result.status
+    terminal_update = {
+        "status": assignment_status, "validated_sha": validated_sha,
+        "validated_round": round_number, "exit_reason": exit_reason,
+    }
+    if assignment_status != "recovery-required":
+        terminal_update["gate_request"] = None
+    assignment.update(terminal_update)
+    state["done_count"] = 0
+    return f"⛔ task-{order} gate {assignment_status}｜{exit_reason}"
+
+
+def mark_managed_worker_blocked(state, reason) -> bool:
+    """Persist a controlled worker failure as supervisor-visible terminal state."""
+    if state.get("runner") != parallel_worker.WORKER_RUNNER:
+        return False
+    assignment = state.get("assignment")
+    if not isinstance(assignment, dict):
+        return False
+    assignment.update({
+        "status": "blocked",
+        "exit_reason": str(reason).strip() or "managed worker failure",
+        "gate_request": None,
+    })
+    state["done_count"] = 0
+    return True
+
+
 def render_task_list(state):
     """將 plan 投影成 prompt 內的精簡任務清單，標示完成與目前任務並限制單行長度。"""
     done_orders = {e["order"] for e in state["completed"]}
@@ -1544,10 +1898,16 @@ def render_task_list(state):
 
 def build_prompt(tpl_path, mapping):
     """以固定 placeholder 做純文字替換；不執行模板內容。"""
-    text = tpl_path.read_text(encoding="utf-8")
-    for k, v in mapping.items():
-        text = text.replace(f"<<{k}>>", v)
-    return text
+    template = tpl_path.read_text(encoding="utf-8")
+    placeholder_re = re.compile(r"<<([A-Z][A-Z0-9_]*)>>")
+    required = {match.group(1) for match in placeholder_re.finditer(template)}
+    missing = sorted(required - set(mapping))
+    if missing:
+        unresolved = [f"<<{name}>>" for name in missing]
+        raise ValueError(f"prompt placeholder 未完整注入:{', '.join(unresolved)}")
+    # 單次替換只解讀 template 本身的 token。GOAL/TASK/NOTES 等不可信文字即使含
+    # ``<<TOKEN>>`` 也保持原樣，不會被後續 mapping 項目二次替換或誤判為漏注入。
+    return placeholder_re.sub(lambda match: str(mapping[match.group(1)]), template)
 
 
 def coordinator_command(action, *args, python_executable=None):
@@ -1613,6 +1973,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
                         help="搭配 --import-plan:從規劃期(讓 agent 補完)或直接執行期開跑")
     parser.add_argument("--pause-after-plan", action="store_true",
                         help="規劃收斂後暫停:不自動進入執行期,人工按「▶ 運行」才開始執行輪")
+    parser.add_argument("--allow-serial-stack", action="store_true",
+                        help="明確允許普通 Loop 忽略 plan.stack 並依 order 串行執行")
     parser.add_argument("--max-rounds", type=int, default=0, help="總輪數上限;0=不限(測試用)")
     parser.add_argument("--reset-state", action="store_true", help="清掉 workspace state 從頭跑")
     parser.add_argument("--preflight-only", action="store_true",
@@ -1622,6 +1984,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
                         help="完成 preflight 並建立 stopped workspace/state 後退出，不啟動 agent")
     parser.add_argument("--resume-interrupted", action="store_true",
                         help="僅限已開始且有既有綠點的執行期輪次：保留現場並略過啟動 Validate")
+    parallel_worker.add_arguments(parser)
     return parser
 
 
@@ -1651,6 +2014,14 @@ def parse_runtime_options(argv=None) -> RuntimeOptions:
                                     args.reset_state or args.import_plan):
         parser.error("--resume-interrupted 不可搭配 --preflight-only、--init-only、"
                      "--reset-state 或 --import-plan")
+    worker_launch = parallel_worker.validate_launch_args(parser, args)
+    if worker_launch is not None and args.allow_serial_stack:
+        parser.error("managed worker 不可搭配 --allow-serial-stack；stack 由 supervisor 派工")
+    if worker_launch is not None and args.pause_after_plan:
+        parser.error("managed worker 固定從 exec 啟動，不可搭配 --pause-after-plan")
+    if worker_launch is not None and args.notify_cmd:
+        parser.error("managed worker 不可直接送全域 notify；終態通知由 supervisor 統一處理")
+    args.managed_worker_launch = worker_launch
 
     repo = Path(args.repo).resolve()
     workspace_name = args.name or repo.name
@@ -1698,10 +2069,14 @@ def guard_repository_baseline(repo: Path, protected, *, allow_dirty=False) -> No
 def run_preflight_check(repo: Path, validate_cmd, timeout_seconds: float) -> None:
     """執行不建立 state 的完整啟動健檢；失敗時以既有 fail-closed 路徑終止。"""
     log(f"🔎 Preflight 健檢（--preflight-only,不啟動 loop）｜驗證:{shlex.join(validate_cmd)}")
+    before_validate = repository_snapshot(repo)
     ok, tail, timed_out = run_validate(validate_cmd, repo, timeout_seconds)
-    if is_dirty(repo):
-        fail(f"preflight-only:validate `{shlex.join(validate_cmd)}` 執行後弄髒工作樹——"
-             "validate 必須只產生 ignored build artifacts。輸出尾段:\n" + tail)
+    after_validate = repository_snapshot(repo)
+    if after_validate != before_validate or after_validate.dirty:
+        effect = ("執行後弄髒工作樹" if after_validate.dirty
+                  else "執行後改變 HEAD/Git snapshot")
+        fail(f"preflight-only:validate `{shlex.join(validate_cmd)}` {effect}——"
+             "validate 不可 commit，也不可修改 tracked/untracked 原始碼。輸出尾段:\n" + tail)
     if not ok:
         timeout_note = f"（逾時 {timeout_seconds:g} 秒）" if timed_out else ""
         fail(f"preflight-only:驗證失敗{timeout_note}——全新啟動會被擋"
@@ -1713,14 +2088,18 @@ def establish_startup_green_anchor(repo: Path, workspace, state, protected,
                                    validate_cmd, timeout_seconds: float) -> None:
     """驗證目前 HEAD，或在紅燈時確認既有 last-green 仍是合法、安全的錨點。"""
     log(f"🔎 啟動前檢查｜執行驗證：{shlex.join(validate_cmd)}")
+    before_validate = repository_snapshot(repo)
     ok, tail, timed_out = run_validate(validate_cmd, repo, timeout_seconds)
+    after_validate = repository_snapshot(repo)
     # validator 若修改原始碼，就算 exit 0 也不能讓副作用混成下一輪 agent 變更。
-    if is_dirty(repo):
-        fail(f"啟動前驗證 `{shlex.join(validate_cmd)}` 執行後弄髒工作樹——"
-             "validate 必須只產生 ignored build artifacts,不能修改 tracked/untracked 原始碼。"
+    if after_validate != before_validate or after_validate.dirty:
+        effect = ("執行後弄髒工作樹" if after_validate.dirty
+                  else "執行後改變 HEAD/Git snapshot")
+        fail(f"啟動前驗證 `{shlex.join(validate_cmd)}` {effect}——"
+             "validate 必須只產生 ignored build artifacts,不能 commit 或修改 tracked/untracked 原始碼。"
              f"輸出尾段:\n{tail}")
     if ok:
-        state["last_green_sha"] = head_sha(repo)
+        state["last_green_sha"] = after_validate.head
         log(f"✅ 啟動前檢查完成｜驗證通過｜綠點 {state['last_green_sha'][:8]}")
         return
 
@@ -1833,7 +2212,7 @@ def reset_run_artifacts(workspace) -> None:
 
 def process_plan_round(state, workspace, round_token: str, *, tampered, changed,
                        agent_failed: bool, completion_missing: bool,
-                       flag_threshold: int) -> str:
+                       flag_threshold: int, allow_serial_stack: bool = False) -> str:
     """套用規劃期訊號與共識規則，必要時切換到執行期，回傳本輪事件摘要。"""
     event = ""
     if workspace.signal("called_create_plan", round_token):
@@ -1841,10 +2220,32 @@ def process_plan_round(state, workspace, round_token: str, *, tampered, changed,
         state["flag"] = 0
         pending = workspace.take_pending_plan(round_token)
         if pending is not None:
-            state["plan"] = pending
-            state["plan_version"] += 1
-            event = f"📝 計畫已更新｜v{state['plan_version']}｜共 {len(pending)} 條任務"
-            log(event)
+            from engine.work import (plan_has_stack, validate_plan,
+                                     validate_serial_stack_opt_in)
+            normalized, pending_errors = validate_plan(pending)
+            if not pending_errors and plan_has_stack(normalized):
+                pending_errors.append(
+                    "規劃期不接受 stack；請以 frozen plan 直接從 exec 啟動")
+            if not pending_errors:
+                pending_errors.extend(validate_serial_stack_opt_in(
+                    normalized, allow_serial_stack=allow_serial_stack))
+            if pending_errors:
+                state["notes"].append(
+                    f"⛔ create-plan ingest 已拒絕：{pending_errors[0]}")
+                event = f"⛔ create-plan ingest 已拒絕｜{pending_errors[0]}"
+                log(event)
+            elif plan_has_stack(state["plan"]) and normalized != state["plan"]:
+                # Planner prompt v1 不擁有 stack 語意。既有人工 stack 一旦載入就不可由
+                # create-plan 靜默移除或改寫；要改請離線產生新的 frozen plan 再 import。
+                state["notes"].append(
+                    "⚠️ 既有計畫含人工 stack，已拒絕 create-plan 改寫；請離線審核後重新 import。")
+                event = "⛔ 計畫含人工 stack｜拒絕 planner 改寫"
+                log(event)
+            else:
+                state["plan"] = normalized
+                state["plan_version"] += 1
+                event = f"📝 計畫已更新｜v{state['plan_version']}｜共 {len(normalized)} 條任務"
+                log(event)
         else:
             event = "❌ create-plan 校驗未通過｜保留原計畫"
             log(event)
@@ -1862,6 +2263,17 @@ def process_plan_round(state, workspace, round_token: str, *, tampered, changed,
         log("ℹ️ Agent 本輪未送出 create-plan 或 plan-ok｜repo 無異動，保留既有規劃共識")
 
     if state["flag"] > flag_threshold:
+        from engine.work import plan_has_stack, validate_serial_stack_opt_in
+        stack_errors = (["規劃期 plan 不可帶 stack；請以 frozen plan 直接從 exec 啟動"]
+                        if plan_has_stack(state["plan"]) else
+                        validate_serial_stack_opt_in(
+                            state["plan"], allow_serial_stack=allow_serial_stack))
+        if stack_errors:
+            state["flag"] = 0
+            state["notes"].append(f"⛔ plan→exec 已拒絕：{stack_errors[0]}")
+            event = f"⛔ plan→exec 已拒絕｜{stack_errors[0]}"
+            log(event)
+            return event
         state["phase"] = "exec"
         state["flag"] = 0
         state["current_order"] = 1
@@ -1878,10 +2290,33 @@ def process_plan_round(state, workspace, round_token: str, *, tampered, changed,
 
 def process_exec_round(state, workspace, round_token: str, *, task_id: str,
                        round_number: int, repo: Path, protected, validate_cmd,
-                       args, head_after: str, dirty: bool, tampered, changed,
+                       args, head_before: str, pre_validate_snapshot: RepositorySnapshot,
+                       tampered, changed, managed_block_reason=None,
                        agent_failed: bool, completion_missing: bool):
-    """套用執行期 done/Validate/reset 狀態機，回傳事件摘要與驗證結果。"""
+    """套用執行期 done/Validate/reset，並回傳 Validate 後 exact snapshot。"""
     event = ""
+    head_after = pre_validate_snapshot.head
+    if managed_block_reason is not None:
+        assignment = state.get("assignment")
+        if not isinstance(assignment, dict):
+            raise RuntimeError("managed worker 缺少 assignment state")
+        assignment.update({
+            "status": "blocked",
+            "validated_sha": None,
+            "validated_round": None,
+            "exit_reason": managed_block_reason,
+        })
+        state["done_count"] = 0
+        event = f"⛔ {task_id} blocked｜{managed_block_reason}"
+        log(event)
+        return event, "BLOCKED", pre_validate_snapshot, False
+    if state.get("runner") == parallel_worker.WORKER_RUNNER:
+        task_ref_error = managed_task_ref_error(repo, state["task_ref"])
+        if task_ref_error:
+            mark_managed_worker_blocked(state, task_ref_error)
+            event = f"⛔ {task_id} blocked｜{task_ref_error}"
+            log(event)
+            return event, "BLOCKED", repository_snapshot(repo), True
     done_signaled = workspace.signal("signal_done", round_token)
     create_signaled = workspace.signal("called_create_plan", round_token)
     log(f"📨 Agent 指令｜done {task_id}（回報任務完成）" if done_signaled
@@ -1891,11 +2326,33 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
 
     log(f"🧪 執行驗證｜命令：{shlex.join(validate_cmd)}")
     ok, tail, validate_timed_out = run_validate(validate_cmd, repo, args.validate_timeout)
-    validate_note = "PASS" if ok else "FAIL"
+    post_validate_snapshot = repository_snapshot(repo)
+    validator_changed_snapshot = post_validate_snapshot != pre_validate_snapshot
+    post_validate_rejected = validator_changed_snapshot or post_validate_snapshot.dirty
+    head_after = post_validate_snapshot.head
+    # stall 只反映 agent 在 validator 前是否推進 HEAD。Validator 自己 commit 是拒絕的
+    # side effect，不得藉此把 stall 歸零而永遠逃過 reset。
+    state["stall_rounds"] = (
+        0 if pre_validate_snapshot.head != head_before else state["stall_rounds"] + 1)
+
+    if state.get("runner") == parallel_worker.WORKER_RUNNER:
+        task_ref_error = managed_task_ref_error(repo, state["task_ref"])
+        if task_ref_error:
+            mark_managed_worker_blocked(state, task_ref_error)
+            state["notes"].append(f"⛔ Validator 後 task branch invariant 失敗：{task_ref_error}")
+            event = f"⛔ {task_id} blocked｜{task_ref_error}"
+            log(event)
+            return event, "SIDE-EFFECT", post_validate_snapshot, True
+
+    validate_note = ("FAIL" if not ok else
+                     "SIDE-EFFECT" if validator_changed_snapshot else
+                     "DIRTY" if post_validate_snapshot.dirty else "PASS")
     if ok:
-        log("✅ 驗證通過")
         state["red_streak"] = 0
-        if not dirty:
+        if post_validate_rejected:
+            log("⚠️ 驗證命令通過，但 Validate 後 Git snapshot 不可採納")
+        else:
+            log("✅ 驗證通過")
             state["last_green_sha"] = head_after
     else:
         timeout_note = f"｜逾時 {args.validate_timeout:g} 秒" if validate_timed_out else ""
@@ -1907,16 +2364,40 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
         state["notes"].append(
             f"❌ 上一輪結束後 `{shlex.join(validate_cmd)}` 失敗。先判斷是前一個 commit 沒做好、"
             f"還是前一個 agent 沒做完,把它修好讓驗證過了再繼續。輸出尾段:\n{fenced_block(tail)}")
+    if validator_changed_snapshot:
+        effects = []
+        if post_validate_snapshot.head != pre_validate_snapshot.head:
+            effects.append(
+                f"HEAD {pre_validate_snapshot.head[:8]}→{post_validate_snapshot.head[:8]}")
+        if post_validate_snapshot.head_ref != pre_validate_snapshot.head_ref:
+            effects.append(
+                f"HEAD ref {pre_validate_snapshot.head_ref or '(detached)'}→"
+                f"{post_validate_snapshot.head_ref or '(detached)'}")
+        if post_validate_snapshot.status != pre_validate_snapshot.status:
+            effects.append("index/worktree 狀態改變")
+        if post_validate_snapshot.dirty:
+            effects.append("Validate 後仍有 tracked/untracked dirty")
+        effect_text = "、".join(effects) or "Validate 後 snapshot 不乾淨"
+        state["done_count"] = 0
+        state["notes"].append(
+            f"⚠️ Validator side effect：{effect_text}。本輪 done 不採納；下一輪須對新 snapshot 重新驗證。")
+    elif post_validate_snapshot.dirty:
+        state["done_count"] = 0
+        state["notes"].append(
+            "⚠️ Validate 後 Git snapshot 仍為 dirty；本輪 done 不採納。"
+            "此 dirty 在 validator 前已存在。")
     if create_signaled:
         state["notes"].append("執行期計畫已凍結,create-plan 被忽略。任務本身有問題請在 log/commit 說明,交人處理。")
-    reset_consensus = (tampered or changed or create_signaled or
+    reset_consensus = (tampered or changed or post_validate_rejected or create_signaled or
                        (agent_failed and not completion_missing))
     if reset_consensus:
         state["done_count"] = 0
         reason = ("本輪被判定作廢" if tampered else
-                  "執行期誤打 create-plan，不能同時算完成票" if create_signaled else
-                  "偵測到程式碼或 commit 變更，等待下一輪確認" if changed else
-                  "Agent round 未正常結束")
+                   "執行期誤打 create-plan，不能同時算完成票" if create_signaled else
+                   "Validator 改變 Validate 後 snapshot" if validator_changed_snapshot else
+                   "偵測到程式碼或 commit 變更，等待下一輪確認" if changed else
+                   "Validate 後 snapshot 仍為 dirty" if post_validate_snapshot.dirty else
+                   "Agent round 未正常結束")
         log(f"↩️ done 共識歸零｜{reason}")
     elif done_signaled and ok and not agent_failed:
         state["done_count"] += 1
@@ -1925,26 +2406,39 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
         log(f"ℹ️ Agent 本輪未送出 done｜repo 無異動且驗證通過，保留 done 共識 {state['done_count']}")
 
     if state["done_count"] >= args.done_threshold:
-        task_base_sha = ensure_current_task_base_sha(state, repo, head_after)
-        completed_entry = {"order": state["current_order"], "sha": head_after,
-                           "round": round_number}
-        if task_base_sha:
-            completed_entry["base_sha"] = task_base_sha
-        state["completed"].append(completed_entry)
-        event = f"✅ {task_id} 完成(sha {head_after[:8]},{state['done_count']} 輪共識)"
-        log(event)
-        state["done_count"] = 0
-        next_order = next((task["order"] for task in state["plan"]
-                           if task["order"] > state["current_order"]), None)
-        if next_order is None:
-            state["phase"] = "done"
-            state["current_task_base_sha"] = None
-            state["red_streak"] = 0
-            state["stall_rounds"] = 0
+        if state.get("runner") == parallel_worker.WORKER_RUNNER:
+            event = apply_managed_completion_gate(
+                state, repo, workspace, round_number=round_number, validated_sha=head_after,
+                timeout_seconds=args.validate_timeout,
+            )
+            log(event)
+            gate_snapshot = repository_snapshot(repo)
+            if gate_snapshot != post_validate_snapshot:
+                post_validate_snapshot = gate_snapshot
+                post_validate_rejected = True
+            if state["assignment"]["status"] in parallel_contract.WORKER_QUIESCENT_STATUSES:
+                return event, validate_note, post_validate_snapshot, post_validate_rejected
         else:
-            state["current_order"] = next_order
-            # 下一個 task 的起點就是上一個 task 收斂完成的 HEAD；後續多輪不得更新。
-            state["current_task_base_sha"] = head_after
+            task_base_sha = ensure_current_task_base_sha(state, repo, head_after)
+            completed_entry = {"order": state["current_order"], "sha": head_after,
+                               "round": round_number}
+            if task_base_sha:
+                completed_entry["base_sha"] = task_base_sha
+            state["completed"].append(completed_entry)
+            event = f"✅ {task_id} 完成(sha {head_after[:8]},{state['done_count']} 輪共識)"
+            log(event)
+            state["done_count"] = 0
+            next_order = next((task["order"] for task in state["plan"]
+                               if task["order"] > state["current_order"]), None)
+            if next_order is None:
+                state["phase"] = "done"
+                state["current_task_base_sha"] = None
+                state["red_streak"] = 0
+                state["stall_rounds"] = 0
+            else:
+                state["current_order"] = next_order
+                # 下一個 task 的起點就是上一個 task 收斂完成的 HEAD；後續多輪不得更新。
+                state["current_task_base_sha"] = head_after
 
     reset_reason = ""
     if state["phase"] == "exec":
@@ -1953,24 +2447,31 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
         elif state["stall_rounds"] >= args.stall_limit:
             reset_reason = f"HEAD 停滯 {state['stall_rounds']} 輪"
     if not reset_reason:
-        return event, validate_note
+        return event, validate_note, post_validate_snapshot, post_validate_rejected
 
     green = state["last_green_sha"]
     git(repo, "reset", "--hard", green)
     git(repo, "clean", "-fd")
     workspace.restore_protected(repo, protected)
     if head_sha(repo) != green or is_dirty(repo):
+        reason = (f"reset 回綠點 {green[:8]} 後工作樹不符預期"
+                  f"（HEAD={head_sha(repo)[:8]}、dirty={is_dirty(repo)}）")
+        mark_managed_worker_blocked(state, reason)
         workspace.save_state(state)
         notify(args.notify_cmd, "reset_broken", workspace.dir.name)
-        fail(f"reset 回綠點 {green[:8]} 後工作樹不符預期"
-             f"（HEAD={head_sha(repo)[:8]}、dirty={is_dirty(repo)}）——"
+        fail(f"{reason}——"
              f"綠點錨定不可信，停機交由人員確認。詳見 {workspace.history}")
     previous_order = state["current_order"]
     previous_base = state.get("current_task_base_sha")
     state["completed"] = [entry for entry in state["completed"]
                           if is_ancestor(repo, entry["sha"], green)]
-    state["current_order"] = ((state["completed"][-1]["order"] + 1) if state["completed"] else
-                              (state["plan"][0]["order"] if state["plan"] else 1))
+    if state.get("runner") == parallel_worker.WORKER_RUNNER:
+        state["completed"] = []
+        state["current_order"] = state["assigned_order"]
+    else:
+        state["current_order"] = (
+            (state["completed"][-1]["order"] + 1) if state["completed"] else
+            (state["plan"][0]["order"] if state["plan"] else 1))
     if (state["current_order"] != previous_order or not previous_base or
             not is_ancestor(repo, previous_base, green)):
         state["current_task_base_sha"] = (state["completed"][-1]["sha"]
@@ -1984,11 +2485,41 @@ def process_exec_round(state, workspace, round_token: str, *, task_id: str,
     state["notes"].append(f"🔄 迴圈已 reset --hard 回最後綠點 {green[:8]}({reset_reason})。"
                           "之前未收斂的工作已捨棄,請照當前任務重做。")
     if args.stuck_stop and state["task_reset_counts"][key] >= args.stuck_stop_count:
+        reason = (f"stuck-stop：task-{state['current_order']} 已 reset "
+                  f"{state['task_reset_counts'][key]} 次")
+        mark_managed_worker_blocked(state, reason)
         workspace.save_state(state)
         notify(args.notify_cmd, "stuck_stop", workspace.dir.name)
-        fail(f"stuck-stop：task-{state['current_order']} 已 reset {state['task_reset_counts'][key]} 次，"
-             f"停機交由人員確認。詳見 {workspace.history}")
-    return event, validate_note
+        fail(f"{reason}，停機交由人員確認。詳見 {workspace.history}")
+    return event, validate_note, repository_snapshot(repo), post_validate_rejected
+
+
+def runtime_config_snapshot(args, repo, agent_cmd, validate_cmd) -> dict:
+    """Canonical runtime values persisted by Loop and frozen for managed workers."""
+    return {
+        "flag_threshold": args.flag_threshold,
+        "done_threshold": args.done_threshold,
+        "red_limit": args.red_limit,
+        "stall_limit": args.stall_limit,
+        "stuck_stop": bool(args.stuck_stop),
+        "stuck_stop_count": args.stuck_stop_count,
+        "round_timeout": args.round_timeout,
+        "agent_backoff_max": args.agent_backoff_max,
+        "validate_timeout": args.validate_timeout,
+        "max_rounds": args.max_rounds,
+        "pause_after_plan": bool(args.pause_after_plan),
+        "allow_serial_stack": bool(args.allow_serial_stack),
+        "notify_cmd": args.notify_cmd,
+        "repo": str(repo),
+        # Windows 只在實際 spawn 時解析 python/.cmd 等 launcher；state 保留
+        # Dashboard/parent 傳入的設定值，讓 immutable resume 能逐欄比較。
+        "agent_cmd": (str(args.agent_cmd).strip() if compat.IS_WINDOWS
+                      else compat.join_command(agent_cmd)),
+        "validate_cmd": (str(args.validate_cmd).strip() if compat.IS_WINDOWS
+                         else compat.join_command(validate_cmd)),
+        "goal": args.goal,
+        "plan_doc": args.plan_doc,
+    }
 
 
 def main(argv=None):
@@ -2001,6 +2532,8 @@ def main(argv=None):
     validate_cmd = options.validate_cmd
     protected = options.protected
     plan_doc_display = options.plan_doc_display
+    worker_launch = args.managed_worker_launch
+    requested_runtime_config = runtime_config_snapshot(args, repo, agent_cmd, validate_cmd)
 
     # preflight 失敗也必須出現在 dashboard 的完整 console。舊流程直到所有 git
     # 檢查通過後才設定 console，導致「pid 出現後立刻停止」卻完全看不到原因。
@@ -2011,6 +2544,13 @@ def main(argv=None):
     configure_console(ws.dir / "console.log")
     acquire_run_lock(ws.dir / ".run.lock", f"workspace '{ws.dir.name}'")
     state_exists = ws.state_path.exists() or ws.checkpoint_path.exists()
+    persisted_managed_worker = workspace_has_managed_worker_identity(ws)
+    if persisted_managed_worker and (worker_launch is None or not worker_launch.resume):
+        fail("managed parallel worker 是 parent supervisor 的 readonly workspace；"
+             "普通 run/reset/import/preflight 不可接手或覆寫")
+    if worker_launch is not None and not worker_launch.resume and state_exists:
+        fail("managed worker 首次啟動拒絕覆寫既有 state；crash 現場只能用 "
+             "--managed-worker-resume 與同一份 immutable assignment 接手")
     if args.init_only and state_exists and not args.reset_state:
         fail(f"workspace '{ws.dir.name}' 已初始化；請改用高階 CLI 的 run/restart，"
              "或明確加 --reset-state 重新初始化")
@@ -2018,7 +2558,11 @@ def main(argv=None):
     if not args.preflight_only:  # 健檢模式不得動到既有啟動 handshake 檔
         startup_ready.unlink(missing_ok=True)
 
-    guard_repository_baseline(repo, protected, allow_dirty=args.resume_interrupted)
+    guard_repository_baseline(
+        repo, protected,
+        allow_dirty=(args.resume_interrupted
+                     or (worker_launch is not None and worker_launch.resume)),
+    )
     if args.preflight_only:
         run_preflight_check(repo, validate_cmd, args.validate_timeout)
         return
@@ -2050,6 +2594,27 @@ def main(argv=None):
         fail(f"workspace '{ws.dir.name}' 綁定的是 {bound_repo},但這次 --repo 是 {repo}。"
              f"同名 workspace 指到不同 repo 會用錯 plan/SHA——換個 --name,或加 --reset-state 重來。")
 
+    if state.get("runner") == parallel_worker.WORKER_RUNNER and worker_launch is None:
+        fail("managed parallel worker 只能由 parent supervisor 以 immutable assignment 啟動；"
+             "普通 run/resume/reset 不可接手")
+    if worker_launch is not None and worker_launch.resume:
+        try:
+            parallel_worker.validate_resume_state(state, worker_launch)
+        except parallel_contract.ParallelContractError as exc:
+            fail(f"managed worker resume state 不符:{exc}")
+        if state.get("config") != requested_runtime_config:
+            # argv 是 caller 輸入；未來 supervisor authority 驗證前不可讓偽造 caller
+            # 藉一個漂移參數把合法 worker 永久 terminalize。只拒絕本次啟動，state 不變。
+            fail("managed worker resume runtime argv 與首次 immutable config 不一致")
+    if not args.import_plan and worker_launch is None:
+        from engine.work import plan_has_stack, validate_serial_stack_opt_in
+        if state.get("phase") == "plan" and plan_has_stack(state.get("plan", [])):
+            fail("規劃期 plan 不可帶 stack；請匯入 frozen plan 並直接從 exec 啟動")
+        stack_errors = validate_serial_stack_opt_in(
+            state.get("plan", []), allow_serial_stack=args.allow_serial_stack)
+        if stack_errors:
+            fail(stack_errors[0])
+
     if args.resume_interrupted:
         blocked = interrupted_resume_block_reason(repo, ws.dir, state, protected)
         if blocked:
@@ -2068,12 +2633,17 @@ def main(argv=None):
 
     # 選配:CLI 匯入 plan.json(重置 state,選起跑階段)——dashboard 匯入的 CLI 等價
     if args.import_plan:
-        from engine.work import validate_plan
+        from engine.work import plan_has_stack, validate_plan, validate_serial_stack_opt_in
         try:
             plan_obj = json.loads(Path(args.import_plan).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
             fail(f"--import-plan 讀取/解析失敗:{e}")
         normalized, errs = validate_plan(plan_obj)
+        if not errs and plan_has_stack(normalized) and args.start_phase != "exec":
+            errs.append("含 stack 的 frozen plan 必須直接從 exec 啟動")
+        if not errs and worker_launch is None:
+            errs.extend(validate_serial_stack_opt_in(
+                normalized, allow_serial_stack=args.allow_serial_stack))
         if errs:
             fail("plan.json 校驗未過:\n- " + "\n- ".join(errs))
         state = ws.fresh_state()
@@ -2082,18 +2652,34 @@ def main(argv=None):
         state["phase"] = args.start_phase
         if args.start_phase == "exec":
             state["current_order"] = normalized[0]["order"]
+        if worker_launch is not None:
+            try:
+                state = parallel_worker.initialize_state(state, worker_launch)
+            except parallel_contract.ParallelContractError as exc:
+                fail(f"managed worker assignment 不符合 frozen plan:{exc}")
         log(f"📝 匯入計畫｜{len(normalized)} 條｜從 {'規劃期' if args.start_phase == 'plan' else '執行期'} 開始")
 
+    if worker_launch is not None:
+        task_ref_error = managed_task_ref_error(repo, worker_launch.task_ref)
+        if task_ref_error:
+            if worker_launch.resume and mark_managed_worker_blocked(state, task_ref_error):
+                ws.save_state(state)
+            fail(f"managed worker task branch 不符:{task_ref_error}")
+
     fresh_start = bool(args.reset_state or args.import_plan)
+    skip_startup_validate = bool(
+        args.resume_interrupted or (worker_launch is not None and worker_launch.resume))
     # 一般 run 要先拍快照供舊綠點驗證；Resume 已在人工確認資格後重建當前基準；
     # reset/import 延後到 Validate 綠後，
     # 失敗的 staged 啟動就不會改掉舊 state 對應的 protected snapshot。
-    if not fresh_start and not args.resume_interrupted:
+    if not fresh_start and not skip_startup_validate:
         ws.snapshot_protected(repo, protected)
 
-    if not args.resume_interrupted:
+    if not skip_startup_validate:
         establish_startup_green_anchor(
             repo, ws, state, protected, validate_cmd, args.validate_timeout)
+    elif worker_launch is not None and worker_launch.resume:
+        log("Managed worker Resume｜保留中斷現場並略過啟動 Validate；第一輪仍須完整驗證")
 
     if fresh_start:
         ws.snapshot_protected(repo, protected)
@@ -2121,23 +2707,7 @@ def main(argv=None):
     state["agent_backoff_seconds"] = 0
     state["agent_backoff_until"] = None
     # dashboard 靠 config 做 workspace 掃描與一鍵 run(agent_cmd 會再對 config 白名單驗過才准跑)
-    state["config"] = {"flag_threshold": args.flag_threshold, "done_threshold": args.done_threshold,
-                       "red_limit": args.red_limit, "stall_limit": args.stall_limit,
-                       "stuck_stop": bool(args.stuck_stop),
-                       "stuck_stop_count": args.stuck_stop_count,
-                       "round_timeout": args.round_timeout,
-                       "agent_backoff_max": args.agent_backoff_max,
-                       "validate_timeout": args.validate_timeout,
-                       "pause_after_plan": bool(args.pause_after_plan),
-                       "notify_cmd": args.notify_cmd,
-                       "repo": str(repo),
-                       # Windows 只在實際 spawn 時解析 python/.cmd 等 launcher；state 保留
-                       # Dashboard 傳入的設定值，讓「以此為範本」仍能命中同一個白名單選項。
-                       "agent_cmd": (str(args.agent_cmd).strip() if compat.IS_WINDOWS
-                                     else compat.join_command(agent_cmd)),
-                       "validate_cmd": (str(args.validate_cmd).strip() if compat.IS_WINDOWS
-                                        else compat.join_command(validate_cmd)),
-                       "goal": args.goal, "plan_doc": args.plan_doc}
+    state["config"] = requested_runtime_config
     state["repo_binding"] = str(repo)
     # 舊 session 的停止請求不可跨重啟生效；先清掉，再公開新 pid/session_id。
     ws.stop_after_round_path.unlink(missing_ok=True)
@@ -2201,7 +2771,11 @@ def main(argv=None):
     # Python executable 的絕對路徑，避免 PATH 指到另一套 Python。
     create_cmd = coordinator_command("create-plan")
     planok_cmd = coordinator_command("plan-ok")
-    issue_cmd = coordinator_command("issue")
+    managed_worker = state.get("runner") == parallel_worker.WORKER_RUNNER
+    issue_cmd = (coordinator_command("block", "--reason") if managed_worker
+                 else coordinator_command("issue"))
+    sync_integration = (parallel_contract.managed_sync_instructions(
+        state["integration_ref"], issue_cmd) if managed_worker else "")
     base_env = expose_project_package({**os.environ, "LOOP_WS": str(ws.dir)})
 
     phase_name = "規劃期" if state["phase"] == "plan" else "執行期"
@@ -2241,23 +2815,39 @@ def main(argv=None):
         try:
             goal_path = repo_relative_path(repo, args.goal)
         except ValueError as e:
+            mark_managed_worker_blocked(state, f"goal 路徑不合法：{e}")
             ws.save_state(state)
             fail(f"goal 路徑不合法：{e}")
         if not goal_path.exists():
+            mark_managed_worker_blocked(
+                state, f"{args.goal} 不存在（每輪啟動前檢查）")
             ws.save_state(state)
-            notify(args.notify_cmd, "goal_missing", ws.dir.name)
+            if not managed_worker:
+                notify(args.notify_cmd, "goal_missing", ws.dir.name)
             fail(f"{args.goal} 不存在（每輪啟動前檢查）——請補回並 commit 後再啟動")
+        if managed_worker:
+            task_ref_error = managed_task_ref_error(repo, state["task_ref"])
+            if task_ref_error:
+                mark_managed_worker_blocked(state, task_ref_error)
+                ws.save_state(state)
+                fail(f"managed worker 啟動 Agent 前 task branch 不符:{task_ref_error}")
 
         # 派工資訊落地(work.py 靠原子 dispatch 做 phase/task/token 當場核對)
         cur_task = next((t for t in state["plan"] if t["order"] == state["current_order"]), None)
         if phase == "exec" and cur_task is None:
+            mark_managed_worker_blocked(
+                state, f"執行期找不到 current_order={state['current_order']} 的任務")
             ws.save_state(state)
             fail(f"執行期找不到 current_order={state['current_order']} 的任務"
                  f"（plan {len(state['plan'])} 條）——state 不合法，停機交由人員確認")
         task_id = f"task-{state['current_order']}" if (phase == "exec" and cur_task) else ""
         ws.clear_signals()
         round_token = uuid.uuid4().hex
-        ws.write_dispatch(phase, task_id, round_token)
+        ws.write_dispatch(
+            phase, task_id, round_token,
+            runner=state.get("runner", "loop"),
+            allow_serial_stack=args.allow_serial_stack,
+        )
         round_started = datetime.now().astimezone()
         state["round_started_at"] = round_started.isoformat(timespec="seconds")
         state["round_deadline_at"] = ((round_started + timedelta(seconds=args.round_timeout * 60))
@@ -2288,6 +2878,7 @@ def main(argv=None):
                 "DONE_CMD": done_cmd,
                 "ISSUE_CMD": issue_cmd,
                 "VALIDATE_CMD": shlex.join(validate_cmd),
+                "SYNC_INTEGRATION": sync_integration,
                 "NOTES": notes_text,
             })
         prompt_path = ws.dir / "prompts" / f"round-{rnd:04d}.md"
@@ -2316,12 +2907,15 @@ def main(argv=None):
         # Agent process 已結束的當下先保存是否送出該 phase 的完成回報；Plan 的
         # create-plan / plan-ok 是 DONE 等價訊號，Exec 則是 done。後續竄改／逾時
         # 可能清除 coordinator signals，但不能因此失去這個觀測事實。
+        managed_block_reason = (
+            ws.pending_block_reason(round_token, task_id)
+            if managed_worker and phase == "exec" else None)
         agent_reported_done = (
             (phase == "plan" and (ws.signal("called_create_plan", round_token) or
                                   ws.signal("signal_plan_ok", round_token))) or
             (phase == "exec" and ws.signal("signal_done", round_token))
         )
-        missing_done = not agent_reported_done
+        missing_done = not (agent_reported_done or managed_block_reason is not None)
         state["last_round_seconds"] = round(secs, 3)
         state["last_round_timed_out"] = bool(timed_out)
         state["round_started_at"] = None
@@ -2331,6 +2925,21 @@ def main(argv=None):
         if timed_out:
             state["notes"].append(f"⚠️ 上一輪 agent 超過 {args.round_timeout:g} 分鐘被強制終止,"
                                   "工作可能做到一半——工作區殘留照「收拾現場」步驟判斷。")
+
+        # managed worker 在任何 reset/clean 前再次驗 task ref。Agent 可能在本輪切到
+        # 同 SHA 的 sibling branch；若先 reset --hard，會移動錯誤 branch ref。此時只留下
+        # structured blocked 現場交 supervisor/human reconcile，絕不自動 checkout/reset。
+        if managed_worker:
+            post_agent_task_ref_error = managed_task_ref_error(repo, state["task_ref"])
+            if post_agent_task_ref_error:
+                if managed_block_reason:
+                    post_agent_task_ref_error += f"；agent block 回報：{managed_block_reason}"
+                mark_managed_worker_blocked(state, post_agent_task_ref_error)
+                state["notes"].append(
+                    f"⛔ Agent 後、repo cleanup 前 task branch invariant 失敗："
+                    f"{post_agent_task_ref_error}")
+                ws.save_state(state)
+                fail(f"managed worker task branch 不符:{post_agent_task_ref_error}")
 
         # ---- 協調層竄改偵測:整輪作廢(reset --hard 回輪初 sha) ----
         tampered = []
@@ -2365,12 +2974,17 @@ def main(argv=None):
             # reset --hard 只清 repo，token-scoped pending plan 在 workspace 清不到，必須顯式丟棄——
             # 否則規劃期會把「同一輪偷改 goal + create-plan」提交的髒 plan 當成真相收進去。
             ws.clear_signals()
+            managed_block_reason = None
             log(f"⚠️ 本輪作廢｜偵測到不允許的變更：{', '.join(tampered)}｜相關 signal 已丟棄")
 
         # 不同 Agent CLI 對 exit code 的定義不一致，因此 rc 只供 log 診斷，不參與
-        # round 成敗。唯一的完成依據是該 phase 的 coordinator 訊號；逾時則仍作廢，
-        # 避免已失控、未按 prompt 在回報後停止的程序被算成完整一輪。
-        agent_failed = not agent_reported_done or timed_out
+        # round 成敗。done/plan-ok 是完成票，逾時必須作廢；但 managed block 是 fail-closed
+        # terminal 訊號，不是成功票。token/task 驗證通過後，即使 agent 回報後未及退出而 timeout，
+        # 也必須保留 blocked，不能再開下一輪或跑 validator/gate。
+        agent_failed = (
+            not (agent_reported_done or managed_block_reason is not None)
+            or (timed_out and managed_block_reason is None)
+        )
         if agent_failed:
             state["agent_failure_streak"] = state.get("agent_failure_streak", 0) + 1
             ws.clear_signals()
@@ -2385,23 +2999,29 @@ def main(argv=None):
                 log(f"✅ Agent 完成回報已恢復｜連續異常 {state['agent_failure_streak']} 輪後收到有效訊號")
             state["agent_failure_streak"] = 0
 
-        head_after = head_sha(repo)
-        dirty = is_dirty(repo)
+        pre_validate_snapshot = repository_snapshot(repo)
+        head_after = pre_validate_snapshot.head
+        dirty = pre_validate_snapshot.dirty
         changed = dirty or (head_after != head_before)
-        state["stall_rounds"] = 0 if head_after != head_before else state["stall_rounds"] + 1
 
         if phase == "plan":
+            state["stall_rounds"] = 0 if head_after != head_before else state["stall_rounds"] + 1
             event = process_plan_round(
                 state, ws, round_token, tampered=tampered, changed=changed,
                 agent_failed=agent_failed, completion_missing=missing_done,
-                flag_threshold=args.flag_threshold)
+                flag_threshold=args.flag_threshold,
+                allow_serial_stack=args.allow_serial_stack)
             validate_note = "-"
         else:
-            event, validate_note = process_exec_round(
+            event, validate_note, post_validate_snapshot, post_validate_rejected = process_exec_round(
                 state, ws, round_token, task_id=task_id, round_number=rnd, repo=repo,
                 protected=protected, validate_cmd=validate_cmd, args=args,
-                head_after=head_after, dirty=dirty, tampered=tampered, changed=changed,
+                head_before=head_before, pre_validate_snapshot=pre_validate_snapshot,
+                tampered=tampered, changed=changed,
+                managed_block_reason=managed_block_reason,
                 agent_failed=agent_failed, completion_missing=missing_done)
+            head_after = post_validate_snapshot.head
+            changed = changed or post_validate_rejected
 
         # 規劃期可能在本輪剛切入 exec；在 state 落盤前建立 task-1 的不可變起點。
         # 一般 exec 輪也用同一 helper 為舊版缺欄位 state 做向下相容補記。
@@ -2449,6 +3069,11 @@ def main(argv=None):
             log(f"⏳ Agent 連續未完成 {state['agent_failure_streak']} 輪｜{retry_delay:g} 秒後重試"
                 f"（上限 {args.agent_backoff_max:g} 秒）")
         ws.save_state(state)
+        assignment_status = ((state.get("assignment") or {}).get("status")
+                             if managed_worker else None)
+        if assignment_status in parallel_contract.WORKER_QUIESCENT_STATUSES:
+            log(f"⏹ Managed worker 已進入 {assignment_status}｜保留 phase=exec，交回 supervisor")
+            break
         stop_after_round = ws.take_stop_after_round(os.getpid(), session_id)
         if retry_delay and not stop_after_round:
             try:
