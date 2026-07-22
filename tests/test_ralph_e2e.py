@@ -185,7 +185,11 @@ class TestRalphDashboardE2E(unittest.TestCase):
         self.assertEqual(block["stories_total"], 2)
         self.assertEqual(block["stories_done"], 2)
         self.assertEqual(block["exit_reason"], "completed")
-        self.assertTrue(block["sentinel_complete"])
+        if os.name != "nt":
+            # 真 ralph.sh 用 `tee /dev/stderr` 把 agent 輸出回聲給監督層;Git Bash/MSYS
+            # 下該管道不可靠,sentinel 只存在於 ralph.sh 內部擷取。監督層改以「全部
+            # story 通過」備援判定收斂(上面的 exit_reason=completed 已驗證該路徑)。
+            self.assertTrue(block["sentinel_complete"])
         self.assertGreaterEqual(block["commit_count"], 2)
         self.assertIsNone(block["usage_limit"])
 
