@@ -385,8 +385,9 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   const templateRepoValue = await templateLauncher.getByRole("combobox", { name: "Repo" }).inputValue();
   if (templateRepoValue === "__custom__") {
     // state.config.repo 是 loop.py resolve() 過的絕對路徑；本機 /tmp 若走 symlink（如 macOS）
-    // 可能與 config.repos 掃到的未 resolve 字串不同，此時預填會落到手動輸入欄，仍指向同一個 repo。
-    await expect(templateLauncher.getByLabel("Repo 路徑")).toHaveValue(/\/demo-repo$/);
+    // 或 Windows 的 8.3 短檔名展開，可能與 config.repos 掃到的字串不同，此時預填會落到
+    // 手動輸入欄，仍指向同一個 repo（分隔符依平台可能是 / 或 \）。
+    await expect(templateLauncher.getByLabel("Repo 路徑")).toHaveValue(/[\\/]demo-repo$/);
   } else {
     expect(templateRepoValue).toBe(originalRepo);
   }

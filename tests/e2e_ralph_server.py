@@ -85,16 +85,19 @@ def prepare_fixture():
 
     bindir = fixture / "bin"
     bindir.mkdir()
-    claude = bindir / ("claude.cmd" if os.name == "nt" else "claude")
-    if os.name == "nt":
-        claude.write_text(
-            f'@echo off\n"{sys.executable}" "{FIXTURES / "fake_agent.py"}" %*\n', encoding="utf-8")
-    else:
-        claude.write_text(
-            "#!/usr/bin/env bash\n"
-            f'exec {shutil.which("python3") or sys.executable} "{FIXTURES / "fake_agent.py"}" "$@"\n',
-            encoding="utf-8")
+    # 真 ralph.sh 是在 Git Bash 內呼叫裸名 `claude`,而 MSYS bash 只解析無副檔名檔或
+    # .exe(不吃 .cmd),所以任何平台都要有 shebang 版 wrapper;路徑用 as_posix 加引號,
+    # Windows 反斜線嵌進 bash script 會被當跳脫字元吃掉。
+    claude = bindir / "claude"
+    claude.write_text(
+        "#!/usr/bin/env bash\n"
+        f'exec "{Path(sys.executable).as_posix()}" "{(FIXTURES / "fake_agent.py").as_posix()}" "$@"\n',
+        encoding="utf-8")
     claude.chmod(0o755)
+    if os.name == "nt":
+        # 無 bash 退路(fake_ralph.py)或其他 cmd-based 呼叫仍可用 .cmd 版。
+        (bindir / "claude.cmd").write_text(
+            f'@echo off\n"{sys.executable}" "{FIXTURES / "fake_agent.py"}" %*\n', encoding="utf-8")
 
     env = {
         **os.environ,
