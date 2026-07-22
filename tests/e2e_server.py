@@ -18,6 +18,16 @@ def run(*args, cwd):
     subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True)
 
 
+def canonical_cmd(argv):
+    """與 loop 寫回 state.config 的命令正規形一致(POSIX=shlex、Windows=原生引號)。
+
+    範本預填靠字串比對命中選項;config 裡的命令若不是正規形(例如雙引號包 -c 參數),
+    round-trip 後字串不同,E2E 的「以此為範本啟動」會誤落到自訂欄位。Windows 上
+    shlex.join 的單引號也會讓 CommandLineToArgvW 把引號當字面值,命令根本跑不起來。
+    """
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
+
 def prepare_fixture():
     """建立隔離 repo、假 Agent 與個人設定，確保 E2E 不碰使用者真實 workspace。"""
     fixture = Path(tempfile.mkdtemp(prefix="loop-lite-e2e-"))
@@ -75,12 +85,12 @@ def prepare_fixture():
     config = {
         # 各留兩個選項：讓 E2E 能以「非第一項」啟動，驗證範本預填不是表單初始值的假陽性。
         "agent_cmds": [
-            {"label": "fake agent", "cmd": shlex.join([sys.executable, str(fake_agent)])},
-            {"label": "fake agent alt", "cmd": shlex.join([sys.executable, str(fake_agent), "--alt"])},
+            {"label": "fake agent", "cmd": canonical_cmd([sys.executable, str(fake_agent)])},
+            {"label": "fake agent alt", "cmd": canonical_cmd([sys.executable, str(fake_agent), "--alt"])},
         ],
         "validate_cmds": [
             {"label": "always green", "cmd": "true"},
-            {"label": "always green alt", "cmd": "python -c \"raise SystemExit(0)\""},
+            {"label": "always green alt", "cmd": canonical_cmd([sys.executable, "-c", "raise SystemExit(0)"])},
         ],
         "repo_roots": [str(repos)],
         "notify_cmd": "",

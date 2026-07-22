@@ -70,6 +70,10 @@ class TestRalphDashboardE2E(unittest.TestCase):
         if not ok:
             shutil.rmtree(cls.fixture, ignore_errors=True)
             raise unittest.SkipTest("無法 clone snarktank/ralph(可能無網路),跳過端到端測試")
+        # CI runner 沒有全域 git identity;fake agent 的 commit 會靜默失敗,commit_count 恆為 0。
+        for key, value in (("user.email", "ralph-e2e@example.invalid"),
+                           ("user.name", "Ralph E2E Test")):
+            subprocess.run(["git", "-C", str(cls.clone), "config", key, value], check=True)
 
         # 隔離 PATH 內的 fake `claude`:真正 ralph.sh 會呼叫它;此 wrapper 轉呼 fake_agent.py。
         cls.bindir = cls.fixture / "bin"

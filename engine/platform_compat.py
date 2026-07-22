@@ -172,6 +172,35 @@ def split_command(command: str) -> list[str]:
         ctypes.windll.kernel32.LocalFree(argv)
 
 
+def _resolve_windows_posix_shell(executable, found):
+    """Map a bare ``bash``/``sh`` to Git's POSIX shell on Windows.
+
+    ``System32\\bash.exe`` is the WSL launcher, not a POSIX shell: without an
+    installed distribution it prints an UTF-16 error and exits 1, silently
+    breaking every ``bash script.sh`` invocation.  Only that stub (or a missing
+    lookup) is overridden — a real shell already on PATH is respected.
+    """
+    name = Path(executable).name.casefold()
+    if name not in {"bash", "bash.exe", "sh", "sh.exe"}:
+        return None
+    if found is not None:
+        system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        stub_dirs = {str((system_root / sub)).casefold() for sub in ("System32", "Sysnative")}
+        if str(Path(found).parent).casefold() not in stub_dirs:
+            return None
+    git_path = shutil.which("git")
+    if not git_path:
+        return None
+    stem = "sh.exe" if name.startswith("sh") else "bash.exe"
+    git_dir = Path(git_path).resolve().parent
+    for root in (git_dir.parent, git_dir.parent.parent):
+        for sub in ("bin", "usr/bin"):
+            candidate = root / sub / stem
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
 def resolve_command(args) -> list[str]:
     """Resolve Windows launcher aliases that ``CreateProcess`` cannot execute."""
     values = [str(value) for value in args]
@@ -179,6 +208,10 @@ def resolve_command(args) -> list[str]:
         return values
     executable = values[0]
     found = shutil.which(executable)
+    posix_shell = _resolve_windows_posix_shell(executable, found)
+    if posix_shell is not None:
+        values[0] = posix_shell
+        return values
     portable_builtin = Path(executable).name.casefold()
     if found is None and portable_builtin in {"true", "true.exe"}:
         return [sys.executable, "-c", "raise SystemExit(0)", *values[1:]]
@@ -309,6 +342,21 @@ def process_looks_like_python(pid) -> bool:
     return Path(executable).stem.casefold().startswith(("python", "pypy"))
 
 
+def _posix_group_id(pid):
+    """Group id for a child spawned with ``start_new_session`` (pgid == pid).
+
+    ``os.getpgid`` raises ``ProcessLookupError`` once the leader has been
+    reaped by ``wait()``, yet the group may still hold live descendants (e.g.
+    a background child keeping the stdout pipe open).  Falling back to the pid
+    itself keeps those descendants killable; ``os.killpg`` still raises
+    ``ProcessLookupError`` when the whole group is really gone.
+    """
+    try:
+        return os.getpgid(pid)
+    except ProcessLookupError:
+        return pid
+
+
 def interrupt_process_group(process_or_pid) -> None:
     """Request a graceful stop from a detached child process group."""
     pid = int(getattr(process_or_pid, "pid", process_or_pid))
@@ -319,7 +367,7 @@ def interrupt_process_group(process_or_pid) -> None:
             raise ProcessLookupError(pid)
         os.kill(pid, signal.CTRL_BREAK_EVENT)
     else:
-        os.killpg(os.getpgid(pid), signal.SIGINT)
+        os.killpg(_posix_group_id(pid), signal.SIGINT)
 
 
 def kill_process_group(process_or_pid) -> None:
@@ -328,7 +376,7 @@ def kill_process_group(process_or_pid) -> None:
     if pid <= 1:
         raise ValueError("pid must be greater than 1")
     if not IS_WINDOWS:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
+        os.killpg(_posix_group_id(pid), signal.SIGKILL)
         return
     handle = getattr(process_or_pid, "_loop_job_handle", None)
     if handle:

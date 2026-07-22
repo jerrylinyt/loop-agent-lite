@@ -2457,8 +2457,10 @@ def main(argv=None):
             log(f"⏳ Agent 連續未完成 {state['agent_failure_streak']} 輪｜{retry_delay:g} 秒後重試"
                 f"（上限 {args.agent_backoff_max:g} 秒）")
         ws.save_state(state)
-        stop_after_round = ws.take_stop_after_round(os.getpid(), session_id)
-        if retry_delay and not stop_after_round:
+        if retry_delay:
+            # 退避狀態已落盤；從這一刻起的任何中斷(含 Windows CTRL_BREAK 落在 stop 檢查的
+            # 檔案 I/O 期間)都必須清掉等待狀態,否則 state 會永遠顯示不存在的退避。
+            stop_after_round = False
             try:
                 # 退避已位於兩輪之間；此時收到請求應立即停，不必等完退避，更不能再開一輪。
                 deadline = time.monotonic() + retry_delay
@@ -2475,6 +2477,8 @@ def main(argv=None):
                 state["agent_backoff_seconds"] = 0
                 state["agent_backoff_until"] = None
                 ws.save_state(state)
+        else:
+            stop_after_round = ws.take_stop_after_round(os.getpid(), session_id)
         if stop_after_round:
             state["agent_backoff_seconds"] = 0
             state["agent_backoff_until"] = None
