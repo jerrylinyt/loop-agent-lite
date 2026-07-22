@@ -173,21 +173,23 @@ def split_command(command: str) -> list[str]:
 
 
 def _resolve_windows_posix_shell(executable, found):
-    """Map a bare ``bash``/``sh`` to Git's POSIX shell on Windows.
+    """Pin a bare ``bash``/``sh`` to an absolute POSIX shell path on Windows.
 
-    ``System32\\bash.exe`` is the WSL launcher, not a POSIX shell: without an
-    installed distribution it prints an UTF-16 error and exits 1, silently
-    breaking every ``bash script.sh`` invocation.  Only that stub (or a missing
-    lookup) is overridden — a real shell already on PATH is respected.
+    A bare name must never reach ``CreateProcess``: its lookup order searches
+    ``System32`` BEFORE ``PATH``, so ``System32\\bash.exe`` — the WSL launcher,
+    which without an installed distribution prints an UTF-16 error and exits
+    1 — wins even when Git's bash is on PATH (and ``shutil.which`` says so).
+    A genuine ``PATH`` hit is pinned as-is; the WSL stub (or no hit) falls
+    back to the shell bundled with Git.  Explicit paths are left untouched.
     """
     name = Path(executable).name.casefold()
-    if name not in {"bash", "bash.exe", "sh", "sh.exe"}:
+    if name not in {"bash", "bash.exe", "sh", "sh.exe"} or Path(executable).name != executable:
         return None
     if found is not None:
         system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
         stub_dirs = {str((system_root / sub)).casefold() for sub in ("System32", "Sysnative")}
         if str(Path(found).parent).casefold() not in stub_dirs:
-            return None
+            return str(Path(found))
     git_path = shutil.which("git")
     if not git_path:
         return None
