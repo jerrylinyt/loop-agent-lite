@@ -40,6 +40,14 @@ export interface WorkspaceSummary {
   runner?: WorkspaceRunner;
   /** 僅 runner==="ralph" 時提供的 fleet 摘要。 */
   ralph?: RalphSummary;
+  /** 僅 runner==="parallel-supervisor" 時提供的 base run 摘要。 */
+  parallel?: ParallelSummary;
+  /** Active managed worker 會留在 workspace 導覽，但不納入 fleet aggregate。 */
+  managed_readonly?: boolean;
+  parent_workspace?: string;
+  run_id?: string;
+  assigned_order?: number;
+  assignment?: ParallelWorkerAssignment;
 }
 
 export interface FleetHealth {
@@ -133,6 +141,8 @@ export interface PlanTask {
   order: number;
   task: string;
   ref?: string | null;
+  /** 人工標註的 parallel batch；一般 Plan Editor 不可修改。 */
+  readonly stack?: number;
 }
 
 export interface PlanEditTask {
@@ -208,14 +218,18 @@ export interface DashboardConfig {
   stall_limit?: number;
   /** 規劃收斂後暫停：不自動進入執行期，需人工按「運行」。 */
   pause_after_plan?: boolean;
+  max_parallel?: number;
+  worker_restart_limit?: number;
 }
 
 export interface StartupResponse {
   ok?: boolean;
   starting?: boolean;
+  job_id?: string;
   name?: string;
   pid?: number;
   startup_timeout?: number;
+  control?: "pause" | "abort";
   error?: string;
 }
 
@@ -262,6 +276,14 @@ export interface WorkspaceState {
   runner?: WorkspaceRunner;
   /** runner==="ralph" 的 state.ralph 區塊（見 RALPH_CONTRACT §A + §I）。 */
   ralph?: RalphState;
+  /** parallel base 的 supervisor 投影。 */
+  parallel?: ParallelSummary;
+  /** managed worker 永遠為 true，前端不得顯示 mutation controls。 */
+  managed_readonly?: boolean;
+  parent_workspace?: string;
+  run_id?: string;
+  assigned_order?: number;
+  assignment?: ParallelWorkerAssignment;
 }
 
 export interface SelectCommand {
@@ -314,6 +336,8 @@ export interface ConfigResponse {
 }
 
 export interface JobInfo {
+  id?: string;
+  kind?: string;
   name: string;
   repo: string;
   pid: number;
@@ -340,7 +364,40 @@ export interface BootstrapResponse {
  * 全部欄位皆為可選，反映後端可能尚未提供 ralph 支援或錯誤投影缺欄位。
  * ------------------------------------------------------------------ */
 
-export type WorkspaceRunner = "loop" | "ralph";
+export type WorkspaceRunner = "loop" | "ralph" | "parallel-supervisor" | "parallel-worker";
+/** POST /api/launch 使用的 runner selector；parallel 啟動後投影為 parallel-supervisor。 */
+export type LaunchRunner = "loop" | "ralph" | "parallel";
+
+export type ParallelRunStatus =
+  | "initializing" | "running" | "pause_requested" | "paused"
+  | "cancel_requested" | "finalizing" | "finalizing_cancel" | "blocked"
+  | "completed" | "cancelled";
+
+export interface ParallelTaskStatus {
+  order: number;
+  batch: number;
+  outcome: "pending" | "integrated" | "blocked" | "cancelled";
+  resource_state: string;
+  restart_count: number;
+  error?: string | null;
+}
+
+export interface ParallelSummary {
+  run_id?: string;
+  status?: ParallelRunStatus;
+  terminal_intent?: "completed" | "cancelled" | null;
+  batch?: number | null;
+  tasks?: ParallelTaskStatus[];
+  error?: string | null;
+}
+
+export interface ParallelWorkerAssignment {
+  status?: "running" | "paused" | "recovery-required" | "integrated" | "blocked" | "cancelled";
+  validated_sha?: string | null;
+  validated_round?: number | null;
+  exit_reason?: string | null;
+  pause_generation?: number;
+}
 /** ralph.sh 退出後的終態原因（RALPH_CONTRACT §A）。 */
 export type RalphExitReason =
   | "completed"

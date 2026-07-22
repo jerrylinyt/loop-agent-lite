@@ -4,7 +4,7 @@ import type { FleetHistoryEntry, FleetRoundMetrics, WorkspaceSummary } from "../
 import AnomalyLogModal from "./AnomalyLogModal";
 import { deriveFleetEvents } from "./fleetEvents";
 import { useRoundNow } from "./roundTiming";
-import { postJson } from "../../shared/api/client";
+import { postJobActionAndWait, postJson } from "../../shared/api/client";
 import ActionDialog from "../../shared/components/ActionDialog";
 import FleetWorkspaceCard from "./FleetWorkspaceCard";
 import {
@@ -12,6 +12,25 @@ import {
   visibleFleetWorkspaces, workspaceNeedsAttention,
 } from "./fleetViewModel";
 import type { FleetFilter, FleetSort } from "./fleetViewModel";
+
+function isParallelSupervisor(workspace: WorkspaceSummary) {
+  return workspace.runner === "parallel-supervisor";
+}
+
+function canBulkStop(workspace: WorkspaceSummary) {
+  if (!isParallelSupervisor(workspace)) return workspace.running;
+  return workspace.parallel?.status === "initializing" || workspace.parallel?.status === "running";
+}
+
+function stopActionLabel(workspace: WorkspaceSummary) {
+  return isParallelSupervisor(workspace) ? "Pause" : "立即停止";
+}
+
+function bulkWorkspaceStatus(workspace: WorkspaceSummary) {
+  return isParallelSupervisor(workspace)
+    ? `Parallel ${workspace.parallel?.status ?? "unknown"}`
+    : workspace.running ? "執行中" : "已停止";
+}
 
 /** 監控電視牆:聚合統計 + 全 fleet 即時卡片 + 事件推播。
  * 卡片與歷史事件都走同一條 SSE；事件流仍由前端從 history 尾段推導。 */
@@ -40,24 +59,49 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
   const [selectedNames, setSelectedNames] = useState<string[]>([]);
   const [bulkAction, setBulkAction] = useState<"ack" | "stop" | null>(null);
   const [bulkMessage, setBulkMessage] = useState("");
+  const [bulkRunning, setBulkRunning] = useState(false);
+  const [bulkHasError, setBulkHasError] = useState(false);
   const selectedWorkspaces = workspaces.filter((workspace) => selectedNames.includes(workspace.name));
   // 每種批次操作都有不同前置條件。確認視窗同時列出 eligible 與被跳過項目，
   // 避免使用者以為「選到了」就一定會被修改。
   const eligible = bulkAction === "ack" ? selectedWorkspaces.filter((workspace) => (workspace.unread_issues ?? workspace.issues ?? 0) > 0 && !workspace.running)
-    : bulkAction === "stop" ? selectedWorkspaces.filter((workspace) => workspace.running) : [];
+    : bulkAction === "stop" ? selectedWorkspaces.filter(canBulkStop) : [];
+  const selectedHasParallel = selectedWorkspaces.some(isParallelSupervisor);
+  const selectedHasOrdinary = selectedWorkspaces.some((workspace) => !isParallelSupervisor(workspace));
+  const bulkStopLabel = selectedHasParallel
+    ? selectedHasOrdinary ? "停止 / Pause" : "Pause"
+    : "立即停止";
   const runBulk = async () => {
     if (!bulkAction) return;
-    const targets = [...eligible]; setBulkAction(null);
-    let failed = 0;
+    const action = bulkAction;
+    const targets = [...eligible];
+    setBulkAction(null);
+    setBulkRunning(true);
+    setBulkHasError(false);
+    setBulkMessage(`處理中 0/${targets.length} 個 workspace…`);
+    const failures: string[] = [];
     // 刻意逐筆呼叫既有單 workspace API：單筆鎖或狀態失敗不回滾其他 workspace，
     // 也不另開一條能繞過既有安全檢查的批次後端捷徑。
-    for (const workspace of targets) {
-      const response = bulkAction === "ack" ? await postJson("/api/edit-state", { name: workspace.name, ack_issues: true })
-        : await postJson("/api/stop", { name: workspace.name });
-      if (response.error) failed += 1;
+    try {
+      for (const [index, workspace] of targets.entries()) {
+        const response = action === "ack"
+          ? await postJson("/api/edit-state", { name: workspace.name, ack_issues: true })
+          : await postJobActionAndWait("/api/stop", { name: workspace.name }, workspace.name);
+        if (response.error) {
+          failures.push(`${workspace.name}（${action === "ack" ? "Issues 已讀" : stopActionLabel(workspace)}）：${response.error}`);
+        }
+        setBulkMessage(`處理中 ${index + 1}/${targets.length} 個 workspace…`);
+      }
+      setBulkHasError(failures.length > 0);
+      setBulkMessage(
+        `已處理 ${targets.length - failures.length}/${targets.length} 個 workspace`
+        + (failures.length ? `；失敗：${failures.join("；")}` : ""),
+      );
+      setSelectedNames([]);
+      await Promise.resolve(onChanged());
+    } finally {
+      setBulkRunning(false);
     }
-    setBulkMessage(`已處理 ${targets.length - failed}/${targets.length} 個 workspace${failed ? `，${failed} 個失敗` : ""}`);
-    setSelectedNames([]); await Promise.resolve(onChanged());
   };
 
   useEffect(() => {
@@ -155,11 +199,11 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
         <span className="muted">顯示 {visibleWorkspaces.length} / {workspaces.length}</span>
       </div>
       {!readonly && <div className="bulk-toolbar">
-        <button type="button" className="secondary-button compact-button" aria-expanded={bulkOpen} onClick={() => setBulkOpen((value) => !value)}>批次操作</button>
-        {bulkOpen && <><select multiple aria-label="批次選擇 workspace" value={selectedNames} onChange={(event) => setSelectedNames([...event.target.selectedOptions].map((option) => option.value))}>{visibleWorkspaces.map((workspace) => <option key={workspace.name} value={workspace.name}>{workspace.name} · {workspace.running ? "執行中" : "已停止"}</option>)}</select>
-          <button type="button" className="secondary-button compact-button" disabled={!selectedNames.length} onClick={() => setBulkAction("ack")}>Issues 已讀</button>
-          <button type="button" className="danger-button compact-button" disabled={!selectedNames.length} onClick={() => setBulkAction("stop")}>立即停止</button></>}
-        <span className="muted" role="status">{bulkMessage || (selectedNames.length ? `已選 ${selectedNames.length} 個` : "")}</span>
+        <button type="button" className="secondary-button compact-button" aria-expanded={bulkOpen} disabled={bulkRunning} onClick={() => setBulkOpen((value) => !value)}>批次操作</button>
+        {bulkOpen && <><select multiple aria-label="批次選擇 workspace" value={selectedNames} onChange={(event) => setSelectedNames([...event.target.selectedOptions].map((option) => option.value))}>{visibleWorkspaces.map((workspace) => <option key={workspace.name} value={workspace.name}>{workspace.name} · {bulkWorkspaceStatus(workspace)}</option>)}</select>
+          <button type="button" className="secondary-button compact-button" disabled={bulkRunning || !selectedNames.length} onClick={() => setBulkAction("ack")}>Issues 已讀</button>
+          <button type="button" className={`${selectedHasOrdinary ? "danger-button" : "secondary-button"} compact-button`} disabled={bulkRunning || !selectedNames.length} onClick={() => setBulkAction("stop")}>{bulkStopLabel}</button></>}
+        <span className="muted" role={bulkHasError ? "alert" : "status"} aria-live={bulkHasError ? "assertive" : "polite"}>{bulkMessage || (selectedNames.length ? `已選 ${selectedNames.length} 個` : "")}</span>
       </div>}
       <div className="fleet-body">
         <div className="fleet-grid">
@@ -184,9 +228,9 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
         </aside>
       </div>
       {anomaliesOpen && <AnomalyLogModal onClose={() => setAnomaliesOpen(false)} />}
-      {bulkAction && <ActionDialog title="確認批次操作" message={`將對 ${eligible.length} 個符合條件的 workspace 執行「${bulkAction === "ack" ? "Issues 已讀" : "立即停止"}」；不符合條件者會跳過。`} confirmLabel={`執行 ${eligible.length} 個`} danger={bulkAction !== "ack"} preview={[
-        { label: "符合條件", value: eligible.map((workspace) => workspace.name).join(", ") || "無" },
-        { label: "自動跳過", value: selectedWorkspaces.filter((workspace) => !eligible.includes(workspace)).map((workspace) => workspace.name).join(", ") || "無", tone: "safe" },
+      {bulkAction && <ActionDialog title="確認批次操作" message={`將對 ${eligible.length} 個符合條件的 workspace 執行「${bulkAction === "ack" ? "Issues 已讀" : bulkStopLabel}」；不符合條件者會跳過。`} confirmLabel={`執行 ${eligible.length} 個`} danger={bulkAction !== "ack" && selectedHasOrdinary} preview={[
+        { label: "符合條件", value: eligible.map((workspace) => `${workspace.name}（${bulkAction === "ack" ? "Issues 已讀" : stopActionLabel(workspace)}）`).join(", ") || "無" },
+        { label: "自動跳過", value: selectedWorkspaces.filter((workspace) => !eligible.includes(workspace)).map((workspace) => `${workspace.name}（${bulkWorkspaceStatus(workspace)}）`).join(", ") || "無", tone: "safe" },
         { label: "執行方式", value: "逐 workspace 呼叫既有安全 API；單筆失敗不會阻止其他項目" }
       ]} onClose={() => setBulkAction(null)} onConfirm={() => void runBulk()} />}
     </main>

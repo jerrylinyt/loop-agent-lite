@@ -2,6 +2,7 @@
 import type { WorkspaceSummary } from "../../shared/api/types";
 
 function workspaceMeta(workspace: WorkspaceSummary) {
+  if (workspace.runner === "parallel-supervisor") return `P · ${workspace.parallel?.status ?? "—"}`;
   if (workspace.phase === "exec") return `${workspace.completed ?? 0}/${workspace.plan_len ?? 0}`;
   if (workspace.phase === "plan") return `f${workspace.flag ?? 0}`;
   if (workspace.phase === "done") return "完成";

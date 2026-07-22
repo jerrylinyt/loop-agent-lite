@@ -12,6 +12,8 @@ export function workspaceNeedsAttention(workspace: WorkspaceSummary): boolean {
   const completed = workspace.phase === "done";
   return !!(
     workspace.error ||
+    workspace.parallel?.status === "blocked" ||
+    workspace.parallel?.error ||
     (workspace.unread_issues ?? workspace.issues ?? 0) > 0 ||
     workspace.state_recovery_pending ||
     workspace.goal_changed ||

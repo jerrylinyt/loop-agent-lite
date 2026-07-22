@@ -8,6 +8,7 @@ import FleetOverview from "../features/workspaces/FleetOverview";
 import WorkspaceTabs from "../features/workspaces/WorkspaceTabs";
 import WorkspaceView from "../features/workspaces/WorkspaceView";
 import RalphView from "../features/workspaces/RalphView";
+import ParallelView from "../features/workspaces/ParallelView";
 import CommandPalette from "../features/workspaces/CommandPalette";
 import useDashboardData from "./useDashboardData";
 import useStatusFavicon from "./useStatusFavicon";
@@ -27,6 +28,10 @@ export default function App() {
   const workspace = useMemo(
     () => dashboard.workspaces.find((item) => item.name === dashboard.selected),
     [dashboard.workspaces, dashboard.selected]
+  );
+  const fleetWorkspaces = useMemo(
+    () => dashboard.workspaces.filter((item) => item.runner !== "parallel-worker" && !item.managed_readonly),
+    [dashboard.workspaces]
   );
   useStatusFavicon(workspace, dashboard.state, dashboard.selected);
   const health = dashboard.health;
@@ -124,12 +129,14 @@ export default function App() {
             <GettingStarted readonly={dashboard.bootstrap.readonly} onLaunch={() => openLauncher()} />
           </main>
         ) : overviewOpen ? (
-          <FleetOverview workspaces={dashboard.workspaces} fleetHistory={dashboard.fleetHistory} fleetMetrics={dashboard.fleetMetrics} attentionRequest={attentionRequest} readonly={dashboard.bootstrap.readonly} onSelect={selectFromOverview} onChanged={dashboard.refreshWorkspaces} />
+          <FleetOverview workspaces={fleetWorkspaces} fleetHistory={dashboard.fleetHistory} fleetMetrics={dashboard.fleetMetrics} attentionRequest={attentionRequest} readonly={dashboard.bootstrap.readonly} onSelect={selectFromOverview} onChanged={dashboard.refreshWorkspaces} />
         ) : (
           <main id="main-content" tabIndex={-1} className="dashboard-grid" style={{ gridTemplateColumns: `${leftWidth}px 6px ${rightCollapsed ? "42px" : "minmax(0, 1fr)"}` }}>
             {dashboard.state?.runner === "ralph"
               ? <RalphView key={dashboard.selected} workspace={workspace} state={dashboard.state} consoleText={dashboard.consoleText} readonly={dashboard.bootstrap.readonly} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} />
-              : <WorkspaceView key={dashboard.selected} workspace={workspace} state={dashboard.state} consoleText={dashboard.consoleText} readonly={dashboard.bootstrap.readonly} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} onLaunchFromTemplate={openLauncherFromTemplate} />}
+              : dashboard.state?.runner === "parallel-supervisor" || dashboard.state?.runner === "parallel-worker" || dashboard.state?.managed_readonly
+                ? <ParallelView key={dashboard.selected} workspace={workspace} state={dashboard.state} readonly={dashboard.bootstrap.readonly} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} />
+                : <WorkspaceView key={dashboard.selected} workspace={workspace} state={dashboard.state} consoleText={dashboard.consoleText} readonly={dashboard.bootstrap.readonly} onRefresh={dashboard.refreshState} onRefreshWorkspaces={dashboard.refreshWorkspaces} onLaunchFromTemplate={openLauncherFromTemplate} />}
             <Splitter onResize={resize} />
             <ConsolePane text={dashboard.consoleText} round={dashboard.state?.round ?? 0} running={workspace?.running ?? false} hasWorkspace={!!dashboard.selected} collapsed={rightCollapsed} onToggleCollapse={toggleRight} />
           </main>

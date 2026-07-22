@@ -6,6 +6,8 @@ export interface ModalProps {
   title: string;
   description?: string;
   onClose: () => void;
+  /** Keep a critical async flow visible until it reaches a durable result. */
+  closeDisabled?: boolean;
   children: ReactNode;
   footer?: ReactNode;
   wide?: boolean;
@@ -26,14 +28,16 @@ const FOCUSABLE = [
 
 const modalStack: symbol[] = [];
 
-export default function Modal({ title, description, onClose, children, footer, wide, extraWide, compact, fullScreen, bodyClassName }: ModalProps) {
+export default function Modal({ title, description, onClose, closeDisabled = false, children, footer, wide, extraWide, compact, fullScreen, bodyClassName }: ModalProps) {
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
   const onCloseRef = useRef(onClose);
+  const closeDisabledRef = useRef(closeDisabled);
   const modalId = useRef(Symbol("modal"));
 
   useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+  useEffect(() => { closeDisabledRef.current = closeDisabled; }, [closeDisabled]);
 
   useEffect(() => {
     previousFocus.current = document.activeElement as HTMLElement | null;
@@ -51,6 +55,7 @@ export default function Modal({ title, description, onClose, children, footer, w
       if (modalStack[modalStack.length - 1] !== id) return;
       if (event.key === "Escape") {
         event.preventDefault();
+        if (closeDisabledRef.current) return;
         onCloseRef.current();
         return;
       }
@@ -81,7 +86,7 @@ export default function Modal({ title, description, onClose, children, footer, w
 
   const stop = (event: MouseEvent) => event.stopPropagation();
   return createPortal(
-    <div className="modal-backdrop" onMouseDown={onClose}>
+    <div className="modal-backdrop" onMouseDown={closeDisabled ? undefined : onClose}>
       <div
         ref={panelRef}
         className={`modal${wide ? " modal-wide" : ""}${extraWide ? " modal-extra-wide" : ""}${compact ? " modal-compact" : ""}${fullScreen ? " modal-full-screen" : ""}`}
@@ -96,7 +101,7 @@ export default function Modal({ title, description, onClose, children, footer, w
             <h2 id={titleId}>{title}</h2>
             {description && <p id={`${titleId}-description`}>{description}</p>}
           </div>
-          <button type="button" className="text-button" onClick={onClose} aria-label="關閉對話框">關閉</button>
+          <button type="button" className="text-button" onClick={onClose} disabled={closeDisabled} aria-label="關閉對話框">關閉</button>
         </header>
         <div className={`modal-body${bodyClassName ? ` ${bodyClassName}` : ""}`}>{children}</div>
         {footer && <footer className="modal-footer">{footer}</footer>}

@@ -227,6 +227,7 @@ th { position: sticky; z-index: 1; top: 0; background: var(--surface); font-weig
 .task-cell { min-width: 0; }
 .task-toggle { display: -webkit-box; width: 100%; max-width: 100%; overflow: hidden; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; word-break: break-word; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
 .task-toggle.expanded { display: block; -webkit-line-clamp: unset; }
+.task-stack-badge { display: inline-flex; align-items: center; min-height: 20px; margin-top: 4px; padding: 1px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 600; white-space: nowrap; }
 .task-ref { margin-top: 2px; color: var(--muted); font-size: 12px; }
 .task-status { white-space: nowrap; }
 .task-completion { display: inline-flex; align-items: center; gap: 5px; }
@@ -668,7 +669,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 }
 @media (forced-colors: active) {
   .health-strip-fill, .fleet-progress-fill { forced-color-adjust: none; background: Highlight !important; }
-  .phase-badge, .chip { border: 1px solid ButtonText; }
+  .phase-badge, .chip, .task-stack-badge { border: 1px solid ButtonText; }
 }
 .getting-started { width: min(760px, calc(100vw - 40px)); margin-top: 20px; padding: 16px; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--surface-subtle); text-align: left; }
 .getting-started-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
@@ -762,3 +763,33 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .ralph-prd-raw { max-height: 52vh; margin: 0; overflow: auto; padding: 12px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--bg); color: var(--text); font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
 .form-grid .ralph-inline-select { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; }
 .form-grid .ralph-inline-select select { width: auto; min-height: 26px; }
+
+/* Parallel v1：刻意只呈現 batch/task 狀態與三個 lifecycle controls。 */
+.parallel-workspace-pane { overflow: auto; }
+.parallel-header { border-bottom-color: color-mix(in srgb, var(--accent) 40%, var(--border-soft)); }
+.parallel-runner-tag { color: var(--accent) !important; background: var(--accent-soft) !important; }
+.parallel-readonly-note,
+.parallel-control-message { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+.parallel-task-panel { min-height: 0; margin: 12px; overflow: hidden; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--surface); }
+.parallel-task-panel > p { margin: 10px 12px; }
+.parallel-task-table th:first-child,
+.parallel-task-table td:first-child { width: 46px; }
+.parallel-task-table th:nth-child(2),
+.parallel-task-table td:nth-child(2) { width: 64px; text-align: center; }
+.parallel-task-table th:nth-child(4),
+.parallel-task-table td:nth-child(4) { width: 150px; }
+.parallel-task-table th:nth-child(5),
+.parallel-task-table td:nth-child(5) { width: 130px; }
+.parallel-task-table th:last-child,
+.parallel-task-table td:last-child { width: 58px; text-align: center; }
+.parallel-task-table .commit-sha-button { margin-left: 6px; }
+.parallel-outcome-integrated,
+.parallel-status-completed { color: var(--success); background: var(--success-soft); }
+.parallel-outcome-blocked,
+.parallel-status-blocked { color: var(--danger); background: var(--danger-soft); }
+.parallel-outcome-cancelled,
+.parallel-status-cancelled { color: var(--muted); background: var(--surface-subtle); }
+.parallel-status-pause_requested,
+.parallel-status-cancel_requested,
+.parallel-status-finalizing,
+.parallel-status-finalizing_cancel { color: var(--warning); background: var(--warning-soft); }

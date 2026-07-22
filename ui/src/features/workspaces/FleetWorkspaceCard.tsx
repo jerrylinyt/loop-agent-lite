@@ -58,7 +58,9 @@ export default function FleetWorkspaceCard({ workspace, metrics, roundNow, onSel
         {workspace.running && <span className="breathing-dot" aria-label="執行中" />}
       </div>
       <div className="fleet-card-meta">
+        {workspace.runner === "parallel-supervisor" && <span className="phase-badge parallel-runner-tag">Parallel</span>}
         <span className={`phase-badge phase-${workspace.phase ?? "unknown"}`}>{PHASE_NAMES[workspace.phase ?? ""] ?? "—"}</span>
+        {workspace.runner === "parallel-supervisor" && <span className="muted">{workspace.parallel?.status ?? "unknown"} · batch {workspace.parallel?.batch ?? "—"}</span>}
         <span className="muted">round {workspace.round ?? 0}</span>
         {workspace.phase === "plan" && <span className="muted">flag {workspace.flag ?? 0}</span>}
         {workspace.phase === "exec" && <span className="muted">done {workspace.done_count ?? 0}</span>}
@@ -100,6 +102,8 @@ export default function FleetWorkspaceCard({ workspace, metrics, roundNow, onSel
           {workspace.goal_changed && <span className="chip warning">goal 已變更</span>}
           {workspace.stale_loop_pid && <span className="chip warning">警告：PID 殘留</span>}
           {workspace.error && <span className="chip warning">錯誤：state 錯誤</span>}
+          {workspace.parallel?.status === "blocked" && <span className="chip warning">Parallel blocked</span>}
+          {workspace.parallel?.error && <span className="chip warning" title={workspace.parallel.error}>Parallel：{workspace.parallel.error}</span>}
         </div>
       )}
       {workspace.repo && <div className="fleet-card-repo" title={workspace.repo}>{workspace.repo}</div>}

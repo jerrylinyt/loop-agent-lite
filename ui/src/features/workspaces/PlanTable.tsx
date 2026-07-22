@@ -34,9 +34,9 @@ export default function PlanTable({
       previous.current = state;
       return;
     }
-    const old = new Map((previous.current.plan ?? []).map((task) => [task.order, `${task.task}|${task.ref ?? ""}`]));
+    const old = new Map((previous.current.plan ?? []).map((task) => [task.order, `${task.task}|${task.ref ?? ""}|${task.stack ?? ""}`]));
     const changed = new Set((state.plan ?? [])
-      .filter((task) => old.get(task.order) !== `${task.task}|${task.ref ?? ""}`)
+      .filter((task) => old.get(task.order) !== `${task.task}|${task.ref ?? ""}|${task.stack ?? ""}`)
       .map((task) => task.order));
     setFlashOrders(changed);
     setUpdatedVersion(state.plan_version);
@@ -73,6 +73,7 @@ export default function PlanTable({
   };
 
   const plan = state.plan ?? [];
+  const hasParallelStack = plan.some((task) => task.stack !== undefined);
   const visibleTasks = plan.filter((task) => showDone || !completed.has(task.order));
   return (<>
     <section className="plan-pane">
@@ -82,7 +83,9 @@ export default function PlanTable({
           <span>{completed.size}/{plan.length} 已完成</span>
           {updatedVersion !== null && <span className="plan-update-badge" role="status" aria-label={`計畫已更新 v${updatedVersion}`}>計畫已更新 v{updatedVersion}</span>}
         </div>
-        {canEdit && plan.length > 0 && <button type="button" className="secondary-button" onClick={() => setEditorOpen(true)}>編輯計畫</button>}
+        {canEdit && plan.length > 0 && (hasParallelStack
+          ? <span className="label-help" title="Parallel plan 的 stack 是唯讀欄位；請修改原始 plan 後重新匯入。">Parallel plan 唯讀</span>
+          : <button type="button" className="secondary-button" onClick={() => setEditorOpen(true)}>編輯計畫</button>)}
       </header>
       <div className="table-scroll" ref={scrollRef} onScroll={checkCurrentVisibility}>
         <table>
@@ -125,6 +128,7 @@ export default function PlanTable({
                         return next;
                       })}
                     >{task.task}</button>
+                    {task.stack !== undefined && <span className="task-stack-badge" title={`並行 batch stack ${task.stack}`}>stack {task.stack}</span>}
                     {task.ref && <div className="task-ref">ref: {task.ref}</div>}
                   </td>
                   <td className="task-status">
@@ -154,7 +158,7 @@ export default function PlanTable({
         }}>回到執行中</button>
       )}
     </section>
-    {editorOpen && <PlanEditorModal state={state} onClose={() => setEditorOpen(false)} onSave={onSave} />}
+    {editorOpen && !hasParallelStack && <PlanEditorModal state={state} onClose={() => setEditorOpen(false)} onSave={onSave} />}
     {diffTask && <Suspense fallback={null}><TaskDiffModal workspace={workspace} order={diffTask.order} fallbackTitle={diffTask.title}
       fallbackSha={diffTask.sha} onClose={() => setDiffTask(null)} /></Suspense>}
   </>);
