@@ -76,9 +76,10 @@ def prepare_fixture():
         "counter = ws / '.e2e-agent-count'\n"
         "count = int(counter.read_text()) + 1 if counter.exists() else 1\n"
         "counter.write_text(str(count))\n"
-        # 第一輪快速產生 history、第二輪涵蓋 live timing；第三輪保留足夠時間，
-        # 讓 E2E 穩定驗證「要求本輪後停止 → 撤銷」而不會和輪末競速。
-        "time.sleep(5 if count == 3 else 2 if count == 2 else 0.45)\n",
+        # 第一輪快速產生 history、第二輪涵蓋 live timing。執行期每輪固定留 2.5 秒:
+        # 「要求本輪後停止 → 撤銷」發生在執行期,撤銷必須趕在輪末 claim 之前,
+        # 0.45 秒的短輪在慢 runner 上會讓撤銷與輪末競速而 flake。
+        "time.sleep(2.5 if phase == 'exec' else 5 if count == 3 else 2 if count == 2 else 0.45)\n",
         encoding="utf-8"
     )
 
