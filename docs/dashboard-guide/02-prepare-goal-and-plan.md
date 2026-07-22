@@ -2,14 +2,14 @@
 
 ## 目的
 
-在啟動 loop 前，準備「不可由 Agent 擅自改寫的目標」與「可以逐項執行的任務計畫」。Goal 是真相來源；Plan 是執行順序。寫得越清楚，後面的多輪 Agent 越容易一致判斷完成條件。
+在啟動 loop 前，準備「不可由 Agent 擅自改寫的目標」與「可以逐項執行的任務計畫」。Goal 是真相來源；Plan 是執行順序。Parallel Loop 另外要求人類在 frozen plan 上標註並行 batch；planner 不會替你決定 `stack`。寫得越清楚，後面的多輪 Agent 越容易一致判斷完成條件。
 
 ## Goal 與 Plan 的角色
 
 | 內容 | 用途 | 是否必須 |
 |---|---|---|
-| `goal.md` | 描述背景、目標、範圍、限制、驗收條件與非目標 | 必須有可用版本；通常應 commit |
-| `plan.json` | 由 `order`、`task`、選填 `ref` 組成的純任務陣列 | 選填；留空可讓規劃期 Agent 從零建立 |
+| `goal.md` | 描述背景、目標、範圍、限制、驗收條件與非目標；不描述 `stack`、batch 或 worker 分工 | 必須有可用版本；Parallel 必須沿用目前 branch 已 commit 的版本 |
+| `plan.json` | 基礎欄位是 `order`、`task`、選填 `ref`；Parallel 可再由人類加選填 `stack` | 普通 Loop 選填；Parallel 必須匯入非空 frozen plan |
 | `PLAN.md` | 人類可讀的既有計畫／分析文件 | 專案可自行使用；啟動表單真正匯入的是 JSON plan |
 
 ## A. 準備 `goal.md`
@@ -45,6 +45,16 @@ git commit -m "docs: define loop goal"
 
 啟動表單的 `goal.md` 欄位留空時，Dashboard 沿用 repo 已 commit 的版本。這最容易稽核，也讓 preflight 能確認 Goal 的 Git 狀態。
 
+### Parallel 的 Goal 必須保持拓撲中立
+
+Goal 應只描述所有 workers 共同遵守的需求真相、限制與驗收條件，不要把「task-1 交給 worker A」、`stack` 編號、batch 次序或最大並行數寫成需求。這些是 Plan 的人工排程，不是產品目標。
+
+在 `Parallel Loop` 分頁中：
+
+- `goal.md` 檔案選擇器停用，只能使用目前 branch 上已 commit 的 Goal。
+- 「Goal 產生器 Prompt」與「Goal 成果模板」會提示 Goal 維持拓撲中立；產物仍需審查並 commit。
+- 若需求本身真的限制並行安全，例如測試只能共用一個固定 DB，應把它寫成資源限制；但不要在 Goal 直接替 Plan 指派 `stack`。
+
 ### 要用新檔案時
 
 在啟動表單 `goal.md` 欄選擇 `.md`、`.markdown` 或 `.txt` 檔。啟動會先做路徑與格式安全檢查，再處理 branch 或 state；Goal 錯誤不會留下半套 branch mutation。
@@ -71,7 +81,9 @@ git commit -m "docs: define loop goal"
 
 兩者差異：產生器是「請 Agent 寫 Goal 的指令」；成果模板是「Goal 最後應長什麼樣」。
 
-## C. 準備 `plan.json`（選用）
+從 `Parallel Loop` 分頁開啟產生器並勾選初版 Plan 時，Plan 部分仍只會產生不含 `stack` 的基礎 plan，並要求 task 保留 working set、依賴與共享資源證據。這不是漏欄位：`stack` 必須等人類讀完證據後再加入。
+
+## C. 準備基礎 `plan.json`
 
 合法格式：
 
@@ -89,11 +101,11 @@ git commit -m "docs: define loop goal"
 ]
 ```
 
-格式規則：
+普通 Loop 與基礎 Plan 的格式規則：
 
 - 最外層必須是非空陣列。
 - 每一項必須是物件。
-- 只允許 `order`、`task`、`ref`。
+- 只允許 `order`、`task`、`ref`；普通 Loop 遇到 `stack` 會提示改用 Parallel Loop。
 - `order` 必須是整數、不得重複，且從 1 連續到項目數。
 - `task` 必須是非空字串。
 - `ref` 可省略、設為字串或 `null`。
@@ -111,22 +123,74 @@ Plan Prompt 的輸出契約只接受純 JSON array。產出後仍要人工檢查
 - 任務大小是否合理；不要把整個專案塞成一項，也不要拆成無法獨立驗證的微小動作。
 - `ref` 是否真的存在；沒有真實參考就省略。
 
-## D. 選擇匯入後的起始階段
+## D. 為 Parallel 人工標註 `stack`
 
-只有貼入合法 `plan.json` 時，畫面才出現：
+在 `Parallel Loop` 分頁按「產生基礎 Plan Prompt（不含 stack）」時，外部 Agent 只會輸出 `order/task/ref`。Prompt 會要求每個 task 寫出 working set、檔案／schema／生成物、前置依賴、共享驗證資源與隔離方式，但會明確禁止 Agent 自行推論或輸出 `stack`。
+
+人工審查完成後，才可把 `stack` 正整數加到可安全同批執行的 tasks：
+
+```json
+[
+  {
+    "order": 1,
+    "task": "更新獨立的文件索引；working set 只有 docs/index.md；DoD：執行文件連結檢查通過。",
+    "stack": 1
+  },
+  {
+    "order": 2,
+    "task": "補齊獨立的 CLI help 測試；working set 只有 tests/test_cli_help.py；DoD：執行該測試通過。",
+    "stack": 1
+  },
+  {
+    "order": 3,
+    "task": "依前兩項結果更新發行檢查；DoD：執行完整驗證命令通過。"
+  }
+]
+```
+
+排程語意：
+
+- `stack` 可省略；有值時必須是正整數，boolean 不算整數。
+- 相同 `stack` 的 tasks 必須是連續的 order 區段；同一數字不能在後面再次出現。
+- 相同 `stack` 的連續區段形成一個 batch。未標 `stack` 的每一項都各自形成大小 1 的串行 batch。
+- batch 依最小 order 依序執行；只有同一 batch 內的多個 tasks 才可能並行，且同時執行數仍受「最大並行 workers」限制。
+- 單一 task 即使有 `stack` 也沒有實際並行效果。
+- 合法但完全沒有多 task batch 的 Plan 仍可啟動；Launcher 會警告「目前沒有可並行的 batch」，實際上會全部依序執行。
+
+同一 `stack` 的每個 task 必須全部通過以下人工 checklist：
+
+- [ ] Working set 不重疊：不會同時修改相同檔案、schema、生成物或其他共享輸出。
+- [ ] 沒有語意或資料前置依賴：任何 task 都不需要同 batch 另一項先完成或提供結果。
+- [ ] Validator 外部資源已隔離：固定 port、共用 DB／schema、Docker Compose project、cache、lock 目錄、外部服務與全域環境不會衝突。
+- [ ] 每項 task 都有完整、可獨立重跑的驗證命令、執行目錄與通過條件。
+- [ ] 任一證據不確定時不標 `stack`，讓該 task 自成串行 batch。
+
+貼入 Plan 後先讀 Launcher 的 batch preview，例如 `2 個 batch：stack 1 (#1–#2) → #3`，確認分組與預期一致。可按「複製 Parallel 範本」查看合法形狀，但範例內容與 `stack` 都必須依實際 repo 證據重寫，不能直接照抄。
+
+含 `stack` 的 Plan 是 frozen plan：一般 Plan Editor 不會新增、刪除、重排或修改 `stack`，後端也會拒絕這類編輯。需要改排程時，請修改原始 `plan.json`、重新人工審查，再從 Parallel Launcher 建立新的 run；不要手動修改 state。
+
+## E. 選擇匯入後的起始階段
+
+普通 `Loop coordinator` 只有貼入合法 `plan.json` 時，畫面才出現：
 
 - 「規劃期」：讓 Agent 再審核／調整計畫，適合計畫尚未經多方確認。
 - 「直接執行期」：直接從 task-1 開始，適合計畫已由人審核且驗收條件明確。
 
 匯入會建立全新 state，不是把任務附加到舊進度。若只想調整停止 workspace 的 pending tasks，應使用 [Plan 編輯器](08-edit-plan-and-change-task.md)。
 
+`Parallel Loop` 不提供這兩個選項：Plan 必填且已凍結，固定從 exec 開始；規劃期 Agent 不會讀取或重寫人工 `stack`。若還需要 Agent 規劃，可先用普通 Loop 的「規劃收斂後暫停」取得基礎 Plan，離線人工補 `stack`，再回 Parallel Launcher 啟動。
+
 ## 啟動前自我審查
 
 - [ ] Goal 寫的是結果與限制，不是逐步替 Agent 微操。
+- [ ] Goal 沒有混入 `stack`、batch 或 worker 指派；並行資源限制寫成可驗收的共同限制。
 - [ ] DoD 含實際可執行命令與清楚通過條件。
 - [ ] Goal 已 commit，或明確選了要匯入的新檔。
 - [ ] 若有 Plan，JSON 格式無紅字且 order 連續。
 - [ ] 每一項 task 都能獨立實作、驗證與 commit。
 - [ ] 起始階段選擇符合計畫成熟度。
+- [ ] 若使用 Parallel，每個同 `stack` task 都已核對 working set、依賴、生成物與 validator 共享資源。
+- [ ] 若使用 Parallel，batch preview 符合預期；沒有可並行 batch 的警告是刻意串行，而不是誤以為已並行。
+- [ ] 若使用 Parallel，已接受 frozen plan 固定從 exec 啟動，之後不能用一般 Plan Editor 改 `stack`。
 
 下一步：[啟動新的 loop](03-launch-new-loop.md)。

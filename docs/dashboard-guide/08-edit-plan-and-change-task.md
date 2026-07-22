@@ -4,8 +4,11 @@
 
 在不改寫已發生歷史的前提下，調整尚未執行的 pending tasks；或在確有人工驗證依據時，將 coordinator 切到另一個 task。
 
+> 本流程只適用普通 Loop。Parallel base 的 plan、batch、stack 與 assignment 在啟動時已凍結，Dashboard 會拒絕 Plan 編輯、重新匯入與「前往 task」；managed worker 也全面唯讀。
+
 ## 重要前置條件
 
+- Runner 是普通 Loop，不是 Parallel base／managed worker。
 - Workspace 必須停止。
 - 編輯 Plan 不等於修改 `goal.md`；任務仍必須符合 Goal。
 - 已完成與目前任務會鎖定。
@@ -94,10 +97,14 @@
 | 已由人完整驗證某些 task，可跳過 | 前往後面的 task，讀預覽並 Validate |
 | 要重新驗收先前 task | 退回 task；記得 code 不會回退 |
 | 要回復 Git 程式碼 | 在 target repo 走獨立、經審核的 Git 流程，不是「前往」 |
+| 要修改 Parallel task、順序或 stack | 不可修改既有 run；需要檢查現場可先 Pause，但啟動新 run 前舊 run 必須完成或 Abort 到 `cancelled`。再從原始 Plan 產生並人工審核新的 frozen plan，以新 workspace 名稱啟動 Parallel。 |
+
+Parallel 之所以不開放 pending 區編輯，不只是 UI 限制：plan hash、batch、每個 worker assignment 與 launch spec 已互相綁定。即使 run 是 `paused`／`blocked`，也不能以 ordinary Plan Editor 繞過此契約。
 
 ## 完成檢查
 
 - [ ] Workspace 已停止。
+- [ ] 已確認是普通 Loop；Parallel 應建立新 frozen run，而非編輯現有 state。
 - [ ] 沒有修改鎖定歷史。
 - [ ] 每項 pending task 非空且有可驗收 DoD。
 - [ ] 變更摘要符合預期。

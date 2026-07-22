@@ -2,7 +2,7 @@
 
 ## 目的
 
-在不逐一進入 workspace 的情況下，先回答三個問題：哪些正在跑、哪些需要人處理、整體輪次是否變慢或出現未回 DONE。
+在不逐一進入 workspace 的情況下，先回答三個問題：哪些正在跑、哪些需要人處理、整體輪次是否變慢或出現未回 DONE。Fleet 同時支援普通 Loop、Ralph 與 Parallel base workspace；Parallel 的 managed workers 不重複計入 Fleet。
 
 ## 進入方式
 
@@ -14,11 +14,11 @@
 
 ### 1. 先看頂部五張摘要卡
 
-1. `workspaces`：Dashboard 目前載入幾個 workspace。
-2. `執行中`：目前正在跑 loop 的數量。
+1. `workspaces`：Dashboard 目前載入的頂層 workspace 數。Parallel managed worker 由 parent 管理，不列入這個數字。
+2. `執行中`：目前正在跑的頂層 runner 數；Parallel 以 base supervisor 為一個 runner。
 3. `規劃 / 執行 / 完成`：各階段分布。
-4. `需要關注`：有未讀 issues、state 錯誤、Goal 變更、stale PID、checkpoint／Agent 異常等需要處理的 workspace。
-5. `任務完成`：所有 workspace 已完成 task／總 task 與百分比。
+4. `需要關注`：普通 Loop 的未讀 issues、state／Goal／PID／checkpoint／Agent 異常，或 Parallel base 的 `blocked`／`parallel.error` 等需要處理的 workspace。
+5. `任務完成`：所有頂層 workspace 已完成 task／總 task 與百分比。Parallel 的完成數來自 supervisor 已接受的 integration receipts，不是 worker 自行宣稱的 done。
 
 如果「需要關注」不是 0，先按「需關注」篩選，不要只看完成百分比。
 
@@ -67,6 +67,15 @@ Git 有變更但 Agent 沒回完成 signal 仍算異常，因為 coordinator 不
 
 已完成 workspace 的歷史紅燈／停滯不會被當成目前告警；但未讀 issues、state 復原、Goal 變更、stale PID 或 state 錯誤仍可能需要關注。
 
+Parallel base 卡片另有：
+
+- `Parallel` badge。
+- durable run status，例如 `initializing`、`running`、`paused`、`blocked`、`completed` 或 `cancelled`。
+- 目前 batch；不同 batch 仍依序執行，只有同一 batch 內多個 task 才可能並行。
+- `Parallel blocked` 或完整 Parallel error。這兩種狀況會進入「需關注」。
+
+Parallel base 的 phase 只是既有 Dashboard schema 的投影：完成 run 才是 `done`；暫停、阻擋或取消中的 run 通常仍投影為 `exec`。判讀時應優先看 `Parallel` status，不要只看 phase badge。Managed worker 仍可出現在頂部 workspace 分頁供診斷，但不出現在 Fleet 卡片、摘要或健康總數，避免一個 run 被重複計算。
+
 ### 6. 讀事件推播
 
 右側最近事件依時間顯示任務開始、完成、規劃收斂、驗證轉紅等。點事件可切入相關 workspace。它適合快速掌握變化，不取代完整 history。
@@ -76,12 +85,15 @@ Git 有變更但 Agent 沒回完成 signal 仍算異常，因為 coordinator 不
 ![Fleet 批次操作實際畫面](../assets/dashboard-guide/raw/overview-bulk.jpg)
 
 1. 點「批次操作」。
-2. 多選 workspace。
-3. 選「Issues 已讀」或「立即停止」。
-4. 讀確認預覽：不符合前置條件的項目會列為跳過，符合的項目仍會逐筆使用安全 API。
-5. 確認後再送出。
+2. 多選 workspace。選單會顯示 ordinary 的執行／停止狀態，Parallel 則顯示 durable run status。
+3. 選「Issues 已讀」或停止操作：
+   - 全是普通 workspace：按鈕是「立即停止」。
+   - 全是 Parallel base：按鈕是「Pause」。
+   - 兩者混選：按鈕是「停止 / Pause」。
+4. 讀確認預覽：普通 workspace 只有目前 `running=true` 才會立即停止；Parallel 只有 `initializing`／`running` 才會送出 typed Pause。已 `pause_requested`、`paused`、`blocked` 或終態的 Parallel 會自動跳過，需進 base 詳細頁處理。
+5. 確認後再送出。Dashboard 逐 workspace 呼叫原本的安全 API；單筆失敗不會回滾或阻止其他項目。
 
-批次「立即停止」是緊急操作，不是日常結束方式。
+普通 workspace 的批次「立即停止」是緊急操作，不是日常結束方式。Parallel 的 `Pause` 則是正常控制：停止新派工，讓 workers 在安全邊界停下並保留未整合現場供 Resume；它不等同直接 kill workers。
 
 ## 每日巡檢建議
 
@@ -91,5 +103,7 @@ Git 有變更但 Agent 沒回完成 signal 仍算異常，因為 coordinator 不
 - [ ] 未回 DONE 與異常率是否增加。
 - [ ] 是否有同一 task 長時間沒有開始／完成事件。
 - [ ] 已完成比例是否合理前進。
+- [ ] Parallel 卡片是否停在 `pause_requested`／`finalizing*`，或出現 `blocked`／`parallel.error`。
+- [ ] 判讀 Parallel 時是否看 durable status，而不是只看 phase／running。
 
 下一步：[監看單一 Workspace](05-monitor-workspace.md)。

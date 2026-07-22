@@ -4,8 +4,11 @@
 
 在人工判斷計畫已可執行時直接進執行期，或在 Goal／Plan 需要重新收斂時回規劃期。階段切換會重設 coordinator 計數，因此必須先讀影響預覽。
 
+> 本流程只適用普通 Loop。Parallel 固定以人工審核的 frozen plan 從 exec 啟動，不提供 plan ↔ exec 階段切換；managed worker 也不可切 phase。
+
 ## 前置條件
 
+- Runner 是普通 Loop，不是 Parallel base／managed worker。
 - Workspace 已停止。
 - 進執行期前 Plan 至少有一項。
 - 已理解階段切換只改 coordinator state，不會自動改 target repo 程式碼。
@@ -53,10 +56,16 @@
 - 只是需要重跑目前 task：停止後一般執行即可。
 - 只想調整未來 pending tasks：用 Plan 編輯器。
 - 想讓 Git code 回到舊版本：階段切換不會做 Git rollback。
+- Parallel run：不要把 base 投影的 `exec/done` 當成可人工切換的 phase。要暫停或續跑用 Pause／Resume；Goal／Plan 要重做則 Abort，commit 新真相後啟動新的 Parallel run。
+
+## Parallel 的 phase 為何不能切
+
+Parallel planner 不會在 run 內建立或改寫 stack。Launcher 先凍結 plan／batch／assignment，supervisor 才固定從 exec 派工；只有 durable status 到 `completed` 時 base 才投影為 phase `done`。`paused`、`blocked`、`cancelled` 等判讀都以 Parallel status 為準，不能用 ordinary phase API 重設。
 
 ## 切換後檢查
 
 - [ ] Phase badge 已變成預期階段。
+- [ ] 已確認是普通 Loop；Parallel 應核對 durable run status。
 - [ ] flag／done 與暫態計數已按預覽重設。
 - [ ] Plan 仍是預期版本與項目數。
 - [ ] Target repo HEAD／工作樹沒有被 Dashboard 階段切換改動。

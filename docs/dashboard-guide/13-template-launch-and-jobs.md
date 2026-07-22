@@ -6,6 +6,8 @@
 
 ## A. 以目前 Workspace 為範本啟動
 
+「以此為範本啟動」目前由普通 Loop 詳細頁提供。Parallel base／managed worker 沒有此操作；要建立另一個 Parallel run，請開啟 Launcher 的 `Parallel Loop` 分頁，重新核對 immutable config 與 frozen plan。
+
 ### 可預填的內容
 
 在詳細頁按「以此為範本啟動」後，啟動表單會預填：
@@ -35,7 +37,7 @@ Workspace 名稱留空，避免誤覆寫原 workspace。你必須填新名稱或
 6. 逐列讀「執行前變更 Diff」。
 7. 按啟動，等待 preflight 成功。
 
-如果要並行，必須使用不同 Git worktree；不同 workspace 名稱不能解除同 worktree 的單 writer 限制。
+不要用多個普通 Loop 或手動建立多個 worker worktree 來模擬 Parallel。真正需要同一 Plan 並行時，使用 `Parallel Loop`：base supervisor 會自行建立、驗證、整合與清理每個 managed linked worktree／task branch。不同 workspace 名稱不能解除 owner／writer 防線；若同一 repository 已有普通 owner，先完成或停止它；既有 Parallel run 則必須完成，或 Abort 並收斂到 `cancelled`。Pause 只供同一 run Resume，不會釋出 repo 給新的 writer。
 
 ## B. 查看「執行中的 jobs」
 
@@ -50,18 +52,22 @@ Workspace 名稱留空，避免誤覆寫原 workspace。你必須填新名稱或
 - `執行中` 或 `已結束 rc=N`。
 - Target repo 路徑。
 - 輸出尾段。
-- 活躍 job 的「停止」按鈕。
+- job kind，例如普通 `runner`、長跑 `parallel-supervisor`，或短暫的 `parallel-pause-control`／`parallel-abort-control`。
+- 普通活躍 job 的「停止」，或 Parallel supervisor 的「Pause」按鈕。
+
+Pause／Abort 會建立獨立、短暫的 `parallel-pause-control`／`parallel-abort-control` job。這些 control job 是一次性的 durable protocol client，卡片不提供第二個停止按鈕；應回 Parallel base 看最終 status，而不是只看 control process rc。Resume 不建立 `parallel-resume-control`：它會啟動新的長跑 `parallel-supervisor` owner，先完成 recovery audit，再持續執行同一 frozen run，直到之後 Pause、blocked 或進入終態。
 
 清單每 2 秒更新。Dashboard 保留最近 50 個已結束 job 的尾段供稽核；更早的已結束 job 自動淘汰，活躍 job 不受此限制。淘汰 job 卡片不會刪 workspace state 或 history。
 
 ## 關閉 Dashboard 的影響
 
-關閉 Dashboard process 會停止由它管理、仍在執行的 loop；state 會落地，可重新啟動後續跑。不要只關瀏覽器 tab 就假定 Python process 已停止；真正管理 loop 的是後端 process。
+關閉 Dashboard process 會停止它管理的普通 loops；對 Parallel 則保留較長的 bounded shutdown/Pause 寬限，避免截斷控制協議。若寬限內無法安全收斂，base 會保留 durable 狀態供 recovery，不能因 Dashboard process 已退出就假定 run 已 paused。重開後先讀 base status／error，再重試 Pause、Resume 或 terminal cleanup。只關瀏覽器 tab 不等於停止後端 process。
 
 ## Job 停止與 Workspace 停止
 
-- Job 卡「停止」會呼叫 workspace 的立即停止 API。
-- 日常停止仍建議回 workspace 詳細頁用「本輪後停止」。
+- 普通 Job 卡「停止」會呼叫 workspace 的立即停止 API；日常停止仍建議回詳細頁用「本輪後停止」。
+- Parallel supervisor Job 卡顯示「Pause」，呼叫 typed Pause；不是普通 signal stop，也不等於 Abort。
+- Parallel Pause／Abort control job 無控制按鈕；Resume 後的長跑 supervisor 則仍從 base 使用 Pause。所有 durable 結果都回 base 判讀。
 - Job 已結束但 workspace phase 尚未 done 很正常，表示 process 停止、協調任務未完成。
 
 ## 完成檢查
@@ -69,7 +75,8 @@ Workspace 名稱留空，避免誤覆寫原 workspace。你必須填新名稱或
 - [ ] 新 workspace 使用新的明確名稱。
 - [ ] 範本只複製 config，沒有誤認會複製進度。
 - [ ] 同一 Git worktree 沒有兩個 writer。
+- [ ] Parallel workers／worktrees 由 supervisor 建立，沒有手動啟動或刪除。
 - [ ] 執行前 Diff 已核對 Goal、Plan、Agent、Validate、門檻與 branch。
-- [ ] Job 狀態與 workspace phase 分開判讀。
+- [ ] Job process、workspace phase 與 Parallel durable status 分開判讀。
 
 相關：[啟動新的 loop](03-launch-new-loop.md)。

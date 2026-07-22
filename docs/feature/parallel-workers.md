@@ -1094,8 +1094,10 @@ MVP 必須包含：
 - Parallel Launcher含合法stack會啟 `engine.parallel`；普通Loop含stack明確拒絕。
 - stack template、validation、badge、batch preview；Plan Editor前後端拒改且state byte-equivalent。
 - base PID/status/Run/Resume/Stop/Abort依runner分流；完成後普通Run拒絕。
-- Pause/Resume/Abort control process回傳唯一`job_id`並輪詢至exit 0；spawn成功本身不算操作成功，
-  jobs list也用唯一id作UI key，避免同workspace多個control互相覆蓋。
+- Pause/Abort control process回傳唯一`job_id`並輪詢至exit 0；Resume則以唯一`job_id`啟動新的
+  長跑`parallel-supervisor`owner並輪詢至startup ready。兩者都不能把spawn成功本身當成操作成功；
+  UI以唯一公開id輪詢每次啟動／control；Pause/Abort也以該id作jobs registry key，避免同workspace
+  多個control互相覆蓋，長跑supervisor則維持workspace key以阻擋重複owner。
 - 兩個Dashboard process同時提交不同plan時，各自以`O_EXCL`建立唯一staged artifact並綁定exact raw
   SHA-256；勝出的supervisor只能在base `.run.lock`內讀取、驗證自己argv指定的artifact/hash，不得消費
   另一筆submission，也不得在驗證前建立run artifact或ref。

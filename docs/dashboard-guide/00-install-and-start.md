@@ -2,7 +2,7 @@
 
 ## 目的
 
-把 loop-agent-lite 的本機 Dashboard 跑起來，確認瀏覽器能開啟，並了解資料會存在哪裡。這個流程只安裝與啟動控制台，不會啟動任何 Agent loop。
+把 loop-agent-lite 的本機 Dashboard 跑起來，確認瀏覽器能開啟，並了解普通 Loop、Parallel Loop 與受管 worker 的資料會存在哪裡。這個流程只安裝與啟動控制台，不會啟動任何 Agent loop。
 
 ## 前置條件
 
@@ -38,6 +38,14 @@ python dashboard.py
 第一次且尚無 workspace 時，畫面會提供三步引導：選 repo、準備 Goal／Plan、確認 Validate 後啟動。已有 workspace 時，會直接看到 workspace 詳細頁或 Fleet 總覽。
 
 成功判定：頁面上方看得到「總覽」、「⌘K」與「＋ 啟動／管理」。
+
+點開「＋ 啟動／管理」→「啟動新 loop」後，會看到 runner 分頁：
+
+- `Loop coordinator`：既有的規劃期／執行期單一 coordinator。
+- `Parallel Loop`：匯入人工審核過的 frozen plan，固定從 exec 啟動，再由 supervisor 管理並行 workers。
+- `Ralph`：Ralph runner 的獨立啟動表單。
+
+切換分頁只是在查看表單；尚未按「啟動」前不會建立 workspace 或執行 Agent。
 
 ### 4. 確認這次只是啟動 Dashboard
 
@@ -86,12 +94,28 @@ workspace/<name>/
 └── REPORT.md
 ```
 
+Parallel 會以一個 base workspace 保存 supervisor state，並在 run 期間保存 durable parallel artifacts；目前活躍的每個 task 可能另有受管 worker workspace：
+
+```text
+workspace/<base>/
+├── state.json
+├── console.log
+├── REPORT.md
+└── parallel/<run-id>/
+
+workspace/<base>--<run-id>-task-<N>/   # 活躍或保留診斷現場的 managed worker
+```
+
+managed worker 由 parent supervisor 建立、恢復、清理或歸檔。不要手動啟動、編輯、重設或刪除它；Dashboard 也只提供唯讀畫面。所有控制都回到 `<base>` 的 Parallel workspace 操作。
+
 ## 新手常犯錯誤
 
 - 在 target repo 執行 `python dashboard.py`：Dashboard 應從 loop-agent-lite 根目錄啟動。
 - 關掉終端機後仍期待頁面工作：Dashboard Python process 停掉，瀏覽器就無法更新。
 - 固定輸入 8765：若 port 被占用，請看終端機實際網址。
 - 把 workspace 當成 repo：workspace 放協調資料；target repo 才是程式碼工作區。
+- 把 Parallel worker 當成一般 loop：worker 只執行被指派的 task，生命週期與 Git 整合都由 parent supervisor 管理。
+- 同時用普通 Loop 與 Parallel 操作同一個 target repo：兩者共用 writer／owner 防線；普通 owner 要先完成或停止，Parallel run 則要完成或 Abort 到 `cancelled`，才能啟動另一個 runner。Pause 只供同一 run Resume。
 - 直接雙擊 Python 檔：這樣不容易看到錯誤與實際 port，建議從終端機啟動。
 
 ## 完成檢查
@@ -100,6 +124,7 @@ workspace/<name>/
 - [ ] `python dashboard.py` 正在執行。
 - [ ] 瀏覽器可開啟終端機顯示的網址。
 - [ ] 能看到「＋ 啟動／管理」。
+- [ ] 打開啟動表單時看得到 `Loop coordinator`、`Parallel Loop` 與 `Ralph` runner 分頁。
 - [ ] 尚未誤按啟動任何 workspace。
 
 下一步：[完成第一次個人設定](01-first-time-personal-settings.md)。

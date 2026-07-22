@@ -1,8 +1,8 @@
 # loop-agent-lite Dashboard 新手操作圖解
 
-這套文件是給「第一次使用、還不熟悉 loop-agent-lite」的人。照著新手路線走完，你會知道如何準備 repo、設定 Agent CLI、建立 Goal／Plan、啟動 loop、讀懂每個狀態、處理中斷，以及安全地修改或刪除 workspace。
+這套文件是給「第一次使用、還不熟悉 loop-agent-lite」的人。照著新手路線走完，你會知道如何準備 repo、設定 Agent CLI、建立 Goal／Plan、選擇普通 Loop 或 Parallel Loop、讀懂每個狀態、處理中斷，以及安全地修改或刪除 workspace。
 
-> 圖片來源：2026-07-15 直接操作本機實際 Dashboard 擷取，範例 workspace 為 `dryrun-lab`。圖上的數值、路徑與任務是範例，你的畫面會依 repo 與執行狀態不同。橘色箭頭與中文標籤是文件說明層，底下的 Dashboard 像素沒有重製。
+> 圖片來源：2026-07-15 直接操作本機實際 Dashboard 擷取，範例 workspace 為 `dryrun-lab`。圖上的數值、路徑與任務是範例，你的畫面會依 repo、runner 與執行狀態不同；較早的截圖可能尚未顯示後來加入的 `Parallel Loop` runner 分頁。橘色箭頭與中文標籤是文件說明層，底下的 Dashboard 像素沒有重製。
 
 ![Fleet 總覽完整標註](../assets/dashboard-guide/annotated/overview.jpg)
 
@@ -23,8 +23,8 @@
 |---|---|
 | 安裝、找網址、確認 Dashboard 有啟動 | [00 安裝並啟動](00-install-and-start.md) |
 | 設定 Agent CLI、GUI PATH、Repo Roots、終態通知 | [01 第一次個人設定](01-first-time-personal-settings.md) |
-| 撰寫或產生 `goal.md`、匯入 `plan.json` | [02 準備 Goal 與 Plan](02-prepare-goal-and-plan.md) |
-| 新建或重建 loop | [03 啟動新的 loop](03-launch-new-loop.md) |
+| 撰寫或產生 `goal.md`、匯入 `plan.json`、人工標註 Parallel `stack` | [02 準備 Goal 與 Plan](02-prepare-goal-and-plan.md) |
+| 選擇普通／Parallel runner，新建或重建 loop | [03 啟動新的 loop](03-launch-new-loop.md) |
 | 同時監看所有 workspace、篩選警示、批次操作 | [04 Fleet 總覽](04-monitor-fleet-overview.md) |
 | 看單一 workspace 的階段、進度、健康度與任務 | [05 Workspace 監看](05-monitor-workspace.md) |
 | 篩選 console、分辨 Loop 紀錄與 Agent 原始輸出 | [06 讀取紀錄](06-read-logs.md) |
@@ -48,6 +48,8 @@
 - 「回規劃期」、「跳到 task-N」、「匯入並完整重置」與「永久刪除」都會先顯示影響預覽；逐列讀完再確認。
 - 刪除 workspace 不會刪 target repo，但會永久刪除該 workspace 的 state、history、logs、prompts、snapshots 與 REPORT。
 - 同一個 Git worktree 同一時間只能有一個 loop writer；不要從兩個 Dashboard 同時跑它。
+- Parallel 的 planner／Plan Prompt 不會替你判斷 `stack`；只有人類核對 working set、依賴與共享驗證資源後才能標註。不確定就不標，讓任務串行。
+- Parallel 的 managed worker 是 parent supervisor 管理的唯讀 workspace；Pause、Resume、Abort、重試收尾或刪除都從 Parallel base workspace 操作。
 - 不要手動修改 `workspace/*/state.json`、`state.last-good.json`、計畫真相或受保護的 Goal；請使用 Dashboard 提供的操作。
 
 ## 畫面上的狀態詞
@@ -57,6 +59,10 @@
 | 規劃期 | Agent 正在建立／確認任務計畫；以 `flag` 共識判定計畫是否收斂。 |
 | 執行期 | Agent 逐項處理 task；以 `done` 共識判定目前 task 是否完成。 |
 | 完成 | 所有 task 都已收斂，workspace 產生 `REPORT.md` 並停止。 |
+| Parallel Loop | 由 base supervisor 依 frozen plan 派出受管 workers；每個 worker 仍使用原生 loop 收斂。 |
+| `stack` | 人工加在 `plan.json` task 上的正整數分組；相同值且連續的 tasks 形成同一個 batch。 |
+| batch | Parallel 的排程單位；batch 依 order 串行，只有同一 batch 內的多個 tasks 才可能並行。未標 `stack` 的 task 自成一批。 |
+| Managed Worker | Parallel parent 建立的單一 task 執行 workspace；畫面只提供狀態、歷史、console 與唯讀 frozen task。 |
 | 綠點 | 最近一次合法、Validate 通過且可回復的 Git commit。 |
 | 紅連跳 | 連續驗證失敗／受保護內容異常的輪數；接近門檻時健康色帶變紅。 |
 | 停滯 | HEAD 沒有前進的輪數；到門檻會觸發 reset 防線。 |

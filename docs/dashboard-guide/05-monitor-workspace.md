@@ -2,7 +2,7 @@
 
 ## 目的
 
-讀懂一個 workspace 現在在哪個階段、正在做哪個 task、是否健康、是否接近 timeout，以及下一個安全操作是什麼。
+讀懂一個 workspace 是普通 Loop、Parallel base 或 managed worker，現在正在做哪個 task、是否健康，以及下一個安全操作是什麼。三種畫面的狀態與控制不可混用。
 
 ## 進入方式
 
@@ -13,7 +13,15 @@
 
 ![Workspace 詳細頁完整標註](../assets/dashboard-guide/annotated/workspace.jpg)
 
-## 建議閱讀順序
+## 先辨識 Workspace 類型
+
+- 普通 Loop：顯示「規劃期／執行期／完成」、flag／done、健康色帶及 Plan 操作。
+- Parallel base：標題旁顯示 `Parallel`，以 durable run status、batch 與 task outcome／resource 為真相，控制是 Pause／Resume／Abort。
+- Managed worker：標題旁顯示 `Managed Worker`，只顯示 parent、run、被指派的單一 task、歷史與 console；整頁唯讀。
+
+頂部 workspace 分頁可能同時顯示 Parallel base 與暫時保留供診斷的 managed workers；Fleet 則只計 base，避免重複統計。
+
+## 普通 Loop：建議閱讀順序
 
 ### 1. 看名稱、階段與是否正在運行
 
@@ -80,6 +88,46 @@
 - Issues：Agent 明確回報等待人類決策時出現。
 - Goal／Prompt／紀錄／時間軸／Run 對比都是唯讀。
 
+## Parallel base：讀 durable run
+
+Parallel base 不使用普通 Loop 的 Plan Editor、phase、設定、跳 task 或中斷現場 Resume。建議依序讀：
+
+1. `Parallel` badge 與狀態 chip：
+   - `初始化`／`執行中`：supervisor 正在建立或執行目前 batch。
+   - `暫停收尾中`／`已暫停`：Pause 已送出或已完成。
+   - `取消收尾中`／`取消清理中`：Abort 的 cancellation intent 已固定，正在清理。
+   - `完成收尾中`：所有 task 已整合，正在產生終態產物與清理。
+   - `已阻擋`：需讀 base error 與 task error；可能是人工 block，也可能是 recovery invariant。
+   - `已完成`／`已取消`：不可再 Resume 的終態。
+2. run id、目前 batch 與 `任務 X/Y`。X 是已由 canonical receipt 證明整合的 task 數；worker 的 done threshold 本身不會直接增加 X。
+3. `Parallel tasks` 表：每列都來自 frozen plan 與 durable supervisor state，不能在這裡改 task 或 stack。
+4. base console：確認派工、gate、integration、Pause／Abort、cleanup 與 recovery 的時序。
+
+### Outcome 與 Resource 必須分開讀
+
+| 欄位 | 回答的問題 | 常見值 |
+|---|---|---|
+| Outcome | 這個 task 的邏輯結果是什麼？ | `等待`（pending）、`已整合`、`阻擋`、`取消` |
+| Resource | worker process、worktree 與 gate 現在在哪一段？ | `queued`、`provisioning`、`running`、`gate_pending`、`gate_claimed`、`paused`、`recovery_required`、`exited`、`cleaning`、`cleaned`、`cleanup_failed` |
+
+`Outcome=已整合` 只表示 receipt 已證明 exact validated SHA 進入 primary；Resource 仍可能是 `exited`／`cleaning`，因為 child reap 與 worktree cleanup 是另一條生命週期。反過來，Resource 已 `cleaned` 也不應自行推論 task 已整合；以 Outcome 與完成 SHA 為準。
+
+### 查看 Parallel task Git Diff
+
+已整合 task 的 Outcome 旁會出現短 SHA。點下後，Dashboard 從 Parallel base 綁定的 primary repo 讀取 receipt 投影的 `integration_before → validated_sha` 範圍，顯示 commits、檔案統計與逐檔 patch。這個 diff 不依賴 worker worktree，因此 supervisor 安全清掉 worktree 後仍可查看。
+
+若沒有短 SHA，代表 task 尚無 canonical completion receipt；不要從 worker branch 或工作目錄自行推定已完成。若 diff 回報 SHA／範圍錯誤，先把它視為 recovery 問題，不要手改 base state。
+
+## Managed Worker：只做診斷
+
+Managed worker 畫面只顯示 frozen plan 中被指派的單一 task，以及：
+
+- parent workspace、run id、task order。
+- assignment status 與可能的 `exit_reason`。
+- worker history 與右側 console。
+
+它不顯示其他 task 的內容，也不提供 Run、Resume、Stop、Abort、設定、Plan 編輯、phase、跳 task 或刪除。這不是權限遺漏；worker workspace、branch、gate 與 cleanup 都由 parent supervisor 管理。所有控制回到 Parallel base 執行，不要直接在 worker repo checkout、merge、rebase、改 shared refs，或手動刪除 worker workspace／worktree。
+
 ## 何時需要人工介入
 
 | 畫面現象 | 建議 |
@@ -92,6 +140,9 @@
 | Goal 已變更 | 點 Goal 看差異，通常回規劃期重新收斂。 |
 | PID 殘留／state 復原 | 先查 console 與 process，避免第二個 writer。 |
 | round 倒數最後 60 秒 | 觀察是否正常收尾；不要只因接近 timeout 就立刻 kill。 |
+| Parallel `blocked` | 讀 base error、task Outcome／Resource、worker `exit_reason` 與 console；人工 task block 通常需 Abort 後以修正過的 Goal／Plan 重新開新 run，recovery block 才可能可 Resume。 |
+| Parallel `cleanup_failed` | 現場刻意保留；先找 lock、live child、dirty worktree 或 Git registry 原因，再從 base 重試相應收尾。 |
+| Managed worker 顯示錯誤 | 只蒐集 assigned task、exit reason、history／console；不要直接操作 worker，回 parent base 處理。 |
 
 ## 完成檢查
 
@@ -99,5 +150,7 @@
 - [ ] 知道目前 task、完成任務數、flag／done 各代表什麼。
 - [ ] 看過健康色帶、紅連跳、停滯與 round 計時。
 - [ ] 發現警示時知道從 Loop／Agent log 開始查。
+- [ ] Parallel 時能分辨 base 與 managed worker，並分開解讀 Outcome／Resource。
+- [ ] 知道 Parallel 完成 SHA／Diff 以 receipt 與 primary repo 為準。
 
 下一步：[讀懂 Loop 與 Agent 紀錄](06-read-logs.md)。

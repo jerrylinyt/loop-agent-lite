@@ -2,7 +2,9 @@
 
 ## 目的
 
-依情境選擇平順停止、緊急停止、一般續跑或保留中斷現場 Resume，避免為了「續跑」不必要地略過安全檢查。
+依 runner 選對控制。普通 Loop 使用本輪後停止／立即停止／一般執行／中斷現場 Resume；Parallel base 使用 Pause／Resume／Abort 與終態 recovery。Managed worker 不可直接控制。
+
+> 本頁 A～C 與「Resume 前必要檢查」只適用普通 Loop。Parallel 請直接看下方「Parallel base 控制」。
 
 ## 一張表先選對操作
 
@@ -13,6 +15,8 @@
 | Agent CLI 卡死、失控、跑錯危險命令 | 立即停止 |
 | 停止後工作樹乾淨、Validate 可過 | 運行 → 一般執行 |
 | 明確要保留中斷中的髒工作樹，且有可信綠點 | 運行 → Resume |
+
+Parallel 不使用這張表中的「本輪後停止」或「中斷現場 Resume」。看到 `Parallel` badge 時，改用 base 頁的 Pause／Resume／Abort。
 
 ## A. 本輪後停止（正常首選）
 
@@ -100,5 +104,33 @@ git show --no-patch --oneline <綠點-SHA>
 - 立即停止：console 記錄人工中斷，計時凍結，target repo 現場已人工核對。
 - 一般執行：console 顯示 preflight 與啟動 Validate 通過，再開始新輪。
 - Resume：console 明示「Resume 中斷現場」與沿用的綠點，下一輪結束仍有 Validate。
+
+## Parallel base 控制
+
+| 情境 | 操作 | 結果 |
+|---|---|---|
+| 正常暫停、維護或想保留未整合現場 | Pause | 停止新派工，在安全邊界 quiesce workers；已整合 commits 保留，未整合 worktrees 留給 Resume。 |
+| `paused`，或沒有 task outcome block 的可恢復 `blocked` | Resume | 由新 supervisor owner 先 reconcile durable artifacts、Git refs、receipts、children 與 worktrees，再繼續目前 frozen run。 |
+| 不再繼續本 run，或 task 已人工 block | Abort | 固定 cancellation intent、停止 workers、取消未整合 tasks 並清理由 supervisor 證明安全的 worktrees；不 rollback 已整合 commits。 |
+
+Pause 送出後可能先顯示 `pause_requested`。若控制程序中斷，按「重試 Pause」重播同一安全流程；不要直接 kill managed workers。Pause 完成後是 `paused`，不是 ordinary idle state。
+
+Resume 不接受普通 Loop 的開始時間／綠點欄位，也不略過安全檢查。它會依原 run id、immutable manifest、frozen plan 與 receipt chain 復原；若 primary／sync ref、child identity、dirty worktree 或 operation lease 無法證明，會 fail closed 為 `blocked`。
+
+Abort 是不可逆的 run 決策。到 `cancel_requested`／`finalizing_cancel` 後不能改回繼續執行；若 supervisor 在清理中斷，按「重試取消清理」。完成收尾若停在 `finalizing`，按「重試完成收尾」。這些按鈕雖走 Resume 路由，實際只重播已固定的 terminal intent。
+
+### `blocked` 先分兩類
+
+- task 表出現 `Outcome=阻擋`：managed worker 已用 `engine.work block --reason` 結束 assigned task；同一 frozen run 不會重派該 task。完成真正的人類決策後 Abort，修正／commit Goal、環境或新 frozen plan，再用新 workspace 名稱啟動新的 Parallel run。
+- task outcome 仍 pending／integrated，但 base 因 crash、gate、cleanup 或 invariant 顯示 `blocked`：先修復精確原因；能證明 durable truth 後才按 Resume。若無法安全恢復，使用 Abort 走取消清理。
+
+Managed worker 頁沒有控制按鈕是刻意的。所有 Pause、Resume、Abort、重試收尾與後續刪除都從 parent base 執行。
+
+### Parallel 完成判定
+
+- Pause：base 為 `paused`，沒有 active child；未整合 task 可保留 paused worktree。
+- Resume：console 顯示 recovery audit 通過後才恢復派工。
+- Abort：base 到 `cancelled`；已整合 commits 仍在 primary。
+- 正常完成：base 到 `completed`，report／notify／cleanup 等終態產物已 durable 完成。
 
 下一步：需要調整任務時看 [編輯 Plan 與切換任務](08-edit-plan-and-change-task.md)。

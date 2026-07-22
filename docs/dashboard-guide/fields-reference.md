@@ -27,6 +27,8 @@
 | 需要關注 | 有目前健康問題或未讀人工待辦的數量 | 非 0 時先篩「需關注」 |
 | 任務完成 | 所有 workspace completed task／總 task | 顯示百分比與 progress bar |
 
+Parallel managed workers 可出現在 workspace 導覽中，但不會重複計入 Fleet 的 workspace、task、completed 或 attention aggregate；Parallel base workspace 才是統計與控制單位。
+
 ### 輪次效能
 
 | 欄位 | 意義 | 讀法 |
@@ -54,6 +56,7 @@
 | 顯示 X/Y | 目前過濾結果／總數 | 找不到卡片先查這裡 |
 | 批次操作 | 多選後標 issues 已讀或立即停止 | 確認預覽會列可執行／跳過 |
 | Workspace 卡片 | 名稱、phase、round、done／flag、計時、task、效能、repo | 點卡片進詳細頁 |
+| Parallel badge／status／batch | 表示卡片是 Parallel base，並顯示 supervisor run 狀態與目前 batch | `blocked` 或 parallel error 會進「需關注」 |
 | 事件推播 | 最近 12 則重要事件 | 快速提示，不取代 history |
 
 ## 3. 啟動與管理：基本欄位
@@ -64,18 +67,24 @@
 |---|---:|---|---|
 | 啟動新 loop | — | 顯示啟動表單 | 與 jobs 分頁分開 |
 | 執行中的 jobs | — | 看由 Dashboard 啟動的 process 與尾段 | 不代表 phase |
+| Loop coordinator | — | 普通規劃／執行 coordinator | Plan 可留空；支援規劃期與直接執行期 |
+| Parallel Loop | — | 由 base supervisor 依 frozen plan 管理多個原生 loop workers | Plan 必填、固定 exec；planner 不產生 `stack` |
+| Ralph | — | 顯示 Ralph 專用啟動表單 | 與 Loop／Parallel 欄位分開 |
 | Repo | 是 | Target Git repo | 來自 Repo Roots 或手動路徑 |
 | 管理 Code Repo Roots | — | 設定掃描 parent directories | 寫個人設定 |
 | 手動輸入 Repo | 條件式 | 下拉沒有時填路徑 | 建議絕對路徑 |
 | Repo 狀態 | 唯讀 | 顯示 Goal Git 狀態、工作樹、branch、既有 workspace | dirty tree 會擋一般 preflight |
-| goal.md 檔案 | 否 | 上傳要取代／匯入的 Goal | 留空沿用 repo 已 commit 版本 |
-| Goal 產生器 Prompt | — | 建構交給外部 Agent 的 Goal 撰寫 prompt；可勾選同時產生初版 plan.json | 只在瀏覽器，不寫 repo |
-| Goal 成果模板 | — | 顯示符合契約的 Goal 骨架 | 仍需人工適配 |
-| 匯入 plan.json | 否 | 建立全新純 Plan state | 留空沿用或從零規劃 |
-| 產生 Plan Prompt | — | 產生要求外部 Agent 輸出 Plan JSON 的 prompt | 輸出仍需審查 |
-| 複製 JSON 範本 | — | 複製合法 schema 範例 | Clipboard 失敗時可能填入 textarea |
-| 起始規劃期 | 條件式 | 匯入 Plan 後仍讓規劃輪審核 | 只有 Plan 合法時顯示 |
-| 直接執行期 | 條件式 | 匯入 Plan 後從 task-1 執行 | Plan 應先人工審核 |
+| goal.md 檔案 | 否 | 上傳要取代／匯入的 Goal | 普通 Loop 可用；Parallel 停用並沿用目前 branch 已 commit 版本 |
+| Goal 產生器 Prompt | — | 建構交給外部 Agent 的 Goal 撰寫 prompt；可勾選同時產生初版 plan.json | 只在瀏覽器，不寫 repo；Parallel 提示 Goal 拓撲中立，初版 Plan 仍不含 `stack` |
+| Goal 成果模板 | — | 顯示符合契約的 Goal 骨架 | 仍需人工適配；Parallel 不把 batch／worker 分工寫進 Goal |
+| 匯入 plan.json | 普通否／Parallel 是 | 建立純 Plan state，或提供 Parallel frozen plan | 普通可留空；Parallel 必須非空且固定 exec |
+| 產生 Plan Prompt | — | 普通 Loop 要求外部 Agent 輸出 Plan JSON | 只輸出 `order/task/ref`，仍需審查 |
+| 產生基礎 Plan Prompt（不含 stack） | — | Parallel 語境的基礎 Plan Prompt，補 working set、依賴與共享資源證據 | 明確禁止 Agent 推論／輸出 `stack`；產出後由人類標註 |
+| 複製 JSON 範本 | — | 複製普通 Plan schema 範例 | Clipboard 失敗時可能填入 textarea |
+| 複製 Parallel 範本 | — | 複製含人工 `stack` 形狀與串行 task 的範例 | 範例內容與分組不可直接照抄 |
+| Batch preview | Parallel 條件式 | 顯示 batch 數與 order 分組 | 沒有多 task batch 時警告全部依序執行，但仍是合法 Plan |
+| 起始規劃期 | 普通條件式 | 匯入 Plan 後仍讓規劃輪審核 | 只有普通 Plan 合法時顯示 |
+| 直接執行期 | 普通條件式 | 匯入 Plan 後從 task-1 執行 | Parallel 沒有選項，永遠固定 exec |
 | Workspace 名稱 | 否 | Coordinator 資料識別 | 留空＝repo 目錄名；只允許英數 `._-` 等合法規則 |
 | Agent 命令 | 是 | 每輪實際執行的 CLI | Prompt 由 stdin 傳入 |
 | 管理 Agent CLI | — | 編輯 CLI 與額外 PATH | 寫個人設定 |
@@ -91,8 +100,9 @@
 | `order` | 是 | 任務順序 | int、唯一、從 1 連續 |
 | `task` | 是 | 無前後文也能執行的任務描述 | 非空字串，應含 DoD |
 | `ref` | 否 | 連到 Goal／分析段落 | 字串、`null` 或省略 |
+| `stack` | Parallel 選填 | 人工標註可同批執行的連續 tasks | 正整數；普通 Loop 拒絕；同值只能出現在一個連續 order 區段 |
 
-未知欄位、整份 state、完成狀態與 SHA 會被拒絕。
+未知欄位、整份 state、完成狀態與 SHA 會被拒絕。相同 `stack` 的連續區段是一個 batch；未標 `stack` 的 task 各自是一個串行 batch。batch 依 order 執行，只有同一 batch 內至少兩個 tasks 才有實際並行。
 
 ## 4. 啟動與管理：進階欄位
 
@@ -105,6 +115,8 @@
 | 單輪上限（分） | 0 | Agent round timeout | 限制卡住輪；0 的語意依後端設定驗證 |
 | Agent 異常退避上限（秒） | 0 | 連續 CLI 異常重試最大等待 | 避免快速失敗風暴 |
 | Validate 上限（秒） | 1 | 單次 validator timeout | 逾時終止 process group |
+| 最大並行 workers | 1 | Parallel 同一 batch 同時執行上限；預設 2 | 只在 Parallel 顯示，不會跨 batch 提前派工 |
+| Worker 重啟上限 | 1 | 單 task 非預期 crash 的有限恢復預算；預設 3 | fatal／blocked 不會當成一般 crash 無限重啟 |
 | 規劃收斂後暫停 | checkbox | Plan 收斂後停在 exec 起點 | 提供人工審 Plan gate |
 | 重置 workspace state | checkbox | 清除舊進度重建 | 交易式；新流程未通過前保留舊 state |
 | 在新 branch 跑 | checkbox | 建立 `loop/<workspace>` | Goal 安全檢查先於 checkout |
@@ -112,6 +124,8 @@
 | 執行前變更 Diff | details | 對照 before／after | 送出前核對所有 mutation |
 | 取消 | — | 關閉不送出 | 尚未啟動 |
 | 啟動 | — | 送出交易式 launch | 成功前視窗不關閉 |
+
+Parallel 中「規劃收斂後暫停」、「重置 workspace state」與「在新 branch 跑」都停用：Plan 已凍結且固定 exec，task branches／worktrees 改由 supervisor 管理。
 
 ### 執行前 Diff 列
 
@@ -121,7 +135,7 @@
 | plan / phase | 現有 task／phase 對匯入／重建結果 |
 | Agent | 現有或預設命令對本次命令 |
 | Validate | 命令與 timeout |
-| 收斂 / timeout | flag、done、round、backoff、規劃暫停 |
+| 收斂 / timeout | flag、done、round、backoff；Parallel 另顯示 workers 上限，普通 Loop 可顯示規劃暫停 |
 | Git branch | 目前 branch 對新 branch／不切換 |
 
 ## 5. Agent CLI 管理
@@ -168,6 +182,8 @@
 
 ### 生命週期按鈕
 
+下表是普通 `Loop coordinator` workspace；Parallel base 使用下一小節的專用控制。
+
 | 按鈕 | 出現條件 | 用途／副作用 |
 |---|---|---|
 | 本輪後停止 | running、尚未 draining | 目前輪完整收尾後停止 |
@@ -211,6 +227,63 @@
 | Prompt | 最近一輪完整 prompt | 唯讀 |
 | Goal 已變更警告 | Goal hash 與 Plan 基準不同 | 建議查看 diff、回規劃期 |
 
+### Parallel base workspace
+
+Parallel base 是整個 run 的唯一操作入口。它顯示 `Parallel` badge、run id、目前 batch、已完成／總任務、錯誤，以及 frozen plan 的逐 task 投影。
+
+#### Run status
+
+| 原始 status | 畫面標籤 | 意義／下一步 |
+|---|---|---|
+| `initializing` | 初始化 | 驗證 frozen run 並準備 supervisor 資源；可 Pause 或 Abort |
+| `running` | 執行中 | 目前 batch 正在派工、收斂或整合；可 Pause 或 Abort |
+| `pause_requested` | 暫停收尾中 | 正在停止派工並讓 child 到安全邊界；必要時可「重試 Pause」 |
+| `paused` | 已暫停 | Supervisor 已安全 quiesce；可 Resume 或 Abort |
+| `cancel_requested` | 取消收尾中 | Abort intent 已建立，正在裁決／停止未完成工作 |
+| `finalizing` | 完成收尾中 | Tasks 已達完成條件，正在寫 REPORT、通知與最後投影 |
+| `finalizing_cancel` | 取消清理中 | 正在完成取消後的資源清理與終態投影 |
+| `blocked` | 已阻擋 | 有 invariant、human gate、restart limit、cleanup 或 recovery 問題；先讀 error，再選 Resume recovery 或 Abort |
+| `completed` | 已完成 | 所有 tasks 已整合、workers 已退出且資源 cleaned；base `phase=done` |
+| `cancelled` | 已取消 | Abort 收尾完成；已整合 commits 保留，base 不假裝完成 Goal |
+
+#### 控制按鈕
+
+| 按鈕 | 出現／可用條件 | 用途與副作用 |
+|---|---|---|
+| Pause | `initializing`、`running` | 停止新派工並讓 workers 到安全邊界；不回滾已整合 commit |
+| 重試 Pause | `pause_requested` | 重送同一 pause intent 的恢復路徑，不建立新排程決策 |
+| Resume | `paused`、一般可恢復的 `blocked` | 先 reconcile durable run／child／receipt，再恢復允許的工作 |
+| 重試完成收尾 | 完成 intent 的 `blocked`，或 owner 已停止的 `finalizing` | 重播 REPORT／notify／terminal projection 等既有完成收尾 |
+| 重試取消清理 | 取消 intent 的 `blocked`，或 owner 已停止的 `cancel_requested`／`finalizing_cancel` | 重播既有取消清理；不復活 workers |
+| Abort | 尚無 terminal intent 的初始化、執行、暫停或 blocked run | 確認後取消未整合工作、保留已整合 commits，清理可安全移除的資源 |
+| 刪除 | owner 已停止且 status 是 `completed` 或 `cancelled` | 永久刪除 base workspace 與 durable run artifacts；不刪 target repo／已整合 commits |
+
+#### Parallel tasks 表
+
+| 欄位 | 用途 | 常見值／注意事項 |
+|---|---|---|
+| `#` | Frozen task order | 不可由一般 Plan Editor 重排 |
+| Batch | Supervisor 的 batch 編號／Plan 分組投影 | batch 依序執行，同批才可能並行 |
+| 任務 | 完整 task 與選填 `ref` | task error 會在列內顯示 |
+| Outcome | Task 的業務終態 | `等待`（pending）、`已整合`、`阻擋`、`取消` |
+| Resource | Worker／gate／cleanup lifecycle | `queued`、`provisioning`、`running`、`gate_pending`、`gate_claimed`、`pausing`、`paused`、`crashed`、`recovery_required`、`exited`、`cleaning`、`cleaned`、`cleanup_failed` |
+| 重啟 | 單 task restart_count | 達設定上限會阻擋，不會無限重啟 |
+| 完成 SHA | 開 base primary repo 上該 assignment 的 receipt-aware Git Diff | Worker worktree 清掉後仍由 base 查看 |
+
+`integrated` 只證明 commit 已合法整合，不代表 worker 已退出或資源已清理；run 要等所有任務的資源到 `cleaned` 才能完成。`cleanup_failed` 不會覆寫原本 outcome，會保留錯誤供 Resume recovery。
+
+### Managed worker workspace
+
+| 欄位／區域 | 用途 | 限制 |
+|---|---|---|
+| Managed Worker badge | 表示此 workspace 由 Parallel parent 管理 | 不是獨立普通 loop |
+| parent／run／task | 指向 base workspace、run id、assigned order | 用來回 base 找控制入口 |
+| assignment status | 顯示 running、paused、recovery-required、integrated、blocked 或 cancelled | 只讀投影 |
+| Frozen plan | 只顯示目前被指派的 task 與 batch／stack | 不顯示或執行其他 task |
+| 歷史／Console | 稽核該 worker 的輪次與原始輸出 | 唯讀 |
+
+Managed worker 不顯示 Run、Resume、Stop、Edit、Phase、Delete、issue mutation 或 repo-backed task diff；後端也會拒絕直接 mutation。請一律回 parent Parallel base 使用 Pause、Resume 或 Abort。
+
 ## 8. 任務表與 Plan 編輯器
 
 ### 任務表
@@ -223,6 +296,7 @@
 | 狀態 | 完成、進行中、等待 |
 | 顯示／隱藏已完成 | 展開完成前綴；選擇存瀏覽器 |
 | 完成 SHA | 開該 task Git Diff |
+| stack badge | 顯示 Parallel frozen plan 的人工 batch 標註；只讀 |
 | 前往 | 人工跳／退 task，先顯示 Validate 與完成紀錄影響 |
 | 編輯計畫 | 開 Plan 編輯器；只在停止可用 |
 
@@ -242,6 +316,8 @@
 | 變更摘要 | 鎖定、新增、刪除、移動、文字數 | 送出前核對 |
 | done 計數 | 人工校正目前共識 | 不是 completed task 數 |
 | 儲存變更 | 原子保存並重新編號 pending | 用 plan version 防覆蓋 |
+
+只要 Plan 含 `stack`，前端會標示「Parallel plan 唯讀」並停用一般編輯；後端也以衝突回應拒絕修改且不變更 state。要改 batch，請回原始 JSON 人工重審後從 Parallel Launcher 啟動，不要在編輯器中剝除 `stack`。
 
 ## 9. Console
 
@@ -268,11 +344,13 @@
 | 紅燈連跳 reset | Red streak 防線 | min 1 |
 | HEAD 停滯 reset | Stall 防線 | min 1 |
 | 規劃收斂後暫停 | 人工 Plan gate | 下次規劃收斂使用 |
-| 匯出 plan.json | 下載 order/task/ref | 不含完成進度 |
-| 匯入並完整重置 | 用純 Plan 重建 | 清 round/completed/issues/counters/舊 run |
+| 匯出 plan.json | 下載 order/task/ref 與既有唯讀 `stack` | 不含完成進度 |
+| 匯入並完整重置 | 用普通純 Plan 重建 | 只接受 order/task/ref；含 `stack` 的 frozen plan 必須從 Parallel Launcher 啟動 |
 | 儲存設定 | 保存 config | 不自動運行 |
 
 ## 11. 運行選擇
+
+這個選擇視窗適用普通 Loop。Parallel base 不使用「一般執行／Resume 現場」二選一，而是由專用 Resume 先 reconcile durable run；managed worker 沒有運行按鈕。
 
 ![運行選擇欄位圖解](../assets/dashboard-guide/annotated/run-choice.jpg)
 
@@ -363,7 +441,10 @@
 | 已結束 rc=N | Process 結束與 exit code |
 | Repo | Target repo 路徑 |
 | Tail | Job 輸出尾段 |
-| 停止 | 對 active job 立即停止 |
+| 停止 | 對普通 active job 立即停止 |
+| Pause | 對 active `parallel-supervisor` 送出 Parallel Pause；不把 supervisor 當普通 process 直接殺掉 |
+| Parallel Pause／Abort control job | 顯示 typed control process 的獨立 job id、rc 與 tail；control job 不另顯示停止按鈕，spawn 成功不等於控制已完成 |
+| Parallel Resume | 以新的唯一 job id 啟動長跑 `parallel-supervisor` owner；先等 startup ready，再由同一 process 持續 recovery／執行，直到 Pause、blocked 或終態 |
 
 ## 16. 確認視窗共同欄位
 
