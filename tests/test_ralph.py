@@ -18,6 +18,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from engine import loop as loop_mod  # noqa: E402
+from engine import platform_compat as compat  # noqa: E402
 from engine import ralph as R  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -203,24 +204,35 @@ class TestLoadPrd(unittest.TestCase):
 class TestBuildRalphArgv(unittest.TestCase):
     """build_ralph_argv(base_cmd, args_template, *, iterations, tool, model, prd_path)。"""
 
+    def assert_shell_argv0(self, argv0):
+        """Windows 上裸 shell 名會被釘成絕對路徑(CreateProcess 先搜 System32 的 WSL stub)。"""
+        if compat.IS_WINDOWS:
+            self.assertTrue(Path(argv0).is_absolute(), argv0)
+            self.assertIn(Path(argv0).name.casefold(), {"sh.exe", "bash.exe"})
+        else:
+            self.assertEqual(argv0, "sh")
+
     def test_positional_style_appends_iterations_tool_model(self):
         argv = R.build_ralph_argv(
             "sh /x/ralph.sh", R.ARGS_STYLES["positional"],
             iterations=5, tool="opencode", model="m")
-        self.assertEqual(argv, ["sh", "/x/ralph.sh", "5", "opencode", "m"])
+        self.assert_shell_argv0(argv[0])
+        self.assertEqual(argv[1:], ["/x/ralph.sh", "5", "opencode", "m"])
 
     def test_empty_model_token_is_dropped_entirely(self):
         argv = R.build_ralph_argv(
             "sh /x/ralph.sh", R.ARGS_STYLES["positional"],
             iterations=5, tool="opencode", model="")
-        self.assertEqual(argv, ["sh", "/x/ralph.sh", "5", "opencode"])
+        self.assert_shell_argv0(argv[0])
+        self.assertEqual(argv[1:], ["/x/ralph.sh", "5", "opencode"])
         self.assertNotIn("", argv)
 
     def test_snarktank_style_uses_tool_flag_then_iterations(self):
         argv = R.build_ralph_argv(
             "sh /x/ralph.sh", R.ARGS_STYLES["snarktank"],
             iterations=5, tool="claude", model="")
-        self.assertEqual(argv[:2], ["sh", "/x/ralph.sh"])
+        self.assert_shell_argv0(argv[0])
+        self.assertEqual(argv[1], "/x/ralph.sh")
         self.assertEqual(argv[2:], ["--tool", "claude", "5"])
 
     def test_embedded_placeholder_is_substituted_within_token(self):
@@ -231,7 +243,8 @@ class TestBuildRalphArgv(unittest.TestCase):
 
     def test_base_command_is_shlex_split(self):
         argv = R.build_ralph_argv("sh /x/ralph.sh", [], iterations=1, tool="t", model="")
-        self.assertEqual(argv, ["sh", "/x/ralph.sh"])
+        self.assert_shell_argv0(argv[0])
+        self.assertEqual(argv[1:], ["/x/ralph.sh"])
 
 
 class TestResolveArgsTemplate(unittest.TestCase):

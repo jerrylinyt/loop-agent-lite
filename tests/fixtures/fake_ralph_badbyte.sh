@@ -14,7 +14,13 @@ if s: s["passes"]=True; json.dump(d,open(sys.argv[1],"w")); print(s.get("id","")
 PY
 )
   [ -n "$DONE" ] && { git add -A >/dev/null 2>&1 || true; git commit -q -m "b:$DONE" >/dev/null 2>&1 || true; }
-  REMAIN=$(python3 -c "import json,sys;print(sum(1 for x in json.load(open('$PRD')).get('userStories',[]) if not x.get('passes')))")
+  # 路徑必須走 argv 而不是內嵌進 -c 字串:Git Bash 的 MSYS 路徑轉換只處理獨立引數,
+  # 內嵌在程式碼字串裡的 /tmp/... 到了原生 Windows python 會 FileNotFoundError。
+  REMAIN=$(python3 - "$PRD" <<'PY'
+import json,sys
+print(sum(1 for x in json.load(open(sys.argv[1])).get("userStories",[]) if not x.get("passes")))
+PY
+)
   [ "$REMAIN" = "0" ] && { echo "<promise>COMPLETE</promise>"; exit 0; }
 done
 exit 1

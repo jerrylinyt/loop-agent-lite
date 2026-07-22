@@ -76,12 +76,14 @@ class TestRalphDashboardE2E(unittest.TestCase):
             subprocess.run(["git", "-C", str(cls.clone), "config", key, value], check=True)
 
         # 隔離 PATH 內的 fake `claude`:真正 ralph.sh 會呼叫它;此 wrapper 轉呼 fake_agent.py。
+        # 路徑必須用 as_posix() 並加引號:Windows 反斜線路徑直接嵌進 bash script 會被
+        # 當跳脫字元吃掉(C:\hosted... 變 C:hosted...),Git Bash 對 C:/ 正斜線則沒問題。
         cls.bindir = cls.fixture / "bin"
         cls.bindir.mkdir()
         claude = cls.bindir / "claude"
         claude.write_text(
             "#!/usr/bin/env bash\n"
-            f'exec {shutil.which("python3") or sys.executable} "{FIXTURES / "fake_agent.py"}" "$@"\n',
+            f'exec "{Path(sys.executable).as_posix()}" "{(FIXTURES / "fake_agent.py").as_posix()}" "$@"\n',
             encoding="utf-8")
         claude.chmod(0o755)
 

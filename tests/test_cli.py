@@ -150,9 +150,16 @@ class TestSingleWorkspaceCli(unittest.TestCase):
             self.assertEqual(options.workspace_name, "replay")
             self.assertEqual(options.repo, repo.resolve())
             self.assertEqual(options.agent_cmd, ["agent", "--profile", "night shift"])
+            # Windows 上裸 sh 會被釘成絕對路徑(CreateProcess 先搜 System32 的 WSL stub)。
+            if compat.IS_WINDOWS:
+                self.assertTrue(Path(options.validate_cmd[0]).is_absolute())
+                self.assertIn(Path(options.validate_cmd[0]).name.casefold(),
+                              {"sh.exe", "bash.exe"})
+            else:
+                self.assertEqual(options.validate_cmd[0], "sh")
             self.assertEqual(
-                options.validate_cmd,
-                ["sh", "-c", "python -m unittest && echo green"],
+                options.validate_cmd[1:],
+                ["-c", "python -m unittest && echo green"],
             )
             self.assertEqual(options.args.goal, "specs/goal.md")
             self.assertEqual(options.args.plan_doc, "docs/PLAN.md")
