@@ -71,7 +71,8 @@ def pid_is_loop_alive(pid) -> bool:
                                  capture_output=True, text=True, check=False).stdout
     except OSError:
         return True
-    return "loop.py" in command or "engine.loop" in command
+    return any(marker in command for marker in (
+        "loop.py", "engine.loop", "engine.parallel", "engine.ralph"))
 
 
 def project_status(name: str, metrics_limit=0):
@@ -110,6 +111,8 @@ def project_status(name: str, metrics_limit=0):
     projection = {
         "name": name,
         "workspace": str(directory),
+        "runner": state.get("runner") or "loop",
+        "managed_readonly": bool(state.get("managed_readonly")),
         "phase": state.get("phase"),
         "round": state.get("round", 0),
         "flag": state.get("flag", 0),
@@ -147,6 +150,43 @@ def project_status(name: str, metrics_limit=0):
         "stale_loop_pid": pid is not None and not state_running and not starting,
         "state_recovery_pending": recovered,
     }
+    if projection["runner"] == "parallel-supervisor":
+        parallel = state.get("parallel") if isinstance(state.get("parallel"), dict) else {}
+        projection["parallel"] = {
+            "run_id": parallel.get("run_id"),
+            "status": parallel.get("status"),
+            "terminal_intent": parallel.get("terminal_intent"),
+            "batch": parallel.get("batch"),
+            "tasks": list(parallel.get("tasks") or []),
+            "error": parallel.get("error"),
+        }
+    elif projection["runner"] == "parallel-worker":
+        assignment = state.get("assignment") if isinstance(state.get("assignment"), dict) else {}
+        assigned_order = state.get("assigned_order")
+        assigned_task = next((task for task in plan
+                              if isinstance(task, dict)
+                              and task.get("order") == assigned_order), None)
+        assigned_text = (assigned_task.get("task", "")
+                         if isinstance(assigned_task, dict) else "")
+        if len(assigned_text) > 160:
+            assigned_text = assigned_text[:160] + "…"
+        assigned_complete = any(
+            (entry.get("order") if isinstance(entry, dict) else entry) == assigned_order
+            for entry in completed)
+        # A managed worker owns exactly one assignment.  Its readonly status
+        # must not imply that it can see or execute the parent frozen plan.
+        projection.update({
+            "plan_len": 1 if assigned_task is not None else 0,
+            "completed": int(assigned_complete),
+            "current_order": assigned_order,
+            "current_task": assigned_text,
+        })
+        projection.update({
+            "parent_workspace": state.get("parent_workspace"),
+            "run_id": state.get("run_id"),
+            "assigned_order": assigned_order,
+            "assignment": dict(assignment),
+        })
     if metrics_limit:
         projection["round_metrics"] = loop.read_round_metrics(directory / "history.log", metrics_limit)
     return projection
@@ -179,7 +219,11 @@ def project_all_status(metrics_limit=0):
             if not any(path.exists() or path.is_symlink()
                        for path in (entry / "state.json", entry / "state.last-good.json")):
                 continue
-            results.append(project_status(entry.name, metrics_limit))
+            projected = project_status(entry.name, metrics_limit)
+            if (projected.get("runner") == "parallel-worker"
+                    or projected.get("managed_readonly")):
+                continue
+            results.append(projected)
         except (FileNotFoundError, OSError, ValueError, loop.StateLoadError) as e:
             results.append({"name": entry.name, "error": str(e)})
     return results
@@ -187,13 +231,20 @@ def project_all_status(metrics_limit=0):
 
 def summarize_status(results):
     """將 fleet projection 聚合成 shell/CI 可直接使用的摘要。"""
-    valid = [result for result in results if "error" not in result]
+    fleet_results = [
+        result for result in results
+        if (result.get("runner") != "parallel-worker"
+            and not result.get("managed_readonly"))
+    ]
+    valid = [
+        result for result in fleet_results if "error" not in result
+    ]
     tasks_total = sum(result.get("plan_len", 0) for result in valid)
     tasks_completed = sum(result.get("completed", 0) for result in valid)
     return {
-        "workspace_count": len(results),
+        "workspace_count": len(fleet_results),
         "valid_count": len(valid),
-        "error_count": len(results) - len(valid),
+        "error_count": len(fleet_results) - len(valid),
         "running": sum(1 for result in valid if result.get("running")),
         "planning": sum(1 for result in valid if result.get("phase") == "plan"),
         "executing": sum(1 for result in valid if result.get("phase") == "exec"),
@@ -219,6 +270,15 @@ def projection_needs_attention(result) -> bool:
     但不能讓已完成 workspace 永久停在需關注；真正未處理的 issue、
     checkpoint、goal 變更與 stale PID 仍然會告警。
     """
+    if result.get("runner") == "parallel-worker" or result.get("managed_readonly"):
+        return False
+    if result.get("runner") == "parallel-supervisor":
+        parallel = result.get("parallel") or {}
+        return bool(
+            "error" in result or parallel.get("error")
+            or parallel.get("status") == "blocked"
+            or result.get("stale_loop_pid")
+        )
     completed = result.get("phase") == "done"
     return bool(
         "error" in result or
@@ -293,6 +353,26 @@ def render_human(result, *, timestamp=False) -> None:
     print(f"{prefix}{result['name']}｜{phase}｜round {result['round']}｜"
           f"任務 {result['completed']}/{result['plan_len']}{task}｜{running}｜"
           f"紅連跳 {result['red_streak']}｜停滯 {result['stall_rounds']}｜{issue_note}{round_note}", flush=True)
+    if result.get("runner") == "parallel-supervisor":
+        parallel = result.get("parallel") or {}
+        tasks = parallel.get("tasks") or []
+        integrated = sum(1 for item in tasks if item.get("outcome") == "integrated")
+        print(
+            f"⇉ Parallel｜status {parallel.get('status') or 'unknown'}｜"
+            f"batch {parallel.get('batch') if parallel.get('batch') is not None else '—'}｜"
+            f"integrated {integrated}/{len(tasks)}｜run {(parallel.get('run_id') or '—')[:12]}",
+            flush=True,
+        )
+        if parallel.get("error"):
+            print(f"⚠ {parallel['error']}", flush=True)
+    elif result.get("runner") == "parallel-worker":
+        assignment = result.get("assignment") or {}
+        print(
+            f"↳ Managed worker（唯讀）｜parent {result.get('parent_workspace') or '—'}｜"
+            f"task-{result.get('assigned_order') or '?'}｜"
+            f"status {assignment.get('status') or 'unknown'}",
+            flush=True,
+        )
     if result["state_recovery_pending"]:
         print("🛟 primary state 不可讀，目前只投影 last-good checkpoint（未修改檔案）", flush=True)
     if result.get("agent_failure_streak", 0):

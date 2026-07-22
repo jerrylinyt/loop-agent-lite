@@ -35,6 +35,7 @@ from pathlib import Path
 
 from engine import loop as loop_mod
 from engine import platform_compat as compat
+from engine import repo_owner
 from engine.paths import expose_project_package
 
 # ===== 常數 =====
@@ -249,7 +250,13 @@ def resolve_args_template(style, explicit=None) -> list:
 
 def _git_out(repo, *args):
     """讀取 git 純量輸出;失敗回空字串,不讓監督層因 git 噪音中斷。"""
-    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    try:
+        result = loop_mod.git(repo, *args, check=False)
+    except repo_owner.RepoOwnerError:
+        # Ralph's payload already occupies the owner's single durable child
+        # slot.  Never fall back to an untracked observer while it is active;
+        # the projection after that child is reaped refreshes Git state.
+        return ""
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
@@ -470,6 +477,7 @@ class RalphSupervisor:
         self._active_model = args.model or ""
         self._restart_attempt = 0
         self._limit_block = None
+        self.owner_fence = None
 
     # ---- preflight ----
     def preflight(self):
@@ -706,24 +714,35 @@ class RalphSupervisor:
 
     def _forward_signal(self, sig):
         """對 ralph 的 process group 送訊號;pgid 防線沿用 loop 的 safe_killpg。"""
-        if self.proc is None or self.proc.poll() is not None:
+        if self.proc is None:
             return
         try:
-            loop_mod.safe_killpg(self.proc, sig)
+            if isinstance(self.proc, repo_owner.ControlledOwnerChild):
+                if sig == compat.FORCE_SIGNAL:
+                    self.proc.kill_containment()
+                else:
+                    self.proc.interrupt_containment()
+            elif self.proc.poll() is None:
+                loop_mod.safe_killpg(self.proc, sig)
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
     def _kill_ralph(self):
         """SIGINT 轉發 → 寬限 → SIGKILL 整個 process group;確保空轉 ralph 立即停手。"""
-        if self.proc is None or self.proc.poll() is not None:
+        if self.proc is None:
+            return
+        if (self.proc.poll() is not None
+                and not isinstance(self.proc, repo_owner.ControlledOwnerChild)):
             return
         self._forward_signal(signal.SIGINT)
         grace = _env_float("RALPH_KILL_GRACE_SEC", KILL_GRACE_SEC)
         try:
             self.proc.wait(timeout=grace)
-            return
         except subprocess.TimeoutExpired:
             self._forward_signal(compat.FORCE_SIGNAL)
+        if isinstance(self.proc, repo_owner.ControlledOwnerChild):
+            self.proc.kill_containment()
+            return
         try:
             self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -732,6 +751,24 @@ class RalphSupervisor:
     def _interruptible_sleep(self, seconds):
         """可被停止訊號打斷的等待;回傳是否被要求停止。"""
         return self._stopping.wait(max(0.0, seconds))
+
+    def _finalize_ralph_process(self, proc, reader):
+        """Fence every descendant, record its result, then checkpoint state."""
+        if isinstance(proc, repo_owner.ControlledOwnerChild):
+            proc.kill_containment()
+        else:
+            compat.close_process_group(proc)
+        reader.join(timeout=5)
+        if reader.is_alive():
+            raise repo_owner.OwnerBusy(
+                "Ralph output reader still holds an unclosed descendant pipe")
+        self._last_exit_code = proc.returncode
+        if isinstance(proc, repo_owner.ControlledOwnerChild):
+            proc.record_result(containment_timeout=5.0)
+            # The primary/checkpoint projection must be durable before child
+            # identity is cleared from the common-dir marker.
+            self.ws.save_state(self.state)
+            proc.fence.checkpoint_child(proc.child_generation)
 
     # ---- 單一 ralph run ----
     def _run_one_ralph(self, active_model):
@@ -762,10 +799,16 @@ class RalphSupervisor:
         loop_mod.log(f"🚀 啟動 ralph｜model={active_model or '(預設)'}｜{compat.join_command(argv)}")
         try:
             # binary stdout(不用 text=True):reader 自行以 errors="replace" 解碼,壞位元組不會殺 reader。
-            self.proc = subprocess.Popen(
-                argv, cwd=str(self.repo), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                env=env, **compat.popen_group_kwargs())
-            compat.attach_process_group(self.proc)
+            if self.owner_fence is not None:
+                self.proc = self.owner_fence.spawn_child(
+                    repo_owner.ChildKind.AGENT, argv, cwd=str(self.repo),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+            else:
+                self.proc = subprocess.Popen(
+                    argv, cwd=str(self.repo), stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, env=env,
+                    **compat.popen_group_kwargs())
+                compat.attach_process_group(self.proc)
         except OSError as e:
             loop_mod.fail(f"ralph 啟動失敗:{e}")
         proc = self.proc
@@ -774,21 +817,29 @@ class RalphSupervisor:
             json.dumps({"pid": os.getpid()}).encode("utf-8"))
         reader = threading.Thread(target=self._consume_output, args=(proc, gen), daemon=True)
         reader.start()
-        while proc.poll() is None:
-            if self._stopping.is_set() or self._limit_confirmed.is_set():
-                break
-            self._limit_confirmed.wait(POLL_INTERVAL_SEC)
-            try:
-                self._project()
-            except Exception as e:  # noqa: BLE001 — 輪詢投影失敗不中斷監控
-                loop_mod.log(f"⚠ ralph 進度投影失敗(不影響執行):{e}")
+        try:
+            next_projection = time.monotonic() + POLL_INTERVAL_SEC
+            while proc.poll() is None:
+                if self._stopping.is_set() or self._limit_confirmed.is_set():
+                    break
+                # Wake quickly when the payload leader exits so a background
+                # descendant cannot keep mutating until the next 3s status
+                # projection.  Dashboard projection cadence remains unchanged.
+                self._limit_confirmed.wait(min(
+                    0.05, max(0.0, next_projection - time.monotonic())))
+                if time.monotonic() >= next_projection:
+                    try:
+                        self._project()
+                    except Exception as e:  # noqa: BLE001 — 輪詢投影失敗不中斷監控
+                        loop_mod.log(f"⚠ ralph 進度投影失敗(不影響執行):{e}")
+                    next_projection = time.monotonic() + POLL_INTERVAL_SEC
+        except BaseException:
+            self._kill_ralph()
+            self._finalize_ralph_process(proc, reader)
+            raise
         if self._limit_confirmed.is_set() or self._stopping.is_set():
             self._kill_ralph()
-        # 正常結束也要釋放 Windows Job Object；同時封口任何仍存活的背景子孫。
-        compat.close_process_group(proc)
-        # reader 可能因 grandchild 逃離 pgid 而卡住;gen 綁定確保它即使晚死也不會污染下一個 run。
-        reader.join(timeout=5)
-        self._last_exit_code = proc.returncode
+        self._finalize_ralph_process(proc, reader)
         if self._stopping.is_set():
             return "interrupted"
         if self._limit_confirmed.is_set():
@@ -816,6 +867,11 @@ class RalphSupervisor:
     def run(self):
         """外圈:反覆 spawn ralph,遇 usage limit 就等待/降級後重啟,直到收斂或達安全上限。"""
         self.preflight()
+        try:
+            self.owner_fence = loop_mod._claim_repo_owner(
+                self.repo, self.ws, repo_owner.OwnerKind.RALPH)
+        except repo_owner.RepoOwnerError as exc:
+            loop_mod.fail(f"repository owner fence blocked Ralph: {exc}")
         loop_mod.acquire_run_lock(self.ws.dir / ".run.lock", "run lock")
         (self.ws.dir / "startup_ready.json").unlink(missing_ok=True)
         self.base_sha = _git_out(self.repo, "rev-parse", "HEAD")
@@ -827,9 +883,11 @@ class RalphSupervisor:
                 self.state["loop"]["pid"] = None
                 try:
                     self.ws.save_state(self.state)
-                except Exception:  # noqa: BLE001 — 收尾寫檔失敗不再拋出
-                    pass
+                except Exception:
+                    if self.owner_fence is not None:
+                        raise
         atexit.register(_mark_stopped)
+        loop_mod._REPO_OWNER_STOP_CHECKPOINT = _mark_stopped
         self._install_signal_handlers()
 
         loop_mod.log(f"⚙️ 設定｜repo={self.repo}｜ralph_dir={self.ralph_dir}｜"
@@ -1034,7 +1092,29 @@ def main(argv=None):
     if len(model) > MODEL_MAX_CHARS or any(ord(ch) < 32 for ch in model) or model.startswith("-"):
         loop_mod.fail(f"model 需 ≤{MODEL_MAX_CHARS} 字、不含控制字元且不可以 - 開頭")
     supervisor = RalphSupervisor(args)
-    return supervisor.run()
+    terminal_reason = "ralph-returned"
+    try:
+        result = supervisor.run()
+        if result != 0:
+            terminal_reason = "ralph-failed"
+        return result
+    except KeyboardInterrupt:
+        terminal_reason = "ralph-interrupted"
+        raise
+    except BaseException:
+        terminal_reason = "ralph-failed"
+        raise
+    finally:
+        if loop_mod._REPO_OWNER_FENCE is not None:
+            propagating = sys.exc_info()[0] is not None
+            try:
+                loop_mod._terminalize_repo_owner(terminal_reason)
+            except BaseException as exc:
+                if propagating:
+                    loop_mod.log(
+                        f"repository owner terminalization deferred: {exc}")
+                else:
+                    raise
 
 
 if __name__ == "__main__":

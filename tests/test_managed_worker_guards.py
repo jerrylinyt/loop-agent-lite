@@ -56,6 +56,11 @@ class TestManagedWorkerReadonlyGuard(unittest.TestCase):
             run_config_hash="1" * 64,
             launch_spec_hash="2" * 64,
             manifest_hash="3" * 64,
+            dispatch_token="supervisor-dispatch-token",
+            dispatch_request_id="4" * 32,
+            supervisor_session="5" * 32,
+            supervisor_generation=1,
+            dispatch_attempt=0,
         )
         state = parallel_worker.initialize_state({
             "phase": "exec",
@@ -155,6 +160,27 @@ class TestManagedWorkerReadonlyGuard(unittest.TestCase):
                 self.assertEqual(self.checkpoint_path.read_bytes(), original_checkpoint)
                 self.assertEqual(self.startup_ready.read_bytes(), original_ready)
                 self.assertFalse((self.workspace / "stop-after-round.json").exists())
+                self.assertFalse(self.validator_marker.exists())
+
+    def test_direct_loop_cannot_reset_or_preflight_parallel_base(self):
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        state["runner"] = "parallel-supervisor"
+        state.pop("assignment", None)
+        state.pop("managed_readonly", None)
+        payload = json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")
+        self.state_path.write_bytes(payload)
+        self.checkpoint_path.write_bytes(payload)
+        original_ready = self.startup_ready.read_bytes()
+
+        for extra in (("--reset-state",), ("--preflight-only",)):
+            with self.subTest(extra=extra):
+                result = self._run(*extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("parallel-supervisor base workspace",
+                              result.stdout + result.stderr)
+                self.assertEqual(self.state_path.read_bytes(), payload)
+                self.assertEqual(self.checkpoint_path.read_bytes(), payload)
+                self.assertEqual(self.startup_ready.read_bytes(), original_ready)
                 self.assertFalse(self.validator_marker.exists())
 
 

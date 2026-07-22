@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from engine import platform_compat as compat
+from tests.parallel_worker_harness import prepare_authorized_worker
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -24,8 +25,10 @@ def _git(repo: Path, *args: str):
 @unittest.skipUnless(shutil.which("git"), "需要 PATH 上有 git")
 class TestManagedWorkerEndToEnd(unittest.TestCase):
     def test_worker_integrates_assigned_task_without_global_completion(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        with self.subTest(authority="immutable-parent"):
             repo = root / "repo"
             repo.mkdir()
             _git(repo, "init", "-q")
@@ -35,17 +38,10 @@ class TestManagedWorkerEndToEnd(unittest.TestCase):
             _git(repo, "add", "goal.md")
             _git(repo, "commit", "-qm", "goal")
             head = _git(repo, "rev-parse", "HEAD").stdout.strip()
-            integration_ref = f"refs/heads/loop/{RUN_ID}/integration"
-            task_ref = f"refs/heads/loop/{RUN_ID}/task-2"
-            _git(repo, "update-ref", integration_ref, head)
-            _git(repo, "update-ref", task_ref, head)
-            _git(repo, "symbolic-ref", "HEAD", task_ref)
-
-            plan_path = root / "plan.json"
-            plan_path.write_text(json.dumps([
+            plan = [
                 {"order": 1, "task": "parallel first", "stack": 1},
                 {"order": 2, "task": "parallel second", "stack": 1},
-            ]), encoding="utf-8")
+            ]
             agent_path = root / "agent.py"
             agent_path.write_text(
                 """\
@@ -75,26 +71,18 @@ print(json.dumps({
 }, separators=(",", ":")))
 """, encoding="utf-8")
 
-            workspace_root = root / "workspaces"
-            worker_name = f"base--{RUN_ID}-task-2"
-            command = [
-                sys.executable, "-m", "engine.loop",
-                "--repo", str(repo), "--name", worker_name,
-                "--goal", "goal.md",
-                "--agent-cmd", compat.join_command([sys.executable, str(agent_path)]),
-                "--validate-cmd", compat.join_command([sys.executable, str(validator_path)]),
-                "--done-threshold", "1", "--flag-threshold", "1",
-                "--red-limit", "3", "--stall-limit", "20",
-                "--round-timeout", "1", "--validate-timeout", "20",
-                "--import-plan", str(plan_path), "--start-phase", "exec",
-                "--start-task", "2", "--stop-after-task",
-                "--complete-gate-cmd", compat.join_command([sys.executable, str(gate_path)]),
-                "--integration-ref", integration_ref,
-                "--parent-workspace", "base", "--task-ref", task_ref,
-                "--run-config-hash", "1" * 64,
-                "--launch-spec-hash", "2" * 64,
-                "--manifest-hash", "3" * 64,
-            ]
+            harness = prepare_authorized_worker(
+                root=root, primary_repo=repo, plan=plan, order=2,
+                agent_cmd=compat.join_command([sys.executable, str(agent_path)]),
+                validate_cmd=compat.join_command([sys.executable, str(validator_path)]),
+                gate_cmd=compat.join_command([sys.executable, str(gate_path)]),
+            )
+            self.addCleanup(harness.close)
+            workspace_root = harness.workspace_root
+            worker_name = harness.worker_workspace
+            command = harness.command
+            repo = harness.worker_repo
+            integration_ref = harness.artifacts.manifest["integration_ref"]
             env = {
                 **os.environ,
                 "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root),
@@ -102,14 +90,6 @@ print(json.dumps({
                 "PYTHONUTF8": "1",
                 "PYTHONIOENCODING": "utf-8",
             }
-            notify_attempt = subprocess.run(
-                [*command, "--notify-cmd", "notify-hook"],
-                cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60,
-            )
-            self.assertNotEqual(notify_attempt.returncode, 0)
-            self.assertIn("不可直接送全域 notify", notify_attempt.stdout + notify_attempt.stderr)
-            self.assertFalse((workspace_root / worker_name / "state.json").exists())
-
             result = subprocess.run(
                 command, cwd=REPO_ROOT, env=env,
                 capture_output=True, text=True, timeout=60,
@@ -145,7 +125,7 @@ print(json.dumps({
             checkpoint_path = workspace / "state.last-good.json"
             state_path.write_bytes(state_bytes)
             checkpoint_path.write_bytes(state_bytes)
-            resume_command = list(command)
+            resume_command = list(command[command.index("--") + 1:])
             for option in ("--import-plan", "--start-phase"):
                 index = resume_command.index(option)
                 del resume_command[index:index + 2]

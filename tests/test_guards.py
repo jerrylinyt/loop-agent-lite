@@ -23,12 +23,14 @@ import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from engine import dashboard as D  # noqa: E402
 from engine import loop as L  # noqa: E402
 from engine import platform_compat as compat  # noqa: E402
+from engine import repo_owner  # noqa: E402
 from engine import status as S  # noqa: E402
 from engine import work as W  # noqa: E402
 
@@ -557,11 +559,17 @@ class TestLiveRoundTiming(unittest.TestCase):
             workspace_root = root / "workspace"
             state_path = workspace_root / "live-round" / "state.json"
             agent = root / "slow_agent.py"
-            agent.write_text("import time\ntime.sleep(10)\n")
+            agent_ready = root / "slow-agent.ready"
+            agent.write_text(
+                "import pathlib, sys, time\n"
+                "pathlib.Path(sys.argv[1]).write_text('ready\\n', encoding='utf-8')\n"
+                "time.sleep(10)\n"
+            )
             env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
             process = subprocess.Popen(
                 [*LOOP_CMD, "--repo", str(repo), "--name", "live-round",
-                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--agent-cmd", shlex.join([
+                     sys.executable, str(agent), str(agent_ready)]),
                  "--validate-cmd", "true", "--round-timeout", "1",
                  "--agent-backoff-max", "0", "--max-rounds", "1"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
@@ -576,7 +584,9 @@ class TestLiveRoundTiming(unittest.TestCase):
                     except (FileNotFoundError, json.JSONDecodeError):
                         time.sleep(0.02)
                         continue
-                    if candidate.get("round_started_at") and candidate.get("loop", {}).get("pid"):
+                    if (candidate.get("round_started_at")
+                            and candidate.get("loop", {}).get("pid")
+                            and agent_ready.is_file()):
                         observed = candidate
                         break
                     time.sleep(0.02)
@@ -617,8 +627,22 @@ class TestLiveRoundTiming(unittest.TestCase):
                 self.assertIn("round 1 中斷", stopped_status.stdout)
             finally:
                 if process.poll() is None:
-                    process.kill()
-                    process.wait()
+                    try:
+                        compat.kill_process_group(process)
+                    except (OSError, ProcessLookupError, ValueError):
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                # Windows keeps the kill-on-close Job handle in the test
+                # process.  Close it even when the loop leader already exited,
+                # otherwise a failed assertion can strand a descendant.
+                compat.close_process_group(process)
 
 
 class TestInterruptedResume(unittest.TestCase):
@@ -2849,6 +2873,141 @@ class TestStopIdempotency(unittest.TestCase):
         D.Handler.api_stop(handler, {"name": "verifytmp-not-running"})
         self.assertEqual(handler.response[0], 200)
         self.assertTrue(handler.response[1]["already_stopped"])
+
+    def test_stopped_process_with_nonterminal_owner_requires_recovery(self):
+        class ResponseCapture:
+            response = None
+
+            def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+                self.response = code, json.loads(body)
+
+            def _err(self, message, code=400):
+                self.response = code, {"error": message}
+
+        class FinishedJob:
+            repo = "C:/example/repo"
+            popen = type("Popen", (), {"pid": 1234})()
+
+            @staticmethod
+            def alive():
+                return True
+
+            @staticmethod
+            def stop(wait=False):
+                return wait
+
+        state = {"runner": "loop", "config": {"repo": FinishedJob.repo}}
+        marker = {"state": "active", "child_state": "child_running"}
+        with (mock.patch.object(D, "read_state", return_value=(state, None)),
+              mock.patch.object(
+                  repo_owner.RepoOwnerFence, "inspect", return_value=marker),
+              mock.patch.dict(
+                  D.JOBS, {"owner-stuck": FinishedJob()}, clear=False),
+              mock.patch.object(D, "workspace_console_log")):
+            handler = ResponseCapture()
+            D.Handler.api_stop(handler, {"name": "owner-stuck"})
+
+        self.assertEqual(handler.response[0], 409)
+        self.assertIn("recovery", handler.response[1]["error"])
+
+    def test_already_stopped_still_requires_owner_terminal_checkpoint(self):
+        class ResponseCapture:
+            response = None
+
+            def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+                self.response = code, json.loads(body)
+
+            def _err(self, message, code=400):
+                self.response = code, {"error": message}
+
+        state = {
+            "runner": "loop", "loop": {"pid": None},
+            "config": {"repo": "C:/example/repo"},
+        }
+        marker = {
+            "state": "active", "child_state": "child_running",
+            "workspace": None,
+        }
+        with (mock.patch.object(D, "read_state", return_value=(state, None)),
+              mock.patch.object(D, "loop_pid_alive", return_value=False),
+              mock.patch.object(
+                  repo_owner.RepoOwnerFence, "inspect", return_value=marker),
+              mock.patch.object(D, "workspace_console_log"),
+              mock.patch.dict(D.JOBS, {}, clear=True)):
+            handler = ResponseCapture()
+            D.Handler.api_stop(handler, {"name": "owner-stuck"})
+
+        self.assertEqual(handler.response[0], 409)
+        self.assertIn("terminal checkpoint", handler.response[1]["error"])
+
+    def test_unreadable_stopped_workspace_is_not_collapsed_to_never_started(self):
+        class ResponseCapture:
+            response = None
+
+            def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+                self.response = code, json.loads(body)
+
+            def _err(self, message, code=400):
+                self.response = code, {"error": message}
+
+        with (mock.patch.object(
+                  D, "read_state", return_value=(None, "state/checkpoint corrupt")),
+              mock.patch.object(D, "workspace_state_artifacts_exist", return_value=True),
+              mock.patch.object(D, "loop_pid_alive", return_value=False),
+              mock.patch.dict(D.JOBS, {}, clear=True)):
+            handler = ResponseCapture()
+            D.Handler.api_stop(handler, {"name": "corrupt-stopped"})
+        self.assertEqual(handler.response[0], 409)
+        self.assertIn("state/checkpoint corrupt", handler.response[1]["error"])
+
+    def test_owner_postcondition_accepts_only_newer_generation_or_terminal_target(self):
+        expected = {
+            "workspace": "C:/workspace/old", "session": "a" * 32,
+            "generation": 7,
+            "owner_identity": {"pid": 123, "creation_token": "old"},
+        }
+        replacement = {
+            **expected, "workspace": "C:/workspace/new", "session": "b" * 32,
+            "generation": 8, "state": "active", "child_state": "idle",
+            "owner_identity": {"pid": 456, "creation_token": "new"},
+        }
+        with mock.patch.object(
+                repo_owner.RepoOwnerFence, "inspect", return_value=replacement):
+            self.assertIsNone(D.stopped_owner_recovery_error(
+                "C:/example/repo", expected_workspace=expected["workspace"],
+                expected_owner=expected))
+
+        stale = {
+            **expected, "state": "active", "child_state": "child_running",
+        }
+        with mock.patch.object(
+                repo_owner.RepoOwnerFence, "inspect", return_value=stale):
+            error = D.stopped_owner_recovery_error(
+                "C:/example/repo", expected_workspace=expected["workspace"],
+                expected_owner=expected)
+        self.assertIn("terminal checkpoint", error)
+
+    def test_job_stop_signal_error_is_not_reported_as_success_while_alive(self):
+        class AliveProcess:
+            pid = 9876
+            returncode = None
+
+            @staticmethod
+            def poll():
+                return None
+
+            @staticmethod
+            def wait(timeout=None):
+                raise subprocess.TimeoutExpired("alive", timeout)
+
+        job = object.__new__(D.Job)
+        job.popen = AliveProcess()
+        with (mock.patch.object(
+                  compat, "interrupt_process_group", side_effect=OSError("denied")),
+              mock.patch.object(L, "safe_killpg") as force):
+            stopped = job.stop(wait=True, force_after=None, wait_timeout=0)
+        self.assertFalse(stopped)
+        force.assert_not_called()
 
 
 class TestGracefulRoundStop(unittest.TestCase):

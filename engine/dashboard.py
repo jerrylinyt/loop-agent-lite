@@ -38,12 +38,16 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from engine import loop as loop_mod  # 共用 Workspace/fresh_state,匯入計畫時建 state 不自己發明 schema
+from engine import parallel as parallel_mod
+from engine import parallel_state
 from engine import platform_compat as compat
 from engine import ralph as ralph_mod  # ralph runner 監督層:PRD 解析、argv 組裝與 spawn 引數
+from engine import repo_owner
 from engine.paths import (default_personal_config, default_workspace_root, expose_project_package,
                           legacy_config_path)
 from engine.prompt_templates import prompt_template_bundle, prompt_template_projection
-from engine.work import validate_plan  # 計畫校驗單一來源(create-plan / 匯入共用)
+from engine.work import (plan_has_stack, validate_plan,
+                         validate_serial_stack_opt_in)  # 計畫校驗單一來源(create-plan / 匯入共用)
 
 HERE = Path(__file__).resolve().parent
 ROOT = default_workspace_root()
@@ -60,6 +64,12 @@ TASK_DIFF_MAX_BYTES = 8 * 1024 * 1024  # 單一檔案 patch 上限；多檔採�
 TASK_DIFF_METADATA_MAX_BYTES = 8 * 1024 * 1024  # 檔案清單/commit metadata 超限直接拒絕，不解析截斷資料
 TASK_DIFF_TIMEOUT = 15
 HEALTH_SCHEMA_VERSION = 1
+DASHBOARD_GIT_TIMEOUT = 60
+# engine.parallel control clients may spend 10s publishing/cancelling, another
+# 10s waiting for a claimed response, and 90s proving quiescence.  The UI must
+# not declare failure before that fail-closed protocol has reached a terminal
+# response; keep a small process/startup margin above the 110s protocol bound.
+PARALLEL_CONTROL_STARTUP_TIMEOUT = 125
 DEFAULT_CONFIG = {
     "agent_cmds": [
         {"label": "claude", "cmd": "claude -p"},
@@ -80,6 +90,8 @@ DEFAULT_CONFIG = {
         "validate_timeout": 120,
         "red_limit": 20, "stall_limit": 300, "stuck_stop": False, "stuck_stop_count": 100,
         "pause_after_plan": False,
+        "max_parallel": parallel_mod.DEFAULT_MAX_PARALLEL,
+        "worker_restart_limit": parallel_mod.DEFAULT_WORKER_RESTART_LIMIT,
     },
     # ralph runner:公司內既有的 ralph.sh 迴圈。scripts 是團隊白名單(方便選),
     # 但 Launcher 也允許自訂 base command(ralph_custom),語意同 validate_custom。
@@ -141,6 +153,21 @@ def command_env(cfg):
     existing = [value for value in env.get("PATH", "").split(os.pathsep) if value]
     env["PATH"] = os.pathsep.join(dict.fromkeys(extra + existing))
     return expose_project_package(env)
+
+
+def frozen_parallel_environment(cfg):
+    """Return the explicit non-secret environment frozen by Parallel start."""
+    _, additions = configured_path_dirs(cfg)
+    return {
+        "path_additions": additions,
+        "non_secret": {},
+        "required_secret_names": [],
+    }
+
+
+def parallel_recovery_env():
+    """Recovery gets ambient secrets, but never mutable Dashboard PATH extras."""
+    return expose_project_package(dict(os.environ))
 
 
 def command_not_found(label, executable, cfg):
@@ -436,6 +463,72 @@ def with_state_lock(fn=None, *, repo_fallback=False):
     return decorate(fn) if fn is not None else decorate
 
 
+PARALLEL_CONTROL_ROUTES = {
+    "/api/run": "resume",
+    "/api/resume": "resume",
+    "/api/stop": "pause",
+    "/api/abort": "abort",
+}
+PARALLEL_IMMUTABLE_ROUTES = {
+    "/api/edit-state", "/api/import-plan", "/api/phase", "/api/set-task",
+}
+
+
+def dashboard_operation_error(state, operation, *, parallel_action=None,
+                              immutable_parallel=False):
+    """Return a PID-independent mutation rejection, or ``None`` when allowed.
+
+    This is the single adapter boundary used before Dashboard handlers can
+    write state, control files, Git, or start validators.  Parallel controls
+    are routed to ``engine.parallel``; this function never edits aggregate.
+    """
+    if not isinstance(state, dict):
+        return "workspace state 格式不合法"
+    runner = state.get("runner") or "loop"
+    if runner == "parallel-worker" or state.get("managed_readonly") is True:
+        return (
+            "managed parallel worker 是 parent supervisor 的 readonly workspace；"
+            f"Dashboard {operation} 不可直接操作")
+    if runner != parallel_mod.SUPERVISOR_RUNNER:
+        return None
+    try:
+        status = parallel_mod.parallel_run_status(state)
+    except parallel_mod.ParallelError as exc:
+        return str(exc)
+    if immutable_parallel:
+        return "Parallel plan 已凍結；不可由 Dashboard 編輯或重新匯入"
+    if parallel_action is not None:
+        if parallel_action in {"resume", "abort"} and status in parallel_mod.RUN_TERMINAL:
+            label = "Resume" if parallel_action == "resume" else "Abort"
+            return f"parallel run 已是終態 {status}，不可 {label}"
+        if parallel_action == "resume" and status not in {"paused", "blocked"}:
+            return f"parallel run 目前為 {status}；只有 paused/blocked 可 Resume"
+        if (parallel_action == "abort"
+                and ((state.get("parallel") or {}).get("terminal_intent") == "completed"
+                     or status == "finalizing")):
+            return "parallel completion finalization 已開始，不可改成 Abort"
+        return None
+    if status in parallel_mod.RUN_NONTERMINAL:
+        return (
+            f"parallel workspace 目前為 {status}；{operation} 必須改走 "
+            "Pause/Resume/Abort，不可由普通 Loop 修改")
+    if operation == "delete":
+        return None
+    return f"parallel workspace 已是終態 {status}；{operation} 不適用於 ordinary Loop"
+
+
+def reject_dashboard_operation(handler, state, operation, *, parallel_action=None,
+                               immutable_parallel=False):
+    """Emit a consistent HTTP 409 for a rejected workspace mutation."""
+    error = dashboard_operation_error(
+        state, operation, parallel_action=parallel_action,
+        immutable_parallel=immutable_parallel)
+    if error is None:
+        return False
+    handler._err(error, 409)
+    return True
+
+
 class DashboardServer(ThreadingHTTPServer):
     """SSE 連線是長存 thread；設為 daemon 才不會阻擋 dashboard 優雅關閉。"""
     daemon_threads = True
@@ -445,11 +538,13 @@ class DashboardServer(ThreadingHTTPServer):
 class Job:
     """Dashboard 啟動之 loop process 與 bounded 輸出尾段的生命週期封裝。"""
 
-    def __init__(self, name, repo, popen):
+    def __init__(self, name, repo, popen, *, job_id=None, kind="runner"):
         """保存 process 並啟動 daemon reader，避免 stdout pipe 塞滿阻塞 child。"""
         self.name = name
         self.repo = repo
         self.popen = popen
+        self.job_id = job_id or name
+        self.kind = kind
         self.out = deque(maxlen=200)
         t = threading.Thread(target=self._reader, daemon=True)
         self.reader = t
@@ -477,36 +572,127 @@ class Job:
 
     def info(self):
         """輸出前端 jobs 分頁使用的安全摘要與最近八行。"""
-        return {"name": self.name, "repo": self.repo, "pid": self.popen.pid,
+        return {"id": self.job_id, "kind": self.kind,
+                "name": self.name, "repo": self.repo, "pid": self.popen.pid,
                 "alive": self.alive(), "rc": self.popen.returncode,
                 "tail": "\n".join(list(self.out)[-8:])}
 
-    def stop(self, wait=False):
-        """SIGINT 優雅收尾；8 秒沒死 SIGKILL。wait=True 時等到狀態真的可重啟。"""
+    def stop(self, wait=False, *, force_after=8.0, wait_timeout=None):
+        """Interrupt then, when configured, force-stop after a bounded grace period."""
         if not self.alive():
             return True
+        interrupt_failed = False
         try:
             compat.interrupt_process_group(self.popen)
         except (ProcessLookupError, OSError):
-            return True
+            if not self.alive():
+                return True
+            interrupt_failed = True
 
         def _force():
             """SIGINT 寬限期後仍存活時終止整個 process group。"""
             if self.alive():
                 try:
                     loop_mod.safe_killpg(self.popen, compat.FORCE_SIGNAL)
-                except (ProcessLookupError, PermissionError):
+                except (ProcessLookupError, OSError):
                     pass
-        t = threading.Timer(8, _force)
-        t.daemon = True
-        t.start()
+        timer = None
+        if force_after is not None:
+            timer = threading.Timer(max(0.0, float(force_after)), _force)
+            timer.daemon = True
+            timer.start()
         if not wait:
-            return True
+            return not interrupt_failed
+        if wait_timeout is None:
+            wait_timeout = ((max(0.0, float(force_after)) + 1.0)
+                            if force_after is not None else 9.0)
         try:
-            self.popen.wait(timeout=9)
+            self.popen.wait(timeout=max(0.0, float(wait_timeout)))
         except subprocess.TimeoutExpired:
-            return not self.alive()
-        return True
+            pass
+        finally:
+            if timer is not None and not self.alive():
+                timer.cancel()
+        return not self.alive()
+
+
+def parallel_job(job) -> bool:
+    """Return whether a Dashboard Job belongs to the Parallel protocol."""
+    return str(getattr(job, "kind", "")).startswith("parallel-")
+
+
+def _same_workspace(left, right) -> bool:
+    """Compare durable workspace identities without requiring either path to exist."""
+    try:
+        return (os.path.normcase(os.path.abspath(os.fspath(left)))
+                == os.path.normcase(os.path.abspath(os.fspath(right))))
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def stopping_owner_snapshot(repo, expected_workspace) -> dict | None:
+    """Capture the exact nonterminal owner this stop is intended to quiesce."""
+    if not repo:
+        return None
+    try:
+        marker = repo_owner.RepoOwnerFence.inspect(Path(repo))
+    except repo_owner.RepoOwnerError:
+        return None
+    if (marker is None or marker.get("state") == "terminal"
+            or not _same_workspace(marker.get("workspace"), expected_workspace)):
+        return None
+    return {
+        "workspace": marker.get("workspace"),
+        "session": marker.get("session"),
+        "generation": marker.get("generation"),
+        "owner_identity": marker.get("owner_identity"),
+    }
+
+
+def stopped_owner_recovery_error(
+        repo, *, expected_workspace=None, expected_owner=None) -> str | None:
+    """Return a workspace/generation-bound fail-closed stop postcondition error."""
+    if not repo:
+        return None
+    try:
+        marker = repo_owner.RepoOwnerFence.inspect(Path(repo))
+    except repo_owner.RepoOwnerError as exc:
+        return f"process 已停止，但 repository owner 無法稽核，需 recovery：{exc}"
+    if expected_owner is not None:
+        if marker is None:
+            return "process 已停止，但原 repository owner marker 遺失，需 recovery"
+        expected_generation = expected_owner.get("generation")
+        current_generation = marker.get("generation")
+        if (isinstance(expected_generation, int)
+                and isinstance(current_generation, int)
+                and current_generation > expected_generation):
+            # claim() only advances generation after the previous marker became
+            # terminal, so a newer valid generation proves this stop completed.
+            return None
+        exact_owner = (
+            _same_workspace(marker.get("workspace"), expected_owner.get("workspace"))
+            and marker.get("session") == expected_owner.get("session")
+            and current_generation == expected_generation
+            and marker.get("owner_identity") == expected_owner.get("owner_identity")
+        )
+        if not exact_owner:
+            return (
+                "process 已停止，但 repository owner generation/identity 已非停止目標，"
+                "無法證明 terminal checkpoint，需 recovery"
+            )
+    elif (marker is not None and expected_workspace is not None
+          and marker.get("workspace") is not None
+          and not _same_workspace(marker.get("workspace"), expected_workspace)):
+        # Another workspace may legitimately claim the repo after this
+        # workspace terminalized.  Its nonterminal marker is not our postcondition.
+        return None
+    if marker is not None and marker.get("state") != "terminal":
+        return (
+            "process 已停止，但 repository owner 尚未完成 terminal checkpoint，"
+            "需 recovery："
+            f"{marker.get('state')}/{marker.get('child_state')}"
+        )
+    return None
 
 
 def loop_pid_alive(pid):
@@ -520,7 +706,8 @@ def loop_pid_alive(pid):
     if compat.IS_WINDOWS:
         return True
     r = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
-    return any(marker in r.stdout for marker in ("loop.py", "engine.loop", "engine.ralph"))
+    return any(marker in r.stdout for marker in (
+        "loop.py", "engine.loop", "engine.ralph", "engine.parallel"))
 
 
 def norm_cmd(s):
@@ -531,17 +718,36 @@ def norm_cmd(s):
         return None
 
 
+def _dashboard_git_read(repo: Path, *args: str,
+                        timeout: float = DASHBOARD_GIT_TIMEOUT):
+    """Run one bounded, side-effect-free Git projection command.
+
+    Dashboard reads must not acquire repository optional locks, invoke a
+    configured fsmonitor, pager, or external diff helper, or wait forever.
+    Mutating Git commands continue to use the durable RepoOwner child fence.
+    """
+    env = dict(os.environ)
+    env.update({
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+    })
+    env.pop("GIT_EXTERNAL_DIFF", None)
+    return subprocess.run(
+        ["git", "--no-pager", "-c", "gc.auto=0",
+         "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+         "-c", "diff.external=", "-C", str(repo), *args],
+        capture_output=True, text=True, check=False, timeout=timeout, env=env,
+    )
+
+
 def repo_file_status(repo: Path, relative_path: str) -> str:
     """回傳 repo 檔案相對 HEAD 的狀態，供啟動器用一致語意顯示。"""
-    in_head = subprocess.run(
-        ["git", "-C", str(repo), "cat-file", "-e", f"HEAD:{relative_path}"],
-        capture_output=True,
-    ).returncode == 0
-    dirty = bool(subprocess.run(
-        ["git", "-C", str(repo), "status", "--porcelain", "--", relative_path],
-        capture_output=True,
-        text=True,
-    ).stdout.strip())
+    in_head = _dashboard_git_read(
+        repo, "cat-file", "-e", f"HEAD:{relative_path}").returncode == 0
+    dirty = bool(_dashboard_git_read(
+        repo, "status", "--porcelain", "--", relative_path).stdout.strip())
     if in_head and not dirty:
         return "committed"
     if in_head:
@@ -560,32 +766,202 @@ def suggested_validate_command(repo: Path):
     return None
 
 
+def _checkpoint_controlled_child(
+        fence: repo_owner.RepoOwnerFence,
+        child: repo_owner.ControlledOwnerChild) -> None:
+    """Durably reap one bounded launcher child before another mutation."""
+    child.record_result(containment_timeout=5.0)
+    fence.checkpoint_child(child.child_generation)
+
+
+def _run_launcher_git(
+        fence: repo_owner.RepoOwnerFence, repo: Path, *args: str,
+        timeout: float = DASHBOARD_GIT_TIMEOUT) -> subprocess.CompletedProcess:
+    """Run one Git command below the launcher's durable child fence."""
+    argv = ["git", "-C", str(repo), *args]
+    child = fence.spawn_child(
+        repo_owner.ChildKind.GIT,
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+    try:
+        stdout, stderr = child.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            child.kill_containment(timeout=5.0)
+            try:
+                child.communicate(timeout=1.0)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+            _checkpoint_controlled_child(fence, child)
+        except BaseException as reap_error:
+            raise repo_owner.OwnerBusy(
+                "controlled Git child could not be proven reaped") from reap_error
+        raise RuntimeError(f"Git command timed out after {timeout:g}s") from exc
+    except BaseException:
+        try:
+            child.kill_containment(timeout=5.0)
+            try:
+                child.communicate(timeout=1.0)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+            _checkpoint_controlled_child(fence, child)
+        except BaseException as reap_error:
+            raise repo_owner.OwnerBusy(
+                "controlled Git child could not be proven reaped") from reap_error
+        raise
+    try:
+        _checkpoint_controlled_child(fence, child)
+    except BaseException as exc:
+        # Leave the marker nonterminal when descendant or durable checkpoint
+        # quiescence cannot be proven.
+        raise repo_owner.OwnerBusy(
+            "controlled Git child lifecycle did not reach idle") from exc
+    return subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
+
+
+def _assert_launcher_repo_clean(
+        fence: repo_owner.RepoOwnerFence, repo: Path) -> None:
+    status = _run_launcher_git(
+        fence, repo, "status", "--porcelain", "--untracked-files=normal")
+    if status.returncode != 0:
+        raise RuntimeError(
+            "git status 失敗:" + (status.stdout + status.stderr).strip()[-300:])
+    if status.stdout.strip():
+        raise RuntimeError("primary repo 必須 clean 才能完成 launcher 交接")
+
+
+def _terminalize_failed_launcher(
+        fence: repo_owner.RepoOwnerFence, owner_kind: repo_owner.OwnerKind) -> None:
+    """Quiesce a retained launcher child before releasing a failed owner."""
+    try:
+        fence.quiesce_active_child()
+        marker = fence.marker
+        if (marker["state"] in {"active", "recovering"}
+                and marker["child_state"] in {"idle", "child_reaped"}):
+            fence.terminalize(f"{owner_kind.value}-failed")
+            return
+        raise repo_owner.OwnerBusy(
+            "failed launcher did not reach a quiescent owner checkpoint")
+    except BaseException as exc:
+        raise repo_owner.OwnerBusy(
+            "failed launcher cleanup could not prove quiescence; explicit recovery required"
+        ) from exc
+    finally:
+        fence.close()
+
+
+def _run_dashboard_launcher(
+        repo: Path, name: str, owner_kind: repo_owner.OwnerKind, operation):
+    """Claim before short mutations and terminalize before raw runner spawn."""
+    workspace_dir = safe_workspace_dir(name)
+    fence = repo_owner.RepoOwnerFence.claim(
+        repo,
+        owner_kind=owner_kind,
+        workspace=workspace_dir,
+        state_path=workspace_dir / "state.json",
+    )
+    try:
+        result = operation(fence, workspace_dir)
+    except BaseException:
+        _terminalize_failed_launcher(fence, owner_kind)
+        raise
+    try:
+        fence.terminalize(f"{owner_kind.value}-completed")
+    except BaseException:
+        fence.close()
+        raise
+    return result
+
+
+def _prepare_launcher_workspace(
+        workspace_dir: Path, *, clear_import_plan: bool = False) -> None:
+    loop_mod.ensure_real_directory(workspace_dir, "workspace 目錄")
+    (workspace_dir / "startup_ready.json").unlink(missing_ok=True)
+    if clear_import_plan:
+        (workspace_dir / "import-plan.pending.json").unlink(missing_ok=True)
+
+
+def _write_launcher_bytes(path: Path, data: bytes) -> None:
+    """Atomic write plus a regular-file content checkpoint."""
+    loop_mod.atomic_write_bytes(path, data)
+    fd = loop_mod._open_regular(path, os.O_RDONLY)
+    with os.fdopen(fd, "rb", closefd=True) as stream:
+        if stream.read() != data:
+            raise OSError(f"launcher checkpoint mismatch:{path}")
+
+
+def _write_immutable_launcher_bytes(path: Path, data: bytes) -> None:
+    """Create one regular staging file without any overwrite path."""
+    path = Path(path)
+    loop_mod.ensure_real_directory(path.parent, "launcher staging directory")
+    fd = loop_mod._open_regular(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        | getattr(os, "O_BINARY", 0))
+    try:
+        with os.fdopen(fd, "wb", closefd=True) as stream:
+            written = stream.write(data)
+            if written != len(data):
+                raise OSError(
+                    f"launcher staging short write:{written}/{len(data)}")
+            stream.flush()
+            os.fsync(stream.fileno())
+        # The file data and the directory entry are separate durability
+        # boundaries.  Persist the unique staging name before handing its path
+        # to a new supervisor process.
+        parallel_state._fsync_directory(path.parent)
+    except BaseException:
+        # The UUID-scoped path belongs solely to this failed submission.  It
+        # was never handed to a child, so removing a partial create cannot
+        # invalidate another launch.
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _stage_parallel_plan(workspace_dir: Path, plan) -> tuple[Path, str]:
+    """Write a unique, raw-content-bound plan for exactly one submission."""
+    raw = json.dumps(
+        plan, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+    digest = loop_mod.sha256_bytes(raw)
+    path = Path(workspace_dir) / (
+        f"parallel-plan.{digest}.{uuid.uuid4().hex}.staged.json")
+    _write_immutable_launcher_bytes(path, raw)
+    return path, digest
+
+
 def repo_status_projection(repo: Path):
     """集中組裝 repo 啟動前投影，避免 HTTP handler 同時負責 Git 細節與回應格式。"""
     if not (repo / ".git").exists():
         return {"error": f"{repo} 不是 git repo"}
-    clean = not subprocess.run(
-        ["git", "-C", str(repo), "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    branch_result = subprocess.run(
-        ["git", "-C", str(repo), "branch", "--show-current"],
-        capture_output=True,
-        text=True,
-    )
-    return {
-        "goal": repo_file_status(repo, "goal.md"),
-        "tree_clean": clean,
-        "branch": branch_result.stdout.strip() if branch_result.returncode == 0 else "",
-        "suggested_validate_cmd": suggested_validate_command(repo),
-    }
+    try:
+        status_result = _dashboard_git_read(repo, "status", "--porcelain")
+        if status_result.returncode != 0:
+            detail = (status_result.stderr or status_result.stdout).strip()[-300:]
+            return {"error": f"git status 失敗:{detail or status_result.returncode}"}
+        branch_result = _dashboard_git_read(repo, "branch", "--show-current")
+        return {
+            "goal": repo_file_status(repo, "goal.md"),
+            "tree_clean": not status_result.stdout.strip(),
+            "branch": branch_result.stdout.strip() if branch_result.returncode == 0 else "",
+            "suggested_validate_cmd": suggested_validate_command(repo),
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": f"Git 狀態讀取逾時（{DASHBOARD_GIT_TIMEOUT:g} 秒）"}
+    except OSError as exc:
+        return {"error": f"Git 狀態讀取失敗:{exc}"}
 
 
 def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout=120,
                reset=False, import_plan=None, start_phase="plan", notify_cmd="",
                red_limit=20, stall_limit=300, stuck_stop=False, stuck_count=100,
-               agent_backoff_max=60, pause_after_plan=False, resume_interrupted=False, env=None):
+               agent_backoff_max=60, pause_after_plan=False, resume_interrupted=False, env=None,
+               workspace_prepared=False):
     """spawn loop.py 並登記進 JOBS(呼叫方需持 JOBS_LOCK)。"""
     loop_mod.require_workspace_name(name)
     workspace_dir = safe_workspace_dir(name)
@@ -607,9 +983,10 @@ def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout
         cmd += ["--import-plan", str(import_plan), "--start-phase", start_phase, "--consume-import-plan"]
     if notify_cmd:
         cmd += ["--notify-cmd", notify_cmd]
-    (workspace_dir / "startup_ready.json").unlink(missing_ok=True)
-    if not import_plan:
-        (workspace_dir / "import-plan.pending.json").unlink(missing_ok=True)
+    if not workspace_prepared:
+        (workspace_dir / "startup_ready.json").unlink(missing_ok=True)
+        if not import_plan:
+            (workspace_dir / "import-plan.pending.json").unlink(missing_ok=True)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, bufsize=1, env=env, **compat.popen_group_kwargs())
     compat.attach_process_group(p)
@@ -621,7 +998,7 @@ def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout
 def spawn_ralph(name, repo, *, ralph_cmd, ralph_dir, iterations, tool, model, args_template,
                 prd_path="prd.json", notify_cmd="", usage_limit_action="restart",
                 fallback_models=None, auto_restart_max=ralph_mod.DEFAULT_AUTO_RESTART_MAX,
-                usage_limit_patterns=None, env=None):
+                usage_limit_patterns=None, env=None, workspace_prepared=False):
     """spawn engine.ralph 監督層並登記進 JOBS(呼叫方需持 JOBS_LOCK)。ralph 自成迴圈引擎,
     這支監督層只 spawn/監控/投影,與 loop coordinator 共用 Job 註冊表與停止流程。"""
     loop_mod.require_workspace_name(name)
@@ -637,7 +1014,8 @@ def spawn_ralph(name, repo, *, ralph_cmd, ralph_dir, iterations, tool, model, ar
            "--usage-limit-patterns", json.dumps(list(usage_limit_patterns or []))]
     if notify_cmd:
         cmd += ["--notify-cmd", notify_cmd]
-    (workspace_dir / "startup_ready.json").unlink(missing_ok=True)
+    if not workspace_prepared:
+        (workspace_dir / "startup_ready.json").unlink(missing_ok=True)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, bufsize=1, env=env, **compat.popen_group_kwargs())
     compat.attach_process_group(p)
@@ -646,10 +1024,123 @@ def spawn_ralph(name, repo, *, ralph_cmd, ralph_dir, iterations, tool, model, ar
     return p
 
 
-def run_command_check(cmd, cwd, prompt="", timeout=60, env=None):
+def build_parallel_command(
+        action, name, *, repo=None, import_plan=None, config=None,
+        expected_plan_sha256=None):
+    """Build the exact Dashboard-to-supervisor CLI contract."""
+    loop_mod.require_workspace_name(name)
+    if action not in {"start", "resume", "pause", "abort"}:
+        raise ValueError(f"parallel action 不合法：{action}")
+    cmd = [
+        sys.executable, "-m", "engine.parallel",
+        "--workspace-root", str(ROOT), action,
+    ]
+    if action != "start":
+        return [*cmd, name]
+    if repo is None or import_plan is None or not isinstance(config, dict):
+        raise ValueError("parallel start 缺少 repo/import_plan/config")
+    canonical = parallel_mod.canonical_run_config(config)
+    cmd += [
+        "--repo", str(Path(repo).expanduser().resolve()),
+        "--name", name,
+        "--goal", canonical["goal"],
+        "--agent-cmd", canonical["agent_cmd"],
+        "--validate-cmd", canonical["validate_cmd"],
+        "--flag-threshold", str(canonical["flag_threshold"]),
+        "--done-threshold", str(canonical["done_threshold"]),
+        "--red-limit", str(canonical["red_limit"]),
+        "--stall-limit", str(canonical["stall_limit"]),
+        "--stuck-stop-count", str(canonical["stuck_stop_count"]),
+        "--round-timeout", f"{canonical['round_timeout']:g}",
+        "--agent-backoff-max", f"{canonical['agent_backoff_max']:g}",
+        "--validate-timeout", f"{canonical['validate_timeout']:g}",
+        "--max-parallel", str(canonical["max_parallel"]),
+        "--worker-restart-limit", str(canonical["worker_restart_limit"]),
+        "--import-plan", str(Path(import_plan).resolve()),
+    ]
+    expected_plan_sha256 = parallel_mod.normalize_expected_plan_sha256(
+        expected_plan_sha256)
+    if expected_plan_sha256 is not None:
+        cmd += ["--expected-plan-sha256", expected_plan_sha256]
+    environment = canonical["environment"]
+    for addition in environment["path_additions"]:
+        cmd += ["--path-addition", addition]
+    for key, value in environment["non_secret"].items():
+        encoded = json.dumps(
+            value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        cmd += ["--non-secret-env", f"{key}={encoded}"]
+    for name in environment["required_secret_names"]:
+        cmd += ["--required-secret-name", name]
+    if canonical["plan_doc"]:
+        cmd += ["--plan-doc", canonical["plan_doc"]]
+    if canonical["notify_cmd"]:
+        cmd += ["--notify-cmd", canonical["notify_cmd"]]
+    if canonical["stuck_stop"]:
+        cmd.append("--stuck-stop")
+    return cmd
+
+
+def spawn_parallel(
+        name, repo, *, action, import_plan=None, config=None,
+        expected_plan_sha256=None, env=None, register_supervisor=True,
+        workspace_prepared=False):
+    """Spawn a supervisor or typed control client without touching aggregate."""
+    command = build_parallel_command(
+        action, name, repo=repo, import_plan=import_plan, config=config,
+        expected_plan_sha256=expected_plan_sha256)
+    workspace_dir = safe_workspace_dir(name)
+    if not workspace_prepared:
+        loop_mod.ensure_real_directory(workspace_dir, "workspace 目錄")
+        if register_supervisor:
+            (workspace_dir / "startup_ready.json").unlink(missing_ok=True)
+    p = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env=env, **compat.popen_group_kwargs())
+    compat.attach_process_group(p)
+    _prune_finished_jobs_locked()
+    job_id = f"{name}:{action}:{uuid.uuid4().hex[:8]}"
+    key = name if register_supervisor else job_id
+    kind = "parallel-supervisor" if register_supervisor else f"parallel-{action}-control"
+    JOBS[key] = Job(name, str(repo or ""), p, job_id=job_id, kind=kind)
+    p.dashboard_job_id = job_id
+    return p
+
+
+def run_command_check(cmd, cwd, prompt="", timeout=60, env=None, *,
+                      owner_fence=None, child_kind=repo_owner.ChildKind.TOOL):
     """執行 UI 的命令確認；逾時時連同 CLI 衍生的子程序群組一起清掉。
     killpg 只保證殺得死直接子行程；若有孫行程刻意 setsid 逃離 process group 仍握著
     stdout，收尾讀取最多再等 5 秒，逾時就放棄剩餘輸出而非讓 HTTP 請求永久卡住。"""
+    if owner_fence is not None:
+        child = owner_fence.spawn_child(
+            child_kind, cmd, cwd=str(cwd), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=env)
+        try:
+            output, _ = child.communicate(prompt, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            child.kill_containment(timeout=5.0)
+            try:
+                output, _ = child.communicate(timeout=1.0)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                output = ""
+            _checkpoint_controlled_child(owner_fence, child)
+            return child.returncode, output or "", True
+        except BaseException:
+            try:
+                child.kill_containment(timeout=5.0)
+                try:
+                    child.communicate(timeout=1.0)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    pass
+                _checkpoint_controlled_child(owner_fence, child)
+            except BaseException as reap_error:
+                raise repo_owner.OwnerBusy(
+                    "Dashboard probe child could not be proven reaped") from reap_error
+            raise
+        _checkpoint_controlled_child(owner_fence, child)
+        return child.returncode, output or "", False
+
     p = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, env=env, **compat.popen_group_kwargs())
@@ -687,24 +1178,97 @@ def run_command_check(cmd, cwd, prompt="", timeout=60, env=None):
         compat.close_process_group(p)
 
 
-def job_startup_status(name, pid):
+def run_owned_command_check(cmd, repo, *, name="", prompt="", timeout=60,
+                            env=None, child_kind=repo_owner.ChildKind.TOOL):
+    """Execute one Dashboard probe under the repository-wide owner fence."""
+    owner_name = str(name or "").strip()
+    if not loop_mod.valid_workspace_name(owner_name):
+        candidate = Path(repo).name
+        owner_name = candidate if loop_mod.valid_workspace_name(candidate) else "dashboard-probe"
+    return _run_dashboard_launcher(
+        Path(repo), owner_name, repo_owner.OwnerKind.DASHBOARD_LAUNCHER,
+        lambda fence, _workspace: run_command_check(
+            cmd, repo, prompt=prompt, timeout=timeout, env=env,
+            owner_fence=fence, child_kind=child_kind),
+    )
+
+
+def job_startup_status(name=None, pid=None, *, job_id=None):
     """回報特定 spawn 是否真的通過 preflight/Validate 並成功啟動第一個 Agent。"""
+    job = None
+    if job_id:
+        if (not isinstance(job_id, str) or len(job_id) > 160
+                or re.fullmatch(r"[A-Za-z0-9_.:-]+", job_id) is None):
+            return {"status": "failed", "error": "啟動工作 id 不合法"}
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if job is None:
+                # Long-running supervisors remain keyed by workspace name so
+                # ordinary duplicate-run guards keep working.  Their public
+                # startup identity is still unique per spawn/resume.
+                matches = [candidate for candidate in JOBS.values()
+                           if getattr(candidate, "job_id", None) == job_id]
+                job = matches[0] if len(matches) == 1 else None
+        if job is None:
+            return {"status": "failed", "error": "找不到這次啟動工作"}
+        if name and name != job.name:
+            return {"status": "failed", "error": "啟動工作的 workspace 不符"}
+        if pid not in (None, ""):
+            try:
+                if int(pid) != job.popen.pid:
+                    return {"status": "failed", "error": "啟動工作的 pid 不符"}
+            except (TypeError, ValueError):
+                return {"status": "failed", "error": "啟動狀態 pid 不合法"}
+        name = job.name
+        expected_pid = job.popen.pid
+        if job.kind.endswith("-control"):
+            if job.alive():
+                return {"status": "starting", "pid": expected_pid,
+                        "job_id": job.job_id}
+            job.reader.join(timeout=0.5)
+            info = job.info()
+            if info["rc"] == 0:
+                return {"status": "ready", "pid": expected_pid,
+                        "job_id": job.job_id}
+            return {
+                "status": "failed", "pid": expected_pid, "job_id": job.job_id,
+                "rc": info["rc"],
+                "error": f"Parallel control 失敗（rc={info['rc']}）",
+                "tail": "\n".join(list(job.out)[-80:]),
+            }
     if not loop_mod.valid_workspace_name(name):
         return {"status": "failed", "error": f"workspace 名稱不合法：{loop_mod.WORKSPACE_NAME_RULE}"}
-    try:
-        expected_pid = int(pid)
-    except (TypeError, ValueError):
-        return {"status": "failed", "error": "啟動狀態 pid 不合法"}
-    with JOBS_LOCK:
-        job = JOBS.get(name)
+    if job is None:
+        try:
+            expected_pid = int(pid)
+        except (TypeError, ValueError):
+            return {"status": "failed", "error": "啟動狀態 pid 不合法"}
+        with JOBS_LOCK:
+            job = JOBS.get(name)
     if job is None or job.popen.pid != expected_pid:
         return {"status": "failed", "error": "找不到這次啟動工作（可能已被另一個啟動取代）"}
+    state, _state_error = read_state(name, repair=False)
+    parallel_status = ((state.get("parallel") or {}).get("status")
+                       if state is not None
+                       and state.get("runner") == parallel_mod.SUPERVISOR_RUNNER
+                       else None)
     if not job.alive():
         job.reader.join(timeout=0.5)
         info = job.info()
+        if info["rc"] == 0 and parallel_status in (
+                parallel_mod.RUN_NONTERMINAL | parallel_mod.RUN_TERMINAL):
+            return {"status": "ready", "pid": expected_pid}
         return {"status": "failed", "rc": info["rc"],
                 "error": f"loop 啟動失敗（rc={info['rc']}）",
                 "tail": "\n".join(list(job.out)[-80:])}
+    # ParallelSupervisor 的 durable base checkpoint 就是 readiness truth；
+    # 它不冒充 managed loop 的 startup_ready marker。
+    if (state is not None
+            and state.get("runner") == parallel_mod.SUPERVISOR_RUNNER
+            and (state.get("loop") or {}).get("pid") == expected_pid
+            and parallel_status in (parallel_mod.RUN_NONTERMINAL
+                                    - {"initializing", "blocked"})):
+        return {"status": "ready", "pid": expected_pid}
     try:
         ready = safe_workspace_dir(name) / "startup_ready.json"
         loop_mod.workspace_file(ready, "startup marker")
@@ -749,6 +1313,18 @@ def read_state(name, *, repair=True):
     return state, None
 
 
+def workspace_state_artifacts_exist(name) -> bool:
+    """Return whether a requested workspace has durable state artifacts to audit."""
+    try:
+        state_path = safe_workspace_dir(name) / "state.json"
+    except ValueError:
+        # An unsafe existing workspace path is itself an artifact that must not
+        # be collapsed into the idempotent "never existed" response.
+        return True
+    return (os.path.lexists(state_path)
+            or os.path.lexists(loop_mod.state_checkpoint_path(state_path)))
+
+
 def write_state(name, st):
     """原子寫 workspace 主 state 與 last-good checkpoint。"""
     loop_mod.require_workspace_name(name)
@@ -763,6 +1339,73 @@ def _load_state_or_err(handler, name, *, repair=True):
         handler._err(err)
         return None
     return st
+
+
+def protected_workspace_for_repo(repo):
+    """Find a managed worker or nonterminal Parallel base bound to ``repo``.
+
+    This lookup is deliberately projection-only (``repair=False``).  It closes
+    repo-only Dashboard routes that otherwise bypass the workspace-name guard.
+    """
+    try:
+        target = Path(repo).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not ROOT.is_dir():
+        return None
+    for directory in ROOT.iterdir():
+        if (not loop_mod.valid_workspace_name(directory.name)
+                or directory.is_symlink() or not directory.is_dir()):
+            continue
+        state, _error = read_state(directory.name, repair=False)
+        if (state is None or
+                not (state.get("runner") in {
+                    "parallel-worker", parallel_mod.SUPERVISOR_RUNNER}
+                     or state.get("managed_readonly") is True)):
+            continue
+        bound = (state.get("config") or {}).get("repo")
+        try:
+            if isinstance(bound, str) and Path(bound).expanduser().resolve() == target:
+                if (state.get("runner") == "parallel-worker"
+                        or state.get("managed_readonly") is True):
+                    return directory.name, state
+                if state.get("runner") == parallel_mod.SUPERVISOR_RUNNER:
+                    try:
+                        status = parallel_mod.parallel_run_status(state)
+                    except parallel_mod.ParallelError:
+                        # A malformed nonterminal-looking owner is not a safe
+                        # reason to run an unfenced command in the same repo.
+                        return directory.name, state
+                    if status in parallel_mod.RUN_NONTERMINAL:
+                        return directory.name, state
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return None
+
+
+def managed_workspace_for_repo(repo):
+    """Compatibility projection for callers interested only in workers."""
+    protected = protected_workspace_for_repo(repo)
+    if protected is None:
+        return None
+    name, state = protected
+    if (state.get("runner") == "parallel-worker"
+            or state.get("managed_readonly") is True):
+        return name
+    return None
+
+
+def reject_repo_operation(handler, repo, operation):
+    """Reject a repo-only action that aliases protected Parallel ownership."""
+    protected = protected_workspace_for_repo(repo)
+    if protected is None:
+        return False
+    name, state = protected
+    error = dashboard_operation_error(state, operation)
+    if error is None:
+        error = f"repo 屬於受保護的 Parallel workspace {name}"
+    handler._err(f"{error}（workspace {name}）", 409)
+    return True
 
 
 RALPH_PRD_RAW_MAX = 512 * 1024   # /api/ralph/prd 原文投影上限
@@ -1134,6 +1777,11 @@ def read_fleet_observability():
     for d in sorted(ROOT.iterdir()):
         if not loop_mod.valid_workspace_name(d.name) or d.is_symlink() or not d.is_dir():
             continue
+        state, _state_error = read_state(d.name, repair=False)
+        if (state is not None and
+                (state.get("runner") == "parallel-worker"
+                 or state.get("managed_readonly") is True)):
+            continue
         try:
             history = loop_mod.workspace_file(d / "history.log", "history.log")
             fd = loop_mod._open_regular(history, os.O_RDONLY)
@@ -1237,6 +1885,11 @@ def read_anomaly_records(workspace_dir: Path = None, *, run="current"):
             for directory in sorted(ROOT.iterdir()):
                 if (not loop_mod.valid_workspace_name(directory.name) or directory.is_symlink() or
                         not directory.is_dir()):
+                    continue
+                state, _state_error = read_state(directory.name, repair=False)
+                if (state is not None and
+                        (state.get("runner") == "parallel-worker"
+                         or state.get("managed_readonly") is True)):
                     continue
                 try:
                     metrics = loop_mod.read_round_metrics(
@@ -1423,17 +2076,35 @@ def ws_running(name, st=None):
 
 
 def stop_all_jobs():
-    """Dashboard 關閉時對所有活躍 job 發出優雅停止並給共同十秒寬限。"""
+    """Gracefully stop jobs without truncating Parallel's bounded Pause protocol."""
     with JOBS_LOCK:
         jobs = [j for j in JOBS.values() if j.alive()]
     if not jobs:
         return
     print(f"⏹ 關閉 dashboard:停止 {len(jobs)} 個 loop …", flush=True)
     for j in jobs:
-        j.stop()
-    deadline = time.monotonic() + 10
+        if parallel_job(j):
+            accepted = j.stop(force_after=PARALLEL_CONTROL_STARTUP_TIMEOUT)
+        else:
+            accepted = j.stop()
+        if not accepted:
+            print(
+                f"⚠ 無法送出停止信號:{j.name}/pid={j.popen.pid}; "
+                "仍會等待 force/recovery 邊界",
+                flush=True,
+            )
+    grace = (PARALLEL_CONTROL_STARTUP_TIMEOUT + 1
+             if any(parallel_job(j) for j in jobs) else 10)
+    deadline = time.monotonic() + grace
     while time.monotonic() < deadline and any(j.alive() for j in jobs):
         time.sleep(0.2)
+    survivors = [j for j in jobs if j.alive()]
+    for j in survivors:
+        print(
+            f"⚠ {j.name}/pid={j.popen.pid} 停止後仍存活；"
+            "不得視為已停止，需 recovery",
+            flush=True,
+        )
 
 
 def load_config():
@@ -1668,7 +2339,22 @@ def list_workspaces():
                         drain_claimed=drain_claimed)
             runner = st.get("runner") or "loop"
             info["runner"] = runner
-            if runner == "ralph":
+            if (runner == "parallel-worker"
+                    or st.get("managed_readonly") is True):
+                # Keep active workers discoverable for their dedicated
+                # read-only detail/console view.  Fleet aggregates filter this
+                # marker so the same frozen plan is not counted N times.
+                info.update({
+                    "runner": "parallel-worker",
+                    "managed_readonly": True,
+                    "parent_workspace": st.get("parent_workspace"),
+                    "run_id": st.get("run_id"),
+                    "assigned_order": st.get("assigned_order"),
+                    "plan_len": 1,
+                    "completed": 0,
+                    "resume_available": False,
+                })
+            elif runner == "ralph":
                 rb = st.get("ralph") or {}
                 info["ralph"] = {
                     "stories_done": rb.get("stories_done", 0),
@@ -1688,9 +2374,24 @@ def list_workspaces():
                 info["current_task"] = next(
                     (s.get("title", "") for s in (rb.get("stories") or [])
                      if not s.get("passes")), "")
+            elif runner == parallel_mod.SUPERVISOR_RUNNER:
+                pb = st.get("parallel") if isinstance(st.get("parallel"), dict) else {}
+                info["parallel"] = {
+                    "run_id": pb.get("run_id"),
+                    "status": pb.get("status"),
+                    "terminal_intent": pb.get("terminal_intent"),
+                    "batch": pb.get("batch"),
+                    "tasks": list(pb.get("tasks") or []),
+                    "error": pb.get("error"),
+                }
             if not running:
                 if runner == "ralph":
                     info["resume_available"] = st.get("phase") != "done"
+                elif runner == parallel_mod.SUPERVISOR_RUNNER:
+                    info["resume_available"] = ((st.get("parallel") or {}).get("status")
+                                                in {"paused", "blocked"})
+                elif runner == "parallel-worker" or st.get("managed_readonly") is True:
+                    info["resume_available"] = False
                 else:
                     info["resume_available"] = interrupted_resume_block_reason(d.name, st) is None
         out.append(info)
@@ -1715,6 +2416,13 @@ def _workspace_needs_attention(info):
         if rb.get("exit_reason") in ("failed", "usage_limit_giveup"):
             return True
         return bool(unread_issues > 0 or info.get("stale_loop_pid"))
+    if info.get("runner") == parallel_mod.SUPERVISOR_RUNNER:
+        parallel = info.get("parallel") or {}
+        return bool(
+            parallel.get("error") or
+            parallel.get("status") == "blocked" or
+            info.get("stale_loop_pid")
+        )
     return bool(
         unread_issues > 0 or
         info.get("state_recovery_pending") or
@@ -1732,7 +2440,10 @@ def _workspace_needs_attention(info):
 
 def fleet_health_projection(workspaces=None):
     """回傳唯讀 fleet health projection，供探針、SSE 與 UI 共用。"""
-    items = list_workspaces() if workspaces is None else list(workspaces)
+    discovered = list_workspaces() if workspaces is None else list(workspaces)
+    items = [item for item in discovered
+             if not (item.get("runner") == "parallel-worker"
+                     or item.get("managed_readonly") is True)]
     error_count = sum(1 for item in items if item.get("error"))
     attention = sum(1 for item in items if _workspace_needs_attention(item))
     status = "error" if error_count else "degraded" if attention else "ok"
@@ -1838,6 +2549,10 @@ def normalize_plan_edit(state, tasks, expected_version):
             f"plan 已更新（目前 v{state.get('plan_version', 0)}），請重新載入後再編輯", 409)
 
     original = state.get("plan") or []
+    if plan_has_stack(original):
+        raise PlanEditError(
+            "含 stack 的 frozen plan 只能由 Parallel supervisor 編排；"
+            "Dashboard 普通 Loop 編輯器不可移除或重排 stack", 409)
     locked_count = locked_plan_task_count(state, original)
     if len(tasks) < locked_count:
         raise PlanEditError("已完成或目前任務不可刪除")
@@ -1908,6 +2623,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/drain": "api_drain",
         "/api/cancel-drain": "api_cancel_drain",
         "/api/stop": "api_stop",
+        "/api/abort": "api_abort",
         "/api/run": "api_run",
         "/api/resume": "api_resume",
         "/api/edit-state": "api_edit_state",
@@ -2134,12 +2850,17 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/api/job-startup":
                 name = q.get("name", [""])[0]
                 pid = q.get("pid", [""])[0]
-                if not loop_mod.valid_workspace_name(name):
+                job_id = q.get("job_id", [""])[0]
+                if not job_id and not loop_mod.valid_workspace_name(name):
                     self._err(f"workspace 名稱不合法：{loop_mod.WORKSPACE_NAME_RULE}")
                     return
-                self._out(200, json.dumps(job_startup_status(name, pid), ensure_ascii=False))
+                self._out(200, json.dumps(
+                    job_startup_status(name, pid, job_id=job_id or None),
+                    ensure_ascii=False))
             elif u.path == "/api/repo-status":
                 repo = Path(q.get("repo", [""])[0]).expanduser()
+                if reject_repo_operation(self, repo, "repo-status"):
+                    return
                 self._out(200, json.dumps(repo_status_projection(repo), ensure_ascii=False))
             elif u.path == "/api/state":
                 d = self._ws_dir(q)
@@ -2304,6 +3025,23 @@ class Handler(BaseHTTPRequestHandler):
             if handler_name is None:
                 self._err("not found", 404)
                 return
+            # One central, PID-independent guard runs before every workspace
+            # mutation handler.  It deliberately uses repair=False so a POST
+            # cannot repair/write state merely while deciding whether it is allowed.
+            guarded_name = str(body.get("name") or "").strip()
+            if not guarded_name and u.path == "/api/launch":
+                guarded_name = Path(str(body.get("repo") or "")).expanduser().name
+            if loop_mod.valid_workspace_name(guarded_name):
+                guarded_state, _guard_error = read_state(guarded_name, repair=False)
+                if guarded_state is not None and reject_dashboard_operation(
+                        self, guarded_state, u.path,
+                        parallel_action=PARALLEL_CONTROL_ROUTES.get(u.path),
+                        immutable_parallel=u.path in PARALLEL_IMMUTABLE_ROUTES):
+                    return
+            requested_repo = body.get("repo")
+            if isinstance(requested_repo, str) and requested_repo.strip():
+                if reject_repo_operation(self, requested_repo, u.path):
+                    return
             if u.path in Handler.LOOP_ONLY_ROUTES:
                 name = str(body.get("name") or "")
                 if loop_mod.valid_workspace_name(name):
@@ -2320,9 +3058,15 @@ class Handler(BaseHTTPRequestHandler):
     @with_state_lock(repo_fallback=True)
     def api_launch(self, body):
         """交易式啟動/重置 loop：完成所有可失敗 preflight 後才提交 state 與 spawn。"""
-        if str(body.get("runner") or "loop") == "ralph":
+        runner = str(body.get("runner") or "loop")
+        if runner == "ralph":
             # ralph runner 走獨立分支;沿用同一把 state lock(不另加 decorator 以免重入死鎖)。
             return self.api_launch_ralph(body)
+        if runner == "parallel":
+            return self.api_launch_parallel(body)
+        if runner != "loop":
+            self._err("runner 只能是 loop / parallel / ralph")
+            return
         cfg = load_config()
         if "error" in cfg:
             self._err(cfg["error"])
@@ -2349,7 +3093,7 @@ class Handler(BaseHTTPRequestHandler):
             if command_problem:
                 self._err(command_problem)
                 return
-        repo = Path(str(body.get("repo") or "")).expanduser()
+        repo = Path(str(body.get("repo") or "")).expanduser().resolve()
         if not (repo / ".git").exists():
             self._err(f"{repo} 不是 git repo(preflight 之後還會再驗一次)")
             return
@@ -2361,6 +3105,9 @@ class Handler(BaseHTTPRequestHandler):
             safe_workspace_dir(name)
         except ValueError as e:
             self._err(str(e))
+            return
+        existing, _existing_error = read_state(name, repair=False)
+        if existing is not None and reject_dashboard_operation(self, existing, "launch"):
             return
         d = cfg.get("defaults") or {}
         try:
@@ -2394,6 +3141,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._err(f"plan.json 解析失敗:{e}")
                 return
             normalized, errs = validate_plan(plan_obj)
+            if not errs:
+                errs.extend(validate_serial_stack_opt_in(
+                    normalized, allow_serial_stack=False))
             if errs:
                 self._err("plan.json 校驗未過:\n- " + "\n- ".join(errs))
                 return
@@ -2421,68 +3171,242 @@ class Handler(BaseHTTPRequestHandler):
                 if j.alive() and Path(j.repo) == repo:
                     self._err(f"repo {repo} 已有 loop 在跑({j.name}),同一 repo 不能同時跑兩個")
                     return
-            # ---- 通過衝突檢查後才做任何 git mutation ----
-            # 選配:在新 branch 跑(loop/<name>),不弄髒主線;已存在就 checkout 續用
-            if body.get("new_branch"):
-                br = f"loop/{name}"
-                exists = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", br],
-                                        capture_output=True, text=True).returncode == 0
-                r = subprocess.run(["git", "-C", str(repo), "checkout", "-q"] + ([br] if exists else ["-b", br]),
-                                   capture_output=True, text=True)
-                if r.returncode != 0:
-                    self._err(f"切換 branch {br} 失敗:" + (r.stdout + r.stderr).strip()[-300:])
-                    return
-                workspace_console_log(name, f"已切換 Git branch｜{br}")
-            # goal.md 隨啟動自動 commit(gate#1:人選了檔=人審過)。檔名固定、指定 pathspec,
-            # 內容與 HEAD 相同就不產生新 commit。
-            if goal_content.strip():
-                try:
-                    loop_mod.atomic_write_bytes(goal_path, goal_content.encode("utf-8"))
-                except (OSError, ValueError) as e:
-                    self._err(f"goal.md 不安全或無法寫入:{e}")
-                    return
-                r = subprocess.run(["git", "-C", str(repo), "add", "--", "goal.md"],
-                                   capture_output=True, text=True)
-                if r.returncode != 0:
-                    self._err("git add goal.md 失敗:" + (r.stdout + r.stderr).strip()[-300:])
-                    return
-                r = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet", "--", "goal.md"],
-                                   capture_output=True, text=True)
-                if r.returncode != 0:  # 有變更才 commit
-                    r = subprocess.run(["git", "-C", str(repo), "commit",
-                                        "-m", "loop-lite: 匯入需求 goal.md", "--", "goal.md"],
-                                       capture_output=True, text=True)
-                    if r.returncode != 0:
-                        self._err("git commit goal.md 失敗:" + (r.stdout + r.stderr).strip()[-300:])
-                        return
-                    workspace_console_log(name, "已匯入並 commit goal.md")
-            if normalized is not None:
-                lws = loop_mod.Workspace(name)
-                import_plan_path = lws.dir / "import-plan.pending.json"
-                loop_mod.atomic_write_bytes(
-                    import_plan_path,
-                    json.dumps(normalized, ensure_ascii=False, indent=2).encode("utf-8"),
-                )
-                workspace_console_log(
-                    name,
-                    f"準備匯入 plan.json｜共 {len(normalized)} 條｜Validate 通過後才取代舊 state",
-                )
-            else:
+            # ---- 通過衝突檢查後才 claim；claim/audit 失敗時不得留下 mutation ----
+            def launcher_operation(fence, workspace_dir):
+                _assert_launcher_repo_clean(fence, repo)
+                _prepare_launcher_workspace(
+                    workspace_dir, clear_import_plan=normalized is None)
+                if body.get("new_branch"):
+                    br = f"loop/{name}"
+                    probe = _run_launcher_git(
+                        fence, repo, "rev-parse", "--verify", "--quiet", br)
+                    checkout = _run_launcher_git(
+                        fence, repo, "checkout", "-q",
+                        *([br] if probe.returncode == 0 else ["-b", br]))
+                    if checkout.returncode != 0:
+                        raise RuntimeError(
+                            f"切換 branch {br} 失敗:"
+                            + (checkout.stdout + checkout.stderr).strip()[-300:])
+                    workspace_console_log(name, f"已切換 Git branch｜{br}")
+
+                if goal_content.strip():
+                    _write_launcher_bytes(goal_path, goal_content.encode("utf-8"))
+                    added = _run_launcher_git(fence, repo, "add", "--", "goal.md")
+                    if added.returncode != 0:
+                        raise RuntimeError(
+                            "git add goal.md 失敗:"
+                            + (added.stdout + added.stderr).strip()[-300:])
+                    staged = _run_launcher_git(
+                        fence, repo, "diff", "--cached", "--quiet", "--", "goal.md")
+                    if staged.returncode not in {0, 1}:
+                        raise RuntimeError(
+                            "git diff goal.md 失敗:"
+                            + (staged.stdout + staged.stderr).strip()[-300:])
+                    if staged.returncode == 1:
+                        committed = _run_launcher_git(
+                            fence, repo, "commit", "-m",
+                            "loop-lite: 匯入需求 goal.md", "--", "goal.md")
+                        if committed.returncode != 0:
+                            raise RuntimeError(
+                                "git commit goal.md 失敗:"
+                                + (committed.stdout + committed.stderr).strip()[-300:])
+                        workspace_console_log(name, "已匯入並 commit goal.md")
+
                 import_plan_path = None
-            p = spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt,
-                           validate_timeout=vt,
-                           reset=bool(body.get("reset_state")) and normalized is None,
-                           import_plan=import_plan_path, start_phase=start_phase,
-                           notify_cmd=str(cfg.get("notify_cmd") or ""),
-                           red_limit=rl, stall_limit=sl,
-                           agent_backoff_max=ab,
-                           stuck_stop=bool(d.get("stuck_stop")),
-                           stuck_count=int(d.get("stuck_stop_count", 100)),
-                           pause_after_plan=pause_after_plan,
-                           env=command_env(cfg))
+                if normalized is not None:
+                    import_plan_path = workspace_dir / "import-plan.pending.json"
+                    _write_launcher_bytes(
+                        import_plan_path,
+                        json.dumps(normalized, ensure_ascii=False, indent=2).encode("utf-8"),
+                    )
+                    workspace_console_log(
+                        name,
+                        f"準備匯入 plan.json｜共 {len(normalized)} 條｜Validate 通過後才取代舊 state",
+                    )
+                _assert_launcher_repo_clean(fence, repo)
+                return import_plan_path
+
+            try:
+                import_plan_path = _run_dashboard_launcher(
+                    repo, name, repo_owner.OwnerKind.DASHBOARD_LAUNCHER,
+                    launcher_operation)
+            except Exception as exc:
+                self._err(f"Dashboard launcher owner 檢查或短操作失敗:{exc}")
+                return
+            try:
+                p = spawn_loop(
+                    name, repo, agent_cmd, validate_cmd, ft, dt, rt,
+                    validate_timeout=vt,
+                    reset=bool(body.get("reset_state")) and normalized is None,
+                    import_plan=import_plan_path, start_phase=start_phase,
+                    notify_cmd=str(cfg.get("notify_cmd") or ""),
+                    red_limit=rl, stall_limit=sl,
+                    agent_backoff_max=ab,
+                    stuck_stop=bool(d.get("stuck_stop")),
+                    stuck_count=int(d.get("stuck_stop_count", 100)),
+                    pause_after_plan=pause_after_plan,
+                    env=command_env(cfg), workspace_prepared=True)
+            except Exception as exc:
+                self._err(f"loop runner 啟動失敗:{exc}")
+                return
         workspace_console_log(name, f"啟動 loop｜pid={p.pid}｜repo={repo}")
         self._out(200, json.dumps({"ok": True, "starting": True, "name": name, "pid": p.pid,
                                    "startup_timeout": vt + 15}, ensure_ascii=False))
+
+    def api_launch_parallel(self, body):
+        """Launch only the frozen-plan supervisor CLI; never start engine.loop directly."""
+        if str(body.get("start_phase") or "") != "exec":
+            self._err("Parallel Loop 固定 start_phase=exec")
+            return
+        if body.get("goal_content") or body.get("new_branch") or body.get("reset_state"):
+            self._err(
+                "Parallel Launcher 只接受已 commit 的 goal 與目前 branch；"
+                "不可同時匯入 goal、切 branch 或重置既有 state")
+            return
+        raw_plan = body.get("plan_json")
+        if not isinstance(raw_plan, str) or not raw_plan.strip():
+            self._err("Parallel Loop 必須提供非空 frozen plan.json")
+            return
+        try:
+            parsed_plan = json.loads(raw_plan)
+        except json.JSONDecodeError as exc:
+            self._err(f"plan.json 解析失敗:{exc}")
+            return
+        normalized, errors = validate_plan(parsed_plan)
+        if errors:
+            self._err("plan.json 校驗未過:\n- " + "\n- ".join(errors))
+            return
+        if not normalized:
+            self._err("Parallel Loop 的 frozen plan 不可為空")
+            return
+
+        cfg = load_config()
+        if "error" in cfg:
+            self._err(cfg["error"])
+            return
+        agents = cfg.get("agent_cmds") or []
+        validators = cfg.get("validate_cmds") or []
+        try:
+            agent_cmd = agents[int(body.get("agent_idx"))]["cmd"]
+        except (TypeError, ValueError, IndexError, KeyError):
+            self._err(f"agent_idx 不合法,合法值 0..{len(agents) - 1}")
+            return
+        custom = str(body.get("validate_custom") or "").strip()
+        if custom:
+            validate_cmd = custom
+        else:
+            try:
+                validate_cmd = validators[int(body.get("validate_idx"))]["cmd"]
+            except (TypeError, ValueError, IndexError, KeyError):
+                self._err(f"validate_idx 不合法,合法值 0..{len(validators) - 1}")
+                return
+        for command, label in ((agent_cmd, "Agent CLI"), (validate_cmd, "Validate 命令")):
+            problem = command_error(command, label, cfg)
+            if problem:
+                self._err(problem)
+                return
+
+        repo = Path(str(body.get("repo") or "")).expanduser().resolve()
+        if not (repo / ".git").exists():
+            self._err(f"{repo} 不是 git repo")
+            return
+        name = str(body.get("name") or "").strip() or repo.name
+        if not loop_mod.valid_workspace_name(name):
+            self._err(f"workspace 名稱 {name} 不合法：{loop_mod.WORKSPACE_NAME_RULE}")
+            return
+        try:
+            workspace_dir = safe_workspace_dir(name)
+        except ValueError as exc:
+            self._err(str(exc))
+            return
+        existing, _existing_error = read_state(name, repair=False)
+        if existing is not None:
+            if reject_dashboard_operation(self, existing, "parallel start"):
+                return
+            self._err(
+                f"workspace {name} 已存在；Parallel run 請使用新名稱，"
+                "或先完成既有 run 的 Abort/cleanup", 409)
+            return
+
+        defaults = cfg.get("defaults") or {}
+        requested = lambda key, default: (body[key] if body.get(key) is not None
+                                           else defaults.get(key, default))
+        try:
+            values = {
+                "repo": str(repo),
+                "goal": "goal.md",
+                "plan_doc": "",
+                "agent_cmd": agent_cmd,
+                "validate_cmd": validate_cmd,
+                "flag_threshold": parse_numeric_setting(
+                    requested("flag_threshold", 10), integer=True, minimum=1),
+                "done_threshold": parse_numeric_setting(
+                    requested("done_threshold", 3), integer=True, minimum=1),
+                "red_limit": parse_numeric_setting(
+                    requested("red_limit", 20), integer=True, minimum=1),
+                "stall_limit": parse_numeric_setting(
+                    requested("stall_limit", 300), integer=True, minimum=1),
+                "stuck_stop_count": parse_numeric_setting(
+                    requested("stuck_stop_count", 100), integer=True, minimum=1),
+                "max_parallel": parse_numeric_setting(
+                    requested("max_parallel", parallel_mod.DEFAULT_MAX_PARALLEL),
+                    integer=True, minimum=1),
+                "worker_restart_limit": parse_numeric_setting(
+                    requested("worker_restart_limit",
+                              parallel_mod.DEFAULT_WORKER_RESTART_LIMIT),
+                    integer=True, minimum=1),
+                "round_timeout": parse_numeric_setting(
+                    requested("round_timeout", 30), integer=False, minimum=0),
+                "agent_backoff_max": parse_numeric_setting(
+                    requested("agent_backoff_max", 60), integer=False, minimum=0),
+                "validate_timeout": parse_numeric_setting(
+                    requested("validate_timeout", 120), integer=False, minimum=1e-300),
+                "stuck_stop": bool(defaults.get("stuck_stop")),
+                "notify_cmd": str(cfg.get("notify_cmd") or ""),
+                "environment": frozen_parallel_environment(cfg),
+            }
+            values = parallel_mod.canonical_run_config(values)
+        except (TypeError, ValueError, parallel_mod.ParallelError) as exc:
+            self._err(f"Parallel 執行設定不合法:{exc}")
+            return
+
+        with JOBS_LOCK:
+            for job in JOBS.values():
+                if job.alive() and job.name == name:
+                    self._err(f"workspace {name} 已有 runner 在跑(pid {job.popen.pid})", 409)
+                    return
+                if job.alive() and job.repo and Path(job.repo) == repo:
+                    self._err(f"repo {repo} 已有 runner 在跑({job.name})", 409)
+                    return
+            def launcher_operation(_fence, claimed_workspace):
+                _assert_launcher_repo_clean(_fence, repo)
+                _prepare_launcher_workspace(claimed_workspace)
+                staged = _stage_parallel_plan(claimed_workspace, normalized)
+                _assert_launcher_repo_clean(_fence, repo)
+                return staged
+
+            try:
+                plan_path, plan_sha256 = _run_dashboard_launcher(
+                    repo, name, repo_owner.OwnerKind.PARALLEL_LAUNCHER,
+                    launcher_operation)
+            except Exception as exc:
+                self._err(f"Parallel launcher owner 檢查或 pending plan 寫入失敗:{exc}")
+                return
+            try:
+                p = spawn_parallel(
+                    name, repo, action="start", import_plan=plan_path,
+                    expected_plan_sha256=plan_sha256,
+                    config=values, env=command_env(cfg), register_supervisor=True,
+                    workspace_prepared=True)
+            except Exception as exc:
+                self._err(f"Parallel supervisor 啟動失敗:{exc}")
+                return
+        workspace_console_log(
+            name, f"啟動 Parallel Loop｜pid={p.pid}｜tasks={len(normalized)}")
+        self._out(200, json.dumps({
+            "ok": True, "starting": True, "name": name, "pid": p.pid,
+            "startup_timeout": values["validate_timeout"] + 15,
+        }, ensure_ascii=False))
 
     def api_launch_ralph(self, body):
         """交易式啟動 ralph runner：完成可失敗檢查後才 spawn 監督層。與 api_launch 共用 state lock。"""
@@ -2507,7 +3431,7 @@ class Handler(BaseHTTPRequestHandler):
         if problem:
             self._err(problem)
             return
-        repo = Path(str(body.get("repo") or "")).expanduser()
+        repo = Path(str(body.get("repo") or "")).expanduser().resolve()
         if not (repo / ".git").exists():
             self._err(f"{repo} 不是 git repo")
             return
@@ -2609,47 +3533,73 @@ class Handler(BaseHTTPRequestHandler):
                         self._err(f"另一個 ralph run（{j.name}）正在使用相同的 ralph 目錄與 PRD"
                                   f"（{ralph_dir}/{prd_path}），會互相覆蓋；請用不同的 ralph_dir")
                         return
-            if body.get("new_branch"):
-                br = f"ralph/{name}"
-                exists = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", br],
-                                        capture_output=True, text=True).returncode == 0
-                r = subprocess.run(["git", "-C", str(repo), "checkout", "-q"] + ([br] if exists else ["-b", br]),
-                                   capture_output=True, text=True)
-                if r.returncode != 0:
-                    self._err(f"切換 branch {br} 失敗：" + (r.stdout + r.stderr).strip()[-300:])
-                    return
-                workspace_console_log(name, f"已切換 Git branch｜{br}")
-            if prd_target is not None:
-                try:
+            def launcher_operation(fence, workspace_dir):
+                _assert_launcher_repo_clean(fence, repo)
+                _prepare_launcher_workspace(workspace_dir)
+                if body.get("new_branch"):
+                    br = f"ralph/{name}"
+                    probe = _run_launcher_git(
+                        fence, repo, "rev-parse", "--verify", "--quiet", br)
+                    checkout = _run_launcher_git(
+                        fence, repo, "checkout", "-q",
+                        *([br] if probe.returncode == 0 else ["-b", br]))
+                    if checkout.returncode != 0:
+                        raise RuntimeError(
+                            f"切換 branch {br} 失敗："
+                            + (checkout.stdout + checkout.stderr).strip()[-300:])
+                    workspace_console_log(name, f"已切換 Git branch｜{br}")
+
+                if prd_target is not None:
                     prd_target.parent.mkdir(parents=True, exist_ok=True)
-                    loop_mod.atomic_write_bytes(prd_target, prd_content.encode("utf-8"))
-                except (OSError, ValueError) as e:
-                    self._err(f"PRD 寫入失敗：{e}")
-                    return
-                try:
-                    rel = prd_target.resolve().relative_to(repo.resolve())
-                    inside_repo = True
-                except ValueError:
-                    inside_repo = False
-                if inside_repo:
-                    subprocess.run(["git", "-C", str(repo), "add", "--", str(rel)],
-                                   capture_output=True, text=True)
-                    staged = subprocess.run(
-                        ["git", "-C", str(repo), "diff", "--cached", "--quiet", "--", str(rel)],
-                        capture_output=True, text=True)
-                    if staged.returncode != 0:
-                        subprocess.run(["git", "-C", str(repo), "commit", "-m",
-                                        f"ralph: 匯入 {rel}", "--", str(rel)],
-                                       capture_output=True, text=True)
-                        workspace_console_log(name, f"已匯入並 commit {rel}")
-            p = spawn_ralph(name, repo, ralph_cmd=ralph_cmd, ralph_dir=ralph_dir,
-                            iterations=iterations, tool=tool, model=model,
-                            args_template=args_template, prd_path=prd_path,
-                            notify_cmd=str(cfg.get("notify_cmd") or ""),
-                            usage_limit_action=ul_action, fallback_models=fallback_models,
-                            auto_restart_max=auto_restart_max,
-                            usage_limit_patterns=usage_limit_patterns,
-                            env=command_env(cfg))
+                    _write_launcher_bytes(prd_target, prd_content.encode("utf-8"))
+                    try:
+                        rel = prd_target.resolve().relative_to(repo)
+                    except ValueError:
+                        rel = None
+                    if rel is not None:
+                        pathspec = rel.as_posix()
+                        added = _run_launcher_git(fence, repo, "add", "--", pathspec)
+                        if added.returncode != 0:
+                            raise RuntimeError(
+                                f"git add {pathspec} 失敗："
+                                + (added.stdout + added.stderr).strip()[-300:])
+                        staged = _run_launcher_git(
+                            fence, repo, "diff", "--cached", "--quiet", "--", pathspec)
+                        if staged.returncode not in {0, 1}:
+                            raise RuntimeError(
+                                f"git diff {pathspec} 失敗："
+                                + (staged.stdout + staged.stderr).strip()[-300:])
+                        if staged.returncode == 1:
+                            committed = _run_launcher_git(
+                                fence, repo, "commit", "-m", f"ralph: 匯入 {pathspec}",
+                                "--", pathspec)
+                            if committed.returncode != 0:
+                                raise RuntimeError(
+                                    f"git commit {pathspec} 失敗："
+                                    + (committed.stdout + committed.stderr).strip()[-300:])
+                            workspace_console_log(name, f"已匯入並 commit {pathspec}")
+                _assert_launcher_repo_clean(fence, repo)
+
+            try:
+                _run_dashboard_launcher(
+                    repo, name, repo_owner.OwnerKind.DASHBOARD_LAUNCHER,
+                    launcher_operation)
+            except Exception as exc:
+                self._err(f"Dashboard launcher owner 檢查或短操作失敗:{exc}")
+                return
+            try:
+                p = spawn_ralph(
+                    name, repo, ralph_cmd=ralph_cmd, ralph_dir=ralph_dir,
+                    iterations=iterations, tool=tool, model=model,
+                    args_template=args_template, prd_path=prd_path,
+                    notify_cmd=str(cfg.get("notify_cmd") or ""),
+                    usage_limit_action=ul_action, fallback_models=fallback_models,
+                    auto_restart_max=auto_restart_max,
+                    usage_limit_patterns=usage_limit_patterns,
+                    env=command_env(cfg), workspace_prepared=True)
+            except Exception as exc:
+                self._err(f"ralph runner 啟動失敗:{exc}")
+                return
         workspace_console_log(name, f"啟動 ralph｜pid={p.pid}｜repo={repo}｜iterations={iterations}")
         self._out(200, json.dumps({"ok": True, "starting": True, "name": name, "pid": p.pid,
                                    "startup_timeout": 30}, ensure_ascii=False))
@@ -2721,12 +3671,50 @@ class Handler(BaseHTTPRequestHandler):
         self._out(200, json.dumps({"ok": True, "starting": True, "name": name, "pid": p.pid,
                                    "startup_timeout": 30}, ensure_ascii=False))
 
+    def _start_existing_parallel(self, name, st):
+        """Spawn the typed parallel Resume entrypoint, never an ordinary loop."""
+        if reject_dashboard_operation(
+                self, st, "resume", parallel_action="resume"):
+            return
+        config = st.get("config") if isinstance(st.get("config"), dict) else {}
+        repo = config.get("repo")
+        if not isinstance(repo, str) or not (Path(repo) / ".git").exists():
+            self._err("parallel state 缺少可用的 primary repo")
+            return
+        with JOBS_LOCK:
+            job = JOBS.get(name)
+            if job is not None and job.alive():
+                self._err(f"{name} 已在執行中(pid {job.popen.pid})", 409)
+                return
+            p = spawn_parallel(
+                name, repo, action="resume", env=parallel_recovery_env(),
+                register_supervisor=True)
+        try:
+            configured_timeout = float(config.get("validate_timeout", 120))
+            if not math.isfinite(configured_timeout) or configured_timeout <= 0:
+                raise ValueError
+            startup_timeout = max(30.0, configured_timeout + 15)
+        except (TypeError, ValueError):
+            startup_timeout = 135.0
+        workspace_console_log(name, f"Resume Parallel Loop｜pid={p.pid}")
+        self._out(200, json.dumps({
+            "ok": True, "starting": True, "name": name, "pid": p.pid,
+            "job_id": p.dashboard_job_id,
+            "startup_timeout": startup_timeout,
+        }, ensure_ascii=False))
+
     def _start_existing_workspace(self, body, *, resume_interrupted):
         """run/resume 共用設定白名單、單 writer 與 spawn 流程。"""
         name = str(body.get("name") or "")
         st = _load_state_or_err(self, name)
         if st is None:
             return
+        if (st.get("runner") == "parallel-worker"
+                or st.get("managed_readonly") is True):
+            reject_dashboard_operation(self, st, "run/resume")
+            return
+        if st.get("runner") == parallel_mod.SUPERVISOR_RUNNER:
+            return Handler._start_existing_parallel(self, name, st)
         if (st.get("runner") or "loop") == "ralph":
             # ralph 天然可續跑（未完成 story 即續跑點）；重跑＝依保存設定重新 spawn 監督層。
             return Handler._start_existing_ralph(self, name, st)
@@ -2827,6 +3815,9 @@ class Handler(BaseHTTPRequestHandler):
         st = _load_state_or_err(self, name)
         if st is None:
             return
+        if reject_dashboard_operation(
+                self, st, "edit-state", immutable_parallel=True):
+            return
         if ws_running(name, st):
             self._err(f"{name} 執行中,全部鎖死——先停止才能編輯")
             return
@@ -2901,6 +3892,9 @@ class Handler(BaseHTTPRequestHandler):
         st = _load_state_or_err(self, name)
         if st is None:
             return
+        if reject_dashboard_operation(
+                self, st, "import-plan", immutable_parallel=True):
+            return
         if ws_running(name, st):
             self._err(f"{name} 執行中,先停止才能匯入 plan.json")
             return
@@ -2914,6 +3908,9 @@ class Handler(BaseHTTPRequestHandler):
             self._err(f"plan.json 解析失敗:{e}")
             return
         normalized, errs = validate_plan(plan_obj)
+        if not errs:
+            errs.extend(validate_serial_stack_opt_in(
+                normalized, allow_serial_stack=False))
         if errs:
             self._err("plan.json 校驗未過:\n- " + "\n- ".join(errs))
             return
@@ -2942,6 +3939,8 @@ class Handler(BaseHTTPRequestHandler):
         name = str(body.get("name") or "")
         st = _load_state_or_err(self, name)
         if st is None:
+            return
+        if reject_dashboard_operation(self, st, "edit-config"):
             return
         if ws_running(name, st):
             self._err(f"{name} 執行中,全部鎖死——先停止才能改設定")
@@ -3010,6 +4009,8 @@ class Handler(BaseHTTPRequestHandler):
             st = _load_state_or_err(self, name)
             if st is None:
                 return
+            if reject_dashboard_operation(self, st, "validate"):
+                return
             if ws_running(name, st):
                 self._err(f"{name} 執行中——先停止才能單獨確認 Validate 命令")
                 return
@@ -3018,6 +4019,8 @@ class Handler(BaseHTTPRequestHandler):
             repo = Path(str(body.get("repo") or "")).expanduser()
         if not (repo / ".git").exists():
             self._err(f"{repo} 不是 git repo(repo 被移走了?)")
+            return
+        if reject_repo_operation(self, repo, "validate"):
             return
         raw = str(body.get("validate_cmd") or "").strip()
         if not raw:
@@ -3045,7 +4048,9 @@ class Handler(BaseHTTPRequestHandler):
             timeout = float(requested_timeout)
             if timeout <= 0:
                 raise ValueError
-            rc, output, timed_out = run_command_check(cmd, repo, timeout=timeout, env=command_env(cfg))
+            rc, output, timed_out = run_owned_command_check(
+                cmd, repo, name=name, timeout=timeout, env=command_env(cfg),
+                child_kind=repo_owner.ChildKind.VALIDATOR)
             output = output.strip()
             tail = "\n".join(output.splitlines()[-50:])
             ok = rc == 0 and not timed_out
@@ -3060,6 +4065,8 @@ class Handler(BaseHTTPRequestHandler):
             self._err("validate_timeout 必須 > 0 秒")
         except FileNotFoundError:
             self._err(f"找不到 Validate 命令：{cmd[0]}")
+        except repo_owner.RepoOwnerError as exc:
+            self._err(f"Validate 無法取得 repo owner:{exc}", 409)
 
     @with_state_lock(repo_fallback=True)
     def api_preflight(self, body):
@@ -3072,6 +4079,8 @@ class Handler(BaseHTTPRequestHandler):
         if not (repo / ".git").exists():
             self._err(f"{repo} 不是 git repo")
             return
+        if reject_repo_operation(self, repo, "preflight"):
+            return
         name = str(body.get("name") or "").strip() or repo.name
         if not loop_mod.valid_workspace_name(name):
             self._err(f"workspace 名稱 {name} 不合法：{loop_mod.WORKSPACE_NAME_RULE}")
@@ -3080,6 +4089,10 @@ class Handler(BaseHTTPRequestHandler):
             safe_workspace_dir(name)
         except ValueError as e:
             self._err(str(e))
+            return
+        existing, _existing_error = read_state(name, repair=False)
+        if (existing is not None
+                and reject_dashboard_operation(self, existing, "preflight")):
             return
         values = cfg.get("validate_cmds") or []
         try:
@@ -3101,7 +4114,12 @@ class Handler(BaseHTTPRequestHandler):
         command = [sys.executable, "-m", "engine.loop", "--repo", str(repo), "--name", name,
                    "--validate-cmd", validate_cmd, "--validate-timeout", str(timeout), "--preflight-only"]
         # loop.py 會自行以 validate_timeout 終止 validator；外層多留緩衝，只在意外卡住時清整群組。
-        rc, output, timed_out = run_command_check(command, repo, timeout=timeout + 15, env=command_env(cfg))
+        # engine.loop claims and releases its own repository owner before the
+        # validator can execute.  Wrapping the launcher in another owner would
+        # deadlock that nested claim; the repo-only Parallel guard above closes
+        # the alias route before this self-fenced process is spawned.
+        rc, output, timed_out = run_command_check(
+            command, repo, timeout=timeout + 15, env=command_env(cfg))
         output = output.strip()
         tail = "\n".join(output.splitlines()[-100:])[-30000:]
         ok = rc == 0 and not timed_out
@@ -3119,6 +4137,8 @@ class Handler(BaseHTTPRequestHandler):
             st = _load_state_or_err(self, name)
             if st is None:
                 return
+            if reject_dashboard_operation(self, st, "test-agent"):
+                return
             if ws_running(name, st):
                 self._err(f"{name} 執行中——先停止才能單獨確認 Agent CLI")
                 return
@@ -3127,6 +4147,8 @@ class Handler(BaseHTTPRequestHandler):
             repo = Path(str(body.get("repo") or "")).expanduser()
         if not (repo / ".git").exists():
             self._err(f"{repo} 不是 git repo(repo 被移走了?)")
+            return
+        if reject_repo_operation(self, repo, "test-agent"):
             return
         cfg = load_config()
         if "error" in cfg:
@@ -3155,10 +4177,14 @@ class Handler(BaseHTTPRequestHandler):
             if command_problem:
                 self._err(command_problem)
                 return
-            rc, output, timed_out = run_command_check(
-                cmd, repo, prompt="test\n", timeout=60, env=command_env(cfg)
+            rc, output, timed_out = run_owned_command_check(
+                cmd, repo, name=name, prompt="test\n", timeout=60,
+                env=command_env(cfg), child_kind=repo_owner.ChildKind.AGENT
             )
-        except (ValueError, FileNotFoundError) as e:
+        except repo_owner.RepoOwnerError as exc:
+            self._err(f"Agent CLI 測試無法取得 repo owner:{exc}", 409)
+            return
+        except (ValueError, FileNotFoundError):
             self._err(command_not_found("Agent CLI", cmd[0] if cmd else raw, cfg))
             return
         tail = "\n".join(output.strip().splitlines()[-100:])
@@ -3180,6 +4206,8 @@ class Handler(BaseHTTPRequestHandler):
             st = _load_state_or_err(self, name)
             if st is None:
                 return
+            if reject_dashboard_operation(self, st, "test-cli"):
+                return
             if ws_running(name, st):
                 self._err(f"{name} 執行中——先停止才能測試 Agent CLI")
                 return
@@ -3188,6 +4216,8 @@ class Handler(BaseHTTPRequestHandler):
             repo = Path(str(body.get("repo") or "")).expanduser()
         if not (repo / ".git").exists():
             self._err(f"{repo} 不是 git repo(repo 被移走了?)")
+            return
+        if reject_repo_operation(self, repo, "test-cli"):
             return
         raw = str(body.get("agent_cmd") or "").strip()
         cfg = load_config()
@@ -3207,11 +4237,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         cmd = compat.split_command(raw)
         try:
-            rc, output, timed_out = run_command_check(
-                cmd, repo, prompt="test\n", timeout=60, env=command_env(cfg)
+            rc, output, timed_out = run_owned_command_check(
+                cmd, repo, name=name, prompt="test\n", timeout=60,
+                env=command_env(cfg), child_kind=repo_owner.ChildKind.AGENT
             )
         except FileNotFoundError:
             self._err(command_not_found("Agent CLI", cmd[0], cfg))
+            return
+        except repo_owner.RepoOwnerError as exc:
+            self._err(f"Agent CLI 測試無法取得 repo owner:{exc}", 409)
             return
         tail = "\n".join(output.strip().splitlines()[-100:])[-30000:]
         self._out(200, json.dumps({"ok": rc == 0 and not timed_out, "rc": rc,
@@ -3355,6 +4389,9 @@ class Handler(BaseHTTPRequestHandler):
         st = _load_state_or_err(self, name)
         if st is None:
             return
+        if reject_dashboard_operation(
+                self, st, "phase", immutable_parallel=True):
+            return
         if ws_running(name, st):
             self._err(f"{name} 執行中,全部鎖死——先停止才能切換 phase")
             return
@@ -3395,6 +4432,9 @@ class Handler(BaseHTTPRequestHandler):
         name = str(body.get("name") or "")
         st = _load_state_or_err(self, name)
         if st is None:
+            return
+        if reject_dashboard_operation(
+                self, st, "set-task", immutable_parallel=True):
             return
         if ws_running(name, st):
             self._err(f"{name} 執行中,全部鎖死——先停止才能調整進度")
@@ -3484,6 +4524,8 @@ class Handler(BaseHTTPRequestHandler):
         st = _load_state_or_err(self, name, repair=False)
         if st is None:
             return
+        if reject_dashboard_operation(self, st, "delete"):
+            return
         if ws_running(name, st):
             self._err(f"{name} 執行中,不能刪除——先停止")
             return
@@ -3537,6 +4579,8 @@ class Handler(BaseHTTPRequestHandler):
         st = _load_state_or_err(self, name)
         if st is None:
             return
+        if reject_dashboard_operation(self, st, "drain"):
+            return
         loop_state = st.get("loop") or {}
         pid = loop_state.get("pid")
         session_id = loop_state.get("session_id")
@@ -3583,6 +4627,8 @@ class Handler(BaseHTTPRequestHandler):
         st = _load_state_or_err(self, name)
         if st is None:
             return
+        if reject_dashboard_operation(self, st, "cancel-drain"):
+            return
         loop_state = st.get("loop") or {}
         pid = loop_state.get("pid")
         session_id = loop_state.get("session_id")
@@ -3619,25 +4665,114 @@ class Handler(BaseHTTPRequestHandler):
         self._out(200, json.dumps({"ok": True, "name": name, "pid": pid,
                                    "cancelled": True}, ensure_ascii=False))
 
+    def _parallel_control(self, name, st, action):
+        """Publish a typed Pause/Abort request through engine.parallel."""
+        if reject_dashboard_operation(
+                self, st, action, parallel_action=action):
+            return
+        repo = (st.get("config") or {}).get("repo")
+        if not isinstance(repo, str) or not repo:
+            self._err("parallel state 缺少 primary repo")
+            return
+        with JOBS_LOCK:
+            p = spawn_parallel(
+                name, repo, action=action, env=parallel_recovery_env(),
+                register_supervisor=False)
+            job_id = p.dashboard_job_id
+        workspace_console_log(
+            name, f"Parallel {'Pause' if action == 'pause' else 'Abort'} request｜pid={p.pid}")
+        self._out(200, json.dumps({
+            "ok": True, "starting": True, "name": name, "pid": p.pid,
+            "job_id": job_id, "control": action,
+            "startup_timeout": PARALLEL_CONTROL_STARTUP_TIMEOUT,
+        }, ensure_ascii=False))
+
+    @with_state_lock
+    def api_abort(self, body):
+        """Explicit destructive Parallel Abort; ordinary loop has no such route."""
+        name = str(body.get("name") or "")
+        st = _load_state_or_err(self, name, repair=False)
+        if st is None:
+            return
+        if st.get("runner") != parallel_mod.SUPERVISOR_RUNNER:
+            if reject_dashboard_operation(self, st, "abort"):
+                return
+            self._err("Abort 只適用於 parallel-supervisor workspace")
+            return
+        return Handler._parallel_control(self, name, st, "abort")
+
+    @with_state_lock
     def api_stop(self, body):
         """冪等停止本 Dashboard 或外部啟動的 loop；先 SIGINT，逾時才 SIGKILL。"""
         name = str(body.get("name") or "")
         if not loop_mod.valid_workspace_name(name):
             self._err(f"workspace 名稱 {name or '(空)'} 不合法：{loop_mod.WORKSPACE_NAME_RULE}")
             return
+        st, state_error = read_state(name, repair=False)
         with JOBS_LOCK:
             j = JOBS.get(name)
-        if j is not None and j.alive():
+        job_alive = j is not None and j.alive()
+        if st is not None:
+            if (st.get("runner") == "parallel-worker"
+                    or st.get("managed_readonly") is True):
+                reject_dashboard_operation(self, st, "stop")
+                return
+        if job_alive and parallel_job(j):
+            if st is None:
+                self._err(
+                    f"{name} 的 Parallel supervisor state 無法安全讀取；"
+                    f"拒絕以普通 signal stop（{state_error or 'state 不存在'}）",
+                    409,
+                )
+                return
+            if st.get("runner") != parallel_mod.SUPERVISOR_RUNNER:
+                self._err(
+                    f"{name} 的執行中 job 是 Parallel，但 state runner 身分不符；"
+                    "拒絕以普通 signal stop，需 recovery",
+                    409,
+                )
+                return
+            return Handler._parallel_control(self, name, st, "pause")
+        if st is not None and st.get("runner") == parallel_mod.SUPERVISOR_RUNNER:
+            if job_alive:
+                self._err(
+                    f"{name} 的 state 是 Parallel supervisor，但執行中 job 身分不符；"
+                    "拒絕停止，需 recovery",
+                    409,
+                )
+                return
+            return Handler._parallel_control(self, name, st, "pause")
+        try:
+            expected_workspace = safe_workspace_dir(name)
+        except ValueError as exc:
+            self._err(str(exc), 409)
+            return
+        if job_alive:
+            expected_owner = stopping_owner_snapshot(j.repo, expected_workspace)
             workspace_console_log(name, f"停止 loop｜pid={j.popen.pid}")
             if not j.stop(wait=True):
                 self._err(f"{name} 停止逾時，程序仍在執行中", 500)
                 return
+            owner_error = stopped_owner_recovery_error(
+                j.repo, expected_workspace=expected_workspace,
+                expected_owner=expected_owner)
+            if owner_error:
+                workspace_console_log(name, owner_error)
+                self._err(owner_error, 409)
+                return
             self._out(200, json.dumps({"ok": True, "name": name}, ensure_ascii=False))
             return
         # 不是本 dashboard 啟動的:用 state.json 記錄的 pid 停(SIGINT 優雅收尾,8 秒後 SIGKILL)
-        st, _ = read_state(name)
         pid = (st.get("loop") or {}).get("pid") if st else None
         if loop_pid_alive(pid):
+            repo = (st.get("config") or {}).get("repo") if st else None
+            if not isinstance(repo, str) or not repo:
+                self._err(
+                    f"{name} state 缺少 primary repo，無法驗證停止後 owner checkpoint",
+                    409,
+                )
+                return
+            expected_owner = stopping_owner_snapshot(repo, expected_workspace)
             workspace_console_log(name, f"停止外部 loop｜pid={pid}")
             # pid 來自 state.json(外部檔案,可能損壞):-1/0 會殺到全機/整組,交給防線把關
             if not loop_mod.safe_kill(int(pid), signal.SIGINT):
@@ -3660,10 +4795,39 @@ class Handler(BaseHTTPRequestHandler):
             if loop_pid_alive(pid):
                 self._err(f"{name} 停止逾時，程序仍在執行中", 500)
                 return
+            owner_error = stopped_owner_recovery_error(
+                repo, expected_workspace=expected_workspace,
+                expected_owner=expected_owner)
+            if owner_error:
+                workspace_console_log(name, owner_error)
+                self._err(owner_error, 409)
+                return
             self._out(200, json.dumps({"ok": True, "name": name, "external": True}, ensure_ascii=False))
             return
         # UI 的 fleet 狀態每幾秒同步一次，程序可能恰好在點擊前自行結束。
-        # stop 應為冪等操作，避免這個正常競態跳出錯誤並讓按鈕卡在舊狀態。
+        # stop 仍為冪等，但 durable workspace 不得跳過 owner terminal postcondition。
+        if st is None and workspace_state_artifacts_exist(name):
+            self._err(
+                f"{name} 的 state 無法安全讀取，無法驗證停止後 owner checkpoint："
+                f"{state_error or '未知錯誤'}",
+                409,
+            )
+            return
+        repo = (getattr(j, "repo", None) if j is not None else None)
+        if not repo and st is not None:
+            repo = (st.get("config") or {}).get("repo")
+        if (j is not None or st is not None) and (not isinstance(repo, str) or not repo):
+            self._err(
+                f"{name} 缺少 primary repo，無法驗證停止後 owner checkpoint",
+                409,
+            )
+            return
+        owner_error = stopped_owner_recovery_error(
+            repo, expected_workspace=expected_workspace)
+        if owner_error:
+            workspace_console_log(name, owner_error)
+            self._err(owner_error, 409)
+            return
         self._out(200, json.dumps({"ok": True, "name": name, "already_stopped": True}, ensure_ascii=False))
 
 

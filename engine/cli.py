@@ -18,7 +18,9 @@ from datetime import datetime
 from pathlib import Path
 
 from engine import loop as loop_mod
+from engine import parallel as parallel_mod
 from engine import platform_compat as compat
+from engine import repo_owner
 from engine import status as status_mod
 from engine.paths import default_workspace_root, expose_project_package
 
@@ -144,8 +146,236 @@ def _workspace_state(name: str, *, repair=False):
     return directory, state, recovered
 
 
+def _recovery_state_repo(directory: Path) -> Path | None:
+    """Return the exact durable repo binding, or None when state is unavailable."""
+    if loop_mod.workspace_directory(directory, create=False) is None:
+        return None
+    try:
+        state, _data, _recovered = loop_mod.load_checkpointed_state(
+            directory / "state.json", repair=False)
+    except (FileNotFoundError, OSError, ValueError, loop_mod.StateLoadError):
+        return None
+    binding = state.get("repo_binding") if isinstance(state, dict) else None
+    config = state.get("config") if isinstance(state, dict) else None
+    configured = config.get("repo") if isinstance(config, dict) else None
+    candidates = []
+    for label, value in (("state.repo_binding", binding),
+                         ("state.config.repo", configured)):
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} 無法識別 recovery repo")
+        try:
+            candidates.append((label, Path(value).expanduser().resolve(strict=True)))
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"{label} 無法解析 recovery repo") from exc
+    if not candidates:
+        return None
+    repo = candidates[0][1]
+    if any(candidate != repo for _label, candidate in candidates[1:]):
+        raise ValueError("state.repo_binding 與 state.config.repo 不一致；拒絕 recovery")
+    return repo
+
+
+def _exact_process_identity_absent(identity: dict, *, boot_changed: bool) -> bool:
+    if boot_changed:
+        return True
+    pid = identity["pid"]
+    try:
+        observed = repo_owner.process_creation_token(pid)
+    except repo_owner.RepoOwnerError:
+        # If a process still appears live but its creation identity cannot be
+        # read, absence is uncertain and recovery remains fail-closed.
+        if compat.IS_WINDOWS:
+            return not compat.process_is_alive(pid)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except (PermissionError, OSError, TypeError, ValueError):
+            return False
+        return False
+    return observed != identity["creation_token"]
+
+
+_STRICT_WINDOWS_CHILD_CONTAINMENT = "windows-job-no-breakaway-v2"
+_STRICT_POSIX_CHILD_CONTAINMENT = "posix-subreaper-guardian-v2"
+
+
+def _reaped_child_has_strict_containment(snapshot: dict) -> bool:
+    """Return whether a durable reap came from the current closed contract.
+
+    Schema-v1 owner markers may have been written by older implementations
+    whose ``job``/``process-group`` containment allowed descendants to escape.
+    Once such a child is checkpointed back to ``idle`` its containment identity
+    is deliberately erased, so same-boot manual recovery must remain closed.
+    """
+    identity = snapshot.get("child_identity")
+    if not isinstance(identity, dict):
+        return False
+    return identity.get("containment_kind") in {
+        _STRICT_WINDOWS_CHILD_CONTAINMENT,
+        _STRICT_POSIX_CHILD_CONTAINMENT,
+    }
+
+
+def _primary_tree_clean(repo: Path) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=normal"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and not result.stdout.strip()
+
+
+def command_recover_owner(args) -> int:
+    """Explicitly recover one exact nonterminal ordinary owner marker."""
+    if not args.acknowledge_child_gone:
+        raise ValueError("recover-owner 必須明確指定 --acknowledge-child-gone")
+    loop_mod.require_workspace_name(args.workspace)
+    workspace = loop_mod.workspace_path(loop_mod.WORKSPACE_ROOT, args.workspace)
+    state_path = workspace / "state.json"
+    state_repo = _recovery_state_repo(workspace)
+    if state_repo is not None:
+        if args.repo is not None:
+            raise ValueError("state 已能識別 repo；--repo 只允許 state 無法識別時使用")
+        candidate_repo = state_repo
+    else:
+        if not isinstance(args.repo, str) or not args.repo.strip():
+            raise ValueError("state 無法識別 repo；必須明確提供 --repo")
+        candidate_repo = Path(args.repo).expanduser().resolve(strict=True)
+
+    marker = repo_owner.RepoOwnerFence.inspect(candidate_repo)
+    if marker is None:
+        raise ValueError("指定 repo 沒有 owner marker")
+    if marker["state"] == "terminal":
+        raise ValueError("owner marker 已 terminal，不需要 recovery")
+    expected_workspace = workspace.resolve(strict=False)
+    expected_state_path = state_path.resolve(strict=False)
+    if marker["workspace"] != str(expected_workspace):
+        raise ValueError("owner marker workspace 與指定 workspace 不一致")
+    if marker["state_path"] != str(expected_state_path):
+        raise ValueError("owner marker state_path 與指定 workspace 不一致")
+    owner_kind = repo_owner.OwnerKind(marker["owner_kind"])
+    canonical_repo = Path(marker["canonical_repo"])
+    if not _primary_tree_clean(canonical_repo):
+        raise ValueError("primary repo 必須 clean 才能 recover owner")
+    current_boot = repo_owner.host_boot_identity()
+
+    def authorize(snapshot: dict) -> bool:
+        if snapshot != marker or not _primary_tree_clean(canonical_repo):
+            return False
+        boot_changed = snapshot["host_boot_identity"] != current_boot
+        if not _exact_process_identity_absent(
+                snapshot["owner_identity"], boot_changed=boot_changed):
+            return False
+        child_state = snapshot["child_state"]
+        if child_state == "idle":
+            # A never-used owner has no historical child-containment contract
+            # to audit.  For later idle generations only a reboot proves that
+            # a legacy detached descendant cannot still be mutating the repo.
+            return snapshot["child_generation"] == 0 or boot_changed
+        if child_state == "child_reaped":
+            return boot_changed or _reaped_child_has_strict_containment(snapshot)
+        if child_state == "launching":
+            # The command-level acknowledgement is the only permitted manual
+            # authority for the identity-publication gap.
+            return bool(args.acknowledge_child_gone)
+        if child_state != "child_running":
+            return False
+        identity = snapshot["child_identity"]
+        if not _exact_process_identity_absent(identity, boot_changed=boot_changed):
+            return False
+        if boot_changed:
+            return True
+        # On Windows, closure of a verified no-breakaway Job handle when the
+        # dead owner exits is kernel evidence that all descendants are gone.
+        # A dead POSIX guardian root is not equivalent evidence: the guardian
+        # itself may have crashed before it reaped a reparented descendant.
+        return (compat.IS_WINDOWS
+                and identity.get("containment_kind")
+                == _STRICT_WINDOWS_CHILD_CONTAINMENT)
+
+    recovered = None
+    try:
+        recovered = repo_owner.RepoOwnerFence.recover(
+            canonical_repo,
+            expected_owner_kind=owner_kind,
+            expected_workspace=expected_workspace,
+            expected_state_path=expected_state_path,
+            expected_session=marker["session"],
+            expected_generation=marker["generation"],
+            recovery_authorizer=authorize,
+        )
+        # RepoOwnerFence.recover durably appends the generation-CAS audit event
+        # to recovery_history before this terminal checkpoint.
+        terminal = recovered.terminalize(
+            "manual-recovery-acknowledged-child-gone")
+    except BaseException:
+        if recovered is not None:
+            recovered.close()
+        raise
+    event = terminal["recovery_history"][-1]
+    print(json.dumps({
+        "ok": True,
+        "workspace": args.workspace,
+        "repo": terminal["canonical_repo"],
+        "owner_kind": terminal["owner_kind"],
+        "from_session": event["from_session"],
+        "from_generation": event["from_generation"],
+        "generation": terminal["generation"],
+        "state": terminal["state"],
+    }, ensure_ascii=False))
+    return 0
+
+
+def _managed_workspace_for_repo(repo: Path) -> str | None:
+    """Find a managed worker worktree even if a caller supplies another name."""
+    target = Path(repo).expanduser().resolve()
+    root = Path(loop_mod.WORKSPACE_ROOT)
+    if not root.is_dir():
+        return None
+    for directory in root.iterdir():
+        if (not loop_mod.valid_workspace_name(directory.name)
+                or directory.is_symlink() or not directory.is_dir()):
+            continue
+        try:
+            state, _raw, _recovered = loop_mod.load_checkpointed_state(
+                directory / "state.json", repair=False)
+        except (FileNotFoundError, OSError, ValueError, loop_mod.StateLoadError):
+            continue
+        if not (state.get("runner") == "parallel-worker"
+                or state.get("managed_readonly") is True):
+            continue
+        bound = (state.get("config") or {}).get("repo")
+        try:
+            if isinstance(bound, str) and Path(bound).expanduser().resolve() == target:
+                return directory.name
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return None
+
+
 def _engine_command(args: list[str]) -> list[str]:
     return [sys.executable, "-m", "engine.loop", *args]
+
+
+def _parallel_command(action: str, name: str) -> list[str]:
+    """Build the one supported high-level parallel control command."""
+    if action not in {"resume", "pause", "abort"}:
+        raise ValueError(f"parallel action 不合法：{action}")
+    loop_mod.require_workspace_name(name)
+    return [
+        sys.executable, "-m", "engine.parallel",
+        "--workspace-root", str(loop_mod.WORKSPACE_ROOT),
+        action, name,
+    ]
 
 
 def _engine_env() -> dict:
@@ -160,6 +390,14 @@ def _exec_engine(args: list[str]):
         # Windows' CRT exec emulation can return before the replacement process
         # has finished.  Waiting for the exact same argv preserves the CLI's
         # synchronous exit-code and state-visibility contract.
+        raise SystemExit(subprocess.run(command, env=_engine_env(), check=False).returncode)
+    os.execve(sys.executable, command, _engine_env())
+
+
+def _exec_parallel(action: str, name: str):
+    """Replace this CLI with the parallel supervisor/control client."""
+    command = _parallel_command(action, name)
+    if compat.IS_WINDOWS:
         raise SystemExit(subprocess.run(command, env=_engine_env(), check=False).returncode)
     os.execve(sys.executable, command, _engine_env())
 
@@ -188,7 +426,22 @@ def _append_common_runtime_args(args: list[str], values) -> None:
 
 
 def command_init(args) -> int:
-    engine_args = ["--repo", str(Path(args.repo).expanduser().resolve()), "--init-only"]
+    target_repo = Path(args.repo).expanduser().resolve()
+    managed_name = _managed_workspace_for_repo(target_repo)
+    if managed_name is not None:
+        raise ValueError(
+            f"repo 屬於 managed parallel worker {managed_name}；"
+            "只能由 parent supervisor 操作")
+    target_name = args.name or target_repo.name
+    target_dir = loop_mod.workspace_path(loop_mod.WORKSPACE_ROOT, target_name)
+    if loop_mod.workspace_directory(target_dir, create=False) is not None:
+        try:
+            _directory, existing, _recovered = _workspace_state(target_name, repair=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            assert_workspace_cli_operation_allowed(existing, "init --force")
+    engine_args = ["--repo", str(target_repo), "--init-only"]
     if args.name:
         engine_args += ["--name", args.name]
     engine_args += ["--goal", args.goal]
@@ -208,7 +461,14 @@ def command_init(args) -> int:
 
 def command_run(args):
     _directory, state, _recovered = _workspace_state(args.name, repair=False)
-    assert_workspace_cli_operation_allowed(state, "run/restart")
+    if state.get("runner") == parallel_mod.SUPERVISOR_RUNNER:
+        if args.reset_state or args.resume_interrupted:
+            raise ValueError(
+                "parallel workspace 不接受 ordinary Loop 的 --reset-state/--resume-interrupted；"
+                "請使用 parallel resume 或 abort")
+        _exec_parallel("resume", args.name)
+        return 0
+    assert_workspace_cli_operation_allowed(state, "run/restart/resume")
     if state.get("phase") == "done" and not args.reset_state:
         raise ValueError(
             f"workspace {args.name} 已完成；要建立全新 run 請明確加 --reset-state")
@@ -271,13 +531,18 @@ def _print_config(name: str, config: dict) -> None:
 
 
 def assert_workspace_cli_operation_allowed(state: dict, operation: str) -> None:
-    """Reject every ordinary mutating/control route for managed workers."""
+    """Central PID-independent guard for ordinary CLI mutations."""
     if (isinstance(state, dict)
             and (state.get("runner") == "parallel-worker"
                  or state.get("managed_readonly") is True)):
         raise ValueError(
             f"managed parallel worker 是 parent supervisor 的 readonly workspace；"
             f"CLI {operation} 不可直接操作")
+    if isinstance(state, dict):
+        try:
+            parallel_mod.assert_base_mutation_allowed(state, operation)
+        except parallel_mod.ParallelError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 def command_config(args) -> int:
@@ -332,6 +597,13 @@ def _pid_matches_workspace(pid: int, name: str) -> bool:
 
 def command_stop(args) -> int:
     directory, state, _recovered = _workspace_state(args.name, repair=False)
+    if state.get("runner") == parallel_mod.SUPERVISOR_RUNNER:
+        if args.now:
+            raise ValueError(
+                "parallel stop 只支援安全 Pause；--now 不可繞過 supervisor fence，"
+                "破壞性停止請使用 abort")
+        _exec_parallel("pause", args.name)
+        return 0
     assert_workspace_cli_operation_allowed(state, "stop")
     loop_state = state.get("loop") if isinstance(state.get("loop"), dict) else {}
     state_pid, session_id = loop_state.get("pid"), loop_state.get("session_id")
@@ -382,6 +654,18 @@ def command_stop(args) -> int:
     return 0
 
 
+def command_abort(args) -> int:
+    """Explicit destructive control reserved for a parallel base workspace."""
+    _directory, state, _recovered = _workspace_state(args.name, repair=False)
+    if (state.get("runner") == "parallel-worker"
+            or state.get("managed_readonly") is True):
+        assert_workspace_cli_operation_allowed(state, "abort")
+    if state.get("runner") != parallel_mod.SUPERVISOR_RUNNER:
+        raise ValueError("abort 只適用於 parallel-supervisor workspace")
+    _exec_parallel("abort", args.name)
+    return 0
+
+
 def _add_tuning_options(parser, *, defaults=True) -> None:
     default = (lambda value: value) if defaults else (lambda _value: None)
     parser.add_argument("--flag-threshold", type=int, default=default(loop_mod.FLAG_THRESHOLD))
@@ -427,8 +711,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     init.add_argument("--notify-cmd", default="")
     _add_tuning_options(init)
 
-    run = commands.add_parser("run", aliases=["restart"],
-                              help="用 state.config 前景執行；restart 是同義命令")
+    run = commands.add_parser("run", aliases=["restart", "resume"],
+                              help="用 state.config 前景執行；restart/resume 是同義命令")
     run.add_argument("name", help="workspace 名稱")
     mode = run.add_mutually_exclusive_group()
     mode.add_argument("--resume-interrupted", action="store_true",
@@ -467,6 +751,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     stop = commands.add_parser("stop", help="預設本輪後停止；--now 立即送 SIGINT")
     stop.add_argument("name")
     stop.add_argument("--now", action="store_true", help="立即中斷目前 round")
+    abort = commands.add_parser("abort", help="明確取消 parallel run 並安全清理資源")
+    abort.add_argument("name")
+    recover = commands.add_parser(
+        "recover-owner", help="危險：以精確 marker authority 手動復原 owner fence")
+    recover.add_argument("workspace", help="marker 記錄的 workspace 名稱")
+    recover.add_argument(
+        "--acknowledge-child-gone", action="store_true",
+        help="確認 operator 已終止所有候選 child/descendant")
+    recover.add_argument(
+        "--repo", default=None,
+        help="僅在 state 無法識別 repo 時提供；不覆寫既有 state binding")
     return parser
 
 
@@ -478,7 +773,7 @@ def main(argv=None) -> int:
     try:
         if args.command == "init":
             return command_init(args)
-        if args.command in ("run", "restart"):
+        if args.command in ("run", "restart", "resume"):
             return command_run(args)
         if args.command == "check":
             return command_check(args)
@@ -488,6 +783,10 @@ def main(argv=None) -> int:
             return command_config(args)
         if args.command == "stop":
             return command_stop(args)
+        if args.command == "abort":
+            return command_abort(args)
+        if args.command == "recover-owner":
+            return command_recover_owner(args)
         parser.error(f"未知命令：{args.command}")
     except (FileNotFoundError, OSError, RuntimeError, ValueError, loop_mod.StateLoadError) as e:
         print(f"❌ {e}", file=sys.stderr)

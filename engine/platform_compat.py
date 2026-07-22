@@ -8,6 +8,7 @@ and lightweight process inspection.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import errno
 import os
 import re
@@ -16,13 +17,18 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+from typing import Mapping
 
 
 IS_WINDOWS = os.name == "nt"
 FORCE_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 _WINDOWS_LOCK_OFFSET = 0x7FFF0000
+_GROUP_SPAWN_LOCAL = threading.local()
+_WINDOWS_BREAK_LOCAL = threading.local()
+_WINDOWS_BREAK_HANDLER = None
 
 if IS_WINDOWS:
     import ctypes
@@ -37,10 +43,27 @@ if IS_WINDOWS:
     _kernel32.SetInformationJobObject.restype = wintypes.BOOL
     _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
     _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _kernel32.IsProcessInJob.argtypes = [
+        wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL),
+    ]
+    _kernel32.IsProcessInJob.restype = wintypes.BOOL
+    _kernel32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _kernel32.QueryInformationJobObject.restype = wintypes.BOOL
     _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     _kernel32.OpenProcess.restype = wintypes.HANDLE
     _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, wintypes.LPDWORD]
     _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    _kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    _kernel32.GetProcessTimes.restype = wintypes.BOOL
     _kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
                                                      wintypes.LPWSTR, wintypes.LPDWORD]
     _kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
@@ -203,33 +226,138 @@ def join_command(args) -> str:
 def popen_group_kwargs() -> dict:
     """Keyword arguments that place a child in an independently stoppable group."""
     if IS_WINDOWS:
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        # A capability is bound to one ``popen_group_kwargs`` / attach pair on
+        # this thread.  Clear an abandoned capability before preparing a later
+        # ordinary spawn (for example after Popen itself raised).
+        _GROUP_SPAWN_LOCAL.guardian_attach_once = False
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP
+        if getattr(_GROUP_SPAWN_LOCAL, "breakaway_once", False):
+            _GROUP_SPAWN_LOCAL.breakaway_once = False
+            _GROUP_SPAWN_LOCAL.guardian_attach_once = True
+            flags |= getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+        return {"creationflags": flags}
     return {"start_new_session": True}
 
 
-def attach_process_group(process) -> None:
+def request_process_group_breakaway() -> None:
+    """Request Job breakaway for the next grouped spawn on this thread.
+
+    This one-shot is used only by the parallel guardian launcher.  It lets the
+    guardian survive closure of a supervisor/dashboard Job, while ordinary
+    payload descendants stay inside the guardian-owned containment Job.
+    """
+    if IS_WINDOWS:
+        _GROUP_SPAWN_LOCAL.breakaway_once = True
+
+
+def _consume_guardian_attach_capability() -> bool:
+    """Consume the trusted caller's one-shot uncontained-guardian capability."""
+    if not IS_WINDOWS:
+        return False
+    granted = getattr(_GROUP_SPAWN_LOCAL, "guardian_attach_once", False) is True
+    _GROUP_SPAWN_LOCAL.guardian_attach_once = False
+    return granted
+
+
+def verify_process_group_containment(
+        process, *, allow_breakaway: bool = True) -> bool:
+    """Verify that ``process`` is in our live Job with the requested policy.
+
+    Merely retaining a Job handle is not a containment proof: assignment may
+    have failed, or the Job may permit an untrusted descendant to request
+    breakaway.  This check queries both kernel membership and effective Job
+    flags.  POSIX grouping is verified by exact PID birth token and PGID.
+    """
+    if not IS_WINDOWS:
+        token = getattr(process, "_loop_start_token", None)
+        group_id = getattr(process, "_loop_group_id", None)
+        if token is None or group_id is None:
+            return False
+        return process_matches_identity(
+            int(process.pid), str(token), int(group_id), include_zombie=True)
+
+    handle = getattr(process, "_loop_job_handle", None)
+    if not handle:
+        return False
+    in_job = wintypes.BOOL()
+    if not _kernel32.IsProcessInJob(
+            wintypes.HANDLE(int(process._handle)), handle,
+            ctypes.byref(in_job)) or not in_job.value:
+        return False
+    info = _JobExtendedLimitInformation()
+    returned = wintypes.DWORD()
+    if not _kernel32.QueryInformationJobObject(
+            handle, 9, ctypes.byref(info), ctypes.sizeof(info),
+            ctypes.byref(returned)):
+        return False
+    flags = int(info.BasicLimitInformation.LimitFlags)
+    kill_on_close = 0x2000
+    breakaway = 0x0800
+    silent_breakaway = 0x1000
+    if not (flags & kill_on_close):
+        return False
+    permits_breakaway = bool(flags & (breakaway | silent_breakaway))
+    if permits_breakaway != bool(allow_breakaway):
+        return False
+    token = getattr(process, "_loop_start_token", None)
+    return (token is not None and process_matches_identity(
+        int(process.pid), str(token), int(process.pid), include_zombie=True))
+
+
+def attach_process_group(process, *, allow_breakaway: bool = True) -> bool:
     """Attach a Windows child to a kill-on-close Job Object.
 
     A Windows process-group id stops being useful once its leader exits.  A Job
     Object retains every descendant, which preserves the POSIX invariant that a
     background grandchild holding stdout can still be terminated after the CLI
-    parent has already returned.
+    parent has already returned.  Return whether the requested containment is
+    active; POSIX children are already contained by ``start_new_session``.
     """
     if not IS_WINDOWS:
-        return
+        try:
+            process._loop_group_id = os.getpgid(int(process.pid))
+            process._loop_start_token = process_start_token(int(process.pid))
+        except (AttributeError, OSError, ProcessLookupError, ValueError):
+            return False
+        return True
+    if _consume_guardian_attach_capability():
+        # The guardian is intentionally protected by its control-pipe lease,
+        # not by the supervisor's kill-on-close Job Object.  This exception is
+        # granted by the trusted launcher's one-shot capability, never by
+        # attacker-controlled argv text.  Explicit teardown still falls back
+        # to taskkill /T through kill_process_group().
+        process._loop_group_kind = "guardian-control-pipe"
+        process._loop_group_id = int(process.pid)
+        process._loop_start_token = process_start_token(int(process.pid))
+        return process._loop_start_token is not None
     handle = _kernel32.CreateJobObjectW(None, None)
     if not handle:
-        return
+        return False
     info = _JobExtendedLimitInformation()
-    info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    info.BasicLimitInformation.LimitFlags = (
+        0x2000 | (0x0800 if allow_breakaway else 0))
     configured = _kernel32.SetInformationJobObject(
         handle, 9, ctypes.byref(info), ctypes.sizeof(info))
     assigned = configured and _kernel32.AssignProcessToJobObject(
         handle, wintypes.HANDLE(int(process._handle)))
     if not assigned:
         _kernel32.CloseHandle(handle)
-        return
+        return False
     process._loop_job_handle = handle
+    process._loop_group_kind = "windows-job-kill-on-close-v1"
+    process._loop_job_allow_breakaway = bool(allow_breakaway)
+    process._loop_group_id = int(process.pid)
+    process._loop_start_token = process_start_token(int(process.pid))
+    if process._loop_start_token is None:
+        close_process_group(process)
+        return False
+    if not verify_process_group_containment(
+            process, allow_breakaway=allow_breakaway):
+        close_process_group(process)
+        return False
+    if not allow_breakaway:
+        process._loop_group_kind = "windows-job-no-breakaway-v2"
+    return True
 
 
 def close_process_group(process) -> None:
@@ -246,6 +374,404 @@ def process_group_id(process_or_pid) -> int:
     """Return the platform group identifier used by this module."""
     pid = int(getattr(process_or_pid, "pid", process_or_pid))
     return pid if IS_WINDOWS else os.getpgid(pid)
+
+
+def _linux_process_stat(pid: int) -> dict | None:
+    """Read one Linux /proc identity without confusing ')' in comm."""
+    if IS_WINDOWS:
+        return None
+    try:
+        raw = (Path("/proc") / str(int(pid)) / "stat").read_text(
+            encoding="ascii", errors="strict")
+        _prefix, tail = raw.rsplit(")", 1)
+        fields = tail.strip().split()
+        if len(fields) < 20:
+            return None
+        return {
+            "pid": int(pid),
+            "state": fields[0],
+            "ppid": int(fields[1]),
+            "group_id": int(fields[2]),
+            "start_token": f"linux:{fields[19]}",
+        }
+    except (FileNotFoundError, NotADirectoryError, OSError, ValueError):
+        return None
+
+
+def _ps_process_stat(pid: int) -> dict | None:
+    """Portable POSIX identity fallback for hosts without procfs."""
+    if IS_WINDOWS:
+        return None
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "pid=", "-o", "ppid=", "-o", "pgid=",
+             "-o", "state=", "-o", "lstart=", "-p", str(int(pid))],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    line = result.stdout.strip()
+    if result.returncode != 0 or not line:
+        return None
+    values = line.split(maxsplit=4)
+    if len(values) != 5:
+        return None
+    try:
+        return {
+            "pid": int(values[0]),
+            "ppid": int(values[1]),
+            "group_id": int(values[2]),
+            "state": values[3][:1],
+            "start_token": f"ps:{values[4]}",
+        }
+    except ValueError:
+        return None
+
+
+def _windows_start_token_from_handle(handle) -> str | None:
+    if not IS_WINDOWS:
+        return None
+    created = wintypes.FILETIME()
+    exited = wintypes.FILETIME()
+    kernel = wintypes.FILETIME()
+    user = wintypes.FILETIME()
+    if not _kernel32.GetProcessTimes(
+            handle, ctypes.byref(created), ctypes.byref(exited),
+            ctypes.byref(kernel), ctypes.byref(user)):
+        return None
+    ticks = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+    return f"windows:{ticks}"
+
+
+def _windows_process_start_token(pid: int) -> str | None:
+    if not IS_WINDOWS:
+        return None
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = _kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return None
+    try:
+        return _windows_start_token_from_handle(handle)
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+def _windows_open_exact_process(pid: int, start_token: str):
+    """Pin one verified process object so its PID cannot be reused mid-fence."""
+    if not IS_WINDOWS:
+        return None
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    SYNCHRONIZE = 0x00100000
+    handle = _kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, int(pid))
+    if not handle:
+        return None
+    if _windows_start_token_from_handle(handle) != start_token:
+        _kernel32.CloseHandle(handle)
+        return None
+    return handle
+
+
+def process_start_token(pid) -> str | None:
+    """Return an OS birth token that distinguishes PID reuse.
+
+    Linux uses the kernel start-time clock tick from ``/proc/<pid>/stat``;
+    Windows uses the process creation FILETIME; other POSIX systems use the
+    full ``ps lstart`` value.  ``None`` means exact identity cannot be proven.
+    """
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if value <= 1:
+        return None
+    if IS_WINDOWS:
+        return _windows_process_start_token(value)
+    stat = _linux_process_stat(value) or _ps_process_stat(value)
+    return None if stat is None else str(stat["start_token"])
+
+
+def capture_process_identity(process_or_pid) -> dict:
+    """Capture the exact PID/birth-token/group triple for durable recovery."""
+    pid = int(getattr(process_or_pid, "pid", process_or_pid))
+    if pid <= 1:
+        raise ValueError("pid must be greater than 1")
+    token = process_start_token(pid)
+    if token is None:
+        raise ProcessLookupError(pid)
+    try:
+        group_id = process_group_id(pid)
+    except (OSError, ProcessLookupError):
+        raise ProcessLookupError(pid) from None
+    if group_id <= 1:
+        raise ValueError("process group id must be greater than 1")
+    return {
+        "pid": pid,
+        "start_token": token,
+        "group_id": int(group_id),
+    }
+
+
+def process_matches_identity(
+    pid,
+    start_token: str,
+    group_id: int | None = None,
+    *,
+    include_zombie: bool = False,
+) -> bool:
+    """Return whether a live process still has one exact captured identity."""
+    try:
+        pid_value = int(pid)
+        group_value = None if group_id is None else int(group_id)
+    except (TypeError, ValueError):
+        return False
+    if pid_value <= 1 or not isinstance(start_token, str) or not start_token:
+        return False
+    if IS_WINDOWS:
+        if not process_is_alive(pid_value):
+            return False
+        if process_start_token(pid_value) != start_token:
+            return False
+        return group_value in (None, pid_value)
+    stat = _linux_process_stat(pid_value) or _ps_process_stat(pid_value)
+    if stat is None or stat["start_token"] != start_token:
+        return False
+    if group_value is not None and stat["group_id"] != group_value:
+        return False
+    return include_zombie or stat["state"] != "Z"
+
+
+def _posix_process_table() -> dict[int, dict]:
+    """Return a best-effort exact process table for recursive fencing."""
+    if IS_WINDOWS:
+        return {}
+    proc = Path("/proc")
+    if proc.is_dir():
+        table = {}
+        try:
+            entries = tuple(proc.iterdir())
+        except OSError:
+            entries = ()
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            stat = _linux_process_stat(int(entry.name))
+            if stat is not None:
+                table[stat["pid"]] = stat
+        return table
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid=,state=,lstart="],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    table = {}
+    for line in result.stdout.splitlines():
+        values = line.split(maxsplit=4)
+        if len(values) != 5:
+            continue
+        try:
+            stat = {
+                "pid": int(values[0]),
+                "ppid": int(values[1]),
+                "group_id": int(values[2]),
+                "state": values[3][:1],
+                "start_token": f"ps:{values[4]}",
+            }
+        except ValueError:
+            continue
+        table[stat["pid"]] = stat
+    return table
+
+
+def _descendant_snapshot(root: Mapping[str, object]) -> dict[int, dict] | None:
+    """Snapshot descendants while verifying the root was not PID-reused."""
+    table = _posix_process_table()
+    root_pid = int(root["pid"])
+    current = table.get(root_pid)
+    if (current is None
+            or current["start_token"] != root["start_token"]
+            or current["group_id"] != int(root["group_id"])):
+        return None
+    children: dict[int, list[int]] = {}
+    for stat in table.values():
+        children.setdefault(stat["ppid"], []).append(stat["pid"])
+    found = {root_pid: current}
+    pending = [root_pid]
+    while pending:
+        parent = pending.pop()
+        for child_pid in children.get(parent, ()):
+            if child_pid in found:
+                continue
+            found[child_pid] = table[child_pid]
+            pending.append(child_pid)
+    return found
+
+
+def _signal_exact_processes(snapshot: Mapping[int, Mapping[str, object]], sig) -> None:
+    """Signal only identities that still match the captured birth token."""
+    for identity in tuple(snapshot.values()):
+        pid = int(identity["pid"])
+        if not process_matches_identity(
+                pid, str(identity["start_token"]),
+                int(identity["group_id"]), include_zombie=True):
+            continue
+        try:
+            os.kill(pid, sig)
+        except (OSError, ProcessLookupError, PermissionError):
+            pass
+
+
+def _signal_exact_groups(snapshot: Mapping[int, Mapping[str, object]], sig) -> None:
+    """Signal captured groups only while an exact member still anchors them."""
+    own_group = os.getpgrp()
+    groups = sorted({int(value["group_id"]) for value in snapshot.values()})
+    for group_id in groups:
+        if group_id <= 1 or group_id == own_group:
+            continue
+        anchored = any(
+            int(value["group_id"]) == group_id
+            and process_matches_identity(
+                int(value["pid"]), str(value["start_token"]), group_id,
+                include_zombie=True)
+            for value in snapshot.values()
+        )
+        if not anchored:
+            continue
+        try:
+            os.killpg(group_id, sig)
+        except (OSError, ProcessLookupError, PermissionError):
+            pass
+
+
+def _snapshot_has_live_process(snapshot: Mapping[int, Mapping[str, object]]) -> bool:
+    return any(
+        process_matches_identity(
+            int(value["pid"]), str(value["start_token"]),
+            int(value["group_id"]))
+        for value in snapshot.values()
+    )
+
+
+def fence_process_tree(
+    process_or_pid,
+    *,
+    start_token: str | None = None,
+    group_id: int | None = None,
+    graceful_timeout: float = 5.0,
+    force_timeout: float = 5.0,
+) -> bool:
+    """Fence an exact process tree, including POSIX descendants in new sessions.
+
+    The root PID is never signalled unless both its OS birth token and group id
+    match.  On POSIX, descendants are recursively captured, briefly stopped to
+    close the fork-vs-snapshot race, then resumed for a graceful interrupt;
+    any survivors are stopped and force-killed by both exact PID and group.
+    Windows uses the guardian-owned Job handle when available and ``taskkill
+    /T`` for an exact recovery owner without that handle.
+
+    ``False`` is deliberately fail-closed: identity was unavailable/reused or
+    complete fencing could not be proven.
+    """
+    pid = int(getattr(process_or_pid, "pid", process_or_pid))
+    token = start_token or getattr(process_or_pid, "_loop_start_token", None)
+    group = (group_id if group_id is not None
+             else getattr(process_or_pid, "_loop_group_id", None))
+    if token is None or group is None:
+        try:
+            identity = capture_process_identity(process_or_pid)
+        except (OSError, ProcessLookupError, ValueError):
+            return False
+        token = identity["start_token"]
+        group = identity["group_id"]
+    identity = {"pid": pid, "start_token": str(token), "group_id": int(group)}
+    if not process_matches_identity(pid, str(token), int(group)):
+        return False
+
+    if IS_WINDOWS:
+        pinned_handle = _windows_open_exact_process(pid, str(token))
+        if not pinned_handle:
+            return False
+        try:
+            try:
+                interrupt_process_group(process_or_pid)
+            except (OSError, ProcessLookupError, ValueError):
+                pass
+            deadline = time.monotonic() + max(0.0, float(graceful_timeout))
+            while time.monotonic() < deadline:
+                if not process_matches_identity(pid, str(token), int(group)):
+                    return True
+                time.sleep(0.02)
+            try:
+                kill_process_group(process_or_pid)
+            except (OSError, ProcessLookupError, ValueError):
+                return not process_matches_identity(pid, str(token), int(group))
+            deadline = time.monotonic() + max(0.0, float(force_timeout))
+            while time.monotonic() < deadline:
+                if not process_matches_identity(pid, str(token), int(group)):
+                    return True
+                time.sleep(0.02)
+            return not process_matches_identity(pid, str(token), int(group))
+        finally:
+            _kernel32.CloseHandle(pinned_handle)
+
+    snapshot = _descendant_snapshot(identity)
+    if snapshot is None:
+        return False
+    # Stop the root first, then recursively discover and stop descendants until
+    # the tree is stable.  No stopped process can create an unobserved session.
+    _signal_exact_processes({pid: snapshot[pid]}, signal.SIGSTOP)
+    for _iteration in range(8):
+        current = _descendant_snapshot(identity)
+        if current is None:
+            break
+        previous_count = len(snapshot)
+        snapshot.update(current)
+        _signal_exact_processes(snapshot, signal.SIGSTOP)
+        if len(snapshot) == previous_count:
+            break
+    _signal_exact_groups(snapshot, signal.SIGCONT)
+    _signal_exact_processes(snapshot, signal.SIGCONT)
+    _signal_exact_groups(snapshot, signal.SIGINT)
+    _signal_exact_processes(snapshot, signal.SIGINT)
+
+    deadline = time.monotonic() + max(0.0, float(graceful_timeout))
+    while time.monotonic() < deadline:
+        current = _descendant_snapshot(identity)
+        if current is not None:
+            snapshot.update(current)
+        if not _snapshot_has_live_process(snapshot):
+            return True
+        time.sleep(0.02)
+
+    # Freeze the surviving exact identities before the force pass.  Repeated
+    # discovery covers descendants that created their own session after SIGINT.
+    for _iteration in range(8):
+        current = _descendant_snapshot(identity)
+        previous_count = len(snapshot)
+        if current is not None:
+            snapshot.update(current)
+        _signal_exact_processes(snapshot, signal.SIGSTOP)
+        if len(snapshot) == previous_count:
+            break
+    _signal_exact_groups(snapshot, signal.SIGKILL)
+    _signal_exact_processes(snapshot, signal.SIGKILL)
+    deadline = time.monotonic() + max(0.0, float(force_timeout))
+    while time.monotonic() < deadline:
+        if not _snapshot_has_live_process(snapshot):
+            return True
+        time.sleep(0.02)
+    return not _snapshot_has_live_process(snapshot)
 
 
 def process_is_alive(pid) -> bool:
@@ -272,6 +798,9 @@ def process_is_alive(pid) -> bool:
         pid = int(pid)
         if pid <= 1:
             return False
+        stat = _linux_process_stat(pid) or _ps_process_stat(pid)
+        if stat is not None:
+            return stat["state"] != "Z"
         os.kill(pid, 0)
         return True
     except (TypeError, ValueError, ProcessLookupError, PermissionError, OSError):
@@ -368,10 +897,62 @@ def wait_process(process, timeout=None):
     return process.returncode
 
 
+def _dispatch_windows_break(signum, frame) -> None:
+    """Deliver CTRL+BREAK now, or remember it across one durable critical section."""
+    handler = _WINDOWS_BREAK_HANDLER
+    if handler is None:
+        return
+    if getattr(_WINDOWS_BREAK_LOCAL, "depth", 0):
+        _WINDOWS_BREAK_LOCAL.pending = (signum, frame)
+        return
+    handler(signum, frame)
+
+
+@contextmanager
+def defer_windows_break():
+    """Defer an asynchronous Windows break until owned resources are released.
+
+    Python runs its ``SIGBREAK`` handler between arbitrary bytecodes on the main
+    thread.  In particular it can raise after a CRT file descriptor has been
+    opened but before Python has stored it in a variable protected by
+    ``finally``.  A leaked read handle then denies ``os.replace`` on Windows.
+    Durable CAS sections use this context so the registered handler runs
+    immediately after their file handles and short lock have been closed.
+    """
+    enabled = (
+        IS_WINDOWS
+        and _WINDOWS_BREAK_HANDLER is not None
+        and threading.current_thread() is threading.main_thread()
+    )
+    if not enabled:
+        yield
+        return
+
+    depth = getattr(_WINDOWS_BREAK_LOCAL, "depth", 0)
+    _WINDOWS_BREAK_LOCAL.depth = depth + 1
+    try:
+        yield
+    finally:
+        _WINDOWS_BREAK_LOCAL.depth = depth
+        if depth == 0:
+            pending = getattr(_WINDOWS_BREAK_LOCAL, "pending", None)
+            if pending is not None and sys.exc_info()[0] is None:
+                del _WINDOWS_BREAK_LOCAL.pending
+                # Preserve a genuine durable-section failure.  Otherwise replay
+                # the break at this resource-safe boundary without changing the
+                # application's existing handler semantics.  A failed section
+                # leaves the request pending for the next successful boundary.
+                handler = _WINDOWS_BREAK_HANDLER
+                if handler is not None:
+                    handler(*pending)
+
+
 def register_windows_break_handler(handler) -> None:
-    """Route a targeted Windows CTRL+BREAK event through an existing handler."""
+    """Route a targeted Windows CTRL+BREAK through an existing handler."""
     if IS_WINDOWS and hasattr(signal, "SIGBREAK"):
-        signal.signal(signal.SIGBREAK, handler)
+        global _WINDOWS_BREAK_HANDLER
+        _WINDOWS_BREAK_HANDLER = handler
+        signal.signal(signal.SIGBREAK, _dispatch_windows_break)
 
 
 def configure_standard_streams() -> None:

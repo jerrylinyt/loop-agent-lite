@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from engine import platform_compat as compat
+from tests.parallel_worker_harness import prepare_authorized_worker
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -24,8 +25,10 @@ def _git(repo: Path, *args: str):
 @unittest.skipUnless(shutil.which("git"), "需要 PATH 上有 git")
 class TestManagedBlockTimeoutEndToEnd(unittest.TestCase):
     def test_block_then_hang_is_blocked_without_round_validator_or_gate(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        with self.subTest(authority="immutable-parent"):
             repo = root / "repo"
             repo.mkdir()
             _git(repo, "init", "-q")
@@ -34,18 +37,7 @@ class TestManagedBlockTimeoutEndToEnd(unittest.TestCase):
             (repo / "goal.md").write_text("# Goal\n", encoding="utf-8")
             _git(repo, "add", "goal.md")
             _git(repo, "commit", "-qm", "goal")
-            head = _git(repo, "rev-parse", "HEAD").stdout.strip()
-            integration_ref = f"refs/heads/loop/{RUN_ID}/integration"
-            task_ref = f"refs/heads/loop/{RUN_ID}/task-1"
-            _git(repo, "update-ref", integration_ref, head)
-            _git(repo, "update-ref", task_ref, head)
-            _git(repo, "symbolic-ref", "HEAD", task_ref)
-
-            plan_path = root / "plan.json"
-            plan_path.write_text(
-                json.dumps([{"order": 1, "task": "must block", "stack": 1}]),
-                encoding="utf-8",
-            )
+            plan = [{"order": 1, "task": "must block", "stack": 1}]
             agent_path = root / "agent.py"
             agent_path.write_text(
                 """\
@@ -81,26 +73,17 @@ time.sleep(30)
                 encoding="utf-8",
             )
 
-            workspace_root = root / "workspaces"
-            worker_name = f"base--{RUN_ID}-task-1"
-            command = [
-                sys.executable, "-m", "engine.loop",
-                "--repo", str(repo), "--name", worker_name,
-                "--goal", "goal.md",
-                "--agent-cmd", compat.join_command([sys.executable, str(agent_path)]),
-                "--validate-cmd", compat.join_command([sys.executable, str(validator_path)]),
-                "--done-threshold", "1", "--flag-threshold", "1",
-                "--red-limit", "3", "--stall-limit", "20",
-                "--round-timeout", "0.05", "--validate-timeout", "20",
-                "--import-plan", str(plan_path), "--start-phase", "exec",
-                "--start-task", "1", "--stop-after-task",
-                "--complete-gate-cmd", compat.join_command([sys.executable, str(gate_path)]),
-                "--integration-ref", integration_ref,
-                "--parent-workspace", "base", "--task-ref", task_ref,
-                "--run-config-hash", "1" * 64,
-                "--launch-spec-hash", "2" * 64,
-                "--manifest-hash", "3" * 64,
-            ]
+            harness = prepare_authorized_worker(
+                root=root, primary_repo=repo, plan=plan, order=1,
+                agent_cmd=compat.join_command([sys.executable, str(agent_path)]),
+                validate_cmd=compat.join_command([sys.executable, str(validator_path)]),
+                gate_cmd=compat.join_command([sys.executable, str(gate_path)]),
+                round_timeout=0.05,
+            )
+            self.addCleanup(harness.close)
+            workspace_root = harness.workspace_root
+            worker_name = harness.worker_workspace
+            command = harness.command
             env = {
                 **os.environ,
                 "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root),

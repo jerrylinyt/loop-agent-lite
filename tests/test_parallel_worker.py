@@ -12,6 +12,7 @@ RUN_ID = "a1b2c3d4"
 HASH_A = "a" * 64
 HASH_B = "b" * 64
 HASH_C = "c" * 64
+DISPATCH_TOKEN = "supervisor-dispatch-token"
 INTEGRATION_REF = f"refs/heads/loop/{RUN_ID}/integration"
 TASK_REF = f"refs/heads/loop/{RUN_ID}/task-3"
 
@@ -46,6 +47,11 @@ def worker_argv(*, resume=False):
         "--run-config-hash", HASH_A,
         "--launch-spec-hash", HASH_B,
         "--manifest-hash", HASH_C,
+        "--dispatch-token", DISPATCH_TOKEN,
+        "--dispatch-request-id", "d" * 32,
+        "--supervisor-session", "e" * 32,
+        "--supervisor-generation", "1",
+        "--dispatch-attempt", "0",
     ]
     if resume:
         argv.append("--managed-worker-resume")
@@ -86,6 +92,11 @@ class TestManagedWorkerLaunchArgs(unittest.TestCase):
         self.assertEqual(value.integration_ref, INTEGRATION_REF)
         self.assertEqual(value.task_ref, worker.task_ref_for(RUN_ID, 3))
         self.assertEqual(value.run_config_hash, HASH_A)
+        self.assertEqual(value.dispatch_token, DISPATCH_TOKEN)
+        self.assertEqual(value.dispatch_request_id, "d" * 32)
+        self.assertEqual(value.supervisor_session, "e" * 32)
+        self.assertEqual(value.supervisor_generation, 1)
+        self.assertEqual(value.dispatch_attempt, 0)
 
     def test_partial_worker_flags_are_rejected_as_one_group(self):
         parser = build_parser()
@@ -136,6 +147,11 @@ class TestManagedWorkerLaunchArgs(unittest.TestCase):
             ("--run-config-hash", "A" * 64),
             ("--launch-spec-hash", "b" * 63),
             ("--manifest-hash", "not-a-hash"),
+            ("--dispatch-token", "bad\nvalue"),
+            ("--dispatch-request-id", "D" * 32),
+            ("--supervisor-session", "short"),
+            ("--supervisor-generation", "0"),
+            ("--dispatch-attempt", "-1"),
             ("--parent-workspace", "../base"),
         )
         for option, invalid in cases:
@@ -231,6 +247,37 @@ class TestManagedWorkerState(unittest.TestCase):
         state["plan"] = [{"order": 1, "task": "only other task"}]
         with self.assertRaisesRegex(contract.ParallelContractError, "assigned_order 3"):
             worker.validate_resume_state(state, launch(resume=True))
+
+    def test_parent_can_resolve_only_exact_recovery_required_stale_gate(self):
+        state = worker.initialize_state(base_state(), launch())
+        request_id = "1" * 32
+        sha = "a" * 40
+        state["assignment"].update({
+            "status": "recovery-required",
+            "validated_sha": sha,
+            "validated_round": 4,
+            "exit_reason": "claimed response was interrupted",
+            "gate_request": {
+                "request_id": request_id,
+                "validated_sha": sha,
+                "validated_round": 4,
+            },
+        })
+
+        resolved = worker.resolve_recovered_stale_gate(
+            state, request_id=request_id,
+            validated_sha=sha, validated_round=4)
+
+        self.assertEqual(resolved["assignment"]["status"], "running")
+        self.assertIsNone(resolved["assignment"]["gate_request"])
+        self.assertIsNone(resolved["assignment"]["validated_sha"])
+        self.assertEqual(state["assignment"]["status"], "recovery-required")
+        self.assertIsNone(
+            worker.validate_resume_state(resolved, launch(resume=True)))
+        with self.assertRaises(contract.ParallelContractError):
+            worker.resolve_recovered_stale_gate(
+                state, request_id="2" * 32,
+                validated_sha=sha, validated_round=4)
 
     def test_persisted_state_accepts_running_and_rejects_terminal_schema_drift(self):
         state = worker.initialize_state(base_state(), launch())

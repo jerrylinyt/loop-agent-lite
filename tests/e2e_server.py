@@ -62,7 +62,28 @@ def prepare_fixture():
         "    else:\n"
         "        subprocess.run([sys.executable, '-m', 'engine.work', 'plan-ok'], env=os.environ, check=True)\n"
         "elif task:\n"
-        "    subprocess.run([sys.executable, '-m', 'engine.work', 'done', task], env=os.environ, check=True)\n"
+        "    branch = subprocess.run(['git', 'symbolic-ref', '--short', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()\n"
+        "    round_changed = False\n"
+        "    if '/task-' in branch:\n"
+        # Production managed-worker prompts merge the supervisor-owned safe
+        # integration ref before inspecting/finishing the task.  The fake
+        # agent must model that rule too, otherwise a legitimate concurrent
+        # loser repeats the same stale SHA forever after its peer integrates.
+        "        worker_state = json.loads((ws / 'state.json').read_text(encoding='utf-8'))\n"
+        "        integration_ref = worker_state['integration_ref']\n"
+        "        before_sync = subprocess.run(['git', 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()\n"
+        "        subprocess.run(['git', 'merge', '--no-edit', integration_ref], check=True)\n"
+        "        after_sync = subprocess.run(['git', 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()\n"
+        "        round_changed = before_sync != after_sync\n"
+        "        task_name = branch.rsplit('/', 1)[-1]\n"
+        "        result_file = Path(f'parallel-e2e-{task_name}.txt')\n"
+        "        if not result_file.exists():\n"
+        "            result_file.write_text(f'{task_name} completed\\n', encoding='utf-8')\n"
+        "            subprocess.run(['git', 'add', result_file.name], check=True)\n"
+        "            subprocess.run(['git', 'commit', '-m', f'e2e: complete {task_name}'], check=True)\n"
+        "            round_changed = True\n"
+        "    if not round_changed:\n"
+        "        subprocess.run([sys.executable, '-m', 'engine.work', 'done', task], env=os.environ, check=True)\n"
         "counter = ws / '.e2e-agent-count'\n"
         "count = int(counter.read_text()) + 1 if counter.exists() else 1\n"
         "counter.write_text(str(count))\n"
@@ -124,7 +145,10 @@ def main():
         from engine import dashboard
         dashboard.run_dashboard(port=args.port, read_only=args.read_only)
     finally:
-        shutil.rmtree(fixture, ignore_errors=True)
+        if os.environ.get("LOOP_AGENT_E2E_KEEP_FIXTURE") == "1":
+            print(f"E2E fixture preserved: {fixture}", flush=True)
+        else:
+            shutil.rmtree(fixture, ignore_errors=True)
 
 
 if __name__ == "__main__":

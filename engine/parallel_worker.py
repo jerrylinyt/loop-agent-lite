@@ -1,18 +1,22 @@
-"""Pure managed-worker launch and state contracts.
+"""Managed-worker launch and state contracts.
 
-This module deliberately performs no Git, filesystem, process, or workspace
-mutation.  ``engine.loop`` may add these arguments to its parser and call the
-helpers before it enters any side-effecting startup path.
+The state helpers are pure.  Launch authorization is the narrow exception: it
+validates immutable artifacts and atomically claims/verifies the durable launch
+spool, but performs no Git, process, or worker-workspace mutation.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping
 
 from engine import parallel_contract as contract
+from engine import platform_compat as compat
 
 
 WORKSPACE_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
@@ -25,6 +29,10 @@ ASSIGNMENT_STATUSES = frozenset({
     "running", "integrated", "paused", "cancelled", "blocked",
     "recovery-required",
 })
+
+
+class LaunchReservationUnavailable(contract.ParallelContractError):
+    """Pause/Abort cancelled a guardian reservation before its claim CAS."""
 
 
 @dataclass(frozen=True)
@@ -42,6 +50,11 @@ class ManagedWorkerLaunch:
     run_config_hash: str
     launch_spec_hash: str
     manifest_hash: str
+    dispatch_token: str
+    dispatch_request_id: str
+    supervisor_session: str
+    supervisor_generation: int
+    dispatch_attempt: int
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -56,6 +69,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-config-hash", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--launch-spec-hash", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--manifest-hash", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--dispatch-token", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--dispatch-request-id", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--supervisor-session", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--supervisor-generation", type=int, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--dispatch-attempt", type=int, default=None,
+                        help=argparse.SUPPRESS)
 
 
 def task_ref_for(run_id: str, order: int) -> str:
@@ -74,11 +94,14 @@ def _valid_workspace_name(value: object) -> bool:
 def _worker_surface_present(args) -> bool:
     string_fields = (
         "complete_gate_cmd", "integration_ref", "parent_workspace", "task_ref",
-        "run_config_hash", "launch_spec_hash", "manifest_hash",
+        "run_config_hash", "launch_spec_hash", "manifest_hash", "dispatch_token",
+        "dispatch_request_id", "supervisor_session",
     )
     return (getattr(args, "start_task", None) is not None
             or getattr(args, "stop_after_task", False) is True
             or getattr(args, "managed_worker_resume", False) is True
+            or getattr(args, "supervisor_generation", None) is not None
+            or getattr(args, "dispatch_attempt", None) is not None
             or any(getattr(args, field, None) is not None for field in string_fields))
 
 
@@ -108,12 +131,18 @@ def validate_launch_args(parser: argparse.ArgumentParser, args) -> ManagedWorker
         "--run-config-hash": getattr(args, "run_config_hash", None),
         "--launch-spec-hash": getattr(args, "launch_spec_hash", None),
         "--manifest-hash": getattr(args, "manifest_hash", None),
+        "--dispatch-token": getattr(args, "dispatch_token", None),
+        "--dispatch-request-id": getattr(args, "dispatch_request_id", None),
+        "--supervisor-session": getattr(args, "supervisor_session", None),
+        "--supervisor-generation": getattr(args, "supervisor_generation", None),
+        "--dispatch-attempt": getattr(args, "dispatch_attempt", None),
     }
     missing = []
     for option, value in required.items():
         if option == "--stop-after-task":
             absent = value is not True
-        elif option == "--start-task":
+        elif option in {
+                "--start-task", "--supervisor-generation", "--dispatch-attempt"}:
             absent = value is None
         else:
             absent = not isinstance(value, str) or not value.strip()
@@ -133,6 +162,24 @@ def validate_launch_args(parser: argparse.ArgumentParser, args) -> ManagedWorker
     gate_cmd = args.complete_gate_cmd.strip()
     if "\x00" in gate_cmd:
         _parser_error(parser, "--complete-gate-cmd 不得含 NUL")
+    dispatch_token = args.dispatch_token
+    if ("\x00" in dispatch_token or "\r" in dispatch_token or "\n" in dispatch_token
+            or len(dispatch_token.encode("utf-8")) > 4096):
+        _parser_error(parser, "--dispatch-token 格式不合法")
+    if (not isinstance(args.dispatch_request_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", args.dispatch_request_id) is None):
+        _parser_error(parser, "--dispatch-request-id 格式不合法")
+    if (not isinstance(args.supervisor_session, str)
+            or re.fullmatch(r"[0-9a-f]{32}", args.supervisor_session) is None):
+        _parser_error(parser, "--supervisor-session 格式不合法")
+    if (not isinstance(args.supervisor_generation, int)
+            or isinstance(args.supervisor_generation, bool)
+            or args.supervisor_generation < 1):
+        _parser_error(parser, "--supervisor-generation 必須是正整數")
+    if (not isinstance(args.dispatch_attempt, int)
+            or isinstance(args.dispatch_attempt, bool)
+            or args.dispatch_attempt < 0):
+        _parser_error(parser, "--dispatch-attempt 必須是非負整數")
 
     try:
         run_id = contract.run_id_from_integration_ref(args.integration_ref)
@@ -189,7 +236,429 @@ def validate_launch_args(parser: argparse.ArgumentParser, args) -> ManagedWorker
         run_config_hash=run_config_hash,
         launch_spec_hash=launch_spec_hash,
         manifest_hash=manifest_hash,
+        dispatch_token=dispatch_token,
+        dispatch_request_id=args.dispatch_request_id,
+        supervisor_session=args.supervisor_session,
+        supervisor_generation=args.supervisor_generation,
+        dispatch_attempt=args.dispatch_attempt,
     )
+
+
+def _validated_launch_artifacts(run_dir: Path):
+    from engine import parallel_state
+
+    try:
+        return parallel_state.validate_run_artifacts(run_dir)
+    except (OSError, ValueError, parallel_state.ParallelStateError) as exc:
+        raise contract.ParallelContractError(
+            f"managed worker immutable authority 無法驗證：{exc}") from exc
+
+
+def _expected_launch_reservation(
+        artifacts, *, task: int, request_id: str,
+        supervisor_session: str, supervisor_generation: int,
+        attempt: int, resume: bool) -> dict:
+    try:
+        assignment_hash = artifacts.assignment_hashes[task]
+    except KeyError as exc:
+        raise contract.ParallelContractError(
+            "managed worker launch task 不在 immutable assignments") from exc
+    return {
+        "schema": 1,
+        "request_id": request_id,
+        "run_id": artifacts.manifest["run_id"],
+        "task": task,
+        "manifest_hash": artifacts.manifest_hash,
+        "run_config_hash": artifacts.run_config_hash,
+        "launch_spec_hash": assignment_hash,
+        "supervisor_session": supervisor_session,
+        "supervisor_generation": supervisor_generation,
+        "attempt": attempt,
+        "resume": resume,
+    }
+
+
+def _require_live_parent(
+        artifacts, *, task_order: int, supervisor_session: str,
+        supervisor_generation: int, attempt: int) -> None:
+    """Prove the exact supervisor still permits this assignment to start."""
+    from engine import loop as loop_mod  # runtime import avoids module cycle
+    from engine import parallel_state
+
+    run_id = artifacts.manifest["run_id"]
+    parent_workspace = artifacts.manifest["parent_workspace"]
+    workspace_root = artifacts.run_dir.parent.parent.parent
+    base_dir = loop_mod.workspace_path(workspace_root, parent_workspace)
+    try:
+        base_state, _raw, _recovered = loop_mod.load_checkpointed_state(
+            base_dir / "state.json", repair=False)
+    except (FileNotFoundError, OSError, ValueError, loop_mod.StateLoadError) as exc:
+        raise contract.ParallelContractError(
+            f"managed worker parent state 無法驗證：{exc}") from exc
+    parallel = base_state.get("parallel")
+    loop_state = base_state.get("loop")
+    if (base_state.get("runner") != "parallel-supervisor"
+            or not isinstance(parallel, dict)
+            or parallel.get("run_id") != run_id
+            or parallel.get("manifest_hash") != artifacts.manifest_hash
+            or parallel.get("supervisor_generation") != supervisor_generation
+            or not isinstance(loop_state, dict)
+            or loop_state.get("session_id") != supervisor_session
+            or not isinstance(loop_state.get("pid"), int)
+            or isinstance(loop_state.get("pid"), bool)):
+        raise contract.ParallelContractError(
+            "managed worker parent supervisor state 不具有效 launch authority")
+    try:
+        aggregate = parallel_state.validate_aggregate(
+            parallel_state.read_canonical_json(
+                artifacts.run_dir, "aggregate.json"),
+            run_id=run_id,
+            plan=artifacts.plan,
+        )
+    except (OSError, ValueError, parallel_state.ParallelStateError) as exc:
+        raise contract.ParallelContractError(
+            f"managed worker parent aggregate 無法驗證：{exc}") from exc
+    if (aggregate["status"] not in {"initializing", "running"}
+            or aggregate["terminal_intent"] is not None
+            or aggregate["batch"] != parallel.get("batch")):
+        raise contract.ParallelContractError(
+            "managed worker parent aggregate 已不允許派工")
+    tasks = aggregate.get("tasks")
+    matches = ([task for task in tasks
+                if isinstance(task, dict)
+                and task.get("order") == task_order]
+               if isinstance(tasks, list) else [])
+    if len(matches) != 1:
+        raise contract.ParallelContractError(
+            "managed worker task 不在 parent aggregate projection")
+    task = matches[0]
+    if (task.get("outcome") != "pending"
+            or task.get("resource_state") not in {"provisioning", "running"}
+            or task.get("restart_count") != attempt
+            or task.get("batch") != aggregate.get("batch")):
+        raise contract.ParallelContractError(
+            "managed worker task 目前 batch/resource/restart attempt 不可派工")
+    try:
+        owner = loop_mod.active_run_lock_owner(base_dir / ".run.lock")
+    except (OSError, ValueError) as exc:
+        raise contract.ParallelContractError(
+            f"managed worker parent run lock 無法安全讀取：{exc}") from exc
+    if (not isinstance(owner, dict)
+            or owner.get("pid") != loop_state.get("pid")
+            or owner.get("session_id") != supervisor_session
+            or owner.get("generation") != supervisor_generation):
+        raise contract.ParallelContractError(
+            "managed worker parent supervisor 未持有一致的 base run lock/session/generation")
+
+
+def _launch_spool(artifacts):
+    from engine import parallel_spool
+
+    try:
+        return parallel_spool.DurableSpool(artifacts.run_dir / "launches")
+    except (OSError, ValueError, parallel_spool.SpoolError) as exc:
+        raise contract.ParallelContractError(
+            f"managed worker launch reservation 無法驗證：{exc}") from exc
+
+
+def _publish_launch_rejected(spool, request_id: str, pid: int, reason: str) -> None:
+    from engine import parallel_spool
+
+    try:
+        spool.publish_response(request_id, {
+            "schema": 1,
+            "request_id": request_id,
+            "status": "rejected",
+            "pid": pid,
+            "reason": reason,
+        })
+    except parallel_spool.SpoolError as exc:
+        raise contract.ParallelContractError(
+            "managed worker claim 後 authority 失效，且 rejected marker 無法落盤："
+            f"{exc}") from exc
+
+
+def claim_guardian_launch(
+        run_dir: Path | str, child_record: Mapping[str, object], *,
+        payload_pid: int) -> object:
+    """Claim and authorize one reservation before guardian payload release.
+
+    The durable ACKed child record supplies the exact owner generation and
+    payload identity.  A Pause/Abort cancellation that wins the spool CAS keeps
+    the inert bootstrap behind its pipe forever; a successful claim binds the
+    authorized response to that already-fenceable payload PID.
+    """
+    from engine import parallel_spool
+
+    artifacts = _validated_launch_artifacts(Path(run_dir))
+    required = (
+        "run_id", "task", "child_id", "supervisor_session",
+        "supervisor_generation", "attempt", "resume", "state", "payload_pid",
+    )
+    if not isinstance(child_record, Mapping) or any(
+            field not in child_record for field in required):
+        raise contract.ParallelContractError(
+            "guardian launch 缺少 durable child authority")
+    if (child_record["state"] != "acked"
+            or child_record["run_id"] != artifacts.manifest["run_id"]
+            or not isinstance(payload_pid, int) or isinstance(payload_pid, bool)
+            or payload_pid < 2 or child_record["payload_pid"] != payload_pid):
+        raise contract.ParallelContractError(
+            "guardian launch durable payload identity 不符")
+    task = child_record["task"]
+    request_id = child_record["child_id"]
+    session = child_record["supervisor_session"]
+    generation = child_record["supervisor_generation"]
+    attempt = child_record["attempt"]
+    resume = child_record["resume"]
+    expected = _expected_launch_reservation(
+        artifacts,
+        task=task,
+        request_id=request_id,
+        supervisor_session=session,
+        supervisor_generation=generation,
+        attempt=attempt,
+        resume=resume,
+    )
+    _require_live_parent(
+        artifacts,
+        task_order=task,
+        supervisor_session=session,
+        supervisor_generation=generation,
+        attempt=attempt,
+    )
+    spool = _launch_spool(artifacts)
+    try:
+        record = spool.get_request(request_id)
+    except parallel_spool.SpoolError as exc:
+        raise contract.ParallelContractError(
+            f"managed worker launch reservation 無法驗證：{exc}") from exc
+    if record is None or record.state != "pending" or record.payload != expected:
+        state = None if record is None else record.state
+        error_type = (
+            LaunchReservationUnavailable if state == "cancelled"
+            else contract.ParallelContractError)
+        raise error_type(
+            f"managed worker launch reservation 不可 claim（state={state!r}）")
+    try:
+        claimed = spool.claim_request(request_id)
+    except parallel_spool.SpoolError as exc:
+        raise contract.ParallelContractError(
+            f"managed worker launch reservation claim 失敗：{exc}") from exc
+    if not claimed.transitioned or claimed.record.state != "claimed":
+        raise LaunchReservationUnavailable(
+            "managed worker launch reservation 已取消、已使用或遭競態取走")
+    if claimed.record.payload != expected:
+        _publish_launch_rejected(
+            spool, request_id, payload_pid,
+            "launch reservation claim 後 payload 漂移")
+        raise contract.ParallelContractError(
+            "managed worker launch reservation claim 後 payload 漂移")
+    try:
+        _require_live_parent(
+            artifacts,
+            task_order=task,
+            supervisor_session=session,
+            supervisor_generation=generation,
+            attempt=attempt,
+        )
+    except contract.ParallelContractError as exc:
+        _publish_launch_rejected(spool, request_id, payload_pid, str(exc))
+        raise
+    try:
+        spool.publish_response(request_id, {
+            "schema": 1,
+            "request_id": request_id,
+            "status": "authorized",
+            "pid": payload_pid,
+            "supervisor_session": session,
+            "supervisor_generation": generation,
+            "attempt": attempt,
+        })
+    except parallel_spool.SpoolError as exc:
+        raise contract.ParallelContractError(
+            f"managed worker launch authorized marker 無法落盤：{exc}") from exc
+    return artifacts
+
+
+def authorize_launch(
+    workspace_root: Path,
+    workspace_name: str,
+    repo: Path,
+    launch: ManagedWorkerLaunch,
+    *,
+    import_plan: str = "",
+    runtime_config: dict | None = None,
+):
+    """Bind hidden worker argv to immutable artifacts and one live parent.
+
+    Hidden flags are not authority by themselves.  Before startup validation or
+    any repository mutation, a worker must prove that its exact workspace,
+    worktree, refs, hashes, gate command, and opaque dispatch token came from a
+    currently locked parallel-supervisor base workspace.
+    """
+    launch = _require_launch(launch, resume=launch.resume)
+    from engine import parallel_state
+
+    try:
+        run_dir = parallel_state.derive_run_directory(
+            workspace_root, launch.parent_workspace, launch.run_id)
+        artifacts = parallel_state.validate_run_artifacts(
+            run_dir, workspace_root=workspace_root)
+        assignment = artifacts.assignments[launch.assigned_order]
+        token = parallel_state.read_dispatch_token(
+            run_dir, launch.assigned_order,
+            expected_hash=assignment["dispatch_token_hash"],
+        )
+    except (KeyError, OSError, ValueError, parallel_state.ParallelStateError) as exc:
+        raise contract.ParallelContractError(
+            f"managed worker immutable authority 無法驗證：{exc}") from exc
+
+    exact = {
+        "run_id": launch.run_id,
+        "parent_workspace": launch.parent_workspace,
+        "assigned_order": launch.assigned_order,
+        "integration_ref": launch.integration_ref,
+        "task_ref": launch.task_ref,
+        "gate_command": launch.complete_gate_cmd,
+        "run_config_hash": launch.run_config_hash,
+    }
+    for field, expected in exact.items():
+        if assignment.get(field) != expected:
+            raise contract.ParallelContractError(
+                f"managed worker assignment {field} 與 argv 不一致")
+    if artifacts.assignment_hashes[launch.assigned_order] != launch.launch_spec_hash:
+        raise contract.ParallelContractError("managed worker launch_spec_hash 不符 immutable assignment")
+    if artifacts.manifest_hash != launch.manifest_hash:
+        raise contract.ParallelContractError("managed worker manifest_hash 不符 immutable manifest")
+    if token != launch.dispatch_token:
+        raise contract.ParallelContractError("managed worker dispatch token 不符 immutable assignment")
+    if assignment.get("worker_workspace") != workspace_name:
+        raise contract.ParallelContractError("managed worker workspace 名稱不符 immutable assignment")
+    if Path(assignment.get("worker_repo", "")).resolve() != Path(repo).resolve():
+        raise contract.ParallelContractError("managed worker repo 不符 immutable worktree")
+    expected_workspace_path = Path(workspace_root) / workspace_name
+    if Path(assignment.get("worker_workspace_path", "")) != expected_workspace_path:
+        raise contract.ParallelContractError("managed worker workspace path 不符 immutable assignment")
+    if launch.resume:
+        if import_plan:
+            raise contract.ParallelContractError("managed worker resume 不可重新匯入 plan")
+    else:
+        try:
+            plan_path = Path(import_plan).expanduser().resolve(strict=True)
+            expected_plan = (artifacts.run_dir / "plan.json").resolve(strict=True)
+        except OSError as exc:
+            raise contract.ParallelContractError(
+                f"managed worker plan authority 無法驗證：{exc}") from exc
+        if plan_path != expected_plan:
+            raise contract.ParallelContractError(
+                "managed worker import plan 不符 immutable run plan")
+    if not isinstance(runtime_config, dict):
+        raise contract.ParallelContractError("managed worker 缺少 canonical runtime config")
+    expected_runtime = {
+        key: artifacts.run_config[key]
+        for key in (
+            "flag_threshold", "done_threshold", "red_limit", "stall_limit",
+            "stuck_stop", "stuck_stop_count", "round_timeout",
+            "agent_backoff_max", "validate_timeout", "agent_cmd",
+            "validate_cmd", "goal", "plan_doc",
+        )
+    }
+    expected_runtime.update({
+        "max_rounds": 0,
+        "pause_after_plan": False,
+        "allow_serial_stack": False,
+        "notify_cmd": "",
+        "repo": str(Path(assignment["worker_repo"]).resolve()),
+    })
+    if runtime_config != expected_runtime:
+        raise contract.ParallelContractError(
+            "managed worker runtime argv 不符 immutable run config")
+
+    from engine import parallel_child
+    from engine import parallel_spool
+
+    expected_reservation = _expected_launch_reservation(
+        artifacts,
+        task=launch.assigned_order,
+        request_id=launch.dispatch_request_id,
+        supervisor_session=launch.supervisor_session,
+        supervisor_generation=launch.supervisor_generation,
+        attempt=launch.dispatch_attempt,
+        resume=launch.resume,
+    )
+    _require_live_parent(
+        artifacts,
+        task_order=launch.assigned_order,
+        supervisor_session=launch.supervisor_session,
+        supervisor_generation=launch.supervisor_generation,
+        attempt=launch.dispatch_attempt,
+    )
+    launch_spool = _launch_spool(artifacts)
+    try:
+        record = launch_spool.get_request(launch.dispatch_request_id)
+        response = launch_spool.get_response(launch.dispatch_request_id)
+        child = parallel_child.read_child_record(
+            artifacts.run_dir, launch.assigned_order,
+            launch.dispatch_request_id)
+    except (OSError, ValueError, parallel_spool.SpoolError,
+            parallel_child.ParallelChildError) as exc:
+        raise contract.ParallelContractError(
+            f"managed worker guardian authorization 無法驗證：{exc}") from exc
+    if (record is None or record.state != "claimed"
+            or record.payload != expected_reservation):
+        state = None if record is None else record.state
+        raise contract.ParallelContractError(
+            f"managed worker launch 缺少 guardian claimed authority（state={state!r}）")
+    payload_pid = child.get("payload_pid")
+    expected_child = {
+        "state": "acked",
+        "run_id": launch.run_id,
+        "task": launch.assigned_order,
+        "child_id": launch.dispatch_request_id,
+        "supervisor_session": launch.supervisor_session,
+        "supervisor_generation": launch.supervisor_generation,
+        "attempt": launch.dispatch_attempt,
+        "resume": launch.resume,
+    }
+    if (any(child.get(field) != value for field, value in expected_child.items())
+            or not isinstance(payload_pid, int) or isinstance(payload_pid, bool)
+            or payload_pid < 2):
+        raise contract.ParallelContractError(
+            "managed worker durable ACKed child authority 不符")
+    if compat.IS_WINDOWS:
+        identity_matches = (
+            os.getppid() == payload_pid
+            and compat.process_matches_identity(
+                payload_pid, child["payload_start_token"]))
+    else:
+        identity_matches = (
+            os.getpid() == payload_pid
+            and compat.process_matches_identity(
+                payload_pid, child["payload_start_token"]))
+    if not identity_matches:
+        raise contract.ParallelContractError(
+            "managed worker process 不符合 guardian durable payload identity")
+    expected_response = {
+        "schema": 1,
+        "request_id": launch.dispatch_request_id,
+        "status": "authorized",
+        "pid": payload_pid,
+        "supervisor_session": launch.supervisor_session,
+        "supervisor_generation": launch.supervisor_generation,
+        "attempt": launch.dispatch_attempt,
+    }
+    if response is None or response.payload != expected_response:
+        raise contract.ParallelContractError(
+            "managed worker 缺少 exact guardian authorized response")
+    _require_live_parent(
+        artifacts,
+        task_order=launch.assigned_order,
+        supervisor_session=launch.supervisor_session,
+        supervisor_generation=launch.supervisor_generation,
+        attempt=launch.dispatch_attempt,
+    )
+    return artifacts
 
 
 def _assigned_task(state: dict, assigned_order: int) -> dict:
@@ -298,12 +767,27 @@ def validate_resume_state(state: dict, launch: ManagedWorkerLaunch) -> None:
     assignment = state.get("assignment")
     if not isinstance(assignment, dict) or not ASSIGNMENT_FIELDS.issubset(assignment):
         raise contract.ParallelContractError("worker state assignment schema 不完整")
-    if (assignment["status"] != "running" or assignment["exit_reason"] is not None
-            or assignment.get("gate_request") is not None
-            or assignment.get("validated_sha") is not None
-            or assignment.get("validated_round") is not None):
+    status = assignment["status"]
+    idle_running = (
+        status == "running"
+        and assignment["exit_reason"] is None
+        and assignment.get("gate_request") is None
+        and assignment.get("validated_sha") is None
+        and assignment.get("validated_round") is None
+    )
+    resumable_paused = (
+        status == "paused"
+        and isinstance(assignment.get("exit_reason"), str)
+        and bool(assignment["exit_reason"].strip())
+        and assignment.get("gate_request") is None
+        and ((assignment.get("validated_sha") is None
+              and assignment.get("validated_round") is None)
+             or (assignment.get("validated_sha") is not None
+                 and assignment.get("validated_round") is not None))
+    )
+    if not (idle_running or resumable_paused):
         raise contract.ParallelContractError(
-            "managed worker resume 只接受 idle running（validated/gate/exit 欄位全為 null）")
+            "managed worker resume 只接受 idle running 或 supervisor-paused state")
     pause_generation = assignment["pause_generation"]
     if (not isinstance(pause_generation, int) or isinstance(pause_generation, bool)
             or pause_generation < 0):
@@ -316,6 +800,166 @@ def validate_resume_state(state: dict, launch: ManagedWorkerLaunch) -> None:
     validated_sha = assignment["validated_sha"]
     if validated_sha is not None:
         contract.require_git_sha(validated_sha)
+
+
+def prepare_resume_state(state: dict, launch: ManagedWorkerLaunch) -> dict:
+    """Validate an explicitly authorized resume and consume paused metadata."""
+    validate_resume_state(state, launch)
+    resumed = copy.deepcopy(state)
+    assignment = resumed["assignment"]
+    if assignment["status"] == "paused":
+        assignment.update({
+            "status": "running",
+            "validated_sha": None,
+            "validated_round": None,
+            "exit_reason": None,
+            "gate_request": None,
+        })
+        resumed["done_count"] = 0
+        resumed.setdefault("notes", []).append(
+            "▶ parent supervisor 已明確 Resume；清除 paused gate snapshot 後重新完整收斂。")
+    return resumed
+
+
+def mark_supervisor_paused(
+    state: dict,
+    *,
+    pause_generation: int,
+    reason: str | None = None,
+) -> dict:
+    """Persist a managed worker's graceful supervisor Pause boundary.
+
+    The worker calls this only after atomically claiming its exact-session
+    stop-after-round marker.  Keeping the generation in the worker checkpoint
+    lets owner-loss recovery distinguish a completed graceful stop from an
+    abrupt crash without PID inference.
+    """
+    validate_persisted_state(state)
+    if (not isinstance(pause_generation, int)
+            or isinstance(pause_generation, bool)
+            or pause_generation < 0):
+        raise contract.ParallelContractError(
+            "pause_generation 必須是非負整數")
+    paused = copy.deepcopy(state)
+    assignment = paused["assignment"]
+    current_generation = assignment["pause_generation"]
+    if pause_generation < current_generation:
+        raise contract.ParallelContractError(
+            "pause_generation 不可倒退")
+    if assignment["status"] not in {"running", "paused"}:
+        raise contract.ParallelContractError(
+            "只有 idle running/paused managed worker 可完成平順 Pause")
+    if assignment.get("gate_request") is not None:
+        raise contract.ParallelContractError(
+            "保留 gate_request 的 worker 不可投影為 paused")
+    assignment.update({
+        "status": "paused",
+        "pause_generation": pause_generation,
+        "exit_reason": (
+            reason or f"supervisor pause generation {pause_generation}"),
+    })
+    validate_persisted_state(paused)
+    return paused
+
+
+def mark_supervisor_cancelled(
+    state: dict,
+    *,
+    reason: str = "parent supervisor requested Abort",
+) -> dict:
+    """Persist a graceful managed-worker Abort boundary."""
+    validate_persisted_state(state)
+    cancelled = copy.deepcopy(state)
+    assignment = cancelled["assignment"]
+    if assignment["status"] not in {"running", "paused", "cancelled"}:
+        raise contract.ParallelContractError(
+            "只有 idle running/paused managed worker 可完成平順 Abort")
+    if assignment.get("gate_request") is not None:
+        raise contract.ParallelContractError(
+            "保留 gate_request 的 worker 不可投影為 cancelled")
+    assignment.update({
+        "status": "cancelled",
+        "exit_reason": reason,
+    })
+    validate_persisted_state(cancelled)
+    return cancelled
+
+
+def resolve_recovered_stale_gate(
+    state: dict, *, request_id: str, validated_sha: str,
+    validated_round: int,
+) -> dict:
+    """Parent-only projection after journal recovery proves a claimed gate stale.
+
+    The caller must already have fenced/reaped the worker.  Exact retained gate
+    identity is required so recovery cannot clear an unrelated completion vote.
+    """
+    validate_persisted_state(state)
+    assignment = state["assignment"]
+    expected = {
+        "request_id": request_id,
+        "validated_sha": validated_sha,
+        "validated_round": validated_round,
+    }
+    if (assignment.get("status") not in {"running", "recovery-required"}
+            or assignment.get("gate_request") != expected
+            or assignment.get("validated_sha") != validated_sha
+            or assignment.get("validated_round") != validated_round):
+        raise contract.ParallelContractError(
+            "stale gate recovery 不符合 retained worker gate identity")
+    resolved = copy.deepcopy(state)
+    resolved_assignment = resolved["assignment"]
+    resolved_assignment.update({
+        "status": "running",
+        "validated_sha": None,
+        "validated_round": None,
+        "exit_reason": None,
+        "gate_request": None,
+    })
+    resolved["done_count"] = 0
+    resolved.setdefault("notes", []).append(
+        "↪ parent 已完成 claimed gate journal recovery；結果為 stale，Resume 後重新同步與 Validate。")
+    validate_persisted_state(resolved)
+    return resolved
+
+
+def resolve_recovered_integrated_gate(
+    state: dict, *, request_id: str, validated_sha: str,
+    validated_round: int,
+) -> dict:
+    """Project exact receipt authority into a fenced worker checkpoint.
+
+    A supervisor may crash after the gate transaction commits but before the
+    worker consumes its success response.  Once the replacement supervisor has
+    verified the journal/receipt and reaped the old child, it may finish the
+    same state projection without inventing a new request.
+    """
+    validate_persisted_state(state)
+    assignment = state["assignment"]
+    expected = {
+        "request_id": request_id,
+        "validated_sha": validated_sha,
+        "validated_round": validated_round,
+    }
+    if (assignment.get("status") not in {"running", "recovery-required"}
+            or assignment.get("gate_request") != expected
+            or assignment.get("validated_sha") != validated_sha
+            or assignment.get("validated_round") != validated_round):
+        raise contract.ParallelContractError(
+            "integrated gate recovery 不符合 retained worker gate identity")
+    resolved = copy.deepcopy(state)
+    resolved["assignment"].update({
+        "status": "integrated",
+        "validated_sha": validated_sha,
+        "validated_round": validated_round,
+        "exit_reason": None,
+        "gate_request": None,
+    })
+    resolved["done_count"] = 0
+    resolved.setdefault("notes", []).append(
+        "✅ parent 已由 canonical receipt 完成 claimed gate 的 integrated 投影。")
+    validate_persisted_state(resolved)
+    return resolved
 
 
 def validate_persisted_state(state: dict) -> None:
