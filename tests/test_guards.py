@@ -534,6 +534,80 @@ class TestRoundTelemetry(unittest.TestCase):
             self.assertEqual(unrelated_log.read_text(encoding="utf-8"), "do not manage")
 
 
+class TestRoundOutcomeJudgement(unittest.TestCase):
+    """prompt 契約規定的兩條「不送完成訊號」路徑,不得被輪末判定連坐。"""
+
+    def test_issue_only_round_lands_in_state_despite_missing_completion(self):
+        # prompt 契約:回報 issue 後直接結束、不送 create-plan/plan-ok/done。
+        # 該輪雖記為未完成回報(保留退避節流),issue 本身必須落入 state 供 dashboard 檢視。
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            agent = root / "issue_agent.py"
+            agent.write_text(
+                "import subprocess, sys\n"
+                "sys.stdin.read()\n"
+                "subprocess.run([sys.executable, '-m', 'engine.work', 'issue',\n"
+                "                'goal contradicts itself'], check=True)\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            result = subprocess.run(
+                [*LOOP_CMD, "--repo", str(repo), "--name", "issue-survives",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--agent-backoff-max", "0", "--max-rounds", "1"],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            state = json.loads((workspace_root / "issue-survives" / "state.json").read_text())
+            self.assertEqual([issue["text"] for issue in state["issues"]],
+                             ["goal contradicts itself"],
+                             "issue-only 輪的回報不得被 clear_signals 連坐作廢")
+            self.assertEqual(state["issues"][0]["round"], 1)
+            self.assertEqual(state["issues"][0]["where"], "plan")
+            self.assertEqual(L.unread_issue_count(state), 1)
+            self.assertEqual(state["agent_failure_streak"], 1)
+
+    def test_exec_commit_round_is_not_agent_failure(self):
+        # prompt 契約:本輪有任何 commit 就不執行 done(完成票留給之後的乾淨輪次)。
+        # 這是正常工作輪:不得累計 failure streak、不得觸發退避、不得佔用異常 log 額度。
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            plan = root / "plan.json"
+            plan.write_text('[{"order": 1, "task": "implement feature"}]')
+            agent = root / "commit_agent.py"
+            agent.write_text(
+                "import subprocess, sys\n"
+                "from pathlib import Path\n"
+                "sys.stdin.read()\n"
+                "Path('feature.txt').write_text('implemented')\n"
+                "subprocess.run(['git', 'add', '-A'], check=True)\n"
+                "subprocess.run(['git', 'commit', '-qm', 'task-1 implement feature'], check=True)\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            result = subprocess.run(
+                [*LOOP_CMD, "--repo", str(repo), "--name", "commit-not-failure",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--import-plan", str(plan),
+                 "--start-phase", "exec", "--agent-backoff-max", "0", "--max-rounds", "1"],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            state = json.loads((workspace_root / "commit-not-failure" / "state.json").read_text())
+            history = (workspace_root / "commit-not-failure" / "history.log").read_text()
+            self.assertEqual(state["agent_failure_streak"], 0,
+                             "按契約不送 done 的 commit 輪不得記為 Agent 異常")
+            self.assertIn("agent_ok=True", history)
+            self.assertIn("done_missing=True", history, "審計欄位仍須照實記錄未送 done")
+            self.assertNotIn("Agent round 異常", result.stdout)
+            self.assertEqual(state["done_count"], 0, "commit 輪的完成票仍須歸零等待下輪確認")
+            anomaly_dir = workspace_root / "commit-not-failure" / "logs" / "anomalies"
+            anomaly_logs = list(anomaly_dir.glob("*.log")) if anomaly_dir.exists() else []
+            self.assertEqual(anomaly_logs, [], "正常工作輪不得佔用異常 log 保留額度")
+
+
 class TestLiveRoundTiming(unittest.TestCase):
     """進行中 round 可觀測；正常輪末清除，立即停止則保留凍結的中斷上下文。"""
 

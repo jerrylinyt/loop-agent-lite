@@ -2332,6 +2332,11 @@ def main(argv=None):
             state["notes"].append(f"⚠️ 上一輪 agent 超過 {args.round_timeout:g} 分鐘被強制終止,"
                                   "工作可能做到一半——工作區殘留照「收拾現場」步驟判斷。")
 
+        # issue 是給人類看的回報,不參與任何計數;prompt 規定的回報路徑是「issue 後直接
+        # 結束、不送完成訊號」,而竄改/失敗處理都會 clear_signals,所以必須搶在那之前
+        # 收進 state,否則正規回報一律被連坐作廢,dashboard 永遠看不到。
+        ingest_pending_issues(ws, state, round_token, rnd, task_id, phase)
+
         # ---- 協調層竄改偵測:整輪作廢(reset --hard 回輪初 sha) ----
         tampered = []
         # 受保護檔案(goal/plan-doc)被刪或被改 = 最嚴重破壞:整輪 reset + clean,該輪所有變更
@@ -2367,10 +2372,19 @@ def main(argv=None):
             ws.clear_signals()
             log(f"⚠️ 本輪作廢｜偵測到不允許的變更：{', '.join(tampered)}｜相關 signal 已丟棄")
 
+        head_after = head_sha(repo)
+        dirty = is_dirty(repo)
+        changed = dirty or (head_after != head_before)
+        state["stall_rounds"] = 0 if head_after != head_before else state["stall_rounds"] + 1
+
         # 不同 Agent CLI 對 exit code 的定義不一致，因此 rc 只供 log 診斷，不參與
-        # round 成敗。唯一的完成依據是該 phase 的 coordinator 訊號；逾時則仍作廢，
-        # 避免已失控、未按 prompt 在回報後停止的程序被算成完整一輪。
-        agent_failed = not agent_reported_done or timed_out
+        # round 成敗。完成依據是該 phase 的 coordinator 訊號；另外 exec 輪的 prompt 契約
+        # 是「有 commit 就不執行 done」（完成票留給之後的乾淨輪次獨立判斷），所以留下
+        # commit 的輪次同樣是有效回報，不得記為 Agent 異常；只留未 commit 殘檔仍算異常，
+        # 契約要求工作區收乾淨。逾時則一律作廢，避免已失控、未按 prompt 在回報後停止的
+        # 程序被算成完整一輪。（head_after 取自竄改 reset 之後,被作廢的 commit 不豁免。）
+        agent_failed = (not (agent_reported_done or (phase == "exec" and head_after != head_before))
+                        or timed_out)
         if agent_failed:
             state["agent_failure_streak"] = state.get("agent_failure_streak", 0) + 1
             ws.clear_signals()
@@ -2384,11 +2398,6 @@ def main(argv=None):
             if state.get("agent_failure_streak", 0):
                 log(f"✅ Agent 完成回報已恢復｜連續異常 {state['agent_failure_streak']} 輪後收到有效訊號")
             state["agent_failure_streak"] = 0
-
-        head_after = head_sha(repo)
-        dirty = is_dirty(repo)
-        changed = dirty or (head_after != head_before)
-        state["stall_rounds"] = 0 if head_after != head_before else state["stall_rounds"] + 1
 
         if phase == "plan":
             event = process_plan_round(
@@ -2410,8 +2419,6 @@ def main(argv=None):
             state["current_task_base_sha"] = None
         ensure_current_task_base_sha(state, repo, head_after)
 
-        ingest_pending_issues(ws, state, round_token, rnd, task_id, phase)
-
         will_retry = (agent_failed and state["phase"] != "done" and
                       not (args.max_rounds and state["round"] >= args.max_rounds))
         retry_delay = agent_failure_backoff(state["agent_failure_streak"], args.agent_backoff_max) \
@@ -2421,7 +2428,9 @@ def main(argv=None):
                                           .isoformat(timespec="seconds")) if retry_delay else None
 
         round_finished_at = datetime.now().isoformat(timespec="seconds")
-        if missing_done:
+        # 異常 log 跟著 agent_failed 走:按契約不送 done 的 commit 輪是正常工作輪,
+        # 不得佔用異常保留額度;反之逾時輪即使有送訊號也要留稽核。
+        if agent_failed:
             try:
                 preserve_anomaly_log(
                     ws.dir, ws.dir / "logs" / f"round-{rnd:04d}.log",
