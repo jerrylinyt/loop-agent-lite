@@ -106,7 +106,11 @@ def managed_sync_instructions(integration_ref: str, block_command: str) -> str:
     if not isinstance(block_command, str) or not block_command.strip():
         raise ParallelContractError("block command 必須是非空字串")
     return (
-        "1a. **同步整合基線（受管 worker）**：先用 "
+        "1a. **只處理 assigned task（受管 worker）**：`任務總覽`只提供依賴背景；"
+        "只能修改與 `你的工作` 直接相關的範圍，不得順手實作、重構或完成 sibling／future task。"
+        f"若完成 assigned task 必須跨入 sibling task 範圍，執行 `{block_command} "
+        "\"assigned task 邊界不足，會跨入 sibling task\"` 後立即停止。\n"
+        "1b. **同步整合基線（受管 worker）**：先用 "
         "`git rev-parse -q --verify MERGE_HEAD` 判斷是否已有 merge-in-progress。\n"
         f"   - 沒有 merge-in-progress：執行 `git merge --no-edit {integration_ref}`；"
         "顯示 already up-to-date 視為 no-op。\n"

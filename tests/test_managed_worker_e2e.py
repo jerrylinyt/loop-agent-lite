@@ -109,6 +109,8 @@ print(json.dumps({
             prompt = (workspace / "prompts" / "round-0001.md").read_text(encoding="utf-8")
             self.assertIn(f"git merge --no-edit {integration_ref}", prompt)
             self.assertIn("engine.work block --reason", prompt)
+            self.assertIn("只處理 assigned task", prompt)
+            self.assertIn("不得順手實作、重構或完成 sibling／future task", prompt)
             self.assertNotIn("<<SYNC_INTEGRATION>>", prompt)
 
             # A forged/stale resume argv must be rejected without allowing the caller

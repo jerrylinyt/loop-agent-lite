@@ -77,15 +77,21 @@ test("Parallel launcher and workspace use frozen plan plus Pause/Resume/Abort ro
       ok: true, starting: true, control: "abort", job_id: "control-abort", name: "parallel-base", pid: 703,
     } });
   });
-  await page.route("**/api/config", (route) => route.fulfill({ json: {
-    agent_cmds: [{ label: "Agent", cmd: "agent --test" }],
-    validate_cmds: [{ label: "Validate", cmd: "validator --test" }],
-    repos: ["/repo"], defaults: {
-      flag_threshold: 10, done_threshold: 3, round_timeout: 30,
-      agent_backoff_max: 60, validate_timeout: 120, pause_after_plan: false,
-      max_parallel: 2, worker_restart_limit: 3,
-    },
-  } }));
+  await page.route("**/api/config", async (route) => {
+    const response = await route.fetch();
+    const config = await response.json();
+    await route.fulfill({ response, json: {
+      ...config,
+      agent_cmds: [{ label: "Agent", cmd: "agent --test" }],
+      validate_cmds: [{ label: "Validate", cmd: "validator --test" }],
+      repos: ["/repo"], defaults: {
+        ...config.defaults,
+        flag_threshold: 10, done_threshold: 3, round_timeout: 30,
+        agent_backoff_max: 60, validate_timeout: 120, pause_after_plan: false,
+        max_parallel: 2, worker_restart_limit: 3,
+      },
+    } });
+  });
   await page.route("**/api/repo-status?**", (route) => route.fulfill({ json: {
     goal: "committed", tree_clean: true, branch: "main",
   } }));
@@ -122,13 +128,49 @@ test("Parallel launcher and workspace use frozen plan plus Pause/Resume/Abort ro
   await launcher.getByRole("tab", { name: "Parallel Loop" }).click();
   await expect(launcher.getByLabel("goal.md")).toBeDisabled();
   await expect(launcher.getByText("Parallel 固定從 exec 啟動。")).toHaveCount(0);
+  await expect(launcher.getByTestId("parallel-plan-review-guidance")).toContainText("先產生基礎 Plan，再由人類標註 stack");
+  await expect(launcher.getByRole("button", { name: "產生 Plan Prompt", exact: true })).toHaveCount(0);
+
+  await launcher.getByRole("button", { name: "Goal 成果模板" }).click();
+  const goalTemplate = page.getByRole("dialog", { name: "Goal 成果模板" });
+  await expect(goalTemplate.getByTestId("parallel-goal-template-guidance")).toContainText("不要在 Goal 成果模板加入 stack");
+  await goalTemplate.getByRole("button", { name: "上一頁", exact: false }).click();
+
+  await launcher.getByRole("button", { name: "Goal 產生器 Prompt" }).click();
+  let promptTemplates = page.getByRole("dialog", { name: "外部 Agent 產生器 Prompt" });
+  await expect(promptTemplates.getByTestId("parallel-goal-prompt-guidance")).toContainText("Goal 只描述共享目標、限制與驗收");
+  const promptPreview = promptTemplates.getByTestId("prompt-template-preview");
+  await expect(promptPreview).not.toContainText("Parallel 基礎 Plan 準備契約");
+  await promptTemplates.getByLabel(/同時產生初版 plan\.json/).check();
+  await expect(promptTemplates.getByTestId("parallel-plan-prompt-guidance")).toContainText("只產生不含 stack 的基礎 plan");
+  await expect(promptPreview).toContainText("不得自行推論、建議或輸出 `stack`");
+  await promptTemplates.getByRole("button", { name: "上一頁", exact: false }).click();
+
+  const basicPlanPrompt = launcher.getByRole("button", { name: "產生基礎 Plan Prompt（不含 stack）", exact: true });
+  await expect(basicPlanPrompt).toBeEnabled();
+  await basicPlanPrompt.click();
+  promptTemplates = page.getByRole("dialog", { name: "外部 Agent 產生器 Prompt" });
+  await expect(promptTemplates.getByRole("tab", { name: "基礎 Plan 拆分模板" })).toHaveAttribute("aria-selected", "true");
+  await expect(promptTemplates.getByTestId("parallel-plan-prompt-guidance")).toContainText("人工檢查任務獨立性");
+  await expect(promptTemplates.getByTestId("parallel-plan-prompt-guidance")).toContainText("人工加入相同的 stack 正整數");
+  await expect(promptTemplates.getByTestId("prompt-template-preview")).toContainText("`stack` 必須由人類讀完任務邊界");
+  await promptTemplates.getByRole("button", { name: "上一頁", exact: false }).click();
+
   const plan = launcher.getByLabel("匯入 plan.json");
+  await plan.fill(JSON.stringify([
+    { order: 1, task: "serial one" },
+    { order: 2, task: "serial two" },
+  ]));
+  await expect(launcher.getByText("2 個 batch：#1 → #2")).toBeVisible();
+  await expect(launcher.getByTestId("parallel-plan-concurrency-warning")).toContainText("所有任務會依序執行");
+  await expect(launcher.getByRole("button", { name: "啟動", exact: true })).toBeEnabled();
   await plan.fill(JSON.stringify([
     { order: 1, task: "parallel one", stack: 1 },
     { order: 2, task: "parallel two", stack: 1 },
     { order: 3, task: "serial three" },
   ]));
   await expect(launcher.getByText("2 個 batch：stack 1 (#1–#2) → #3")).toBeVisible();
+  await expect(launcher.getByTestId("parallel-plan-concurrency-warning")).toHaveCount(0);
   await launcher.getByLabel("Workspace 名稱").fill("parallel-new");
   await page.waitForTimeout(300);
   await expect(launcher.getByLabel("Workspace 名稱")).toHaveValue("parallel-new");

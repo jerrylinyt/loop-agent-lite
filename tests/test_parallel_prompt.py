@@ -32,6 +32,7 @@ class TestConditionalExecPrompt(unittest.TestCase):
         prompt = loop.build_prompt(EXEC_PROMPT, mapping())
 
         self.assertNotIn("同步整合基線", prompt)
+        self.assertNotIn("只處理 assigned task", prompt)
         self.assertNotIn("parallel", prompt.lower())
         self.assertNotRegex(prompt, r"<<[A-Z][A-Z0-9_]*>>")
         self.assertIn("engine.work issue", prompt)
@@ -44,6 +45,9 @@ class TestConditionalExecPrompt(unittest.TestCase):
 
         self.assertLess(prompt.index("收拾現場"), prompt.index("同步整合基線"))
         self.assertLess(prompt.index("同步整合基線"), prompt.index("判斷本任務是否已完成"))
+        self.assertIn("只處理 assigned task", prompt)
+        self.assertIn("不得順手實作、重構或完成 sibling／future task", prompt)
+        self.assertIn("assigned task 邊界不足，會跨入 sibling task", prompt)
         self.assertIn("engine.work block --reason", prompt)
         self.assertNotIn("engine.work issue", prompt)
         self.assertNotRegex(prompt, r"<<[A-Z][A-Z0-9_]*>>")

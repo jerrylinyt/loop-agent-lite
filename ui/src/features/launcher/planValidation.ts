@@ -5,9 +5,17 @@ export const PLAN_TEMPLATE = JSON.stringify([
 ], null, 2);
 
 export const PARALLEL_PLAN_TEMPLATE = JSON.stringify([
-  { order: 1, task: "可與下一項同批執行的獨立任務", stack: 1 },
-  { order: 2, task: "與上一項不共用檔案、schema 或外部資源", stack: 1 },
-  { order: 3, task: "未標 stack 的任務會自成一個串行 batch" }
+  {
+    order: 1,
+    task: "範例，請先替換：明列 working set、生成物、語意依賴與獨立驗證資源；DoD：填入可重跑命令與通過判準。",
+    stack: 1
+  },
+  {
+    order: 2,
+    task: "範例，請先替換：與 order 1 不共用檔案、schema、生成物、port、DB、cache 或 lock；DoD：填入隔離後的驗證命令。",
+    stack: 1
+  },
+  { order: 3, task: "範例，請先替換：不確定是否獨立或有前置依賴時不標 stack，任務會自成串行 batch；DoD：填入驗證方式。" }
 ], null, 2);
 
 interface PlanValidationOptions {
@@ -63,8 +71,8 @@ export function validatePlan(text: string, { required = false, allowStack = fals
   return "";
 }
 
-/** 僅在 validatePlan 通過後用於 launcher 的輕量 batch 預覽。 */
-export function getPlanBatchPreview(text: string) {
+/** 僅在 validatePlan 通過後用於 launcher 的輕量 batch 預覽與實際並行判定。 */
+export function getPlanBatchAnalysis(text: string) {
   try {
     const plan = JSON.parse(text) as ValidatedPlanTask[];
     const tasks = [...plan].sort((a, b) => a.order - b.order);
@@ -81,8 +89,16 @@ export function getPlanBatchPreview(text: string) {
       return first.stack === undefined ? orders : `stack ${first.stack} (${orders})`;
     });
     if (batches.length > labels.length) labels.push(`其餘 ${batches.length - labels.length} 批`);
-    return `${batches.length} 個 batch：${labels.join(" → ")}`;
+    return {
+      preview: `${batches.length} 個 batch：${labels.join(" → ")}`,
+      // 單一 task 即使帶 stack 也沒有並行；必須有同一 batch 至少兩個 task。
+      hasParallelBatch: batches.some((batch) => batch.length > 1)
+    };
   } catch {
-    return "";
+    return null;
   }
+}
+
+export function getPlanBatchPreview(text: string) {
+  return getPlanBatchAnalysis(text)?.preview ?? "";
 }

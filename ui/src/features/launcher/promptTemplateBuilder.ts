@@ -5,7 +5,7 @@ export type PromptTemplateMode = "goal" | "plan";
 
 const RESOURCE_PLACEHOLDER_RE = /<<[A-Z][A-Z0-9_]*>>/g;
 const RESOURCE_MARKER_RE = /<<[^\r\n]*?>>/g;
-const REQUIRED_BUNDLE_FIELDS = ["base", "goal", "goal_template", "plan", "goal_plan_bridge", "missing_requirement", "team_template_example"] as const;
+const REQUIRED_BUNDLE_FIELDS = ["base", "goal", "goal_template", "plan", "parallel_plan", "goal_plan_bridge", "missing_requirement", "team_template_example"] as const;
 const BASE_PLACEHOLDERS = [
   "<<OUTPUT_NAME>>", "<<ORIGINAL_REQUIREMENT_BLOCK>>", "<<PROJECT_CONTEXT_SECTION>>",
   "<<TEMPLATE_LABEL>>", "<<TEMPLATE_DESCRIPTION>>", "<<TEMPLATE_INSTRUCTIONS>>",
@@ -32,13 +32,13 @@ function hasExactPlaceholders(source: string, expected: readonly string[]) {
 
 export function isPromptTemplateBundleSupported(bundle: PromptTemplateBundle | null | undefined): bundle is PromptTemplateBundle {
   return !!bundle
-    && bundle.schema_version === 4
+    && bundle.schema_version === 5
     && REQUIRED_BUNDLE_FIELDS.every((field) => typeof bundle[field] === "string" && !!bundle[field].trim())
     && hasExactPlaceholders(bundle.base, BASE_PLACEHOLDERS)
     && bundle.base.trimEnd().endsWith("<<MODE_CONTRACT>>")
     && hasExactPlaceholders(bundle.missing_requirement, ["<<OUTPUT_NAME>>", "<<OUTPUT_NAME>>"])
     && hasExactPlaceholders(bundle.goal_template, GOAL_TEMPLATE_PLACEHOLDERS)
-    && [bundle.goal, bundle.plan, bundle.goal_plan_bridge, bundle.team_template_example]
+    && [bundle.goal, bundle.plan, bundle.parallel_plan, bundle.goal_plan_bridge, bundle.team_template_example]
       .every((resource) => hasExactPlaceholders(resource, []));
 }
 
@@ -93,7 +93,8 @@ export function buildExternalAgentPrompt({
   mode,
   requirement,
   projectContext,
-  includePlanDraft = false
+  includePlanDraft = false,
+  parallelContext = false
 }: {
   template: PromptTemplate;
   bundle: PromptTemplateBundle;
@@ -102,6 +103,8 @@ export function buildExternalAgentPrompt({
   projectContext: string;
   /** 只在 goal 模式生效：在 goal 契約後接合併輸出契約與 plan 拆分規則，讓 Agent 一併輸出初版 plan.json。 */
   includePlanDraft?: boolean;
+  /** Parallel launcher 語境：Plan 仍不含 stack，但附加人工標註前必須具備的證據契約。 */
+  parallelContext?: boolean;
 }) {
   if (!isPromptTemplateBundleSupported(bundle)) return "";
 
@@ -116,9 +119,12 @@ export function buildExternalAgentPrompt({
     });
   }
 
-  const modeContract = mode === "goal"
-    ? (withPlanDraft ? [bundle.goal, bundle.goal_plan_bridge, bundle.plan].join("\n\n") : bundle.goal)
+  const planContract = parallelContext
+    ? [bundle.parallel_plan, bundle.plan].join("\n\n")
     : bundle.plan;
+  const modeContract = mode === "goal"
+    ? (withPlanDraft ? [bundle.goal, bundle.goal_plan_bridge, planContract].join("\n\n") : bundle.goal)
+    : planContract;
   return renderPromptResource(bundle.base, {
     "<<OUTPUT_NAME>>": outputName,
     "<<ORIGINAL_REQUIREMENT_BLOCK>>": markdownQuote(requirementText),
@@ -141,10 +147,17 @@ export function buildGoalArtifactTemplate(template: PromptTemplate, bundle: Prom
   });
 }
 
-export function promptDownloadName(template: PromptTemplate, mode: PromptTemplateMode, includePlanDraft = false) {
+export function promptDownloadName(
+  template: PromptTemplate,
+  mode: PromptTemplateMode,
+  includePlanDraft = false,
+  parallelContext = false
+) {
   // 非安全字元轉成連字號，避免模板 id 產生意外路徑或空檔名。
   const safeId = template.id.replace(/[^a-z0-9._-]+/gi, "-").replace(/^-+|-+$/g, "") || "custom";
-  const modeName = mode === "goal" && includePlanDraft ? "goal-plan" : mode;
+  const includesPlan = mode === "plan" || includePlanDraft;
+  const baseModeName = mode === "goal" && includePlanDraft ? "goal-plan" : mode;
+  const modeName = parallelContext && includesPlan ? `parallel-${baseModeName}` : baseModeName;
   return `${safeId}-${modeName}-prompt.md`;
 }
 

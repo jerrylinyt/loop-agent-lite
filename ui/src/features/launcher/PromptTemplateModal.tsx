@@ -16,6 +16,7 @@ export default function PromptTemplateModal({
   warnings,
   projectConfigPath,
   initialMode,
+  parallelContext = false,
   onClose
 }: {
   templates: PromptTemplate[];
@@ -23,6 +24,7 @@ export default function PromptTemplateModal({
   warnings?: string[];
   projectConfigPath?: string;
   initialMode: PromptTemplateMode;
+  parallelContext?: boolean;
   onClose: () => void;
 }) {
   const [mode, setMode] = useState<PromptTemplateMode>(initialMode);
@@ -52,15 +54,21 @@ export default function PromptTemplateModal({
     }
     return [...grouped.entries()];
   }, [templates]);
+  const withPlanDraft = mode === "goal" && includePlanDraft;
+  const includesPlan = mode === "plan" || withPlanDraft;
   const prompt = template
-    ? buildExternalAgentPrompt({ template, bundle, mode, requirement, projectContext, includePlanDraft })
+    ? buildExternalAgentPrompt({
+      template, bundle, mode, requirement, projectContext, includePlanDraft, parallelContext
+    })
     : "";
   const hasRequirement = !!requirement.trim();
   const requirementIsUntouchedSeed = hasRequirement && !requirementTouched;
-  const withPlanDraft = mode === "goal" && includePlanDraft;
   const outputName = mode === "goal"
     ? (withPlanDraft ? "goal.md 與初版 plan.json" : "goal.md")
-    : "plan.json";
+    : (parallelContext ? "不含 stack 的基礎 plan.json" : "plan.json");
+  const filename = template
+    ? promptDownloadName(template, mode, withPlanDraft, parallelContext)
+    : "";
 
   const copyPrompt = async () => {
     try {
@@ -73,8 +81,8 @@ export default function PromptTemplateModal({
 
   const downloadPrompt = () => {
     if (!template) return;
-    downloadPromptFile(prompt, promptDownloadName(template, mode, withPlanDraft));
-    setMessage(`成功：已下載 ${promptDownloadName(template, mode, withPlanDraft)}`);
+    downloadPromptFile(prompt, filename);
+    setMessage(`成功：已下載 ${filename}`);
   };
 
   const footer = (
@@ -115,7 +123,7 @@ export default function PromptTemplateModal({
             className={mode === "plan" ? "active" : ""}
             onClick={() => { setMode("plan"); setMessage(""); }}
           >
-            Plan 拆分模板
+            {parallelContext ? "基礎 Plan 拆分模板" : "Plan 拆分模板"}
           </button>
         </div>
         <label>
@@ -139,6 +147,27 @@ export default function PromptTemplateModal({
           </label>
         )}
       </div>
+
+      {parallelContext && (
+        includesPlan ? (
+          <div className="prompt-template-warning" data-testid="parallel-plan-prompt-guidance">
+            <strong>Parallel 基礎 Plan：Agent 不負責決定 stack</strong>
+            <ul>
+              <li>這份 Prompt 只產生不含 stack 的基礎 plan，並要求保留人工審查所需的 working set、依賴與共享資源證據。</li>
+              <li>產出後必須人工檢查任務獨立性，再為安全且連續的 task 人工加入相同的 stack 正整數。</li>
+              <li>任一項不確定就不標 stack；合法但未標 stack 的 plan 會完全串行。</li>
+            </ul>
+          </div>
+        ) : (
+          <div className="prompt-template-warning" data-testid="parallel-goal-prompt-guidance">
+            <strong>Parallel Goal 維持拓撲中立</strong>
+            <ul>
+              <li>Goal 只描述共享目標、限制與驗收，不放 stack 或 worker 排程。</li>
+              <li>完成後先將 goal.md commit 到目前 branch，再回 Launcher 準備 frozen plan。</li>
+            </ul>
+          </div>
+        )
+      )}
 
       {!!warnings?.length && (
         <div className="prompt-template-warning" role="alert">
@@ -195,7 +224,7 @@ export default function PromptTemplateModal({
               <strong>即時預覽</strong>
               <span>下載後交給可讀取專案的外部 Agent</span>
             </div>
-            <code>{template ? promptDownloadName(template, mode) : ""}</code>
+            <code>{filename}</code>
           </header>
           <pre data-testid="prompt-template-preview">{prompt}</pre>
         </section>

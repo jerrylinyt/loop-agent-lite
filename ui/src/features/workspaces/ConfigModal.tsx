@@ -168,12 +168,12 @@ export default function ConfigModal({
         </div>
         <label className="checkbox-row"><input type="checkbox" checked={pauseAfterPlan} onChange={(event) => setPauseAfterPlan(event.target.checked)} />規劃收斂後暫停：不自動進入執行期，需按「運行」開始執行</label>
         <section className="plan-transfer" aria-labelledby="plan-transfer-title">
-          <div><strong id="plan-transfer-title">plan.json</strong><span>只包含 order／task／ref，不包含完成進度</span></div>
+          <div><strong id="plan-transfer-title">plan.json</strong><span>匯出純 Plan 欄位（order／task／ref 與既有 stack），不包含完成進度</span></div>
           <div className="plan-transfer-actions">
             <button type="button" className="secondary-button" disabled={!plan.length || importing} onClick={exportPlan}>匯出 plan.json</button>
             <label className={`secondary-button file-button${importing ? " disabled" : ""}`}>匯入並完整重置<input ref={importInput} type="file" accept="application/json,.json" disabled={importing} onChange={(event) => void selectImport(event.target.files?.[0])} /></label>
           </div>
-          <p>匯入成功後會清除 round、完成紀錄、issues 與收斂計數，保留 workspace 設定和 target repo，並停在規劃期。</p>
+          <p>此處匯入只接受普通 Loop 的 order／task／ref；含 stack 的 frozen plan 請由 Parallel Launcher 啟動。匯入成功後會清除 round、完成紀錄、issues 與收斂計數，保留 workspace 設定和 target repo，並停在規劃期。</p>
         </section>
       </div>
       {cliManagerOpen && available && <CliManagerModal config={available} repo={config.repo ?? ""} workspace={workspace} onClose={() => setCliManagerOpen(false)} onSaved={(next) => {

@@ -388,6 +388,12 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .prompt-template-toolbar select { width: 100%; min-height: 32px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); }
 .prompt-template-warning { margin-bottom: 10px; padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent); border-radius: 8px; background: var(--warning-soft); color: var(--warning); font-size: 12px; }
 .prompt-template-warning ul { margin: 5px 0 0; padding-left: 18px; }
+.parallel-plan-guidance { padding: 9px 10px; border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border-soft)); border-radius: 8px; background: var(--accent-soft); color: var(--text); font-size: 12px; }
+.parallel-plan-guidance p { margin: 5px 0; color: var(--muted); }
+.parallel-plan-guidance details { margin-top: 5px; }
+.parallel-plan-guidance summary { cursor: pointer; color: var(--accent); }
+.parallel-plan-guidance ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); }
+.parallel-plan-summary { flex-wrap: wrap; }
 .prompt-template-grid { display: grid; height: min(570px, 62vh); min-height: 420px; grid-template-columns: minmax(300px, .9fr) minmax(360px, 1.25fr); gap: 12px; }
 .prompt-template-editor { min-height: 0; overflow: auto; padding-right: 3px; align-content: start; }
 .prompt-template-summary { padding: 9px 10px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--surface); }

@@ -480,12 +480,14 @@ export default function LauncherModal({
         warnings={config.prompt_template_warnings}
         projectConfigPath={config.project_config_path}
         initialMode={promptTemplateMode}
+        parallelContext={parallelMode}
         onClose={() => setPromptTemplateMode(null)}
       />}
       {goalTemplateOpen && isPromptTemplateBundleSupported(config?.prompt_template_bundle) && <GoalTemplateModal
         templates={config?.prompt_templates ?? []}
         bundle={config.prompt_template_bundle}
         warnings={config?.prompt_template_warnings}
+        parallelContext={parallelMode}
         onClose={() => setGoalTemplateOpen(false)}
       />}
     </Modal>

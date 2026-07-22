@@ -35,14 +35,26 @@ class TestPromptTemplateResources(unittest.TestCase):
         self.assertEqual(
             set(bundle),
             {
-                "schema_version", "base", "goal", "goal_template", "plan", "goal_plan_bridge",
-                "missing_requirement", "team_template_example",
+                "schema_version", "base", "goal", "goal_template", "plan", "parallel_plan",
+                "goal_plan_bridge", "missing_requirement", "team_template_example",
             },
         )
         self.assertTrue(bundle["base"].endswith("<<MODE_CONTRACT>>"))
         self.assertNotIn("_json", bundle["base"])
         self.assertIn("最終輸出契約：goal.md", bundle["goal"])
         self.assertIn("最終輸出契約：plan.json", bundle["plan"])
+
+    def test_parallel_plan_guidance_preserves_human_owned_stack_boundary(self):
+        bundle, error = P.prompt_template_bundle()
+        self.assertIsNone(error)
+        guidance = bundle["parallel_plan"]
+        self.assertIn("不含 `stack` 的基礎 plan", guidance)
+        self.assertIn("不得自行推論、建議或輸出 `stack`", guidance)
+        self.assertIn("由人類", guidance)
+        self.assertIn("working set", guidance)
+        for resource in ("生成物", "port", "DB", "cache", "lock", "外部服務"):
+            self.assertIn(resource, guidance)
+        self.assertIn("任一條不確定就維持串行", guidance)
 
     def test_goal_plan_bridge_merges_both_contracts_into_one_pass(self):
         bundle, error = P.prompt_template_bundle()

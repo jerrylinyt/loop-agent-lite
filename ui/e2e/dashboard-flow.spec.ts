@@ -166,7 +166,7 @@ test("Goal 產生器 Prompt 與 Goal 成果模板分開，且 Plan 仍可使用"
   await expect(promptTemplates).toBeHidden();
   await expect(launcher).toBeVisible();
 
-  await launcher.getByRole("button", { name: "產生 Plan Prompt" }).click();
+  await launcher.getByRole("button", { name: "產生 Plan Prompt", exact: true }).click();
   promptTemplates = page.getByRole("dialog", { name: "外部 Agent 產生器 Prompt" });
   await expect(promptTemplates.getByRole("tab", { name: "Plan 拆分模板" })).toHaveAttribute("aria-selected", "true");
   await promptTemplates.getByRole("button", { name: "上一頁", exact: false }).click();
@@ -191,7 +191,7 @@ test("固定 Prompt 資源失效會停用產生器與成果模板並顯示原因
   const launcher = page.getByRole("dialog", { name: "啟動與管理" });
   await expect(launcher.getByRole("button", { name: "Goal 產生器 Prompt" })).toBeDisabled();
   await expect(launcher.getByRole("button", { name: "Goal 成果模板" })).toBeDisabled();
-  await expect(launcher.getByRole("button", { name: "產生 Plan Prompt" })).toBeDisabled();
+  await expect(launcher.getByRole("button", { name: "產生 Plan Prompt", exact: true })).toBeDisabled();
   await expect(launcher.getByRole("alert")).toContainText("Prompt 模板停用：E2E 固定 Prompt 資源損毀");
   await expect(launcher.getByRole("combobox", { name: "Repo" })).toBeEnabled();
 });

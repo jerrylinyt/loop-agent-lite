@@ -302,11 +302,13 @@ export interface PromptTemplate {
 }
 
 export interface PromptTemplateBundle {
-  schema_version: 4;
+  schema_version: 5;
   base: string;
   goal: string;
   goal_template: string;
   plan: string;
+  /** Parallel 模式產生基礎 Plan 時附加；明確禁止 Agent 自動輸出 stack，並補足人工審查證據。 */
+  parallel_plan: string;
   /** Goal 模式勾選「同時產生初版 plan.json」時，插在 goal 與 plan 契約之間的合併輸出契約。 */
   goal_plan_bridge: string;
   missing_requirement: string;

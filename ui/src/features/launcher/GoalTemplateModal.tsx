@@ -8,10 +8,11 @@ import {
   goalTemplateDownloadName
 } from "./promptTemplateBuilder";
 
-export default function GoalTemplateModal({ templates, bundle, warnings, onClose }: {
+export default function GoalTemplateModal({ templates, bundle, warnings, parallelContext = false, onClose }: {
   templates: PromptTemplate[];
   bundle: PromptTemplateBundle;
   warnings?: string[];
+  parallelContext?: boolean;
   onClose: () => void;
 }) {
   const [templateId, setTemplateId] = useState(templates[0]?.id ?? "");
@@ -85,6 +86,16 @@ export default function GoalTemplateModal({ templates, bundle, warnings, onClose
           </div>
         )}
       </div>
+
+      {parallelContext && (
+        <div className="prompt-template-warning" data-testid="parallel-goal-template-guidance">
+          <strong>Parallel 的 Goal 仍是共享需求真相</strong>
+          <ul>
+            <li>不要在 Goal 成果模板加入 stack、batch 或 worker 分工；這些屬於人工 Plan 排程。</li>
+            <li>依實際需求完成並審查 goal.md 後，先 commit 到目前 branch，Parallel Launcher 才會沿用。</li>
+          </ul>
+        </div>
+      )}
 
       {!!warnings?.length && (
         <div className="prompt-template-warning" role="alert">
