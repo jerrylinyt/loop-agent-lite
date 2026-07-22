@@ -46,6 +46,7 @@ from engine.work import validate_plan
 
 DEFAULT_MAX_PARALLEL = 2
 DEFAULT_WORKER_RESTART_LIMIT = 3
+WORKER_GUARDIAN_REAP_TIMEOUT = 25.0
 LAUNCH_RESERVATION_SCHEMA = 1
 SUPERVISOR_RUNNER = "parallel-supervisor"
 RUN_NONTERMINAL = frozenset({
@@ -53,6 +54,15 @@ RUN_NONTERMINAL = frozenset({
     "cancel_requested", "finalizing", "finalizing_cancel", "blocked",
 })
 RUN_TERMINAL = frozenset({"completed", "cancelled"})
+_PRISTINE_ABORT_INIT_FIELDS = frozenset({
+    "schema", "run_id", "manifest_hash", "bootstrap_request_id",
+    "bootstrap_claimed_session", "bootstrap_claimed_generation",
+    "assigned_control_generation", "preflight_operation_id",
+    "preflight_request_hash", "initialize_operation_id",
+    "initialize_request_hash", "integration_branch",
+    "integration_start_sha", "blocked_preflight_nonce",
+    "blocked_preflight_lease_hash",
+})
 
 
 class ParallelError(RuntimeError):
@@ -865,6 +875,27 @@ def _repository_start_identity(
     return branch, head
 
 
+def normalize_expected_primary_identity(
+    ref: object, sha: object,
+) -> tuple[str | None, str | None]:
+    """Validate the optional Dashboard launcher-to-supervisor handoff pair."""
+    if ref is None and sha is None:
+        return None, None
+    if ref is None or sha is None:
+        raise ParallelError(
+            "expected primary ref/SHA 必須成對提供")
+    if (not isinstance(ref, str) or not ref.startswith("refs/heads/")
+            or ref == "refs/heads/"
+            or any(character in ref for character in "\x00\r\n")):
+        raise ParallelError("expected primary ref 必須是完整 branch ref")
+    try:
+        normalized_sha = parallel_contract.require_git_sha(
+            sha, "expected primary SHA")
+    except parallel_contract.ParallelContractError as exc:
+        raise ParallelError(str(exc)) from exc
+    return ref, normalized_sha
+
+
 def _assignment_for_worker(
     artifacts: parallel_state.ValidatedRunArtifacts, order: int,
 ) -> dict:
@@ -1542,6 +1573,195 @@ class ParallelSupervisor:
             raise ParallelError("startup PREFLIGHT result authority mismatch")
         return repo_executor.canonical_hash(result)
 
+    def _durable_pristine_abort_control(
+            self, supplied: Mapping[str, object] | None = None) -> dict:
+        durable = _read_bootstrap_control(self.artifacts)
+        claimed = durable.get("claimed_by")
+        if (durable.get("action") != "abort"
+                or durable.get("state") not in {"claimed", "applied"}
+                or not isinstance(claimed, dict)):
+            raise ParallelError(
+                "pristine Abort initialization lacks a durable claimed Abort")
+        identity = (
+            durable.get("request_id"), durable.get("action"),
+            durable.get("assigned_control_generation"),
+            claimed.get("session"), claimed.get("generation"),
+        )
+        if supplied is not None:
+            supplied_claimed = supplied.get("claimed_by")
+            supplied_identity = (
+                supplied.get("request_id"), supplied.get("action"),
+                supplied.get("assigned_control_generation"),
+                (supplied_claimed or {}).get("session")
+                if isinstance(supplied_claimed, Mapping) else None,
+                (supplied_claimed or {}).get("generation")
+                if isinstance(supplied_claimed, Mapping) else None,
+            )
+            if supplied_identity != identity:
+                raise ParallelError(
+                    "pristine Abort control changed before initialization")
+        return durable
+
+    def _pristine_abort_init_common(
+            self, control: Mapping[str, object],
+            preflight_request: Mapping[str, object],
+            initialize_request: Mapping[str, object]) -> dict:
+        claimed = control["claimed_by"]
+        return {
+            "schema": 1,
+            "run_id": self.run_id,
+            "manifest_hash": self.artifacts.manifest_hash,
+            "bootstrap_request_id": control["request_id"],
+            "bootstrap_claimed_session": claimed["session"],
+            "bootstrap_claimed_generation": claimed["generation"],
+            "assigned_control_generation": control["assigned_control_generation"],
+            "preflight_operation_id": preflight_request["operation_id"],
+            "preflight_request_hash": repo_executor.canonical_hash(
+                preflight_request),
+            "initialize_operation_id": initialize_request["operation_id"],
+            "initialize_request_hash": repo_executor.canonical_hash(
+                initialize_request),
+            "integration_branch": self.artifacts.manifest["integration_branch"],
+            "integration_start_sha": self.artifacts.manifest[
+                "integration_start_sha"],
+        }
+
+    def _audit_pristine_abort_init_authority(
+            self, preflight_request: Mapping[str, object],
+            initialize_request: Mapping[str, object],
+            supplied_control: Mapping[str, object] | None = None) -> dict:
+        # Before the Abort aggregate checkpoint, the current durable bootstrap
+        # claim is the authorization.  Afterwards terminal_intent=cancelled is
+        # itself the monotonic authority and the single-slot bootstrap record
+        # may legitimately have advanced to a later Resume/Abort request.
+        pre_checkpoint_control = None
+        if self.aggregate.get("terminal_intent") != "cancelled":
+            pre_checkpoint_control = self._durable_pristine_abort_control(
+                supplied_control)
+        try:
+            record = parallel_state.read_canonical_json(
+                self.artifacts.run_dir, "startup/pristine-abort-init.json")
+        except (OSError, parallel_state.ParallelStateError) as exc:
+            raise ParallelError(
+                f"pristine Abort initialization authority unavailable：{exc}"
+            ) from exc
+        if not isinstance(record, dict) or set(record) != _PRISTINE_ABORT_INIT_FIELDS:
+            raise ParallelError(
+                "pristine Abort initialization authority schema mismatch")
+        if pre_checkpoint_control is not None:
+            expected = self._pristine_abort_init_common(
+                pre_checkpoint_control, preflight_request, initialize_request)
+        else:
+            expected = {
+                "schema": 1,
+                "run_id": self.run_id,
+                "manifest_hash": self.artifacts.manifest_hash,
+                "preflight_operation_id": preflight_request["operation_id"],
+                "preflight_request_hash": repo_executor.canonical_hash(
+                    preflight_request),
+                "initialize_operation_id": initialize_request["operation_id"],
+                "initialize_request_hash": repo_executor.canonical_hash(
+                    initialize_request),
+                "integration_branch": self.artifacts.manifest[
+                    "integration_branch"],
+                "integration_start_sha": self.artifacts.manifest[
+                    "integration_start_sha"],
+            }
+        if any(record.get(key) != value for key, value in expected.items()):
+            raise ParallelError(
+                "pristine Abort initialization authority mismatch")
+        bootstrap_request_id = record.get("bootstrap_request_id")
+        bootstrap_session = record.get("bootstrap_claimed_session")
+        bootstrap_generation = record.get("bootstrap_claimed_generation")
+        assigned_generation = record.get("assigned_control_generation")
+        if (not isinstance(bootstrap_request_id, str)
+                or len(bootstrap_request_id) != 32
+                or any(ch not in "0123456789abcdef"
+                       for ch in bootstrap_request_id)
+                or not isinstance(bootstrap_session, str)
+                or len(bootstrap_session) != 32
+                or any(ch not in "0123456789abcdef"
+                       for ch in bootstrap_session)
+                or not isinstance(bootstrap_generation, int)
+                or isinstance(bootstrap_generation, bool)
+                or bootstrap_generation < 1
+                or not isinstance(assigned_generation, int)
+                or isinstance(assigned_generation, bool)
+                or assigned_generation < 1):
+            raise ParallelError(
+                "pristine Abort bootstrap history identity is invalid")
+        nonce = record.get("blocked_preflight_nonce")
+        lease_hash = record.get("blocked_preflight_lease_hash")
+        if (not isinstance(nonce, str) or len(nonce) != 32
+                or any(ch not in "0123456789abcdef" for ch in nonce)
+                or not isinstance(lease_hash, str) or len(lease_hash) != 64
+                or any(ch not in "0123456789abcdef" for ch in lease_hash)):
+            raise ParallelError(
+                "pristine Abort blocked PREFLIGHT identity is invalid")
+        return record
+
+    def _publish_pristine_abort_init_authority(
+            self, preflight_request: Mapping[str, object],
+            initialize_request: Mapping[str, object],
+            blocked_lease: Mapping[str, object],
+            supplied_control: Mapping[str, object]) -> dict:
+        control = self._durable_pristine_abort_control(supplied_control)
+        record = {
+            **self._pristine_abort_init_common(
+                control, preflight_request, initialize_request),
+            "blocked_preflight_nonce": blocked_lease["nonce"],
+            "blocked_preflight_lease_hash": repo_executor.canonical_hash(
+                blocked_lease),
+        }
+        try:
+            parallel_state.write_or_verify_immutable_json(
+                self.artifacts.run_dir,
+                "startup/pristine-abort-init.json",
+                record,
+            )
+        except (OSError, parallel_state.ParallelStateError) as exc:
+            raise ParallelError(
+                f"pristine Abort initialization authority publish failed：{exc}"
+            ) from exc
+        return self._audit_pristine_abort_init_authority(
+            preflight_request, initialize_request, control)
+
+    def _authorize_pristine_abort_init_supersession(
+            self, blocked_lease: Mapping[str, object],
+            authority: Mapping[str, object],
+            preflight_request: Mapping[str, object],
+            initialize_request: Mapping[str, object]) -> bool:
+        """Bind blocked PREFLIGHT replacement to the immutable Abort marker."""
+        try:
+            if (blocked_lease.get("state") != "terminal"
+                    or blocked_lease.get("terminal_status") != "blocked"
+                    or blocked_lease.get("immutable_spec_hash")
+                    != self.executor.authority_hash
+                    or blocked_lease.get("operation")
+                    != repo_executor.Operation.PREFLIGHT.value
+                    or blocked_lease.get("operation_id")
+                    != authority.get("preflight_operation_id")
+                    or blocked_lease.get("operation_id")
+                    != preflight_request.get("operation_id")
+                    or blocked_lease.get("nonce")
+                    != authority.get("blocked_preflight_nonce")
+                    or blocked_lease.get("request") != preflight_request
+                    or blocked_lease.get("request_hash")
+                    != authority.get("preflight_request_hash")
+                    or authority.get("preflight_request_hash")
+                    != repo_executor.canonical_hash(preflight_request)
+                    or authority.get("initialize_operation_id")
+                    != initialize_request.get("operation_id")
+                    or authority.get("initialize_request_hash")
+                    != repo_executor.canonical_hash(initialize_request)
+                    or authority.get("blocked_preflight_lease_hash")
+                    != repo_executor.canonical_hash(blocked_lease)):
+                return False
+        except (TypeError, ValueError):
+            return False
+        return repo_executor.RepoExecutor.fence_recovery_lease(
+            dict(blocked_lease))
+
     def _validate_initialization_success(
             self, request: dict,
             init_paths: Mapping[str, Path]) -> tuple[str, str]:
@@ -1667,7 +1887,9 @@ class ParallelSupervisor:
 
     def recover_startup_initialization(
             self, *, reconcile_pending: bool = False,
-            initialize_pristine: bool = True) -> bool | None:
+            initialize_pristine: bool = True,
+            pristine_abort_control: Mapping[str, object] | None = None,
+    ) -> bool | None:
         """Replay pristine startup initialization, but reject partial evidence.
 
         A supervisor can disappear after publishing the immutable run and base
@@ -1733,6 +1955,14 @@ class ParallelSupervisor:
             and lease["request_hash"]
             == repo_executor.canonical_hash(initialize_request)
         )
+        preflight_result_hash = self._validate_preflight_result(
+            preflight_request)
+        blocked_preflight_abort = bool(
+            pristine_abort_control is not None
+            and canonical_preflight_lease
+            and lease["state"] == "terminal"
+            and lease["terminal_status"] == "blocked"
+        )
 
         complete = all(present.values()) and sync_tip is not None
         if complete:
@@ -1745,28 +1975,38 @@ class ParallelSupervisor:
                     or lease["result_hash"] != init_result_hash):
                 raise ParallelError(
                     "startup initialization has a non-success terminal lease")
+            if preflight_result_hash is None:
+                self._audit_pristine_abort_init_authority(
+                    preflight_request, initialize_request)
             return False
 
-        if lease is not None and lease["state"] != "terminal":
+        replayable_startup_lease = (
+            lease is not None
+            and (lease["state"] != "terminal"
+                 or lease["terminal_status"] == "blocked")
+        )
+        if replayable_startup_lease and not blocked_preflight_abort:
             allowed_pending = canonical_preflight_lease or canonical_init_lease
             if (not reconcile_pending or not allowed_pending
                     or (canonical_preflight_lease
                         and (any(present.values()) or sync_tip is not None))):
                 raise ParallelError(
                     "partial/unknown startup initialization has a non-canonical "
-                    "pending lease")
-            if (canonical_init_lease
-                    and self._validate_preflight_result(
-                        preflight_request) is None):
-                raise ParallelError(
-                    "pending startup initialization lacks exact PREFLIGHT proof")
+                    "pending/blocked lease")
+            if canonical_init_lease and preflight_result_hash is None:
+                if pristine_abort_control is None:
+                    raise ParallelError(
+                        "pending startup initialization lacks exact PREFLIGHT proof")
+                self._audit_pristine_abort_init_authority(
+                    preflight_request, initialize_request,
+                    pristine_abort_control)
             try:
                 result = self.executor.reconcile_pending_operation(
                     recovery_authorizer=(
                         repo_executor.RepoExecutor.fence_recovery_lease))
             except repo_executor.RepoExecutorError as exc:
                 raise ParallelError(
-                    f"startup operation recovery blocked：{exc}") from exc
+                    f"startup operation exact replay blocked：{exc}") from exc
             if result is None or result.get("operation") not in {
                     repo_executor.Operation.PREFLIGHT.value,
                     repo_executor.Operation.INITIALIZE_RUN_REFS.value}:
@@ -1774,7 +2014,8 @@ class ParallelSupervisor:
                     "startup operation recovery returned unexpected result")
             return self.recover_startup_initialization(
                 reconcile_pending=False,
-                initialize_pristine=initialize_pristine)
+                initialize_pristine=initialize_pristine,
+                pristine_abort_control=pristine_abort_control)
 
         pristine = (
             not any(present.values())
@@ -1796,15 +2037,14 @@ class ParallelSupervisor:
             canonical_terminal_preflight = (
                 canonical_preflight_lease
                 and lease["state"] == "terminal"
-                and lease["terminal_status"] == "validated"
+                and (lease["terminal_status"] == "validated"
+                     or blocked_preflight_abort)
             )
             if not canonical_terminal_preflight:
                 raise ParallelError(
                     "partial/unknown startup initialization has a non-PREFLIGHT "
                     "same-run lease")
-        preflight_result_hash = self._validate_preflight_result(
-            preflight_request)
-        if same_run_lease:
+        if same_run_lease and not blocked_preflight_abort:
             if preflight_result_hash is None:
                 raise ParallelError(
                     "startup PREFLIGHT lease lacks its exact durable result")
@@ -1856,6 +2096,37 @@ class ParallelSupervisor:
             raise ParallelError(
                 f"pristine startup initialization requires exact primary start：{exc}"
             ) from exc
+
+        if blocked_preflight_abort:
+            # Abort must remain available when a configured validator is
+            # permanently failing.  The durable claimed Abort plus exhaustive
+            # pristine proof authorizes only the mechanical private sync-ref
+            # initialization; it never validates or dispatches worker work.
+            # Fence any retained PREFLIGHT child identity before the INIT lease
+            # supersedes that blocked operation.
+            if not repo_executor.RepoExecutor.fence_recovery_lease(lease):
+                raise ParallelError(
+                    "pristine Abort cannot fence blocked PREFLIGHT child")
+            init_authority = self._publish_pristine_abort_init_authority(
+                preflight_request, initialize_request, lease,
+                pristine_abort_control)
+            try:
+                self.executor.supersede_blocked_operation(
+                    initialize_request,
+                    recovery_authorizer=lambda blocked: (
+                        self._authorize_pristine_abort_init_supersession(
+                            blocked, init_authority, preflight_request,
+                            initialize_request)),
+                )
+            except repo_executor.RepoExecutorError as exc:
+                raise ParallelError(
+                    "RepoExecutor pristine Abort initialization supersession "
+                    f"blocked: {exc}") from exc
+            self.recover_startup_initialization(
+                reconcile_pending=False,
+                initialize_pristine=False,
+                pristine_abort_control=pristine_abort_control)
+            return True
 
         if not initialize_pristine:
             # Missing worker secrets may not run the configured validator just
@@ -2672,9 +2943,18 @@ class ParallelSupervisor:
             # Do not SIGKILL the guardian: its payload uses a distinct process
             # group.  EOF is the guardian protocol and only the guardian may
             # publish acked -> reaped after fencing that group.
-            return int(compat.wait_process(handle.process))
-        finally:
+            returncode = int(compat.wait_process(
+                handle.process, timeout=WORKER_GUARDIAN_REAP_TIMEOUT))
+        except subprocess.TimeoutExpired as exc:
+            # Keep both the durable ACKed identity and the local containment
+            # handle.  The caller projects recovery_required/blocked and lets
+            # a later owner perform exact fencing; it must never forge reaped.
+            raise ParallelError(
+                f"guardian 未在 {WORKER_GUARDIAN_REAP_TIMEOUT:g} 秒內完成 child fence"
+            ) from exc
+        else:
             compat.close_process_group(handle.process)
+            return returncode
 
     def _wait_for_child_ack(self, handle: WorkerHandle) -> dict:
         deadline = time.monotonic() + 5.0
@@ -3751,9 +4031,14 @@ class ParallelSupervisor:
             return
         try:
             observation = self.executor.observe_worktree(order)
-            if (observation["exists"] or observation["registered"]
+            blocked_remove = (
+                self.executor.blocked_remove_supersession_candidate({
+                    order: self._task(order)["outcome"],
+                }))
+            if (blocked_remove is not None
+                    or observation["exists"] or observation["registered"]
                     or observation.get("task_ref_tip") is not None):
-                self._execute({
+                request = {
                     "operation": repo_executor.Operation.REMOVE_WORKTREE.value,
                     "operation_id": _operation_id(
                         self.run_id, "remove", order, self.generation),
@@ -3766,7 +4051,16 @@ class ParallelSupervisor:
                         "terminal_outcome": self._task(order)["outcome"],
                         "observation_token": observation["observation_token"],
                     },
-                })
+                }
+                try:
+                    self.executor.execute(request)
+                except repo_executor.LeaseBusy:
+                    self.executor.supersede_blocked_operation(
+                        request,
+                        recovery_authorizer=lambda blocked: (
+                            self._authorize_cleanup_supersession(
+                                blocked, request, order)),
+                    )
             self.aggregate = parallel_state.transition_task(
                 self.aggregate, order, resource_state="cleaned")
             self.checkpoint()
@@ -3777,6 +4071,44 @@ class ParallelSupervisor:
             self.checkpoint()
             raise ParallelError(
                 f"task-{order} cleanup recovery failed：{exc}") from exc
+
+    def _authorize_cleanup_supersession(
+            self, blocked_lease: Mapping[str, object],
+            successor_request: Mapping[str, object], order: int) -> bool:
+        """Authorize only a repaired, pre-intent REMOVE retry for one task."""
+        try:
+            old_request = blocked_lease.get("request")
+            if not isinstance(old_request, dict):
+                return False
+            operation, operation_id, task, authority, expected = (
+                self.executor._validate_request(old_request))
+            successor_expected = successor_request.get("expected")
+            if not isinstance(successor_expected, Mapping):
+                return False
+            if (blocked_lease.get("state") != "terminal"
+                    or blocked_lease.get("terminal_status") != "blocked"
+                    or blocked_lease.get("immutable_spec_hash")
+                    != self.executor.authority_hash
+                    or blocked_lease.get("operation")
+                    != repo_executor.Operation.REMOVE_WORKTREE.value
+                    or operation != repo_executor.Operation.REMOVE_WORKTREE
+                    or blocked_lease.get("operation_id") != operation_id
+                    or blocked_lease.get("request_hash")
+                    != repo_executor.canonical_hash(old_request)
+                    or task != order
+                    or authority != successor_request.get("authority")
+                    or expected.get("terminal_outcome")
+                    != successor_expected.get("terminal_outcome")
+                    or os.path.lexists(
+                        self.executor._intent_path("remove", operation_id))
+                    or os.path.lexists(
+                        self.executor._receipt_path("remove", operation_id))):
+                return False
+        except (AttributeError, KeyError, TypeError, ValueError,
+                repo_executor.RepoExecutorError):
+            return False
+        return repo_executor.RepoExecutor.fence_recovery_lease(
+            dict(blocked_lease))
 
     def reap_workers(self) -> bool:
         progressed = False
@@ -4208,7 +4540,15 @@ class ParallelSupervisor:
             if self.aggregate["status"] not in RUN_TERMINAL | {"blocked"}:
                 self.aggregate = parallel_state.transition_run_status(
                     self.aggregate, "blocked")
-            self.quiesce_blocked()
+            try:
+                self.quiesce_blocked()
+            except (OSError, ValueError, ParallelError,
+                    parallel_state.ParallelStateError,
+                    parallel_spool.SpoolError):
+                # A bounded guardian fence may deliberately retain a live
+                # handle.  Preserve the active owner projection and return the
+                # durable blocked result instead of leaking a CLI exception.
+                self.checkpoint(active=True)
             return 2
 
 
@@ -5100,6 +5440,8 @@ def _publish_recovered_control_responses(
 def _reconcile_executor_lease(
     spec: repo_executor.ImmutableRepoSpec,
     executor: repo_executor.RepoExecutor,
+    *,
+    allowed_blocked_removes: Mapping[int, str] | None = None,
 ) -> tuple[repo_executor.RepoExecutor, dict | None]:
     """Fence and replay the exact nonterminal operation before state recovery.
 
@@ -5108,6 +5450,14 @@ def _reconcile_executor_lease(
     unaudited handoff window.
     """
     try:
+        if (allowed_blocked_removes
+                and executor.blocked_remove_supersession_candidate(
+                    allowed_blocked_removes) is not None):
+            # A repaired cleanup has a new observation token, so exact replay
+            # is guaranteed to reject it.  Leave this byte-stable lease for
+            # reconcile_existing(), which audits aggregate task/outcome state
+            # before issuing an explicitly-authorized successor REMOVE.
+            return executor, None
         result = executor.reconcile_pending_operation(
             recovery_authorizer=repo_executor.RepoExecutor.fence_recovery_lease)
     except repo_executor.RepoExecutorError as exc:
@@ -5371,9 +5721,17 @@ def _recover_existing_parallel(
             # canonical PREFLIGHT/INITIALIZE requests may be fenced and replayed.
             startup_state = supervisor.recover_startup_initialization(
                 reconcile_pending=True,
-                initialize_pristine=not bool(missing_secrets))
+                initialize_pristine=not bool(missing_secrets),
+                pristine_abort_control=(
+                    bootstrap if effective_action == "abort" else None))
+            allowed_blocked_removes = {
+                task["order"]: task["outcome"]
+                for task in supervisor.aggregate["tasks"]
+                if task["resource_state"] in {"cleaning", "cleanup_failed"}
+            }
             executor, _recovered_operation = _reconcile_executor_lease(
-                spec, executor)
+                spec, executor,
+                allowed_blocked_removes=allowed_blocked_removes)
             supervisor.executor = executor
             # First commit any previously claimed live-owner control.  Its
             # response must land before the later bootstrap generation is
@@ -5493,6 +5851,11 @@ def start_parallel(args, workspace_root: Path) -> int:
         raise ParallelError(f"workspace name 不合法：{name!r}")
     config = _runtime_config_from_args(args, repo)
     require_required_secrets(config["environment"])
+    expected_primary_ref, expected_primary_sha = (
+        normalize_expected_primary_identity(
+            getattr(args, "expected_primary_ref", None),
+            getattr(args, "expected_primary_sha", None),
+        ))
     workspace = loop_mod.Workspace(name)
     if workspace.state_path.exists() or workspace.checkpoint_path.exists():
         state = workspace.load_state()
@@ -5542,6 +5905,13 @@ def start_parallel(args, workspace_root: Path) -> int:
             # the same-repository common-dir owner audit has linearized.
             branch, start_sha = _repository_start_identity(
                 repo, owner_fence=launcher_fence)
+            if (expected_primary_ref is not None
+                    and (branch != expected_primary_ref
+                         or start_sha != expected_primary_sha)):
+                raise ParallelError(
+                    "primary branch/HEAD changed after Dashboard launcher handoff："
+                    f"expected {expected_primary_ref}@{expected_primary_sha}, "
+                    f"observed {branch}@{start_sha}")
             run_dir = parallel_state.derive_run_directory(
                 workspace_root, name, run_id)
             gate_command = build_gate_client_command(
@@ -5644,6 +6014,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     _add_runtime_arguments(start)
     start.add_argument("--import-plan", required=True)
     start.add_argument("--expected-plan-sha256", default=None)
+    start.add_argument("--expected-primary-ref", default=None)
+    start.add_argument("--expected-primary-sha", default=None)
     for action in ("resume", "pause", "abort"):
         command = commands.add_parser(action, help=f"{action} 既有 parallel run")
         command.add_argument("name")

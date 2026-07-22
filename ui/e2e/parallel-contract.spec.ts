@@ -64,27 +64,33 @@ test("Parallel controls follow the complete status and terminal-intent matrix", 
     pause: boolean;
     resume: boolean;
     abort: boolean;
+    running?: boolean;
+    pauseLabel?: string;
     resumeLabel?: string;
   }> = [
     { status: "initializing", intent: null, pause: true, resume: false, abort: true },
     { status: "running", intent: null, pause: true, resume: false, abort: true },
-    { status: "pause_requested", intent: null, pause: false, resume: false, abort: true },
+    { status: "pause_requested", intent: null, pause: true, resume: false, abort: true, pauseLabel: "重試 Pause" },
     { status: "paused", intent: null, pause: false, resume: true, abort: true },
     { status: "blocked", intent: null, pause: false, resume: true, abort: true },
     { status: "blocked", intent: "completed", pause: false, resume: true, abort: false, resumeLabel: "重試完成收尾" },
     { status: "blocked", intent: "cancelled", pause: false, resume: true, abort: false, resumeLabel: "重試取消清理" },
     { status: "cancel_requested", intent: "cancelled", pause: false, resume: false, abort: false },
-    { status: "finalizing", intent: "completed", pause: false, resume: false, abort: false },
+    { status: "cancel_requested", intent: "cancelled", pause: false, resume: true, abort: false, running: false, resumeLabel: "重試取消清理" },
+    { status: "finalizing", intent: "completed", pause: false, resume: false, abort: false, resumeLabel: "重試完成收尾" },
+    { status: "finalizing", intent: "completed", pause: false, resume: true, abort: false, running: false, resumeLabel: "重試完成收尾" },
     { status: "finalizing_cancel", intent: "cancelled", pause: false, resume: false, abort: false },
+    { status: "finalizing_cancel", intent: "cancelled", pause: false, resume: true, abort: false, running: false, resumeLabel: "重試取消清理" },
     { status: "completed", intent: "completed", pause: false, resume: false, abort: false },
     { status: "cancelled", intent: "cancelled", pause: false, resume: false, abort: false },
   ];
 
   for (const item of cases) {
     state = supervisorState(item.status, item.intent);
+    workspace.running = item.running ?? true;
     await page.goto("/");
     await expect(page.getByRole("heading", { name: workspace.name })).toBeVisible();
-    const pause = page.getByRole("button", { name: "Pause", exact: true });
+    const pause = page.getByRole("button", { name: item.pauseLabel ?? "Pause", exact: true });
     const resume = page.getByRole("button", {
       name: item.resumeLabel ?? "Resume",
       exact: true,
@@ -115,6 +121,60 @@ test("durable Parallel error remains visible when a recovery control also fails"
   await page.getByRole("button", { name: "Resume", exact: true }).click();
   await expect(page.getByText("primary invariant mismatch", { exact: true })).toBeVisible();
   await expect(page.getByText("錯誤：resume recovery failed", { exact: true })).toBeVisible();
+});
+
+test("terminal Parallel workspace can be deleted without touching the target repo", async ({ page }) => {
+  const workspace: WorkspaceSummary = {
+    name: "parallel-finished", runner: "parallel-supervisor", phase: "done",
+    running: false, round: 2, completed: 1, plan_len: 1, repo: "/repo",
+    parallel: { run_id: "8".repeat(32), status: "completed", batch: 1 },
+  };
+  const state = supervisorState("completed", "completed");
+  state.phase = "done";
+  let deletedName: string | undefined;
+  await mockShell(page, workspace, () => state);
+  await page.route("**/api/delete-workspace", async (route) => {
+    deletedName = (await route.request().postDataJSON()).name;
+    return route.fulfill({ json: { ok: true, deleted: true } });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "刪除", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "確認刪除 Parallel workspace" });
+  await expect(dialog).toContainText("target repo 與已整合 commits 不受影響");
+  await dialog.getByRole("button", { name: "永久刪除", exact: true }).click();
+  await expect.poll(() => deletedName).toBe(workspace.name);
+});
+
+test("transition recovery controls use the idempotent backend routes", async ({ page }) => {
+  const workspace: WorkspaceSummary = {
+    name: "parallel-transition-recovery", runner: "parallel-supervisor", phase: "exec",
+    running: false, round: 2, completed: 0, plan_len: 1, repo: "/repo",
+    parallel: { run_id: "9".repeat(32), status: "pause_requested", batch: 1 },
+  };
+  let state = supervisorState("pause_requested", null);
+  const calls: string[] = [];
+  await mockShell(page, workspace, () => state);
+  for (const [endpoint, action] of [["stop", "pause"], ["abort", "abort"], ["resume", "resume"]] as const) {
+    await page.route(`**/api/${endpoint}`, (route) => {
+      calls.push(action);
+      return route.fulfill({ json: { ok: true } });
+    });
+  }
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "重試 Pause", exact: true }).click();
+  await expect.poll(() => calls).toEqual(["pause"]);
+
+  state = supervisorState("finalizing_cancel", "cancelled");
+  await page.goto("/");
+  await page.getByRole("button", { name: "重試取消清理", exact: true }).click();
+  await expect.poll(() => calls).toEqual(["pause", "resume"]);
+
+  state = supervisorState("finalizing", "completed");
+  await page.goto("/");
+  await page.getByRole("button", { name: "重試完成收尾", exact: true }).click();
+  await expect.poll(() => calls).toEqual(["pause", "resume", "resume"]);
 });
 
 test("managed_readonly is a fail-safe worker route even for legacy runner data", async ({ page }) => {

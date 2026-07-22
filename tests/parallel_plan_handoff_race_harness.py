@@ -88,18 +88,23 @@ def main() -> int:
     def stage(fence, claimed_workspace):
         dashboard._assert_launcher_repo_clean(fence, repo)
         dashboard._prepare_launcher_workspace(claimed_workspace)
-        result = dashboard._stage_parallel_plan(claimed_workspace, plan)
-        dashboard._assert_launcher_repo_clean(fence, repo)
-        return result
+        staged_path, staged_hash = dashboard._stage_parallel_plan(
+            claimed_workspace, plan)
+        primary_ref, primary_sha = dashboard.parallel_mod._repository_start_identity(
+            repo, owner_fence=fence)
+        return staged_path, staged_hash, primary_ref, primary_sha
 
-    staged_path, staged_hash = dashboard._run_dashboard_launcher(
-        repo, args.name, repo_owner.OwnerKind.PARALLEL_LAUNCHER, stage)
+    staged_path, staged_hash, primary_ref, primary_sha = (
+        dashboard._run_dashboard_launcher(
+            repo, args.name, repo_owner.OwnerKind.PARALLEL_LAUNCHER, stage))
     command = dashboard.build_parallel_command(
         "start",
         args.name,
         repo=repo,
         import_plan=staged_path,
         expected_plan_sha256=staged_hash,
+        expected_primary_ref=primary_ref,
+        expected_primary_sha=primary_sha,
         config=_runtime_config(
             repo, agent, validator, args.label,
             agent_ready, agent_finish),
@@ -109,6 +114,8 @@ def main() -> int:
         "task": args.task,
         "staged_path": str(staged_path),
         "staged_sha256": staged_hash,
+        "expected_primary_ref": primary_ref,
+        "expected_primary_sha": primary_sha,
         "argv": command,
     }
     loop_mod.atomic_write_bytes(

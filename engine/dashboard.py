@@ -502,7 +502,19 @@ def dashboard_operation_error(state, operation, *, parallel_action=None,
             label = "Resume" if parallel_action == "resume" else "Abort"
             return f"parallel run 已是終態 {status}，不可 {label}"
         if parallel_action == "resume" and status not in {"paused", "blocked"}:
-            return f"parallel run 目前為 {status}；只有 paused/blocked 可 Resume"
+            # A hard crash can leave the durable completion intent and base
+            # projection in a finalization transition.  The Parallel recovery
+            # owner knows how to replay either durable terminal intent; a live
+            # owner rejects the conflicting control after revalidating session.
+            terminal_intent = (state.get("parallel") or {}).get("terminal_intent")
+            completion_recovery = (
+                status == "finalizing" and terminal_intent == "completed")
+            cancellation_recovery = (
+                status in {"cancel_requested", "finalizing_cancel"}
+                and terminal_intent == "cancelled")
+            if not (completion_recovery or cancellation_recovery):
+                return (f"parallel run 目前為 {status}；只有 paused/blocked 或"
+                        "中斷的 terminal transition 可 Resume")
         if (parallel_action == "abort"
                 and ((state.get("parallel") or {}).get("terminal_intent") == "completed"
                      or status == "finalizing")):
@@ -1026,7 +1038,8 @@ def spawn_ralph(name, repo, *, ralph_cmd, ralph_dir, iterations, tool, model, ar
 
 def build_parallel_command(
         action, name, *, repo=None, import_plan=None, config=None,
-        expected_plan_sha256=None):
+        expected_plan_sha256=None, expected_primary_ref=None,
+        expected_primary_sha=None):
     """Build the exact Dashboard-to-supervisor CLI contract."""
     loop_mod.require_workspace_name(name)
     if action not in {"start", "resume", "pause", "abort"}:
@@ -1062,6 +1075,14 @@ def build_parallel_command(
         expected_plan_sha256)
     if expected_plan_sha256 is not None:
         cmd += ["--expected-plan-sha256", expected_plan_sha256]
+    expected_primary_ref, expected_primary_sha = (
+        parallel_mod.normalize_expected_primary_identity(
+            expected_primary_ref, expected_primary_sha))
+    if expected_primary_ref is not None:
+        cmd += [
+            "--expected-primary-ref", expected_primary_ref,
+            "--expected-primary-sha", expected_primary_sha,
+        ]
     environment = canonical["environment"]
     for addition in environment["path_additions"]:
         cmd += ["--path-addition", addition]
@@ -1082,12 +1103,15 @@ def build_parallel_command(
 
 def spawn_parallel(
         name, repo, *, action, import_plan=None, config=None,
-        expected_plan_sha256=None, env=None, register_supervisor=True,
+        expected_plan_sha256=None, expected_primary_ref=None,
+        expected_primary_sha=None, env=None, register_supervisor=True,
         workspace_prepared=False):
     """Spawn a supervisor or typed control client without touching aggregate."""
     command = build_parallel_command(
         action, name, repo=repo, import_plan=import_plan, config=config,
-        expected_plan_sha256=expected_plan_sha256)
+        expected_plan_sha256=expected_plan_sha256,
+        expected_primary_ref=expected_primary_ref,
+        expected_primary_sha=expected_primary_sha)
     workspace_dir = safe_workspace_dir(name)
     if not workspace_prepared:
         loop_mod.ensure_real_directory(workspace_dir, "workspace 目錄")
@@ -2388,8 +2412,17 @@ def list_workspaces():
                 if runner == "ralph":
                     info["resume_available"] = st.get("phase") != "done"
                 elif runner == parallel_mod.SUPERVISOR_RUNNER:
-                    info["resume_available"] = ((st.get("parallel") or {}).get("status")
-                                                in {"paused", "blocked"})
+                    parallel_state = st.get("parallel") or {}
+                    parallel_status = parallel_state.get("status")
+                    terminal_intent = parallel_state.get("terminal_intent")
+                    info["resume_available"] = (
+                        parallel_status in {"paused", "blocked"}
+                        or (parallel_status == "finalizing"
+                            and terminal_intent == "completed")
+                        or (parallel_status in {
+                                "cancel_requested", "finalizing_cancel"}
+                            and terminal_intent == "cancelled")
+                    )
                 elif runner == "parallel-worker" or st.get("managed_readonly") is True:
                     info["resume_available"] = False
                 else:
@@ -3381,14 +3414,23 @@ class Handler(BaseHTTPRequestHandler):
             def launcher_operation(_fence, claimed_workspace):
                 _assert_launcher_repo_clean(_fence, repo)
                 _prepare_launcher_workspace(claimed_workspace)
-                staged = _stage_parallel_plan(claimed_workspace, normalized)
-                _assert_launcher_repo_clean(_fence, repo)
-                return staged
+                plan_path, plan_sha256 = _stage_parallel_plan(
+                    claimed_workspace, normalized)
+                # Bind the submission to the exact clean branch/HEAD observed
+                # while the launcher still owns the repository.  The spawned
+                # supervisor must compare this pair after its own owner claim,
+                # before publishing any run artifact.
+                primary_ref, primary_sha = (
+                    parallel_mod._repository_start_identity(
+                        repo, owner_fence=_fence))
+                return plan_path, plan_sha256, primary_ref, primary_sha
 
             try:
-                plan_path, plan_sha256 = _run_dashboard_launcher(
+                (plan_path, plan_sha256,
+                 expected_primary_ref, expected_primary_sha) = (
+                    _run_dashboard_launcher(
                     repo, name, repo_owner.OwnerKind.PARALLEL_LAUNCHER,
-                    launcher_operation)
+                    launcher_operation))
             except Exception as exc:
                 self._err(f"Parallel launcher owner 檢查或 pending plan 寫入失敗:{exc}")
                 return
@@ -3396,6 +3438,8 @@ class Handler(BaseHTTPRequestHandler):
                 p = spawn_parallel(
                     name, repo, action="start", import_plan=plan_path,
                     expected_plan_sha256=plan_sha256,
+                    expected_primary_ref=expected_primary_ref,
+                    expected_primary_sha=expected_primary_sha,
                     config=values, env=command_env(cfg), register_supervisor=True,
                     workspace_prepared=True)
             except Exception as exc:

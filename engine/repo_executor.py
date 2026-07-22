@@ -1208,7 +1208,8 @@ class RepoExecutor:
 
     def _reserve(self, operation: Operation, operation_id: str, request_hash: str,
                  expected: dict, request: dict, *,
-                 recovery_authorizer: Callable[[dict], bool] | None) -> dict:
+                 recovery_authorizer: Callable[[dict], bool] | None,
+                 allow_blocked_supersession: bool = False) -> dict:
         recovery_snapshot = None
         with self._short_lock(self.operation_lock_path):
             existing = None
@@ -1227,34 +1228,53 @@ class RepoExecutor:
                 if existing["state"] == "terminal":
                     if compatible:
                         if existing["terminal_status"] == "blocked":
-                            raise LeaseBusy(
-                                "operation is durably blocked:"
-                                f"{existing['reason'] or 'no reason'}")
-                        raise InvariantError(
-                            "terminal operation lease has no durable result")
-                    if existing["operation_id"] == operation_id:
-                        raise InvariantError(
-                            "operation_id is bound to a different terminal lease")
-                    lease = self._new_lease(
-                        operation, operation_id, request_hash, expected, request)
-                    self._atomic_json(self.lease_path, lease)
-                    return lease
-                same_owner = (
-                    compatible
-                    and existing["executor_session"] == self._session
-                    and existing["pid"] == os.getpid()
-                    and existing["executor_creation_token"]
-                    == self._executor_creation_token
-                )
-                if same_owner:
-                    return existing
-                if not compatible:
-                    raise LeaseBusy(
-                        f"nonterminal operation lease 仍在:"
-                        f"{existing['operation']}/{existing['operation_id']}"
+                            # A blocked terminal lease has no immutable result.
+                            # It may only be replaced by an explicit recovery
+                            # owner replaying these exact request bytes after
+                            # contained-child fencing.  Retrying the closed,
+                            # journal-aware operation is what turns "blocked"
+                            # into a proved result; ordinary owners still reject
+                            # the lease until that happens.
+                            recovery_snapshot = json.loads(
+                                json.dumps(existing, allow_nan=False))
+                        else:
+                            raise InvariantError(
+                                "terminal operation lease has no durable result")
+                    else:
+                        if existing["operation_id"] == operation_id:
+                            raise InvariantError(
+                                "operation_id is bound to a different terminal lease")
+                        if existing["terminal_status"] == "blocked":
+                            if not allow_blocked_supersession:
+                                raise LeaseBusy(
+                                    "operation is durably blocked and requires "
+                                    "explicit fenced supersession:"
+                                    f"{existing['reason'] or 'no reason'}")
+                            recovery_snapshot = json.loads(
+                                json.dumps(existing, allow_nan=False))
+                        else:
+                            lease = self._new_lease(
+                                operation, operation_id, request_hash, expected,
+                                request)
+                            self._atomic_json(self.lease_path, lease)
+                            return lease
+                else:
+                    same_owner = (
+                        compatible
+                        and existing["executor_session"] == self._session
+                        and existing["pid"] == os.getpid()
+                        and existing["executor_creation_token"]
+                        == self._executor_creation_token
                     )
-                recovery_snapshot = json.loads(
-                    json.dumps(existing, allow_nan=False))
+                    if same_owner:
+                        return existing
+                    if not compatible:
+                        raise LeaseBusy(
+                            f"nonterminal operation lease 仍在:"
+                            f"{existing['operation']}/{existing['operation_id']}"
+                        )
+                    recovery_snapshot = json.loads(
+                        json.dumps(existing, allow_nan=False))
             else:
                 lease = self._new_lease(
                     operation, operation_id, request_hash, expected, request)
@@ -1266,6 +1286,12 @@ class RepoExecutor:
         # child are gone.  Do that outside the short operation-fence lock, then
         # reacquire it and compare every byte of the observed lease before CAS.
         if recovery_authorizer is None:
+            if (recovery_snapshot is not None
+                    and recovery_snapshot["state"] == "terminal"
+                    and recovery_snapshot["terminal_status"] == "blocked"):
+                raise LeaseBusy(
+                    "operation is durably blocked and requires fenced exact replay:"
+                    f"{recovery_snapshot['reason'] or 'no reason'}")
             raise LeaseBusy("nonterminal operation lease requires fenced recovery")
         try:
             proof_input = json.loads(
@@ -1274,14 +1300,20 @@ class RepoExecutor:
         except Exception as exc:
             raise LeaseBusy("operation lease recovery authorization failed") from exc
         if not authorized:
-            raise LeaseBusy("nonterminal operation lease requires fenced recovery")
+            raise LeaseBusy("operation lease requires explicit fenced recovery")
 
         with self._short_lock(self.operation_lock_path):
             if not os.path.lexists(self.lease_path):
                 raise LeaseBusy("operation lease changed during recovery proof")
             existing = self._read_json(self.lease_path, "operation lease")
             self._validate_lease_shape(existing)
-            if existing != recovery_snapshot or existing["state"] == "terminal":
+            replayable_blocked = (
+                existing["state"] == "terminal"
+                and existing["terminal_status"] == "blocked"
+            )
+            if (existing != recovery_snapshot
+                    or (existing["state"] == "terminal"
+                        and not replayable_blocked)):
                 raise LeaseBusy("operation lease changed during recovery proof")
             lease = self._new_lease(
                 operation, operation_id, request_hash, expected, request)
@@ -1517,11 +1549,23 @@ class RepoExecutor:
             RepoExecutor._validate_lease_shape(snapshot)
         except (RepoExecutorError, TypeError, ValueError):
             return False
-        if snapshot["state"] == "terminal":
+        terminal_blocked = (
+            snapshot["state"] == "terminal"
+            and snapshot["terminal_status"] == "blocked"
+        )
+        if snapshot["state"] == "terminal" and not terminal_blocked:
             return False
-        if compat.process_matches_identity(
+        if (terminal_blocked
+                and snapshot["child_state"] not in {"idle", "reaped"}):
+            return False
+        # A blocked operation has returned control to its executor, so a live
+        # executor process is not itself conflicting authority.  Its current
+        # child identity is still authoritative, however: reaped publication
+        # can race a failed guardian ACK, and exact replay must fence that live
+        # identity before replacing the lease.
+        if (not terminal_blocked and compat.process_matches_identity(
                 snapshot["pid"], snapshot["executor_creation_token"],
-                include_zombie=True):
+                include_zombie=True)):
             return False
         # Older schema-v2 Windows children used a breakaway-capable Job.  Even
         # their durable ``reaped``/``idle`` checkpoints cannot prove that an
@@ -1607,27 +1651,103 @@ class RepoExecutor:
         return self._execute_request(
             request, recovery_authorizer=authorizer)
 
+    def supersede_blocked_operation(
+            self, request: dict, *,
+            recovery_authorizer: Callable[[dict], bool]) -> dict:
+        """Replace one blocked lease with an explicitly-authorized successor.
+
+        Exact crash replay belongs to :meth:`reconcile_operation`.  This
+        narrower escape hatch is for protocols that have separately published
+        immutable authority for a *different* successor request.  ``_reserve``
+        supplies the complete blocked lease to the authorizer outside the
+        short lock, then performs a byte-for-byte compare-and-swap.  Ordinary
+        ``execute`` and every exact-replay API deliberately leave this mode
+        disabled, even when the executor has a default recovery authorizer.
+        """
+        if not callable(recovery_authorizer):
+            raise AuthorityError("recovery_authorizer must be callable")
+        return self._execute_request(
+            request,
+            recovery_authorizer=recovery_authorizer,
+            allow_blocked_supersession=True,
+        )
+
     def reconcile_pending_operation(
             self, *,
             recovery_authorizer: Callable[[dict], bool] | None = None,
     ) -> dict | None:
-        """Load and replay the exact request from a nonterminal durable lease."""
+        """Replay an exact nonterminal or durably-blocked operation lease.
+
+        A blocked terminal lease has no immutable result and therefore cannot
+        authorize ordinary repo reuse.  Parallel recovery must replay the same
+        closed operation after fencing; a second deterministic refusal remains
+        blocked, while a successful replay publishes the missing result.
+        """
         self._start()
         with self._short_lock(self.operation_lock_path):
             if not os.path.lexists(self.lease_path):
                 return None
             lease = self._read_json(self.lease_path, "operation lease")
             self._validate_lease_shape(lease)
-            if lease["state"] == "terminal":
+            if (lease["state"] == "terminal"
+                    and lease["terminal_status"] != "blocked"):
                 return None
             request = json.loads(json.dumps(lease["request"], allow_nan=False))
         return self.reconcile_operation(
             request, recovery_authorizer=recovery_authorizer)
 
+    def blocked_remove_supersession_candidate(
+            self, allowed_blocked_removes: Mapping[int, str]) -> dict | None:
+        """Return an exact pre-intent blocked REMOVE that recovery may defer.
+
+        Generic lease recovery must exact-replay every other pending/blocked
+        operation.  A cleanup refusal is different: an operator repair changes
+        its observation token, so the aggregate cleanup protocol must publish a
+        new REMOVE request through :meth:`supersede_blocked_operation`.
+        """
+        if not isinstance(allowed_blocked_removes, Mapping):
+            raise AuthorityError(
+                "allowed_blocked_removes must be a task/outcome mapping")
+        allowed: dict[int, str] = {}
+        for task, outcome in allowed_blocked_removes.items():
+            task_id = _require_positive_int(task, "blocked remove task")
+            if outcome not in {"integrated", "blocked", "cancelled"}:
+                raise AuthorityError(
+                    "blocked remove terminal outcome is invalid")
+            allowed[task_id] = str(outcome)
+
+        self._start()
+        with self._short_lock(self.operation_lock_path):
+            if not os.path.lexists(self.lease_path):
+                return None
+            lease = self._read_json(self.lease_path, "operation lease")
+            self._validate_lease_shape(lease)
+            if (lease["state"] != "terminal"
+                    or lease["terminal_status"] != "blocked"
+                    or lease["immutable_spec_hash"] != self.authority_hash):
+                return None
+            try:
+                operation, operation_id, task, _authority, expected = (
+                    self._validate_request(lease["request"]))
+            except RepoExecutorError:
+                return None
+            if (operation != Operation.REMOVE_WORKTREE
+                    or lease["operation"] != operation.value
+                    or lease["operation_id"] != operation_id
+                    or lease["request_hash"] != canonical_hash(lease["request"])
+                    or task not in allowed
+                    or expected.get("terminal_outcome") != allowed[task]
+                    or os.path.lexists(self._intent_path("remove", operation_id))
+                    or os.path.lexists(
+                        self._receipt_path("remove", operation_id))):
+                return None
+            return json.loads(json.dumps(lease, allow_nan=False))
+
     def _execute_request(
             self, request: dict, *,
             recovery_authorizer: Callable[[dict], bool] | None,
-            required_operation: Operation | None = None) -> dict:
+            required_operation: Operation | None = None,
+            allow_blocked_supersession: bool = False) -> dict:
         operation, operation_id, task, _authority, expected = self._validate_request(request)
         if required_operation is not None and operation != required_operation:
             raise AuthorityError(
@@ -1638,20 +1758,55 @@ class RepoExecutor:
         if cached is not None:
             if operation != Operation.PREFLIGHT:
                 self._validated_run_artifacts()
-            # A crash may happen after the result commit but before lease terminalization.
-            try:
+            # A crash may happen after the immutable result commit but before
+            # lease terminalization.  Never return that result while its exact
+            # current lease remains pending/blocked: recover the lease by the
+            # same fencing/CAS protocol, then terminalize without redispatching
+            # the already-completed operation.  A newer unrelated lease may
+            # coexist with this historical idempotency result.
+            exact_current_lease = False
+            with self._short_lock(self.operation_lock_path):
+                if os.path.lexists(self.lease_path):
+                    lease = self._read_json(
+                        self.lease_path, "cached-result operation lease")
+                    self._validate_lease_shape(lease)
+                    if lease["operation_id"] == operation_id:
+                        compatible = (
+                            lease["operation"] == operation.value
+                            and lease["request_hash"] == request_hash
+                            and lease["immutable_spec_hash"] == self.authority_hash
+                            and lease["expected"] == expected
+                            and lease["request"] == request
+                        )
+                        if not compatible:
+                            raise InvariantError(
+                                "cached operation_id is bound to a different lease")
+                        if (lease["state"] == "terminal"
+                                and lease["terminal_status"] != "blocked"):
+                            if (lease["terminal_status"]
+                                    != cached.get("status", "completed")
+                                    or lease["result_hash"]
+                                    != canonical_hash(cached)):
+                                raise InvariantError(
+                                    "cached result conflicts with terminal lease")
+                            return cached
+                        exact_current_lease = True
+            if exact_current_lease:
+                self._reserve(
+                    operation, operation_id, request_hash, expected, request,
+                    recovery_authorizer=recovery_authorizer,
+                )
+                self._mark_running(operation_id, request_hash)
                 self._mark_terminal(
-                    operation_id, request_hash, status=cached.get("status", "completed"),
+                    operation_id, request_hash,
+                    status=cached.get("status", "completed"),
                     result=cached,
                 )
-            except (InvariantError, LeaseBusy):
-                # A later terminal lease is allowed; the per-operation result is
-                # the durable idempotency authority.
-                pass
             return cached
         self._reserve(
             operation, operation_id, request_hash, expected, request,
             recovery_authorizer=recovery_authorizer,
+            allow_blocked_supersession=allow_blocked_supersession,
         )
         self._mark_running(operation_id, request_hash)
         if self._active_operation_id is not None:
@@ -3093,8 +3248,13 @@ class RepoExecutor:
                 intent = self._read_json(intent_path, "remove intent")
                 self._artifact_matches(
                     intent, authority_without_head, "remove intent")
-                observed_head = _require_sha(
-                    intent.get("observed_head"), "remove intent observed_head")
+                if "observed_head" not in intent:
+                    raise InvariantError(
+                        "remove intent lacks observed_head authority")
+                observed_head_raw = intent["observed_head"]
+                observed_head = (
+                    None if observed_head_raw is None else _require_sha(
+                        observed_head_raw, "remove intent observed_head"))
                 authority = {**authority_without_head, "observed_head": observed_head}
                 if intent.get("state") not in {"prepared", "committed"}:
                     raise InvariantError("remove intent state is invalid")
@@ -3105,13 +3265,24 @@ class RepoExecutor:
                 if observation["observation_token"] != expected["observation_token"]:
                     raise InvariantError(
                         "worktree observation token expired; refusing TOCTOU cleanup")
-                if (not observation["exists"] or not observation["registered"]
-                        or observation["head_ref"] != task_ref
-                        or observation["status"] or observation["locked"]
-                        or observation["live_locks"]):
-                    raise InvariantError(
-                        "worktree dirty/locked/unregistered/ref identity cannot be cleaned")
-                observed_head = _require_sha(observation["head"], "observed_head")
+                fully_absent = (
+                    not observation["exists"]
+                    and not observation["registered"]
+                    and observation.get("task_ref_tip") is None
+                )
+                if fully_absent:
+                    observed_head = None
+                else:
+                    if (not observation["exists"]
+                            or not observation["registered"]
+                            or observation["head_ref"] != task_ref
+                            or observation["status"] or observation["locked"]
+                            or observation["live_locks"]):
+                        raise InvariantError(
+                            "worktree dirty/locked/unregistered/ref identity "
+                            "cannot be cleaned")
+                    observed_head = _require_sha(
+                        observation["head"], "observed_head")
                 authority = {**authority_without_head, "observed_head": observed_head}
                 intent = {**authority, "state": "prepared", "prepared_at": _now()}
                 self._atomic_json(intent_path, intent)
@@ -3144,6 +3315,9 @@ class RepoExecutor:
                 path_present = os.path.lexists(target)
                 registered = target in records
                 if path_present and registered:
+                    if observed_head is None:
+                        raise InvariantError(
+                            "absent cleanup authority conflicts with live worktree")
                     current = self.observe_worktree(task)
                     if (current["observation_token"] != expected["observation_token"]
                             or current["head"] != observed_head
@@ -3161,7 +3335,11 @@ class RepoExecutor:
                     raise InvariantError(
                         "git worktree remove did not remove canonical resource")
                 ref_tip = self._ref_tip(task_ref)
-                if ref_tip == observed_head:
+                if observed_head is None:
+                    if ref_tip is not None:
+                        raise InvariantError(
+                            "absent cleanup authority conflicts with task ref")
+                elif ref_tip == observed_head:
                     self._git("update-ref", "-d", task_ref, observed_head)
                 elif ref_tip is not None:
                     raise InvariantError("cleanup task ref was moved by another actor")
@@ -3178,7 +3356,8 @@ class RepoExecutor:
                     "receipt_hash": receipt["receipt_hash"],
                 })
                 self._atomic_json(intent_path, intent)
-                status = "removed"
+                status = (
+                    "already-removed" if observed_head is None else "removed")
         return {
             "operation": Operation.REMOVE_WORKTREE.value,
             "operation_id": operation_id,

@@ -319,6 +319,24 @@ class TestParallelSupervisorRecovery(unittest.TestCase):
         executor._atomic_json(executor.lease_path, lease)
         return lease
 
+    def publish_claimed_abort_control(self, aggregate: dict) -> dict:
+        record = {
+            "schema": 1, "run_id": RUN_ID, "request_id": "f" * 32,
+            "action": "abort", "state": "claimed",
+            "expected_supervisor_generation": 1,
+            "expected_aggregate_version": aggregate["version"],
+            "expected_control_generation": aggregate["control_generation"],
+            "created_at": "2026-07-22T00:00:00+00:00",
+            "claimed_by": {
+                "session": "6" * 32, "generation": 2,
+                "claimed_at": "2026-07-22T00:00:01+00:00",
+            },
+            "assigned_control_generation": aggregate["control_generation"] + 1,
+            "applied": None,
+        }
+        parallel._write_bootstrap_control(self.artifacts, record)
+        return record
+
     def publish_initial_base_projection(self):
         workspace = loop_mod.Workspace("base")
         aggregate = parallel_state.build_initial_aggregate(
@@ -791,6 +809,129 @@ class TestParallelSupervisorRecovery(unittest.TestCase):
         self.assertEqual(
             recovered.aggregate["tasks"][0]["resource_state"], "cleaned")
         self.assertFalse(executor.worktree_path(1).exists())
+
+    def test_cleanup_retry_journals_operator_removed_resource(self):
+        executor = self.true_executor()
+        aggregate = parallel_state.build_initial_aggregate(
+            RUN_ID, self.artifacts.plan)
+        aggregate = parallel_state.transition_task(
+            aggregate, 1, resource_state="provisioning")
+        aggregate = parallel_state.transition_task(
+            aggregate, 1, resource_state="running")
+        aggregate = parallel_state.set_terminal_intent(
+            aggregate, "cancelled")
+        aggregate = parallel_state.transition_run_status(
+            aggregate, "cancel_requested")
+        aggregate = parallel_state.transition_task(
+            aggregate, 1, outcome="cancelled", resource_state="exited",
+            explicit_abort=True)
+        supervisor = self.supervisor(aggregate, executor)
+        dirty = executor.worktree_path(1) / "dirty.txt"
+        dirty.write_text("dirty\n", encoding="utf-8")
+        with (mock.patch.object(supervisor, "checkpoint"),
+              self.assertRaisesRegex(parallel.ParallelError, "cleanup failed")):
+            supervisor._cleanup_terminal_task(1)
+        blocked = repo_executor.RepoExecutor._read_json(
+            executor.lease_path, "test blocked remove before manual cleanup")
+
+        git(self.repo, "worktree", "remove", "--force",
+            str(executor.worktree_path(1)))
+        git(self.repo, "update-ref", "-d", executor.task_ref(1))
+        recovered = parallel.ParallelSupervisor(
+            workspace_root=self.workspace_root,
+            workspace=mock.Mock(),
+            artifacts=self.artifacts,
+            aggregate=supervisor.aggregate,
+            executor=executor,
+            pending_launch_hash=PENDING_LAUNCH_HASH,
+            session="6" * 32,
+            generation=2,
+            bootstrap_required=False,
+        )
+        with mock.patch.object(recovered, "checkpoint"):
+            recovered._reconcile_cleanup(1)
+
+        self.assertEqual(
+            recovered.aggregate["tasks"][0]["resource_state"], "cleaned")
+        latest = repo_executor.RepoExecutor._read_json(
+            executor.lease_path, "test absent cleanup successor")
+        self.assertEqual(latest["terminal_status"], "already-removed")
+        self.assertEqual(latest["reason"], f"recovered-from:{blocked['nonce']}")
+
+    def test_public_resume_defers_and_supersedes_repaired_cleanup_lease(self):
+        workspace, _initial = self.publish_initial_base_projection()
+        pending_hash = parallel._pending_launch_hash(self.artifacts)
+        spec = parallel.build_repo_spec(
+            self.artifacts,
+            pending_launch_hash=pending_hash,
+            supervisor_session=SESSION,
+            generation=1,
+        )
+        executor = repo_executor.RepoExecutor(spec)
+        self.addCleanup(executor.close)
+        aggregate = parallel_state.build_initial_aggregate(
+            RUN_ID, self.artifacts.plan)
+        supervisor = parallel.ParallelSupervisor(
+            workspace_root=self.workspace_root,
+            workspace=workspace,
+            artifacts=self.artifacts,
+            aggregate=aggregate,
+            executor=executor,
+            pending_launch_hash=pending_hash,
+            session=SESSION,
+            generation=1,
+            bootstrap_required=False,
+        )
+        supervisor.preflight_and_initialize()
+        supervisor._create_worktree(1)
+        aggregate = parallel_state.transition_task(
+            aggregate, 1, resource_state="provisioning")
+        aggregate = parallel_state.transition_task(
+            aggregate, 1, resource_state="running")
+        aggregate = parallel_state.set_terminal_intent(
+            aggregate, "cancelled")
+        aggregate = parallel_state.transition_run_status(
+            aggregate, "cancel_requested")
+        aggregate = parallel_state.transition_task(
+            aggregate, 1, outcome="cancelled", resource_state="exited",
+            explicit_abort=True)
+        supervisor.aggregate = aggregate
+        dirty = executor.worktree_path(1) / "dirty.txt"
+        dirty.write_text("dirty\n", encoding="utf-8")
+        with self.assertRaisesRegex(parallel.ParallelError, "cleanup failed"):
+            supervisor._cleanup_terminal_task(1)
+        supervisor.checkpoint(active=False)
+        blocked = repo_executor.RepoExecutor._read_json(
+            executor.lease_path, "test public blocked cleanup lease")
+        self.assertEqual(blocked["terminal_status"], "blocked")
+        self.assertFalse(executor._intent_path(
+            "remove", blocked["operation_id"]).exists())
+        executor.close()
+        dirty.unlink()
+
+        observed = {}
+
+        def finish_after_reconcile(recovered):
+            observed["supervisor"] = recovered
+            return 0
+
+        with mock.patch.object(
+                parallel.ParallelSupervisor, "abort",
+                autospec=True, side_effect=finish_after_reconcile):
+            result = parallel.control_existing_parallel(
+                self.workspace_root, workspace.name, "resume")
+
+        self.assertEqual(result, 0)
+        recovered = observed["supervisor"]
+        self.assertEqual(
+            recovered.aggregate["tasks"][0]["resource_state"], "cleaned")
+        self.assertFalse(recovered.executor.worktree_path(1).exists())
+        latest = repo_executor.RepoExecutor._read_json(
+            recovered.executor.lease_path, "test superseded cleanup lease")
+        self.assertEqual(
+            latest["operation"], repo_executor.Operation.REMOVE_WORKTREE.value)
+        self.assertIn(latest["terminal_status"], {"removed", "already-removed"})
+        self.assertEqual(latest["reason"], f"recovered-from:{blocked['nonce']}")
 
     def test_claimed_abort_dominates_later_resume_and_is_acknowledged(self):
         spool = parallel_spool.DurableSpool(
@@ -1384,6 +1525,108 @@ class TestParallelSupervisorRecovery(unittest.TestCase):
         # owner recovery is separate, so the successful Abort owns generation 3.
         self.assertEqual(recovered.generation, 3)
 
+    def test_no_owner_abort_recovers_permanently_blocked_pristine_preflight(self):
+        workspace, aggregate = self.publish_initial_base_projection()
+        shutil.rmtree(loop_mod.Workspace(
+            self.artifacts.assignments[1]["worker_workspace"]).dir)
+        pending_hash = parallel._pending_launch_hash(self.artifacts)
+        spec = parallel.build_repo_spec(
+            self.artifacts,
+            pending_launch_hash=pending_hash,
+            supervisor_session=SESSION,
+            generation=1,
+        )
+        executor = repo_executor.RepoExecutor(spec)
+        supervisor = parallel.ParallelSupervisor(
+            workspace_root=self.workspace_root,
+            workspace=workspace,
+            artifacts=self.artifacts,
+            aggregate=aggregate,
+            executor=executor,
+            pending_launch_hash=pending_hash,
+            session=SESSION,
+            generation=1,
+            bootstrap_required=False,
+        )
+        request = supervisor._preflight_request()
+        lease = self.reserve_operation(executor, request)
+        executor._mark_terminal(
+            request["operation_id"], lease["request_hash"],
+            status="blocked", reason="validator permanently unavailable")
+        executor.close()
+
+        with mock.patch.object(
+                repo_executor.RepoExecutor, "_preflight",
+                side_effect=AssertionError("Abort reran validator")) as validator:
+            result = parallel.control_existing_parallel(
+                self.workspace_root, workspace.name, "abort")
+
+        validator.assert_not_called()
+        recovered = parallel._load_existing_parallel_run(
+            self.workspace_root, workspace.name)
+        self.assertEqual(result, 0, recovered.aggregate)
+        self.assertEqual(recovered.aggregate["status"], "cancelled")
+        self.assertEqual(recovered.generation, 2)
+        self.assertFalse((
+            executor.results_dir / f'{request["operation_id"]}.json').exists())
+        latest = repo_executor.RepoExecutor._read_json(
+            executor.lease_path, "test terminal Abort lease")
+        self.assertEqual(
+            latest["operation"], repo_executor.Operation.SHUTDOWN.value)
+        self.assertEqual(latest["terminal_status"], "shutdown")
+        self.assertEqual(
+            git(self.repo, "rev-parse", executor.sync_ref).stdout.strip(), self.start)
+
+    def test_pristine_abort_survives_crash_after_bootstrap_apply(self):
+        workspace, aggregate = self.publish_initial_base_projection()
+        shutil.rmtree(loop_mod.Workspace(
+            self.artifacts.assignments[1]["worker_workspace"]).dir)
+        pending_hash = parallel._pending_launch_hash(self.artifacts)
+        spec = parallel.build_repo_spec(
+            self.artifacts,
+            pending_launch_hash=pending_hash,
+            supervisor_session=SESSION,
+            generation=1,
+        )
+        executor = repo_executor.RepoExecutor(spec)
+        supervisor = parallel.ParallelSupervisor(
+            workspace_root=self.workspace_root, workspace=workspace,
+            artifacts=self.artifacts, aggregate=aggregate, executor=executor,
+            pending_launch_hash=pending_hash, session=SESSION, generation=1,
+            bootstrap_required=False,
+        )
+        request = supervisor._preflight_request()
+        lease = self.reserve_operation(executor, request)
+        executor._mark_terminal(
+            request["operation_id"], lease["request_hash"],
+            status="blocked", reason="validator permanently unavailable")
+        executor.close()
+
+        with mock.patch.object(
+                parallel.ParallelSupervisor, "reconcile_existing",
+                side_effect=KeyboardInterrupt):
+            first = parallel.control_existing_parallel(
+                self.workspace_root, workspace.name, "abort")
+        interrupted = parallel._load_existing_parallel_run(
+            self.workspace_root, workspace.name)
+        self.assertEqual(first, 2)
+        self.assertEqual(interrupted.aggregate["status"], "blocked")
+        self.assertEqual(
+            interrupted.aggregate["terminal_intent"], "cancelled")
+        old_bootstrap = parallel._read_bootstrap_control(self.artifacts)
+        self.assertEqual(old_bootstrap["state"], "applied")
+
+        second = parallel.control_existing_parallel(
+            self.workspace_root, workspace.name, "resume")
+        recovered = parallel._load_existing_parallel_run(
+            self.workspace_root, workspace.name)
+        self.assertEqual(second, 0, recovered.aggregate)
+        self.assertEqual(recovered.aggregate["status"], "cancelled")
+        new_bootstrap = parallel._read_bootstrap_control(self.artifacts)
+        self.assertNotEqual(
+            new_bootstrap["request_id"], old_bootstrap["request_id"])
+        self.assertEqual(new_bootstrap["state"], "applied")
+
     def test_pristine_startup_recovery_replays_preflight_and_initialize_once(self):
         executor = self.pristine_executor()
         aggregate = parallel_state.build_initial_aggregate(
@@ -1502,7 +1745,7 @@ class TestParallelSupervisorRecovery(unittest.TestCase):
         supervisor = self.supervisor(aggregate, executor)
 
         with self.assertRaisesRegex(
-                parallel.ParallelError, "non-canonical pending lease"):
+                parallel.ParallelError, "non-canonical pending/blocked lease"):
             supervisor.recover_startup_initialization(
                 reconcile_pending=True)
 
@@ -1540,7 +1783,7 @@ class TestParallelSupervisorRecovery(unittest.TestCase):
         executor.close()
 
         with self.assertRaisesRegex(
-                parallel.ParallelError, "non-canonical pending lease"):
+                parallel.ParallelError, "non-canonical pending/blocked lease"):
             parallel.control_existing_parallel(
                 self.workspace_root, workspace.name, "abort")
 
@@ -1565,6 +1808,153 @@ class TestParallelSupervisorRecovery(unittest.TestCase):
         self.assertTrue(supervisor.recover_startup_initialization(
             reconcile_pending=True))
         self.assertEqual(executor.audit_recovery_state()["sync_sha"], self.start)
+
+    def test_blocked_canonical_preflight_exact_replay_can_initialize(self):
+        executor = self.pristine_executor()
+        aggregate = parallel_state.build_initial_aggregate(
+            RUN_ID, self.artifacts.plan)
+        supervisor = self.supervisor(aggregate, executor)
+        request = supervisor._preflight_request()
+        lease = self.reserve_operation(executor, request)
+        executor._mark_terminal(
+            request["operation_id"], lease["request_hash"],
+            status="blocked", reason="transient validator failure")
+
+        self.assertTrue(supervisor.recover_startup_initialization(
+            reconcile_pending=True))
+
+        audit = executor.audit_recovery_state()
+        self.assertEqual(audit["sync_sha"], self.start)
+        preflight_result = executor._read_json(
+            executor.results_dir / f'{request["operation_id"]}.json',
+            "test recovered PREFLIGHT result")
+        self.assertEqual(preflight_result["result"]["status"], "validated")
+
+    def test_pristine_abort_bypasses_blocked_validator_but_initializes_sync_ref(self):
+        executor = self.pristine_executor()
+        aggregate = parallel_state.build_initial_aggregate(
+            RUN_ID, self.artifacts.plan)
+        supervisor = self.supervisor(aggregate, executor)
+        request = supervisor._preflight_request()
+        lease = self.reserve_operation(executor, request)
+        executor._mark_terminal(
+            request["operation_id"], lease["request_hash"],
+            status="blocked", reason="validator remains unavailable")
+        control = self.publish_claimed_abort_control(aggregate)
+
+        with mock.patch.object(executor, "_preflight") as validator:
+            self.assertTrue(supervisor.recover_startup_initialization(
+                reconcile_pending=True, pristine_abort_control=control))
+
+        validator.assert_not_called()
+        self.assertFalse((
+            executor.results_dir / f'{request["operation_id"]}.json').exists())
+        self.assertEqual(executor._ref_tip(executor.sync_ref), self.start)
+        latest = executor._read_json(
+            executor.lease_path, "test pristine Abort INIT lease")
+        self.assertEqual(
+            latest["operation"],
+            repo_executor.Operation.INITIALIZE_RUN_REFS.value)
+        self.assertEqual(latest["terminal_status"], "initialized")
+
+    def test_unvalidated_pending_init_without_abort_authority_is_rejected(self):
+        executor = self.pristine_executor()
+        aggregate = parallel_state.build_initial_aggregate(
+            RUN_ID, self.artifacts.plan)
+        supervisor = self.supervisor(aggregate, executor)
+        control = self.publish_claimed_abort_control(aggregate)
+        self.reserve_operation(executor, supervisor._initialize_refs_request())
+
+        with self.assertRaisesRegex(
+                parallel.ParallelError,
+                "pristine Abort initialization authority unavailable"):
+            supervisor.recover_startup_initialization(
+                reconcile_pending=True, pristine_abort_control=control)
+
+        self.assertIsNone(executor._ref_tip(executor.sync_ref))
+
+    def test_pristine_abort_marker_cannot_switch_claim_before_cancel_checkpoint(self):
+        executor = self.pristine_executor()
+        aggregate = parallel_state.build_initial_aggregate(
+            RUN_ID, self.artifacts.plan)
+        supervisor = self.supervisor(aggregate, executor)
+        preflight = supervisor._preflight_request()
+        initialize = supervisor._initialize_refs_request()
+        lease = self.reserve_operation(executor, preflight)
+        executor._mark_terminal(
+            preflight["operation_id"], lease["request_hash"],
+            status="blocked", reason="validator unavailable")
+        blocked = executor._read_json(
+            executor.lease_path, "test blocked PREFLIGHT lease")
+        first = self.publish_claimed_abort_control(aggregate)
+        authority = supervisor._publish_pristine_abort_init_authority(
+            preflight, initialize, blocked, first)
+        tampered = dict(authority)
+        tampered["blocked_preflight_lease_hash"] = "0" * 64
+        self.assertFalse(
+            supervisor._authorize_pristine_abort_init_supersession(
+                blocked, tampered, preflight, initialize))
+
+        second = dict(first)
+        second["request_id"] = "e" * 32
+        second["claimed_by"] = {
+            "session": "7" * 32, "generation": 3,
+            "claimed_at": "2026-07-22T00:00:02+00:00",
+        }
+        parallel._write_bootstrap_control(self.artifacts, second)
+        with self.assertRaisesRegex(
+                parallel.ParallelError,
+                "pristine Abort initialization authority mismatch"):
+            supervisor._audit_pristine_abort_init_authority(
+                preflight, initialize, second)
+
+    def test_pristine_abort_init_crash_after_ref_replays_from_immutable_authority(self):
+        executor = self.pristine_executor()
+        aggregate = parallel_state.build_initial_aggregate(
+            RUN_ID, self.artifacts.plan)
+        supervisor = self.supervisor(aggregate, executor)
+        preflight = supervisor._preflight_request()
+        lease = self.reserve_operation(executor, preflight)
+        executor._mark_terminal(
+            preflight["operation_id"], lease["request_hash"],
+            status="blocked", reason="validator remains unavailable")
+        control = self.publish_claimed_abort_control(aggregate)
+        armed = {"initialize.after_ref"}
+
+        def inject(point):
+            if point in armed:
+                armed.remove(point)
+                raise RuntimeError("crash after private sync ref")
+
+        executor._fault_injector = inject
+        with self.assertRaisesRegex(
+                parallel.ParallelError, "unexpected failure"):
+            supervisor.recover_startup_initialization(
+                reconcile_pending=True, pristine_abort_control=control)
+        self.assertTrue((
+            self.artifacts.run_dir
+            / "startup/pristine-abort-init.json").is_file())
+        interrupted = executor._read_json(
+            executor.lease_path, "test interrupted Abort INIT lease")
+        self.assertEqual(
+            interrupted["operation"],
+            repo_executor.Operation.INITIALIZE_RUN_REFS.value)
+        self.assertEqual(interrupted["terminal_status"], "blocked")
+        executor.close()
+
+        recovered_executor = repo_executor.RepoExecutor(executor.spec)
+        self.addCleanup(recovered_executor.close)
+        recovered = self.supervisor(aggregate, recovered_executor)
+        with mock.patch.object(recovered_executor, "_preflight") as validator:
+            recovered.recover_startup_initialization(
+                reconcile_pending=True, pristine_abort_control=control)
+
+        validator.assert_not_called()
+        self.assertEqual(
+            recovered_executor._ref_tip(recovered_executor.sync_ref), self.start)
+        latest = recovered_executor._read_json(
+            recovered_executor.lease_path, "test recovered Abort INIT lease")
+        self.assertEqual(latest["terminal_status"], "initialized")
 
     def test_pending_canonical_init_requires_and_uses_preflight_proof(self):
         executor = self.pristine_executor()

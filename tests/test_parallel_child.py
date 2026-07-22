@@ -379,6 +379,28 @@ class TestGuardianProtocol(unittest.TestCase):
         self.counter += 1
         return f"{self.counter:032x}"
 
+    def test_payload_force_fence_has_no_unbounded_final_wait(self):
+        process = mock.Mock()
+        process.args = ["payload"]
+        process.poll.return_value = None
+        timeouts = [
+            subprocess.TimeoutExpired(process.args, 5),
+            subprocess.TimeoutExpired(process.args, 5),
+        ]
+        with mock.patch.object(
+                compat, "fence_process_tree", return_value=True), \
+                mock.patch.object(
+                    compat, "wait_process", side_effect=timeouts) as wait:
+            with self.assertRaisesRegex(
+                    parallel_child.ParallelChildError, "bounded force fence"):
+                parallel_child._terminate_payload(process)
+
+        self.assertEqual(
+            wait.call_args_list,
+            [mock.call(process, timeout=5), mock.call(process, timeout=5)],
+        )
+        process.kill.assert_called_once_with()
+
     def _spawn(self, payload, *, recorded_hash=None, recorded_pid=None):
         child_id = self._next_child_id()
         argv = parallel_child.build_guardian_argv(

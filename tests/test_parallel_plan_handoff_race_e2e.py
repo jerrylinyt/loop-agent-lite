@@ -13,8 +13,11 @@ import time
 import unittest
 from pathlib import Path
 
+from engine import dashboard
+from engine import loop as loop_mod
 from engine import parallel_state
 from engine import platform_compat as compat
+from engine import repo_owner
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -33,6 +36,110 @@ def _read_json(path: Path):
 
 @unittest.skipUnless(shutil.which("git"), "requires git")
 class TestParallelPlanHandoffRaceEndToEnd(unittest.TestCase):
+    def test_primary_commit_between_staging_and_spawn_fails_before_run_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            workspace_root = root / "workspaces"
+            repo.mkdir()
+            workspace_root.mkdir()
+            _git(repo, "init", "-q")
+            _git(repo, "config", "user.name", "Handoff Drift")
+            _git(repo, "config", "user.email", "drift@example.invalid")
+            (repo / "goal.md").write_text("# Goal\n", encoding="utf-8")
+            _git(repo, "add", "goal.md")
+            _git(repo, "commit", "-qm", "initial")
+            old_dashboard_root = dashboard.ROOT
+            old_workspace_root = loop_mod.WORKSPACE_ROOT
+            dashboard.ROOT = workspace_root
+            loop_mod.WORKSPACE_ROOT = workspace_root
+            try:
+                plan = [{
+                    "order": 1, "task": "must never dispatch",
+                    "ref": None, "stack": 1,
+                }]
+
+                def stage(fence, claimed_workspace):
+                    dashboard._prepare_launcher_workspace(claimed_workspace)
+                    staged_path, staged_hash = dashboard._stage_parallel_plan(
+                        claimed_workspace, plan)
+                    primary_ref, primary_sha = (
+                        dashboard.parallel_mod._repository_start_identity(
+                            repo, owner_fence=fence))
+                    return staged_path, staged_hash, primary_ref, primary_sha
+
+                (staged_path, staged_hash,
+                 expected_ref, expected_sha) = dashboard._run_dashboard_launcher(
+                    repo, "handoff-drift",
+                    repo_owner.OwnerKind.PARALLEL_LAUNCHER, stage)
+
+                mutator_workspace = workspace_root / "legal-mutator"
+                mutator_workspace.mkdir()
+                fence = repo_owner.RepoOwnerFence.claim(
+                    repo,
+                    owner_kind=repo_owner.OwnerKind.DASHBOARD_LAUNCHER,
+                    workspace=mutator_workspace,
+                    state_path=mutator_workspace / "state.json",
+                )
+                try:
+                    (repo / "drift.txt").write_text("new head\n", encoding="utf-8")
+                    dashboard._run_launcher_git(fence, repo, "add", "drift.txt")
+                    dashboard._run_launcher_git(
+                        fence, repo, "commit", "-m", "legal handoff drift")
+                    fence.terminalize("legal-mutator-completed")
+                finally:
+                    fence.close()
+                self.assertNotEqual(
+                    _git(repo, "rev-parse", "HEAD").stdout.strip(), expected_sha)
+
+                config = {
+                    "repo": str(repo), "goal": "goal.md", "plan_doc": "",
+                    "agent_cmd": "agent --must-not-run",
+                    "validate_cmd": compat.join_command([
+                        sys.executable, "-c", "raise SystemExit(0)"],),
+                    "notify_cmd": "", "flag_threshold": 2,
+                    "done_threshold": 1, "red_limit": 3, "stall_limit": 4,
+                    "stuck_stop": False, "stuck_stop_count": 5,
+                    "round_timeout": 1.0, "agent_backoff_max": 1.0,
+                    "validate_timeout": 5.0, "max_parallel": 1,
+                    "worker_restart_limit": 1,
+                    "environment": {
+                        "path_additions": [], "non_secret": {},
+                        "required_secret_names": [],
+                    },
+                }
+                command = dashboard.build_parallel_command(
+                    "start", "handoff-drift", repo=repo,
+                    import_plan=staged_path,
+                    expected_plan_sha256=staged_hash,
+                    expected_primary_ref=expected_ref,
+                    expected_primary_sha=expected_sha,
+                    config=config,
+                )
+                environment = dict(os.environ)
+                environment["LOOP_AGENT_WORKSPACE_ROOT"] = str(workspace_root)
+                prior_pythonpath = environment.get("PYTHONPATH")
+                environment["PYTHONPATH"] = (
+                    str(REPO_ROOT) if not prior_pythonpath
+                    else str(REPO_ROOT) + os.pathsep + prior_pythonpath)
+                result = subprocess.run(
+                    command, cwd=REPO_ROOT, env=environment,
+                    capture_output=True, text=True, timeout=20)
+
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(
+                    "changed after Dashboard launcher handoff", result.stderr)
+                workspace = workspace_root / "handoff-drift"
+                self.assertFalse((workspace / "state.json").exists())
+                self.assertFalse((workspace / "parallel").exists())
+                refs = _git(
+                    repo, "for-each-ref", "--format=%(refname)",
+                    "refs/heads/loop/").stdout.splitlines()
+                self.assertEqual(refs, [])
+            finally:
+                dashboard.ROOT = old_dashboard_root
+                loop_mod.WORKSPACE_ROOT = old_workspace_root
+
     def test_two_dashboard_handoffs_cannot_exchange_or_overwrite_plan(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -187,6 +294,14 @@ subprocess.run([sys.executable, "-m", "engine.work", "done", f"task-{order}"],
                     self.assertEqual(
                         argv[argv.index("--expected-plan-sha256") + 1],
                         item["staged_sha256"],
+                    )
+                    self.assertEqual(
+                        argv[argv.index("--expected-primary-ref") + 1],
+                        item["expected_primary_ref"],
+                    )
+                    self.assertEqual(
+                        argv[argv.index("--expected-primary-sha") + 1],
+                        item["expected_primary_sha"],
                     )
 
                 go.write_bytes(b"go\n")

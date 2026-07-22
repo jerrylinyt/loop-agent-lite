@@ -434,7 +434,14 @@ def _terminate_payload(process: subprocess.Popen) -> int:
             process.kill()
         except (OSError, ProcessLookupError):
             pass
-        return int(compat.wait_process(process))
+        try:
+            return int(compat.wait_process(process, timeout=5))
+        except subprocess.TimeoutExpired as exc:
+            # Without an observed exit the guardian cannot publish durable
+            # reaped proof.  Propagating leaves the ACKed child record intact
+            # for a later exact recovery owner instead of hanging forever.
+            raise ParallelChildError(
+                "payload did not exit after bounded force fence") from exc
 
 
 def _enable_posix_subreaper() -> bool:

@@ -657,6 +657,134 @@ class RepoExecutorGitTest(unittest.TestCase):
         self.assertEqual(lease["child_state"], "idle")
         self.assertGreaterEqual(len(lease["child_history"]), 4)
 
+    def test_durably_blocked_preflight_exact_replay_can_publish_result(self):
+        ready = self.root / "validator-ready"
+        payload = (
+            "from pathlib import Path; import sys;"
+            "raise SystemExit(0 if Path(sys.argv[1]).exists() else 7)"
+        )
+        spec = replace(
+            self.spec,
+            validator_argv=(sys.executable, "-c", payload, str(ready)),
+        )
+        # Even an executor carrying a generic recovery callback may not turn a
+        # different operation into an implicit successor of this blocked
+        # lease.  Only the dedicated supersession API can do that.
+        first = executor_mod.RepoExecutor(
+            spec, recovery_authorizer=lambda _lease: True)
+        with self.assertRaisesRegex(
+                executor_mod.InvariantError, "validator failed rc=7"):
+            first.execute(self.preflight_request())
+        blocked = json.loads(first.lease_path.read_text(encoding="utf-8"))
+        self.assertEqual(blocked["terminal_status"], "blocked")
+
+        initialize = {
+            "operation": "INITIALIZE_RUN_REFS",
+            "operation_id": self.operation_id(),
+            "authority": {"manifest_hash": self.spec.manifest_hash},
+            "expected": {
+                "integration_start_sha": self.start,
+                "sync_ref_absent": True,
+            },
+        }
+        original = first.lease_path.read_bytes()
+        with self.assertRaisesRegex(
+                executor_mod.LeaseBusy, "explicit fenced supersession"):
+            first.execute(copy.deepcopy(initialize))
+        self.assertEqual(first.lease_path.read_bytes(), original)
+
+        with self.assertRaisesRegex(
+                executor_mod.LeaseBusy, "explicit fenced recovery"):
+            first.supersede_blocked_operation(
+                copy.deepcopy(initialize),
+                recovery_authorizer=lambda _lease: False)
+        self.assertEqual(first.lease_path.read_bytes(), original)
+        first.close()
+
+        ready.write_text("ready", encoding="ascii")
+        recovered = executor_mod.RepoExecutor(spec)
+        self.addCleanup(recovered.close)
+        result = recovered.reconcile_pending_operation(
+            recovery_authorizer=executor_mod.RepoExecutor.fence_recovery_lease)
+
+        self.assertEqual(result["status"], "validated")
+        terminal = json.loads(
+            recovered.lease_path.read_text(encoding="utf-8"))
+        self.assertEqual(terminal["terminal_status"], "validated")
+        self.assertIsNotNone(terminal["result_hash"])
+        self.assertEqual(terminal["reason"], f"recovered-from:{blocked['nonce']}")
+
+    def test_cached_result_requires_exact_lease_recovery_before_return(self):
+        request = self.preflight_request()
+        first = self.executor()
+        expected_result = first.execute(copy.deepcopy(request))
+        lease = json.loads(first.lease_path.read_text(encoding="utf-8"))
+        lease.update({
+            "terminal_status": "blocked",
+            "result_hash": None,
+            "reason": "terminal result publication failed",
+        })
+        executor_mod.RepoExecutor._validate_lease_shape(lease)
+        first.lease_path.write_bytes(executor_mod.canonical_json_bytes(lease))
+        first.close()
+
+        recovered = self.executor()
+        original = recovered.lease_path.read_bytes()
+        with (mock.patch.object(
+                  recovered, "_preflight",
+                  side_effect=AssertionError("cached result was redispatched")),
+              self.assertRaisesRegex(
+                  executor_mod.LeaseBusy, "fenced exact replay")):
+            recovered.execute(copy.deepcopy(request))
+        self.assertEqual(recovered.lease_path.read_bytes(), original)
+
+        with mock.patch.object(
+                recovered, "_preflight",
+                side_effect=AssertionError("cached result was redispatched")):
+            result = recovered.reconcile_pending_operation(
+                recovery_authorizer=(
+                    executor_mod.RepoExecutor.fence_recovery_lease))
+
+        self.assertEqual(result, expected_result)
+        terminal = json.loads(
+            recovered.lease_path.read_text(encoding="utf-8"))
+        self.assertEqual(terminal["terminal_status"], "validated")
+        self.assertEqual(
+            terminal["result_hash"], executor_mod.canonical_hash(result))
+        self.assertEqual(terminal["reason"], f"recovered-from:{lease['nonce']}")
+
+    def test_durably_blocked_reaped_child_requires_exact_fence(self):
+        executor = self.executor()
+        executor.execute(self.preflight_request())
+        lease = json.loads(executor.lease_path.read_text(encoding="utf-8"))
+        last_child = lease["child_history"].pop()
+        lease.update({
+            "terminal_status": "blocked",
+            "result_hash": None,
+            "reason": "guardian ACK publication uncertain",
+            "child_state": "reaped",
+            "child_generation": last_child["generation"],
+            "child_kind": last_child["kind"],
+            "child_argv_hash": last_child["argv_hash"],
+            "child_identity": last_child["identity"],
+            "child_result": last_child["result"],
+        })
+        executor_mod.RepoExecutor._validate_lease_shape(lease)
+
+        with mock.patch.object(
+                executor_mod.compat, "process_matches_identity",
+                return_value=True), mock.patch.object(
+                    executor_mod.compat, "fence_process_tree",
+                    return_value=False) as fence:
+            self.assertFalse(
+                executor_mod.RepoExecutor.fence_recovery_lease(lease))
+
+        identity = last_child["identity"]
+        fence.assert_called_once_with(
+            identity["pid"], start_token=identity["start_token"],
+            group_id=identity["group_id"], graceful_timeout=1.0,
+            force_timeout=5.0)
+
     @unittest.skipUnless(executor_mod.compat.IS_WINDOWS, "Windows Job E2E")
     def test_operation_child_breaks_away_from_outer_job_then_owns_job(self):
         request = self.preflight_request()
@@ -1398,14 +1526,16 @@ class RepoExecutorGitTest(unittest.TestCase):
         locked_request["operation_id"] = self.operation_id()
         locked_request["expected"]["observation_token"] = locked["observation_token"]
         with self.assertRaisesRegex(executor_mod.InvariantError, "locked"):
-            executor.execute(locked_request)
+            executor.supersede_blocked_operation(
+                locked_request, recovery_authorizer=lambda _lease: True)
         _git(self.repo, "worktree", "unlock", str(worktree))
 
         clean = executor.observe_worktree(1)
         remove = copy.deepcopy(bad_remove)
         remove["operation_id"] = self.operation_id()
         remove["expected"]["observation_token"] = clean["observation_token"]
-        result = executor.execute(remove)
+        result = executor.supersede_blocked_operation(
+            remove, recovery_authorizer=lambda _lease: True)
 
         self.assertEqual(result["status"], "removed")
         self.assertEqual(result["worker_repo"], str(worktree))
@@ -1416,6 +1546,41 @@ class RepoExecutorGitTest(unittest.TestCase):
         self.assertEqual(audit["receipt_tip"], validated)
         self.assertEqual(audit["primary_sha"], validated)
         self.assertEqual(audit["sync_sha"], validated)
+
+    def test_remove_journals_fresh_fully_absent_observation(self):
+        executor = self.executor()
+        self.initialize(executor)
+        self.create(executor, 1)
+        worktree = executor.worktree_path(1)
+        task_ref = executor.task_ref(1)
+        _git(self.repo, "worktree", "remove", "--force", str(worktree))
+        _git(self.repo, "update-ref", "-d", task_ref)
+        observation = executor.observe_worktree(1)
+        self.assertFalse(observation["exists"])
+        self.assertFalse(observation["registered"])
+        self.assertIsNone(observation["task_ref_tip"])
+
+        operation_id = self.operation_id()
+        result = executor.execute({
+            "operation": "REMOVE_WORKTREE",
+            "operation_id": operation_id,
+            "task": 1,
+            "authority": {
+                "manifest_hash": self.spec.manifest_hash,
+                "assignment_hash": self.artifacts.assignment_hashes[1],
+            },
+            "expected": {
+                "terminal_outcome": "cancelled",
+                "observation_token": observation["observation_token"],
+            },
+        })
+
+        self.assertEqual(result["status"], "already-removed")
+        intent = executor_mod.RepoExecutor._read_json(
+            executor._intent_path("remove", operation_id),
+            "test absent remove intent")
+        self.assertIsNone(intent["observed_head"])
+        self.assertEqual(intent["state"], "committed")
 
     def test_initialize_rejects_unknown_preexisting_safe_ref(self):
         executor = self.executor()

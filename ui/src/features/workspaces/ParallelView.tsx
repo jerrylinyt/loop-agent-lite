@@ -34,9 +34,10 @@ export default function ParallelView({ workspace, state, readonly, onRefresh, on
   onRefresh: () => void | Promise<void>;
   onRefreshWorkspaces: () => void | Promise<void>;
 }) {
-  const [busy, setBusy] = useState<"pause" | "resume" | "abort" | null>(null);
+  const [busy, setBusy] = useState<"pause" | "resume" | "abort" | "delete" | null>(null);
   const [message, setMessage] = useState("");
   const [confirmAbort, setConfirmAbort] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [workerHistoryOpen, setWorkerHistoryOpen] = useState(false);
   const [diffTask, setDiffTask] = useState<{ order: number; title: string; sha: string } | null>(null);
   const completedByOrder = useMemo(
@@ -110,15 +111,28 @@ export default function ParallelView({ workspace, state, readonly, onRefresh, on
           return;
         }
       }
-      setMessage(action === "pause" ? "已送出 Pause" : action === "resume" ? "已啟動 Resume" : "已送出 Abort");
+      setMessage(action === "pause"
+        ? "已送出 Pause"
+        : action === "resume"
+          ? terminalIntent === "cancelled"
+            ? "已啟動取消清理"
+            : status === "finalizing" ? "已啟動完成收尾" : "已啟動 Resume"
+          : "已送出 Abort");
       await Promise.all([Promise.resolve(onRefresh()), Promise.resolve(onRefreshWorkspaces())]);
     } finally {
       setBusy(null);
     }
   };
   const terminalIntent = parallel.terminal_intent ?? null;
-  const canPause = status === "initializing" || status === "running";
-  const canResume = status === "paused" || status === "blocked";
+  const pauseRecovery = status === "pause_requested";
+  const completionRecovery = status === "finalizing"
+    && terminalIntent === "completed"
+    && workspace?.running === false;
+  const cancelRecovery = terminalIntent === "cancelled"
+    && (status === "cancel_requested" || status === "finalizing_cancel")
+    && workspace?.running === false;
+  const canPause = status === "initializing" || status === "running" || pauseRecovery;
+  const canResume = status === "paused" || status === "blocked" || completionRecovery || cancelRecovery;
   const canAbort = terminalIntent === null && (
     status === "initializing"
     || status === "running"
@@ -126,9 +140,11 @@ export default function ParallelView({ workspace, state, readonly, onRefresh, on
     || status === "paused"
     || status === "blocked"
   );
-  const resumeLabel = status === "blocked" && terminalIntent === "completed"
+  const canDelete = !workspace?.running && (status === "completed" || status === "cancelled");
+  const pauseLabel = pauseRecovery ? "重試 Pause" : "Pause";
+  const resumeLabel = (status === "blocked" || status === "finalizing") && terminalIntent === "completed"
     ? "重試完成收尾"
-    : status === "blocked" && terminalIntent === "cancelled"
+    : terminalIntent === "cancelled" && (status === "blocked" || cancelRecovery)
       ? "重試取消清理"
       : "Resume";
   const titleByOrder = new Map((state.plan ?? []).map((task) => [task.order, task.task]));
@@ -139,9 +155,10 @@ export default function ParallelView({ workspace, state, readonly, onRefresh, on
         <div className="workspace-title-row">
           <div className="workspace-title"><h1>{workspace?.name ?? "workspace"}</h1><span className="phase-badge parallel-runner-tag">Parallel</span></div>
           {!readonly && workspace && <div className="workspace-actions">
-            <button type="button" className="secondary-button" disabled={!canPause || busy !== null} onClick={() => void mutate("pause")}>{busy === "pause" ? "Pause 中…" : "Pause"}</button>
+            <button type="button" className="secondary-button" disabled={!canPause || busy !== null} onClick={() => void mutate("pause")}>{busy === "pause" ? `${pauseLabel} 中…` : pauseLabel}</button>
             <button type="button" className="success-button" disabled={!canResume || busy !== null} onClick={() => void mutate("resume")}>{busy === "resume" ? `${resumeLabel}中…` : resumeLabel}</button>
             <button type="button" className="danger-button" disabled={!canAbort || busy !== null} onClick={() => setConfirmAbort(true)}>{busy === "abort" ? "Abort 中…" : "Abort"}</button>
+            {canDelete && <button type="button" className="danger-button" disabled={busy !== null} onClick={() => setConfirmDelete(true)}>刪除</button>}
           </div>}
         </div>
         <div className="workspace-status-row"><div className="primary-status">
@@ -176,7 +193,11 @@ export default function ParallelView({ workspace, state, readonly, onRefresh, on
           })}</tbody>
         </table></div>
       </section>
-      {confirmAbort && <ActionDialog title="確認 Abort Parallel run" message="Abort 會停止 workers，保留已整合 commits，並清理可安全移除的 worktrees；此操作不可用普通 Resume 復原。" confirmLabel="Abort" danger preview={[
+      {confirmAbort && <ActionDialog
+        title="確認 Abort Parallel run"
+        message="Abort 會停止 workers，保留已整合 commits，並清理可安全移除的 worktrees；此操作不可用普通 Resume 復原。"
+        confirmLabel="Abort"
+        danger preview={[
         { label: "run", value: parallel.run_id ?? "—" },
         { label: "目前狀態", value: status ?? "unknown" },
         { label: "已整合", value: `${completedByOrder.size} tasks`, tone: "safe" },
@@ -188,6 +209,36 @@ export default function ParallelView({ workspace, state, readonly, onRefresh, on
         }
         void mutate("abort");
       }} />}
+      {confirmDelete && workspace && <ActionDialog
+        title="確認刪除 Parallel workspace"
+        message={`永久刪除 ${workspace.name}？整個 workspace 與 durable run artifacts 都會直接移除，無法復原；target repo 與已整合 commits 不受影響。`}
+        confirmLabel="永久刪除"
+        danger preview={[
+          { label: "永久刪除", value: `workspace/${workspace.name}`, tone: "warning" },
+          { label: "run", value: parallel.run_id ?? "—" },
+          { label: "終態", value: status ?? "unknown" },
+          { label: "不受影響", value: state.config?.repo ? `target repo：${state.config.repo}` : "target repo 與已整合 commits", tone: "safe" },
+        ]} onClose={() => setConfirmDelete(false)} onConfirm={() => {
+          setConfirmDelete(false);
+          if (!canDelete) {
+            setMessage("錯誤：Parallel 狀態已變更，請重新確認後再操作");
+            return;
+          }
+          setBusy("delete");
+          setMessage("");
+          void (async () => {
+            try {
+              const response = await postJson<{ ok?: boolean; deleted?: boolean }>("/api/delete-workspace", { name: workspace.name });
+              if (response.error) {
+                setMessage(`錯誤：${response.error}`);
+                return;
+              }
+              await Promise.resolve(onRefreshWorkspaces());
+            } finally {
+              setBusy(null);
+            }
+          })();
+        }} />}
       {diffTask && <Suspense fallback={null}><TaskDiffModal workspace={workspace?.name ?? ""} order={diffTask.order} fallbackTitle={diffTask.title} fallbackSha={diffTask.sha} onClose={() => setDiffTask(null)} /></Suspense>}
     </section>
   );

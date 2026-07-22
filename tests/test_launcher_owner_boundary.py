@@ -298,6 +298,11 @@ class DashboardLauncherOwnerTest(unittest.TestCase):
             self.assertEqual(hashlib.sha256(raw).hexdigest(), expected_hash)
             self.assertIn(expected_hash, staged.name)
             self.assertEqual(json.loads(raw.decode("utf-8"))[0]["task"], "frozen")
+            self.assertTrue(
+                spawn_kwargs["expected_primary_ref"].startswith("refs/heads/"))
+            self.assertEqual(
+                spawn_kwargs["expected_primary_sha"],
+                _git(repo, "rev-parse", "HEAD").stdout.strip())
             self.assertFalse(
                 (workspace_root / "owned-parallel"
                  / "parallel-plan.pending.json").exists())

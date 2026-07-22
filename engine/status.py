@@ -160,7 +160,11 @@ def project_status(name: str, metrics_limit=0):
             "tasks": list(parallel.get("tasks") or []),
             "error": parallel.get("error"),
         }
-    elif projection["runner"] == "parallel-worker":
+    elif (projection["runner"] == "parallel-worker"
+          or projection["managed_readonly"]):
+        # The readonly marker is the fail-safe authority for legacy worker
+        # projections whose runner string predates the parallel-worker enum.
+        projection["runner"] = "parallel-worker"
         assignment = state.get("assignment") if isinstance(state.get("assignment"), dict) else {}
         assigned_order = state.get("assigned_order")
         assigned_task = next((task for task in plan

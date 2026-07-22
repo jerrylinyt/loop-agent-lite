@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -146,6 +147,21 @@ class TestParallelPlanning(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(
                     parallel.ParallelError, "SHA-256"):
                 parallel.normalize_expected_plan_sha256(value)
+
+    def test_expected_primary_identity_requires_canonical_pair(self):
+        self.assertEqual(
+            parallel.normalize_expected_primary_identity(None, None),
+            (None, None))
+        for ref, sha in (
+            ("refs/heads/main", None),
+            (None, "1" * 40),
+            ("main", "1" * 40),
+            ("refs/heads/main", "A" * 40),
+            ("refs/heads/main", "1" * 39),
+        ):
+            with self.subTest(ref=ref, sha=sha), self.assertRaises(
+                    parallel.ParallelError):
+                parallel.normalize_expected_primary_identity(ref, sha)
 
 
 class TestCanonicalWorkerCommand(unittest.TestCase):
@@ -381,6 +397,50 @@ class TestImmutableWorkerEnvironment(unittest.TestCase):
             self.assertFalse((workspace / "state.json").exists())
             self.assertFalse((workspace / "parallel").exists())
 
+    def test_dashboard_primary_identity_drift_blocks_before_run_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            workspace_root = root / "workspaces"
+            repo = root / "repo"
+            repo.mkdir()
+            plan = root / "plan.json"
+            plan.write_text(json.dumps([
+                {"order": 1, "task": "one", "ref": None, "stack": 1},
+            ]), encoding="utf-8")
+            expected_sha = "1" * 40
+            observed_sha = "2" * 40
+            args = parallel.build_argument_parser().parse_args([
+                "start", "--repo", str(repo), "--name", "base",
+                "--agent-cmd", "agent", "--validate-cmd", "validate",
+                "--import-plan", str(plan),
+                "--expected-primary-ref", "refs/heads/main",
+                "--expected-primary-sha", expected_sha,
+            ])
+            launcher_fence = mock.Mock()
+            with mock.patch.object(
+                    parallel.loop_mod, "WORKSPACE_ROOT", workspace_root), \
+                    mock.patch.object(
+                        parallel.repo_owner.RepoOwnerFence, "claim",
+                        return_value=launcher_fence), \
+                    mock.patch.object(
+                        parallel, "_repository_start_identity",
+                        return_value=("refs/heads/main", observed_sha)), \
+                    mock.patch.object(
+                        parallel.parallel_state,
+                        "materialize_run_artifacts") as materialize:
+                with self.assertRaisesRegex(
+                        parallel.ParallelError,
+                        "changed after Dashboard launcher handoff"):
+                    parallel.start_parallel(args, workspace_root)
+
+            materialize.assert_not_called()
+            launcher_fence.terminalize.assert_called_once_with(
+                "parallel-launch-failed-before-handoff")
+            launcher_fence.close.assert_called_once_with()
+            workspace = workspace_root / "base"
+            self.assertFalse((workspace / "state.json").exists())
+            self.assertFalse((workspace / "parallel").exists())
+
 
 class TestGateFailureProjection(unittest.TestCase):
     def test_repo_executor_failure_blocks_with_recovery_required_without_type_error(self):
@@ -454,6 +514,29 @@ class TestGateFailureProjection(unittest.TestCase):
 
 
 class TestWorkerReapOwnership(unittest.TestCase):
+    def test_guardian_fence_timeout_is_bounded_and_keeps_containment(self):
+        supervisor = object.__new__(parallel.ParallelSupervisor)
+        process = mock.Mock()
+        process.args = ["guardian"]
+        control = mock.Mock()
+        handle = parallel.WorkerHandle(
+            1, process, control, {"request_id": "6" * 32}, False)
+
+        with mock.patch.object(
+                parallel.compat, "wait_process",
+                side_effect=subprocess.TimeoutExpired(
+                    process.args, parallel.WORKER_GUARDIAN_REAP_TIMEOUT)) as wait, \
+                mock.patch.object(
+                    parallel.compat, "close_process_group") as close_group:
+            with self.assertRaisesRegex(parallel.ParallelError, "guardian.*秒"):
+                supervisor._fence_worker_handle(handle)
+
+        wait.assert_called_once_with(
+            process, timeout=parallel.WORKER_GUARDIAN_REAP_TIMEOUT)
+        control.close.assert_called_once_with()
+        self.assertIsNone(handle.control)
+        close_group.assert_not_called()
+
     def test_failed_terminal_reap_proof_keeps_worker_handle_owned(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -722,6 +805,63 @@ class TestFinalizationInterrupt(unittest.TestCase):
             self.assertEqual(supervisor.aggregate["status"], "blocked")
             quiesce.assert_called_once_with()
             pause.assert_not_called()
+
+    def test_run_retains_active_projection_when_blocked_quiesce_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace_root = root / "workspaces"
+            repo = root / "repo"
+            workspace_root.mkdir()
+            repo.mkdir()
+            artifacts = parallel_state.materialize_run_artifacts(
+                workspace_root, "base", RUN_ID,
+                [{"order": 1, "task": "one", "stack": 1}],
+                run_config(repo), "a" * 40, "refs/heads/main",
+                "python -m engine.parallel_gate --run-dir fixed",
+                dispatch_tokens={1: DISPATCH_TOKEN},
+            )
+            aggregate = parallel_state.build_initial_aggregate(
+                RUN_ID, artifacts.plan)
+            aggregate = parallel_state.transition_run_status(
+                aggregate, "running")
+            supervisor = parallel.ParallelSupervisor(
+                workspace_root=workspace_root,
+                workspace=mock.Mock(),
+                artifacts=artifacts,
+                aggregate=aggregate,
+                executor=mock.Mock(),
+                pending_launch_hash="9" * 64,
+                session="a" * 32,
+                generation=1,
+                bootstrap_required=False,
+            )
+            supervisor.handles[1] = mock.Mock()
+
+            with (mock.patch.object(
+                      supervisor, "process_controls", return_value=False),
+                  mock.patch.object(
+                      supervisor, "process_gate_requests", return_value=False),
+                  mock.patch.object(
+                      supervisor, "reap_workers", return_value=False),
+                  mock.patch.object(
+                      supervisor, "_advance_batch", return_value=False),
+                  mock.patch.object(
+                      supervisor, "_all_complete", return_value=False),
+                  mock.patch.object(
+                      supervisor, "_dispatch_available",
+                      side_effect=parallel.ParallelError("run failed")),
+                  mock.patch.object(
+                      supervisor, "quiesce_blocked",
+                      side_effect=parallel.ParallelError(
+                          "guardian fence timed out")) as quiesce,
+                  mock.patch.object(supervisor, "checkpoint") as checkpoint):
+                self.assertEqual(supervisor.run(), 2)
+
+            self.assertEqual(supervisor.aggregate["status"], "blocked")
+            self.assertEqual(supervisor.aggregate["error"], "run failed")
+            self.assertIn(1, supervisor.handles)
+            quiesce.assert_called_once_with()
+            checkpoint.assert_called_once_with(active=True)
 
 
 class TestPrePayloadWorkspaceArchive(unittest.TestCase):

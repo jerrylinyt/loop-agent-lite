@@ -190,6 +190,25 @@ class TestParallelDashboardBoundary(unittest.TestCase):
             base, "resume", parallel_action="resume")
         self.assertIn("paused/blocked", error)
 
+    def test_parallel_finalizing_completion_delegates_resume_to_recovery_owner(self):
+        base = _parallel_state(Path("repo"), "finalizing")
+        base["parallel"]["terminal_intent"] = "completed"
+        self.assertIsNone(dashboard.dashboard_operation_error(
+            base, "resume", parallel_action="resume"))
+
+        base["parallel"]["terminal_intent"] = None
+        error = dashboard.dashboard_operation_error(
+            base, "resume", parallel_action="resume")
+        self.assertIn("terminal transition", error)
+
+    def test_parallel_cancel_transition_delegates_resume_to_recovery_owner(self):
+        for run_status in ("cancel_requested", "finalizing_cancel"):
+            with self.subTest(status=run_status):
+                base = _parallel_state(Path("repo"), run_status)
+                base["parallel"]["terminal_intent"] = "cancelled"
+                self.assertIsNone(dashboard.dashboard_operation_error(
+                    base, "resume", parallel_action="resume"))
+
     def test_repo_alias_guard_finds_managed_worker(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -313,7 +332,9 @@ class TestParallelDashboardBoundary(unittest.TestCase):
                     os.environ, {"API_TOKEN": "secret-value"}, clear=False):
                 command = dashboard.build_parallel_command(
                     "start", "base", repo=repo, import_plan=plan,
-                    config=config, expected_plan_sha256=plan_sha256)
+                    config=config, expected_plan_sha256=plan_sha256,
+                    expected_primary_ref="refs/heads/main",
+                    expected_primary_sha="1" * 40)
         self.assertEqual(command[1:4], ["-m", "engine.parallel", "--workspace-root"])
         self.assertEqual(command[5], "start")
         self.assertEqual(command[command.index("--name") + 1], "base")
@@ -322,11 +343,21 @@ class TestParallelDashboardBoundary(unittest.TestCase):
             command[command.index("--expected-plan-sha256") + 1],
             plan_sha256,
         )
+        self.assertEqual(
+            command[command.index("--expected-primary-ref") + 1],
+            "refs/heads/main",
+        )
+        self.assertEqual(
+            command[command.index("--expected-primary-sha") + 1],
+            "1" * 40,
+        )
         self.assertNotIn("engine.loop", command)
         parsed = parallel.build_argument_parser().parse_args(command[3:])
         self.assertEqual(parsed.command, "start")
         self.assertEqual(parsed.name, "base")
         self.assertEqual(parsed.expected_plan_sha256, plan_sha256)
+        self.assertEqual(parsed.expected_primary_ref, "refs/heads/main")
+        self.assertEqual(parsed.expected_primary_sha, "1" * 40)
         round_trip = parallel._runtime_config_from_args(parsed, repo.resolve())
         self.assertEqual(round_trip["environment"], {
             "path_additions": [str(frozen_bin.resolve())],
@@ -353,6 +384,16 @@ class TestParallelDashboardBoundary(unittest.TestCase):
             repo = root / "repo"
             repo.mkdir()
             subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Parallel Dashboard Test"],
+                cwd=repo, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "parallel@example.invalid"],
+                cwd=repo, check=True)
+            (repo / "goal.md").write_text("# Goal\n", encoding="utf-8")
+            subprocess.run(["git", "add", "goal.md"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "initial"], cwd=repo, check=True)
             cfg = {
                 "agent_cmds": [{"label": "agent", "cmd": "agent --test"}],
                 "validate_cmds": [{"label": "validate", "cmd": "validator --test"}],
@@ -392,6 +433,12 @@ class TestParallelDashboardBoundary(unittest.TestCase):
         self.assertEqual(spawn.call_args.kwargs["import_plan"], plan_path)
         self.assertEqual(
             spawn.call_args.kwargs["expected_plan_sha256"], plan_sha256)
+        self.assertTrue(
+            spawn.call_args.kwargs["expected_primary_ref"].startswith(
+                "refs/heads/"))
+        self.assertRegex(
+            spawn.call_args.kwargs["expected_primary_sha"],
+            r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
         self.assertEqual(
             spawn.call_args.kwargs["config"]["environment"], {
                 "path_additions": [str((root / "agent-bin").resolve())],
@@ -481,6 +528,28 @@ class TestParallelDashboardBoundary(unittest.TestCase):
         self.assertEqual(health["workspace_count"], 1)
         self.assertEqual(health["running"], 0)
 
+    def test_discovery_advertises_no_owner_terminal_transition_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "base"
+            path.mkdir()
+            (path / "state.json").write_text("{}", encoding="utf-8")
+            state = _parallel_state(root / "repo", "finalizing")
+            state["parallel"]["terminal_intent"] = "completed"
+            with mock.patch.object(dashboard, "ROOT", root), \
+                    mock.patch.object(
+                        dashboard, "read_state", return_value=(state, None)), \
+                    mock.patch.object(dashboard, "ws_running", return_value=False):
+                self.assertTrue(dashboard.list_workspaces()[0]["resume_available"])
+
+            state["parallel"]["status"] = "finalizing_cancel"
+            state["parallel"]["terminal_intent"] = "cancelled"
+            with mock.patch.object(dashboard, "ROOT", root), \
+                    mock.patch.object(
+                        dashboard, "read_state", return_value=(state, None)), \
+                    mock.patch.object(dashboard, "ws_running", return_value=False):
+                self.assertTrue(dashboard.list_workspaces()[0]["resume_available"])
+
 
 class TestParallelStatusProjection(unittest.TestCase):
     def test_managed_worker_projection_exposes_only_assigned_task(self):
@@ -512,6 +581,32 @@ class TestParallelStatusProjection(unittest.TestCase):
                 projection = status.project_status("child")
         self.assertEqual(projection["plan_len"], 1)
         self.assertEqual(projection["completed"], 0)
+        self.assertEqual(projection["current_order"], 2)
+        self.assertEqual(projection["current_task"], "two")
+
+    def test_legacy_readonly_marker_canonicalizes_worker_projection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            (root / "child").mkdir(parents=True)
+            state = {
+                "runner": "loop", "managed_readonly": True,
+                "parent_workspace": "base", "run_id": "a1b2c3d4",
+                "assigned_order": 2, "current_order": 2, "phase": "exec",
+                "plan": [
+                    {"order": 1, "task": "one", "ref": None, "stack": 1},
+                    {"order": 2, "task": "two", "ref": None, "stack": 1},
+                ],
+                "completed": [], "assignment": {"status": "running"},
+            }
+            with mock.patch.object(status.loop, "WORKSPACE_ROOT", root), \
+                    mock.patch.object(
+                        status.loop, "load_checkpointed_state",
+                        return_value=(state, b"", False)), \
+                    mock.patch.object(
+                        status.loop, "active_run_lock_owner", return_value={}):
+                projection = status.project_status("child")
+        self.assertEqual(projection["runner"], "parallel-worker")
+        self.assertEqual(projection["plan_len"], 1)
         self.assertEqual(projection["current_order"], 2)
         self.assertEqual(projection["current_task"], "two")
 
