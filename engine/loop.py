@@ -2378,13 +2378,12 @@ def main(argv=None):
         state["stall_rounds"] = 0 if head_after != head_before else state["stall_rounds"] + 1
 
         # 不同 Agent CLI 對 exit code 的定義不一致，因此 rc 只供 log 診斷，不參與
-        # round 成敗。完成依據是該 phase 的 coordinator 訊號；另外 exec 輪的 prompt 契約
-        # 是「有 commit 就不執行 done」（完成票留給之後的乾淨輪次獨立判斷），所以留下
-        # commit 的輪次同樣是有效回報，不得記為 Agent 異常；只留未 commit 殘檔仍算異常，
-        # 契約要求工作區收乾淨。逾時則一律作廢，避免已失控、未按 prompt 在回報後停止的
-        # 程序被算成完整一輪。（head_after 取自竄改 reset 之後,被作廢的 commit 不豁免。）
-        agent_failed = (not (agent_reported_done or (phase == "exec" and head_after != head_before))
-                        or timed_out)
+        # round 成敗。唯一的健康依據是該 phase 的 coordinator 訊號:prompt 契約要求每輪
+        # 正常收尾都要回報——exec 含 commit 輪也必須送 done,done 只代表「agent 正常工作」,
+        # 完成票在有異動的輪次會自動歸零。commit/diff 不能替代訊號:半途 crash 的輪同樣
+        # 會留下異動,分不出是收尾還是失控。逾時則一律作廢，避免已失控、未按 prompt 在
+        # 回報後停止的程序被算成完整一輪。
+        agent_failed = not agent_reported_done or timed_out
         if agent_failed:
             state["agent_failure_streak"] = state.get("agent_failure_streak", 0) + 1
             ws.clear_signals()
