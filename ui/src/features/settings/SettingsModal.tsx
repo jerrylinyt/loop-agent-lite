@@ -1,10 +1,13 @@
-/** Dashboard 全域設定編輯器：統計輪數、launch 預設值與 Validate 命令清單，儲存至團隊設定檔。 */
+/** Dashboard 全域設定編輯器：統計輪數、launch 預設值、Agent CLI（個人設定＋測試）與 Validate 命令清單。 */
 import { useEffect, useState } from "react";
 import { getJson, postJson } from "../../shared/api/client";
+import CommandTestDialog, { type CommandTestState } from "../../shared/components/CommandTestDialog";
 import Modal from "../../shared/components/Modal";
 import type { ConfigResponse, SelectCommand } from "../../shared/api/types";
 
 const ROUNDS_MAX = 5000;
+
+interface AgentTestResponse { ok?: boolean; rc?: number; timeout?: boolean; output?: string }
 
 export default function SettingsModal({ onClose, onSaved }: {
   onClose: () => void;
@@ -24,7 +27,12 @@ export default function SettingsModal({ onClose, onSaved }: {
   });
   const [stuckStop, setStuckStop] = useState(false);
   const [pauseAfterPlan, setPauseAfterPlan] = useState(false);
+  const [agents, setAgents] = useState<SelectCommand[]>([]);
   const [validates, setValidates] = useState<SelectCommand[]>([]);
+  const [agentOpen, setAgentOpen] = useState(true);
+  const [validateOpen, setValidateOpen] = useState(true);
+  const [testRepo, setTestRepo] = useState("");
+  const [test, setTest] = useState<CommandTestState | null>(null);
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -49,13 +57,25 @@ export default function SettingsModal({ onClose, onSaved }: {
       });
       setStuckStop(d.stuck_stop ?? false);
       setPauseAfterPlan(d.pause_after_plan ?? false);
+      setAgents((response.agent_cmds ?? []).map((item) => ({ ...item })));
       setValidates((response.validate_cmds ?? []).map((item) => ({ ...item })));
+      setTestRepo(response.repos?.[0] ?? "");
     });
   }, []);
 
   const save = async () => {
     setSaving(true);
     setMessage("儲存中…");
+    // Agent CLI 屬個人設定、其餘屬團隊設定,分別走既有端點;前者失敗就不動後者。
+    const cliResponse = await postJson<ConfigResponse>("/api/edit-cli-config", {
+      agent_cmds: agents,
+      extra_path_dirs: config?.extra_path_dirs ?? []
+    });
+    if (cliResponse.error) {
+      setSaving(false);
+      setMessage(`錯誤：${cliResponse.error}`);
+      return;
+    }
     const response = await postJson<ConfigResponse>("/api/edit-settings", {
       metrics,
       defaults: { ...defaults, stuck_stop: stuckStop, pause_after_plan: pauseAfterPlan },
@@ -70,6 +90,25 @@ export default function SettingsModal({ onClose, onSaved }: {
     onClose();
   };
 
+  const testAgent = async (agent: SelectCommand) => {
+    setTest({ loading: true });
+    const response = await postJson<AgentTestResponse>("/api/test-cli", {
+      repo: testRepo,
+      agent_cmd: agent.cmd,
+      extra_path_dirs: config?.extra_path_dirs ?? []
+    });
+    if (response.error) {
+      setTest({ loading: false, ok: false, text: `錯誤：${response.error}`, output: "" });
+      return;
+    }
+    setTest({
+      loading: false,
+      ok: !!response.ok,
+      text: response.timeout ? "錯誤：執行逾時（60 秒）" : response.ok ? `成功：Agent CLI 完成（exit ${response.rc ?? 0}）` : `錯誤：Agent CLI 失敗（exit ${response.rc ?? "?"}）`,
+      output: response.output ?? ""
+    });
+  };
+
   const metricsField = (key: keyof typeof metrics, label: string, hint: string) => (
     <label>{label} <span className="label-help">{hint}</span>
       <input type="number" min={1} max={ROUNDS_MAX} value={metrics[key]}
@@ -82,12 +121,21 @@ export default function SettingsModal({ onClose, onSaved }: {
       onChange={(event) => setDefaults({ ...defaults, [key]: +event.target.value })} /></label>
   );
 
+  const updateAgent = (index: number, patch: Partial<SelectCommand>) => {
+    setAgents((items) => items.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item));
+  };
+
   const updateValidate = (index: number, patch: Partial<SelectCommand>) => {
     setValidates((items) => items.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item));
   };
 
+  const collapseToggle = (name: string, open: boolean, toggle: () => void, controls: string) => (
+    <button type="button" className="text-button" aria-expanded={open} aria-controls={controls}
+      aria-label={`${open ? "收合" : "展開"} ${name} 清單`} onClick={toggle}>{open ? "收合 ▲" : "展開 ▼"}</button>
+  );
+
   return (
-    <Modal title="Dashboard 設定" description={`統計輪數與各項預設值；儲存至團隊設定檔：${config?.project_config_path ?? "…"}`} onClose={onClose} wide footer={
+    <Modal title="Dashboard 設定" description={`統計輪數與各項預設值；Agent CLI 存個人設定，其餘存團隊設定檔：${config?.project_config_path ?? "…"}`} onClose={onClose} wide footer={
       <><button type="button" className="secondary-button" onClick={onClose}>取消</button><button type="button" className="primary-button" disabled={saving || !config} onClick={() => void save()}>{saving ? "儲存中…" : "儲存設定"}</button><span role="status">{message}</span></>
     }>
       <section className="cli-manager-section" aria-labelledby="settings-metrics-title">
@@ -114,9 +162,41 @@ export default function SettingsModal({ onClose, onSaved }: {
         {stuckStop && <div className="number-grid two">{defaultField("stuck_stop_count", "卡死停止門檻（輪）", 1)}</div>}
         <label className="checkbox-row"><input type="checkbox" checked={pauseAfterPlan} onChange={(event) => setPauseAfterPlan(event.target.checked)} />規劃收斂後暫停：不自動進入執行期，需按「運行」開始執行</label>
       </section>
+      <section className="cli-manager-section" aria-labelledby="settings-agent-title">
+        <div className="cli-manager-heading">
+          <div><h3 id="settings-agent-title">Agent CLI</h3><p>個人設定；command 會以固定 prompt「test」執行確認。</p></div>
+          <div className="settings-section-actions">
+            <button type="button" className="secondary-button" onClick={() => { setAgentOpen(true); setAgents((items) => [...items, { label: "", cmd: "" }]); }}>＋ 新增 CLI</button>
+            {collapseToggle("Agent CLI", agentOpen, () => setAgentOpen((value) => !value), "settings-agent-list")}
+          </div>
+        </div>
+        {agentOpen && <div id="settings-agent-list">
+          <label className="settings-test-repo">測試用 repo（執行測試時的工作目錄）
+            <select aria-label="Agent CLI 測試用 repo" value={testRepo} onChange={(event) => setTestRepo(event.target.value)}>
+              {(config?.repos ?? []).map((repo) => <option key={repo} value={repo}>{repo}</option>)}
+              {!(config?.repos ?? []).length && <option value="">（repo roots 沒有掃描到 git repo）</option>}
+            </select>
+          </label>
+          <div className="cli-editor-list cli-editor-scroll">
+            {agents.map((agent, index) => (
+              <div className="cli-editor-row" key={index}>
+                <label>名稱<input aria-label={`Agent CLI ${index + 1} 名稱`} value={agent.label} onChange={(event) => updateAgent(index, { label: event.target.value })} placeholder="例如 Claude" /></label>
+                <label>Command<input aria-label={`Agent CLI ${index + 1} Command`} value={agent.cmd} onChange={(event) => updateAgent(index, { cmd: event.target.value })} placeholder="例如 claude --model haiku -p" /></label>
+                <div className="cli-row-actions"><button type="button" className="secondary-button" disabled={!testRepo || !agent.cmd.trim()} onClick={() => void testAgent(agent)}>執行測試</button><button type="button" className="danger-button" disabled={agents.length <= 1} onClick={() => setAgents((items) => items.filter((_, itemIndex) => itemIndex !== index))}>刪除</button></div>
+              </div>
+            ))}
+          </div>
+        </div>}
+      </section>
       <section className="cli-manager-section" aria-labelledby="settings-validate-title">
-        <div className="cli-manager-heading"><div><h3 id="settings-validate-title">Validate 命令清單</h3><p>啟動表單與 Workspace 設定的 Validate 選項；exit 0 視為驗證通過。</p></div><button type="button" className="secondary-button" onClick={() => setValidates((items) => [...items, { label: "", cmd: "" }])}>＋ 新增命令</button></div>
-        <div className="cli-editor-list">
+        <div className="cli-manager-heading">
+          <div><h3 id="settings-validate-title">Validate 命令清單</h3><p>啟動表單與 Workspace 設定的 Validate 選項；exit 0 視為驗證通過。</p></div>
+          <div className="settings-section-actions">
+            <button type="button" className="secondary-button" onClick={() => { setValidateOpen(true); setValidates((items) => [...items, { label: "", cmd: "" }]); }}>＋ 新增命令</button>
+            {collapseToggle("Validate", validateOpen, () => setValidateOpen((value) => !value), "settings-validate-list")}
+          </div>
+        </div>
+        {validateOpen && <div id="settings-validate-list" className="cli-editor-list cli-editor-scroll">
           {validates.map((item, index) => (
             <div className="cli-editor-row" key={index}>
               <label>名稱<input aria-label={`Validate ${index + 1} 名稱`} value={item.label} onChange={(event) => updateValidate(index, { label: event.target.value })} placeholder="例如 python unittest" /></label>
@@ -125,8 +205,9 @@ export default function SettingsModal({ onClose, onSaved }: {
             </div>
           ))}
           {!validates.length && <p className="empty-inline">沒有預設 Validate 命令；啟動時仍可手動輸入。</p>}
-        </div>
+        </div>}
       </section>
+      {test && <CommandTestDialog state={test} onClose={() => setTest(null)} />}
     </Modal>
   );
 }

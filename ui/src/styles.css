@@ -352,6 +352,11 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .cli-row-actions, .path-editor-row { display: flex; gap: 6px; }
 .path-editor-row input { flex: 1; }
 .cli-path-tip { margin-top: 9px; }
+/* Dashboard 設定:清單預設約三列高,超出改為捲動;收合鈕與新增鈕同列靠右。 */
+.cli-editor-scroll { max-height: 236px; overflow-y: auto; padding-right: 2px; }
+.settings-section-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.settings-test-repo { display: grid; gap: 4px; margin-bottom: 8px; color: var(--muted); font-size: 12px; }
+.settings-test-repo select { min-height: 32px; max-width: 100%; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); }
 .form-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .number-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
 .number-grid.two { grid-template-columns: repeat(2, 1fr); }
