@@ -206,8 +206,16 @@ export interface DashboardConfig {
   validate_timeout?: number;
   red_limit?: number;
   stall_limit?: number;
+  stuck_stop?: boolean;
+  stuck_stop_count?: number;
   /** 規劃收斂後暫停：不自動進入執行期，需人工按「運行」。 */
   pause_after_plan?: boolean;
+}
+
+/** 統計輪數設定：history.log 即時投影的讀取上限，不影響硬碟用量。 */
+export interface MetricsSettings {
+  workspace_rounds: number;
+  fleet_rounds: number;
 }
 
 export interface StartupResponse {
@@ -297,6 +305,7 @@ export interface ConfigResponse {
   validate_cmds: SelectCommand[];
   repos: string[];
   defaults: DashboardConfig;
+  metrics?: MetricsSettings;
   extra_path_dirs?: string[];
   resolved_extra_path_dirs?: string[];
   config_path?: string;

@@ -4278,7 +4278,7 @@ class TestTaskDiffProjection(unittest.TestCase):
 class TestFleetHistoryProjection(unittest.TestCase):
     """fleet 事件流投影:回各 workspace history.log 尾段;無 history 的 workspace 跳過,不動 truth。"""
 
-    def test_aggregate_uses_latest_500_samples_across_all_workspaces(self):
+    def test_aggregate_uses_latest_limit_samples_across_all_workspaces(self):
         samples = [{
             "workspace": "alpha" if index % 2 == 0 else "beta",
             "round": index,
@@ -4287,7 +4287,9 @@ class TestFleetHistoryProjection(unittest.TestCase):
             "missing_done": index in {10, 502},
             "timestamp": f"2026-07-10T{index:04d}",
         } for index in range(503)]
-        metrics = D.aggregate_fleet_round_metrics(samples)
+        self.assertEqual(D.aggregate_fleet_round_metrics([])["limit"], 3000,
+                         "不指定 limit 時應採預設 fleet_rounds")
+        metrics = D.aggregate_fleet_round_metrics(samples, limit=500)
         self.assertEqual(metrics["limit"], 500)
         self.assertEqual(metrics["sample_count"], 500)
         self.assertEqual(metrics["workspace_count"], 2)
@@ -4331,7 +4333,7 @@ class TestFleetHistoryProjection(unittest.TestCase):
                 self.assertEqual(entries[0]["metrics"]["p95_seconds"], 2.5)
                 self.assertEqual(entries[0]["metrics"]["missing_done_count"], 1)
                 self.assertEqual(entries[0]["metrics"]["missing_done_rate_pct"], 100)
-                self.assertEqual(projection["metrics"]["limit"], 500)
+                self.assertEqual(projection["metrics"]["limit"], 3000)
                 self.assertEqual(projection["metrics"]["sample_count"], 1)
                 self.assertEqual(projection["metrics"]["average_seconds"], 2.5)
                 self.assertEqual(projection["metrics"]["missing_done_count"], 1)
@@ -4347,6 +4349,138 @@ class TestFleetHistoryProjection(unittest.TestCase):
                 self.assertIsNone(alpha["round_interrupted_at"])
             finally:
                 D.ROOT = old_root
+
+
+class TestDashboardSettings(unittest.TestCase):
+    """統計輪數與團隊設定編輯:壞值 fail-closed、clamp 到投影硬上限、存檔保留其他欄位。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_metrics_settings_defaults_clamp_and_fail_closed(self):
+        self.assertEqual(D.metrics_settings({}), (1000, 3000))
+        self.assertEqual(D.metrics_settings({"metrics": "bad"}), (1000, 3000))
+        self.assertEqual(
+            D.metrics_settings({"metrics": {"workspace_rounds": True, "fleet_rounds": -5}}),
+            (1000, 3000))
+        self.assertEqual(
+            D.metrics_settings({"metrics": {"workspace_rounds": 200, "fleet_rounds": 999999}}),
+            (200, L.ROUND_METRICS_MAX_SAMPLES))
+
+    def test_fleet_metrics_tail_scales_with_rounds_within_history_cap(self):
+        self.assertEqual(D.fleet_metrics_tail_bytes(100), 512 * 1024)
+        self.assertEqual(D.fleet_metrics_tail_bytes(3000), 3000 * 1024)
+        self.assertEqual(D.fleet_metrics_tail_bytes(10 ** 9), L.HISTORY_MAX_BYTES)
+
+    def test_edit_settings_persists_to_project_config_and_keeps_other_fields(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "team.json"
+            project.write_text(json.dumps({"repo_roots": ["~/keep-me"]}), encoding="utf-8")
+            old = (D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE)
+            D.PROJECT_CONFIG_PATH = project
+            D.PERSONAL_CONFIG_PATH = Path(td) / "personal.json"
+            D.CONFIG_OVERRIDE = None
+            try:
+                handler = self.ResponseCapture()
+                D.Handler.api_edit_settings(handler, {
+                    "metrics": {"workspace_rounds": 1200, "fleet_rounds": 3600},
+                    "defaults": {"round_timeout": 45, "stuck_stop": True},
+                    "validate_cmds": [{"label": "unit", "cmd": "python -m unittest -q"}],
+                })
+                self.assertEqual(handler.response[0], 200)
+                self.assertEqual(handler.response[1]["metrics"],
+                                 {"workspace_rounds": 1200, "fleet_rounds": 3600})
+                saved = json.loads(project.read_text(encoding="utf-8"))
+                self.assertEqual(saved["repo_roots"], ["~/keep-me"], "不得覆蓋非本 modal 的欄位")
+                self.assertEqual(saved["metrics"], {"workspace_rounds": 1200, "fleet_rounds": 3600})
+                self.assertEqual(saved["defaults"]["round_timeout"], 45)
+                self.assertTrue(saved["defaults"]["stuck_stop"])
+                self.assertEqual(saved["defaults"]["done_threshold"],
+                                 D.DEFAULT_CONFIG["defaults"]["done_threshold"],
+                                 "未送欄位應以內建預設補齊成完整 defaults")
+                self.assertEqual(saved["validate_cmds"],
+                                 [{"label": "unit", "cmd": "python -m unittest -q"}])
+            finally:
+                D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE = old
+
+    def test_edit_settings_rejects_bad_rounds_defaults_and_commands(self):
+        with tempfile.TemporaryDirectory() as td:
+            old = (D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE)
+            D.PROJECT_CONFIG_PATH = Path(td) / "team.json"
+            D.PERSONAL_CONFIG_PATH = Path(td) / "personal.json"
+            D.CONFIG_OVERRIDE = None
+            base = {"metrics": {"workspace_rounds": 100, "fleet_rounds": 500},
+                    "defaults": {}, "validate_cmds": []}
+            bad_bodies = (
+                {**base, "metrics": {"workspace_rounds": 0, "fleet_rounds": 500}},
+                {**base, "metrics": {"workspace_rounds": 100,
+                                     "fleet_rounds": L.ROUND_METRICS_MAX_SAMPLES + 1}},
+                {**base, "metrics": {"workspace_rounds": True, "fleet_rounds": 500}},
+                {**base, "metrics": "bad"},
+                {**base, "defaults": {"flag_threshold": 0}},
+                {**base, "defaults": {"round_timeout": "bad"}},
+                {**base, "defaults": "bad"},
+                {**base, "validate_cmds": [{"label": "", "cmd": "true"}]},
+                {**base, "validate_cmds": [{"label": "x", "cmd": "'unclosed"}]},
+                {**base, "validate_cmds": "bad"},
+            )
+            try:
+                for body in bad_bodies:
+                    handler = self.ResponseCapture()
+                    D.Handler.api_edit_settings(handler, body)
+                    with self.subTest(body=body):
+                        self.assertEqual(handler.response[0], 400)
+                self.assertFalse(D.PROJECT_CONFIG_PATH.exists(), "驗證失敗不得寫檔")
+            finally:
+                D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE = old
+
+    def test_edit_settings_override_mode_writes_override_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            override = Path(td) / "override.json"
+            override.write_text(json.dumps(D.DEFAULT_CONFIG), encoding="utf-8")
+            old = (D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE)
+            D.PROJECT_CONFIG_PATH = Path(td) / "team.json"
+            D.PERSONAL_CONFIG_PATH = override
+            D.CONFIG_OVERRIDE = str(override)
+            try:
+                handler = self.ResponseCapture()
+                D.Handler.api_edit_settings(handler, {
+                    "metrics": {"workspace_rounds": 300, "fleet_rounds": 900},
+                    "defaults": {}, "validate_cmds": [],
+                })
+                self.assertEqual(handler.response[0], 200)
+                saved = json.loads(override.read_text(encoding="utf-8"))
+                self.assertEqual(saved["metrics"], {"workspace_rounds": 300, "fleet_rounds": 900})
+                self.assertFalse(D.PROJECT_CONFIG_PATH.exists(), "覆寫模式不得動團隊檔")
+            finally:
+                D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE = old
+
+    def test_round_metrics_endpoint_defaults_to_configured_workspace_rounds(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            workspace = root / "metrics"
+            workspace.mkdir(parents=True)
+            (workspace / "history.log").write_text(
+                "2026-07-10T10:00:00 round=1 phase=exec task=- secs=1.000 timeout=False\n",
+                encoding="utf-8")
+            old_root, old_load = D.ROOT, D.load_config
+            D.ROOT = root
+            D.load_config = lambda: {"metrics": {"workspace_rounds": 7, "fleet_rounds": 9}}
+            try:
+                capture = self.ResponseCapture()
+                capture._ws_dir = D.Handler._ws_dir.__get__(capture)
+                capture.path = "/api/round-metrics?ws=metrics"
+                D.Handler.do_GET(capture)
+                self.assertEqual(capture.response[0], 200)
+                self.assertEqual(capture.response[1]["limit"], 7)
+            finally:
+                D.ROOT, D.load_config = old_root, old_load
 
 
 class TestAnomalyLogProjection(unittest.TestCase):

@@ -263,6 +263,23 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await theme.selectOption("dark");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 
+  // Dashboard 全域設定：統計輪數等團隊設定可從工具列編輯並持久化（改完復原，不影響後續流程）。
+  await page.getByRole("button", { name: "Dashboard 設定" }).click();
+  const dashboardSettings = page.getByRole("dialog", { name: "Dashboard 設定" });
+  await expect(dashboardSettings).toBeVisible();
+  const workspaceRounds = dashboardSettings.getByLabel(/單 workspace 統計輪數/);
+  await expect(workspaceRounds).toHaveValue("1000");
+  await expect(dashboardSettings.getByLabel(/全部 workspace 合併筆數/)).toHaveValue("3000");
+  await workspaceRounds.fill("999");
+  await dashboardSettings.getByRole("button", { name: "儲存設定" }).click();
+  await expect(dashboardSettings).toBeHidden();
+  await page.getByRole("button", { name: "Dashboard 設定" }).click();
+  const reopenedDashboardSettings = page.getByRole("dialog", { name: "Dashboard 設定" });
+  await expect(reopenedDashboardSettings.getByLabel(/單 workspace 統計輪數/)).toHaveValue("999");
+  await reopenedDashboardSettings.getByLabel(/單 workspace 統計輪數/).fill("1000");
+  await reopenedDashboardSettings.getByRole("button", { name: "儲存設定" }).click();
+  await expect(reopenedDashboardSettings).toBeHidden();
+
   await page.getByRole("button", { name: "＋ 啟動第一個 loop" }).click();
   const launcher = page.getByRole("dialog", { name: "啟動與管理" });
   await expect(launcher).toBeVisible();
@@ -415,7 +432,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(overview.getByText("執行中", { exact: true })).toBeVisible();
   const fleetMetrics = overview.getByRole("listitem", { name: "全部 workspace 輪次效能" });
   await expect(fleetMetrics).toBeVisible();
-  await expect(fleetMetrics).toContainText("全部 workspace 近 500 輪");
+  await expect(fleetMetrics).toContainText("全部 workspace 近 3000 輪");
   await expect(fleetMetrics).toContainText("平均");
   await expect(fleetMetrics).toContainText("P50");
   await expect(fleetMetrics).toContainText("P95");
@@ -624,13 +641,13 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page.getByRole("dialog", { name: "啟動與管理" })).toContainText("已結束");
   await page.getByRole("dialog", { name: "啟動與管理" }).getByRole("button", { name: "關閉", exact: true }).click();
 
-  await page.getByRole("button", { name: "設定" }).click();
+  await page.getByRole("button", { name: "設定", exact: true }).click();
   let settings = page.getByRole("dialog", { name: "Workspace 設定" });
   await expect(settings).toBeVisible();
   await settings.getByRole("button", { name: "取消" }).click();
   await expect(settings).toBeHidden();
 
-  await page.getByRole("button", { name: "設定" }).click();
+  await page.getByRole("button", { name: "設定", exact: true }).click();
   settings = page.getByRole("dialog", { name: "Workspace 設定" });
   await settings.getByLabel("Agent 命令").selectOption("0");
   await settings.getByRole("button", { name: "管理 Agent CLI" }).click();
@@ -651,7 +668,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(settings).toBeHidden();
   await expect(loopConsole).toContainText("Dashboard｜更新 Workspace 設定");
 
-  await page.getByRole("button", { name: "設定" }).click();
+  await page.getByRole("button", { name: "設定", exact: true }).click();
   settings = page.getByRole("dialog", { name: "Workspace 設定" });
   await expect(settings.getByLabel("flag 收斂（>）")).toHaveValue("7");
   await expect(settings.getByLabel("done 收斂（≥）")).toHaveValue("888");
@@ -799,7 +816,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await page.getByRole("button", { name: "立即停止" }).click();
   await expect(page.getByRole("button", { name: "運行" })).toBeVisible();
 
-  await page.getByRole("button", { name: "設定" }).click();
+  await page.getByRole("button", { name: "設定", exact: true }).click();
   settings = page.getByRole("dialog", { name: "Workspace 設定" });
   await settings.getByLabel("done 收斂（≥）").fill("1");
   await settings.getByRole("button", { name: "儲存設定" }).click();

@@ -286,7 +286,7 @@ python loop.py status "$WS" --check
 echo $?
 ```
 
-`--check` 遇到 state 錯誤、stale PID、未讀 issues、Goal 變更、Agent 異常等需關注狀態時 exit 1；它不可和 `--watch` 同時使用。`--metrics N` 接受 `0..500`，`0` 代表不掃描 history。
+`--check` 遇到 state 錯誤、stale PID、未讀 issues、Goal 變更、Agent 異常等需關注狀態時 exit 1；它不可和 `--watch` 同時使用。`--metrics N` 接受 `0..5000`，`0` 代表不掃描 history。
 
 Run 尚在 Preflight／啟動 Validate、還沒把正式 session PID 寫入 state 時，status 會用實際 `.run.lock` owner 顯示「啟動檢查中」（JSON 為 `starting: true`），不會誤報已停止。
 

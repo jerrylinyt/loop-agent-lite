@@ -30,7 +30,8 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
     const encodedWorkspace = encodeURIComponent(workspace);
     const [response, metricProjection] = await Promise.all([
       getJson<IncrementalResponse>(`/api/history?ws=${encodedWorkspace}&offset=-1&run=${run}`),
-      getJson<RoundMetrics>(`/api/round-metrics?ws=${encodedWorkspace}&run=${run}&limit=100`)
+      // 不帶 limit：跟隨 Dashboard 設定的單 workspace 統計輪數。
+      getJson<RoundMetrics>(`/api/round-metrics?ws=${encodedWorkspace}&run=${run}`)
     ]);
     if (!isCurrent()) return;
     setLoading(false);
@@ -61,8 +62,8 @@ export default function HistoryModal({ workspace, onClose }: { workspace: string
         <button type="button" role="tab" aria-selected={run === "previous"} className={run === "previous" ? "active" : ""} onClick={() => setRun("previous")}>上一個 run</button>
       </div>
       {metrics && metrics.sample_count > 0 && (
-        <section className="history-analysis" aria-label="近 100 輪效能分析">
-          <div className="history-analysis-head"><strong>近 100 輪效能分析</strong><span>目前共 {metrics.sample_count} 輪樣本</span></div>
+        <section className="history-analysis" aria-label={`近 ${metrics.limit} 輪效能分析`}>
+          <div className="history-analysis-head"><strong>近 {metrics.limit} 輪效能分析</strong><span>目前共 {metrics.sample_count} 輪樣本</span></div>
           <div className="history-metrics" role="list" aria-label="輪次效能摘要">
             <div className="history-metric" role="listitem"><span>樣本</span><strong>{metrics.sample_count} 輪</strong></div>
             <div className="history-metric" role="listitem"><span>平均</span><strong>{formatDuration(metrics.average_seconds)}</strong></div>

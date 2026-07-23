@@ -55,6 +55,10 @@
     "default_auto_restart_max": 6,
     "usage_limit_patterns": []
   },
+  "metrics": {
+    "workspace_rounds": 1000,
+    "fleet_rounds": 3000
+  },
   "defaults": {
     "flag_threshold": 10,
     "done_threshold": 3,

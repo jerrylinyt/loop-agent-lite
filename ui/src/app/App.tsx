@@ -4,6 +4,7 @@ import ConsolePane from "../features/console/ConsolePane";
 import Splitter from "../features/layout/Splitter";
 import LauncherModal from "../features/launcher/LauncherModal";
 import ThemePicker from "../features/theme/ThemePicker";
+import SettingsModal from "../features/settings/SettingsModal";
 import FleetOverview from "../features/workspaces/FleetOverview";
 import WorkspaceTabs from "../features/workspaces/WorkspaceTabs";
 import WorkspaceView from "../features/workspaces/WorkspaceView";
@@ -19,6 +20,7 @@ export default function App() {
   const dashboard = useDashboardData();
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [launcherTemplate, setLauncherTemplate] = useState<DashboardConfig | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [overviewOpen, setOverviewOpen] = useState(() => localStorage.getItem("fleet-overview") === "1");
   const [attentionRequest, setAttentionRequest] = useState(0);
@@ -107,6 +109,7 @@ export default function App() {
             <ThemePicker />
             <button type="button" className="secondary-button command-palette-trigger" aria-keyshortcuts="Meta+K Control+K" onClick={() => setPaletteOpen(true)}>⌘K</button>
             <button type="button" className={`secondary-button${overviewOpen ? " active-toggle" : ""}`} aria-pressed={overviewOpen} onClick={toggleOverview}>總覽</button>
+            {!dashboard.bootstrap.readonly && <button type="button" className="secondary-button" aria-label="Dashboard 設定" onClick={() => setSettingsOpen(true)}>設定</button>}
             {!dashboard.bootstrap.readonly && <button type="button" className="success-button" onClick={() => openLauncher()}>＋ 啟動／管理</button>}
           </div>
         </header>
@@ -137,6 +140,7 @@ export default function App() {
       </div>
       {navigationChord && <div className="navigation-chord" role="status">導覽：按 0 回總覽，1～5 切換 workspace</div>}
       {launcherOpen && <LauncherModal workspaces={dashboard.workspaces} templateConfig={launcherTemplate} onClose={closeLauncher} onLaunched={launched} />}
+      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
       {paletteOpen && <CommandPalette workspaces={dashboard.workspaces} commands={paletteCommands} onClose={() => setPaletteOpen(false)} onSelectWorkspace={(name) => { dashboard.selectWorkspace(name); setOverviewOpen(false); }} />}
     </>
   );

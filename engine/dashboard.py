@@ -81,6 +81,11 @@ DEFAULT_CONFIG = {
         "red_limit": 20, "stall_limit": 300, "stuck_stop": False, "stuck_stop_count": 100,
         "pause_after_plan": False,
     },
+    # 統計輪數只是讀取/聚合上限（history.log 即時投影），不影響硬碟用量；可在 Dashboard 設定 modal 調整。
+    "metrics": {
+        "workspace_rounds": 1000,  # 單 workspace 近期輪數（fleet 卡片、輪次紀錄、Run 對比）
+        "fleet_rounds": 3000,      # 全 workspace 依時間合併後保留的最新筆數（總覽聚合）
+    },
     # ralph runner:公司內既有的 ralph.sh 迴圈。scripts 是團隊白名單(方便選),
     # 但 Launcher 也允許自訂 base command(ralph_custom),語意同 validate_custom。
     "ralph": {
@@ -1080,19 +1085,45 @@ def read_report(name):
 
 
 FLEET_HISTORY_TAIL = 16 * 1024  # 每個 workspace 事件流尾段上限
-FLEET_METRICS_TAIL = 512 * 1024  # 足以 bounded 掃描單 workspace 近期 500 輪
-FLEET_METRICS_LIMIT = 100
-FLEET_AGGREGATE_LIMIT = 500      # 全 workspace 合併後只取時間最新 500 筆
 SSE_PUSH_INTERVAL = 3.0          # 內網環境最多每三秒整理／推送一批變更
 SSE_CONSOLE_MAX_BYTES = 64 * 1024  # console 單次只送最新 64 KiB，避免慢連線累積 backlog
 FLEET_HISTORY_SSE_INTERVAL = SSE_PUSH_INTERVAL
 ANOMALY_ID_RE = loop_mod.ANOMALY_ID_RE
 
 
-def aggregate_fleet_round_metrics(samples, *, history_truncated=False):
-    """依時間合併各 workspace，精確聚合全體最新 500 筆。"""
+def metrics_settings(cfg):
+    """回傳 (workspace_rounds, fleet_rounds)；缺欄或格式錯誤回退預設，並 clamp 到投影硬上限。"""
+    raw = cfg.get("metrics")
+    raw = raw if isinstance(raw, dict) else {}
+
+    def pick(key):
+        fallback = DEFAULT_CONFIG["metrics"][key]
+        try:
+            value = parse_numeric_setting(raw.get(key, fallback), integer=True, minimum=1)
+        except (TypeError, ValueError):
+            return fallback
+        return min(value, loop_mod.ROUND_METRICS_MAX_SAMPLES)
+
+    return pick("workspace_rounds"), pick("fleet_rounds")
+
+
+def loaded_metrics_settings():
+    """讀取目前設定的統計輪數；設定檔讀取失敗時退回預設值，讓唯讀投影不因壞檔停擺。"""
+    cfg = load_config()
+    return metrics_settings({} if "error" in cfg else cfg)
+
+
+def fleet_metrics_tail_bytes(rounds):
+    """依統計輪數推 bounded 掃描視窗：每輪預留 1 KiB，維持舊 512 KiB 下限、history 上限封頂。"""
+    return min(loop_mod.HISTORY_MAX_BYTES, max(512 * 1024, rounds * 1024))
+
+
+def aggregate_fleet_round_metrics(samples, *, limit=None, history_truncated=False):
+    """依時間合併各 workspace，精確聚合全體最新 limit 筆（預設取設定檔 fleet_rounds）。"""
+    if limit is None:
+        limit = DEFAULT_CONFIG["metrics"]["fleet_rounds"]
     samples = sorted(samples, key=lambda sample: (
-        sample["timestamp"], sample["workspace"], sample["round"]))[-FLEET_AGGREGATE_LIMIT:]
+        sample["timestamp"], sample["workspace"], sample["round"]))[-limit:]
     durations = sorted(sample["seconds"] for sample in samples)
 
     def percentile(percent):
@@ -1107,7 +1138,7 @@ def aggregate_fleet_round_metrics(samples, *, history_truncated=False):
     slowest = max(samples, key=lambda sample: (
         sample["seconds"], sample["workspace"], sample["round"])) if samples else None
     return {
-        "limit": FLEET_AGGREGATE_LIMIT,
+        "limit": limit,
         "workspace_count": len({sample["workspace"] for sample in samples}),
         "sample_count": len(samples),
         "average_seconds": round(sum(durations) / len(durations), 3) if durations else None,
@@ -1125,12 +1156,14 @@ def aggregate_fleet_round_metrics(samples, *, history_truncated=False):
 
 
 def read_fleet_observability():
-    """一次 bounded read 投影事件尾段、各 workspace 與全體效能摘要。"""
+    """一次 bounded read 投影事件尾段、各 workspace 與全體效能摘要；輪數取自設定檔。"""
     out = []
     all_samples = []
     any_truncated = False
+    workspace_rounds, fleet_rounds = loaded_metrics_settings()
+    metrics_tail = fleet_metrics_tail_bytes(max(workspace_rounds, fleet_rounds))
     if not ROOT.is_dir():
-        return {"entries": out, "metrics": aggregate_fleet_round_metrics([])}
+        return {"entries": out, "metrics": aggregate_fleet_round_metrics([], limit=fleet_rounds)}
     for d in sorted(ROOT.iterdir()):
         if not loop_mod.valid_workspace_name(d.name) or d.is_symlink() or not d.is_dir():
             continue
@@ -1140,9 +1173,9 @@ def read_fleet_observability():
             with os.fdopen(fd, "rb", closefd=True) as stream:
                 stream.seek(0, os.SEEK_END)
                 size = stream.tell()
-                metrics_start = max(0, size - FLEET_METRICS_TAIL)
+                metrics_start = max(0, size - metrics_tail)
                 stream.seek(metrics_start)
-                metrics_data = stream.read(FLEET_METRICS_TAIL)
+                metrics_data = stream.read(metrics_tail)
         except FileNotFoundError:
             continue
         except (OSError, ValueError):
@@ -1157,9 +1190,9 @@ def read_fleet_observability():
             newline = tail.find("\n")
             tail = tail[newline + 1:] if newline != -1 else tail
         aggregate_metrics = loop_mod.round_metrics_from_history(
-            metrics_text, FLEET_AGGREGATE_LIMIT, history_truncated=metrics_start > 0)
+            metrics_text, fleet_rounds, history_truncated=metrics_start > 0)
         metrics = loop_mod.round_metrics_from_history(
-            metrics_text, FLEET_METRICS_LIMIT, history_truncated=metrics_start > 0)
+            metrics_text, workspace_rounds, history_truncated=metrics_start > 0)
         samples = aggregate_metrics["samples"]
         metrics.pop("samples")
         all_samples.extend({**sample, "workspace": d.name} for sample in samples)
@@ -1168,7 +1201,7 @@ def read_fleet_observability():
     return {
         "entries": out,
         "metrics": aggregate_fleet_round_metrics(
-            all_samples, history_truncated=any_truncated),
+            all_samples, limit=fleet_rounds, history_truncated=any_truncated),
     }
 
 
@@ -1228,9 +1261,10 @@ def anomaly_records_for_workspace(workspace_dir: Path, *, run="current", round_l
 
 
 def read_anomaly_records(workspace_dir: Path = None, *, run="current"):
-    """列出與 workspace 100 輪／Overview 全域 500 輪統計一致的異常，最多回 100 筆。"""
+    """列出與 workspace／Overview 統計輪數設定一致的異常，最多回 100 筆。"""
+    workspace_rounds, fleet_rounds = loaded_metrics_settings()
     if workspace_dir is not None:
-        records = anomaly_records_for_workspace(workspace_dir, run=run, round_limit=100)
+        records = anomaly_records_for_workspace(workspace_dir, run=run, round_limit=workspace_rounds)
     else:
         samples = []
         if ROOT.is_dir():
@@ -1240,7 +1274,7 @@ def read_anomaly_records(workspace_dir: Path = None, *, run="current"):
                     continue
                 try:
                     metrics = loop_mod.read_round_metrics(
-                        directory / "history.log", FLEET_AGGREGATE_LIMIT)
+                        directory / "history.log", fleet_rounds)
                     preserved = {
                         (item["timestamp"], item["round"]): item
                         for item in read_preserved_anomaly_metadata(directory)
@@ -1256,7 +1290,7 @@ def read_anomaly_records(workspace_dir: Path = None, *, run="current"):
                         "log_truncated": bool(saved.get("truncated")) if saved else False,
                     })
         samples = sorted(samples, key=lambda item: (
-            item["timestamp"], item["workspace"], item["round"]))[-FLEET_AGGREGATE_LIMIT:]
+            item["timestamp"], item["workspace"], item["round"]))[-fleet_rounds:]
         records = [sample for sample in samples if sample["missing_done"]]
     records.sort(key=lambda item: (
         item["timestamp"], item["workspace"], item["round"]), reverse=True)
@@ -1513,9 +1547,11 @@ def config_projection(cfg):
     raw_paths, resolved_paths = configured_path_dirs(cfg)
     prompt_templates, prompt_template_warnings = prompt_template_projection(cfg)
     prompt_bundle, prompt_bundle_error = prompt_template_bundle()
+    workspace_rounds, fleet_rounds = metrics_settings(cfg)
     return {"agent_cmds": cfg.get("agent_cmds", []),
             "validate_cmds": cfg.get("validate_cmds", []),
             "defaults": cfg.get("defaults") or {},
+            "metrics": {"workspace_rounds": workspace_rounds, "fleet_rounds": fleet_rounds},
             "extra_path_dirs": raw_paths,
             "resolved_extra_path_dirs": resolved_paths,
             "config_path": str(PERSONAL_CONFIG_PATH),
@@ -1550,6 +1586,25 @@ def save_personal_config(updates):
         current = {key: value for key, value in current.items() if key in PERSONAL_CONFIG_KEYS}
     loop_mod.atomic_write_bytes(
         PERSONAL_CONFIG_PATH,
+        json.dumps(current, ensure_ascii=False, indent=2).encode("utf-8"),
+    )
+
+
+def save_project_config(updates):
+    """寫團隊設定檔（Dashboard 設定 modal 專用）；保留檔內其他欄位，缺檔視為空設定。"""
+    try:
+        current_text = loop_mod.read_regular_text(
+            PROJECT_CONFIG_PATH, f"團隊設定檔 {PROJECT_CONFIG_PATH.name}")
+        current = json.loads(current_text)
+    except FileNotFoundError:
+        current = {}
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"團隊設定檔無法讀取:{e}") from e
+    if not isinstance(current, dict):
+        raise ValueError("團隊設定檔頂層必須是 JSON object")
+    current.update(updates)
+    loop_mod.atomic_write_bytes(
+        PROJECT_CONFIG_PATH,
         json.dumps(current, ensure_ascii=False, indent=2).encode("utf-8"),
     )
 
@@ -1919,6 +1974,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/test-cli": "api_test_cli",
         "/api/edit-cli-config": "api_edit_cli_config",
         "/api/edit-repo-roots": "api_edit_repo_roots",
+        "/api/edit-settings": "api_edit_settings",
         "/api/edit-notify": "api_edit_notify",
         "/api/test-notify": "api_test_notify",
         "/api/phase": "api_phase",
@@ -2194,8 +2250,10 @@ class Handler(BaseHTTPRequestHandler):
                 if run not in ("current", "previous"):
                     self._err("round metrics run 必須是 current 或 previous")
                     return
+                raw_limit = q.get("limit", [None])[0]
                 try:
-                    limit = int(q.get("limit", ["50"])[0])
+                    # 不帶 limit 時跟隨 Dashboard 設定的單 workspace 統計輪數。
+                    limit = loaded_metrics_settings()[0] if raw_limit is None else int(raw_limit)
                 except (TypeError, ValueError):
                     self._err(f"round metrics limit 必須介於 1～{loop_mod.ROUND_METRICS_MAX_SAMPLES}")
                     return
@@ -3322,6 +3380,90 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 save_personal_config({"notify_cmd": raw})
             except ValueError as e:
+                self._err(str(e))
+                return
+            cfg = load_config()
+        self._out(200, json.dumps(config_projection(cfg), ensure_ascii=False))
+
+    def api_edit_settings(self, body):
+        """Dashboard 設定 modal：一次儲存統計輪數、launch 預設值與 Validate 命令清單（團隊設定）。"""
+        raw_metrics = body.get("metrics")
+        if not isinstance(raw_metrics, dict):
+            self._err("metrics 必須是 object")
+            return
+        metrics = {}
+        for key in ("workspace_rounds", "fleet_rounds"):
+            try:
+                value = parse_numeric_setting(raw_metrics.get(key), integer=True, minimum=1)
+            except (TypeError, ValueError):
+                value = 0
+            if not 1 <= value <= loop_mod.ROUND_METRICS_MAX_SAMPLES:
+                self._err(f"{key} 必須是 1～{loop_mod.ROUND_METRICS_MAX_SAMPLES} 的整數")
+                return
+            metrics[key] = value
+        raw_defaults = body.get("defaults")
+        if not isinstance(raw_defaults, dict):
+            self._err("defaults 必須是 object")
+            return
+        default_updates = {}
+        # 數字欄位規則與 workspace 設定一致:round_timeout/agent_backoff_max ≥0,其餘 ≥1。
+        for key, minimum, integer in (
+                ("flag_threshold", 1, True), ("done_threshold", 1, True),
+                ("round_timeout", 0, False), ("agent_backoff_max", 0, False),
+                ("validate_timeout", 1, False), ("red_limit", 1, True),
+                ("stall_limit", 1, True), ("stuck_stop_count", 1, True)):
+            if raw_defaults.get(key) is None:
+                continue
+            try:
+                default_updates[key] = parse_numeric_setting(
+                    raw_defaults[key], integer=integer, minimum=minimum)
+            except (TypeError, ValueError):
+                self._err(f"defaults.{key} 不合法(round_timeout/agent_backoff_max 需 ≥0，其餘需 ≥1)")
+                return
+        for key in ("stuck_stop", "pause_after_plan"):
+            if raw_defaults.get(key) is not None:
+                default_updates[key] = bool(raw_defaults[key])
+        raw_validates = body.get("validate_cmds")
+        if not isinstance(raw_validates, list) or len(raw_validates) > 50:
+            self._err("Validate 命令必須是最多 50 個項目的清單")
+            return
+        validates = []
+        for index, item in enumerate(raw_validates, 1):
+            if not isinstance(item, dict):
+                self._err(f"Validate 命令 #{index} 格式錯誤")
+                return
+            label = str(item.get("label") or "").strip()
+            cmd = str(item.get("cmd") or "").strip()
+            if not label or not cmd:
+                self._err(f"Validate 命令 #{index} 的名稱與 command 不可為空")
+                return
+            if len(label) > 80 or len(cmd) > 2000:
+                self._err(f"Validate 命令 #{index} 內容過長")
+                return
+            try:
+                compat.split_command(cmd)
+            except ValueError as e:
+                self._err(f"Validate 命令 #{index} command 格式錯誤：{e}")
+                return
+            validates.append({"label": label, "cmd": cmd})
+        with CONFIG_LOCK:
+            cfg = load_config()
+            if "error" in cfg:
+                self._err(cfg["error"])
+                return
+            # defaults 以「內建 → 檔內既有 → 本次更新」疊合後整份存回,存檔永遠是完整欄位。
+            defaults = dict(DEFAULT_CONFIG["defaults"])
+            stored_defaults = cfg.get("defaults")
+            if isinstance(stored_defaults, dict):
+                defaults.update(stored_defaults)
+            defaults.update(default_updates)
+            updates = {"metrics": metrics, "defaults": defaults, "validate_cmds": validates}
+            try:
+                if CONFIG_OVERRIDE:
+                    save_personal_config(updates)
+                else:
+                    save_project_config(updates)
+            except (OSError, ValueError) as e:
                 self._err(str(e))
                 return
             cfg = load_config()

@@ -21,8 +21,9 @@ export default function RunCompareModal({ workspace, onClose }: { workspace: str
   useEffect(() => {
     const ws = encodeURIComponent(workspace);
     void Promise.all([
-      getJson<RoundMetrics>(`/api/round-metrics?ws=${ws}&run=current&limit=100`),
-      getJson<RoundMetrics>(`/api/round-metrics?ws=${ws}&run=previous&limit=100`),
+      // 不帶 limit：跟隨 Dashboard 設定的單 workspace 統計輪數。
+      getJson<RoundMetrics>(`/api/round-metrics?ws=${ws}&run=current`),
+      getJson<RoundMetrics>(`/api/round-metrics?ws=${ws}&run=previous`),
       getJson<AnomalyListResponse>(`/api/anomalies?ws=${ws}&run=current`),
       getJson<AnomalyListResponse>(`/api/anomalies?ws=${ws}&run=previous`)
     ]).then(([now, before, nowAnomalies, beforeAnomalies]) => {

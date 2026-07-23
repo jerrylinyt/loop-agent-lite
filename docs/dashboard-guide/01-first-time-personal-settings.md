@@ -89,14 +89,22 @@ command -v claude
 
 確認成功後按「儲存通知設定」。
 
+## D. Dashboard 全域設定（團隊）
+
+點右上角工具列的「設定」可開啟 Dashboard 設定視窗，內容儲存至團隊設定檔 `engine/dashboard.config.shared.json`：
+
+- **統計輪數**：單 workspace 統計輪數（預設 1000）與全部 workspace 合併筆數（預設 3000），上限各 5000。統計是從 `history.log` 尾端即時計算的讀取上限，調大不會增加硬碟用量。
+- **啟動預設值**：flag／done 收斂、單輪上限、Agent 退避、Validate timeout、紅燈連跳與 HEAD 停滯 reset、卡死自動停止、規劃後暫停。這些是「啟動新 loop」表單的預設值；既有 workspace 不受影響。
+- **Validate 命令清單**：啟動表單與 Workspace 設定可選的 Validate 命令（exit 0 視為通過）。
+
 ## 個人設定與團隊設定的界線
 
 | 類型 | 存放 | 典型內容 |
 |---|---|---|
 | 個人設定 | `dashboard.config.local.json` | Agent CLI、額外 PATH、Repo Roots、通知命令 |
-| 團隊預設 | `engine/dashboard.config.shared.json` | 預設 Agent／Validate、門檻、timeout、團隊 Prompt 模板 |
+| 團隊預設 | `engine/dashboard.config.shared.json` | 預設 Agent／Validate、門檻、timeout、統計輪數、團隊 Prompt 模板 |
 
-不同電腦應各自完成個人設定，不必把 local config commit 給團隊。
+不同電腦應各自完成個人設定，不必把 local config commit 給團隊。團隊預設可直接改檔案，或用右上角「設定」視窗編輯。
 
 ## 完成檢查
 

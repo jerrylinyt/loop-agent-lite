@@ -24,7 +24,7 @@
 
 ### 2. 再看跨工作區輪次效能
 
-此卡把所有 workspace 依時間合併，取最新最多 500 個已結束輪次：
+此卡把所有 workspace 依時間合併，取最新最多 N 個已結束輪次（N 依 Dashboard 設定，預設 3000）：
 
 - 平均：全部樣本平均耗時，容易受極慢輪影響。
 - P50：一半輪次比此值快，較接近日常體感。
@@ -63,7 +63,7 @@ Git 有變更但 Agent 沒回完成 signal 仍算異常，因為 coordinator 不
 
 ### 5. 讀單張 Workspace 卡片
 
-卡片通常包含：名稱、階段、round、flag／done、計時、任務進度、目前 task、近 100 輪效能、警示原因與 repo 路徑。點卡片進入詳細頁。
+卡片通常包含：名稱、階段、round、flag／done、計時、任務進度、目前 task、近期輪次效能（輪數依 Dashboard 設定，預設 1000）、警示原因與 repo 路徑。點卡片進入詳細頁。
 
 已完成 workspace 的歷史紅燈／停滯不會被當成目前告警；但未讀 issues、state 復原、Goal 變更、stale PID 或 state 錯誤仍可能需要關注。
 
