@@ -31,7 +31,7 @@
 
 | 欄位 | 意義 | 讀法 |
 |---|---|---|
-| N 輪 | 所有 workspace 依時間合併的最新樣本，最多 500 | 只含已結束輪 |
+| N 輪 | 所有 workspace 依時間合併的最新樣本，上限依 Dashboard 設定（預設 3000） | 只含已結束輪 |
 | 平均 | 算術平均耗時 | 易受極慢輪影響 |
 | P50 | 50th percentile | 接近日常中位體感 |
 | P95 | 95th percentile | 找尾端慢輪，不是成功率 |
@@ -69,7 +69,7 @@
 | 手動輸入 Repo | 條件式 | 下拉沒有時填路徑 | 建議絕對路徑 |
 | Repo 狀態 | 唯讀 | 顯示 Goal Git 狀態、工作樹、branch、既有 workspace | dirty tree 會擋一般 preflight |
 | goal.md 檔案 | 否 | 上傳要取代／匯入的 Goal | 留空沿用 repo 已 commit 版本 |
-| Goal 產生器 Prompt | — | 建構交給外部 Agent 的 Goal 撰寫 prompt | 只在瀏覽器，不寫 repo |
+| Goal 產生器 Prompt | — | 建構交給外部 Agent 的 Goal 撰寫 prompt；可勾選同時產生初版 plan.json | 只在瀏覽器，不寫 repo |
 | Goal 成果模板 | — | 顯示符合契約的 Goal 骨架 | 仍需人工適配 |
 | 匯入 plan.json | 否 | 建立全新純 Plan state | 留空沿用或從零規劃 |
 | 產生 Plan Prompt | — | 產生要求外部 Agent 輸出 Plan JSON 的 prompt | 輸出仍需審查 |
@@ -293,7 +293,7 @@
 | 控制項／欄位 | 用途 |
 |---|---|
 | 目前 run／上一個 run | 切換輪替 history |
-| 樣本、平均、P50、P95、最慢、逾時 | 近 100 輪分析 |
+| 樣本、平均、P50、P95、最慢、逾時 | 近 N 輪分析（N 依 Dashboard 設定，預設 1000） |
 | 未回 DONE | 開異常清單／log |
 | 輪、時間、耗時、階段、任務、訊號、驗證、flag、done、事件 | Coordinator 逐輪判定 |
 | 重新整理 | 重新讀 bounded history |

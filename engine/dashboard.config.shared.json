@@ -8,7 +8,7 @@
   "validate_cmds": [
     {
       "label": "python unittest",
-      "cmd": "python3 -m unittest discover -s tests -t . -q"
+      "cmd": "python -m unittest discover -s tests -t . -q"
     },
     {
       "label": "mvn compile",
@@ -20,7 +20,7 @@
     },
     {
       "label": "react build+test+e2e",
-      "cmd": "sh -c 'npm run build && npm test -- --run && npx playwright test'"
+      "cmd": "npm run check:all"
     }
   ],
   "repo_roots": [
@@ -32,6 +32,33 @@
   ],
   "notify_cmd": "",
   "prompt_templates": [],
+  "ralph": {
+    "scripts": [
+      {
+        "label": "公司 ralph",
+        "cmd": "sh /opt/tools/ralph.sh"
+      }
+    ],
+    "tools": [
+      "opencode",
+      "claude",
+      "amp"
+    ],
+    "default_iterations": 100,
+    "default_args_style": "positional",
+    "prd_filenames": [
+      "prd.json",
+      "prd.md"
+    ],
+    "default_usage_limit_action": "restart",
+    "default_fallback_models": [],
+    "default_auto_restart_max": 6,
+    "usage_limit_patterns": []
+  },
+  "metrics": {
+    "workspace_rounds": 1000,
+    "fleet_rounds": 3000
+  },
   "defaults": {
     "flag_threshold": 10,
     "done_threshold": 3,

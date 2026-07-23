@@ -26,7 +26,6 @@
 import argparse
 import atexit
 import errno
-import fcntl
 import hashlib
 import json
 import math
@@ -45,6 +44,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from engine import platform_compat as compat
 from engine.paths import default_workspace_root, expose_project_package
 
 HERE = Path(__file__).resolve().parent
@@ -68,8 +68,8 @@ TASK_LIST_TRUNC = 80                   # prompt 任務總覽單行截斷長度
 CONSOLE_MAX_BYTES = 5 * 1024 * 1024   # console.log 單檔 5 MiB
 CONSOLE_BACKUPS = 3                    # 保留 console.log.1～.3
 HISTORY_MAX_BYTES = 10 * 1024 * 1024  # history.log 當前 run 上限；只保留最新完整尾段
-ROUND_METRICS_SCAN_BYTES = 2 * 1024 * 1024  # 效能投影只掃尾端，避免讀完整長 history
-ROUND_METRICS_MAX_SAMPLES = 500       # API/CLI 單次最多聚合的近期輪數
+ROUND_METRICS_SCAN_BYTES = 4 * 1024 * 1024  # 效能投影只掃尾端，避免讀完整長 history
+ROUND_METRICS_MAX_SAMPLES = 5000      # API/CLI 單次最多聚合的近期輪數（硬上限；預設值在 dashboard 設定）
 ANOMALY_LOG_MAX_COUNT = 100           # 每個 workspace 最多保留的異常輪 Agent log
 ANOMALY_LOG_MAX_BYTES = 2 * 1024 * 1024  # 單份異常 log 保留尾端上限，最多約 200 MiB/workspace
 ANOMALY_ID_RE = re.compile(r"\d{8}T\d{12}-r\d{6}-[0-9a-f]{8}")
@@ -82,6 +82,7 @@ WORKSPACE_OPS_DIR = ".ops"
 
 _CONSOLE_PATH = None
 _CONSOLE_LOCK = threading.Lock()
+_ATOMIC_REPLACE_LOCK = threading.Lock()
 _RUN_LOCKS = []
 
 
@@ -107,7 +108,7 @@ def workspace_path(root: Path, name: str) -> Path:
         return path
     except OSError as e:
         raise ValueError(f"無法檢查 workspace 目錄：{e}") from e
-    if stat.S_ISLNK(mode):
+    if stat.S_ISLNK(mode) or compat.is_reparse_point(path.lstat()):
         raise ValueError("workspace 目錄不可為 symbolic link（避免逸出 workspace root）")
     return path
 
@@ -127,7 +128,7 @@ def workspace_directory(path: Path, label: str = "workspace 目錄", *, create=F
             raise ValueError(f"{label}無法建立:{e}") from e
     except OSError as e:
         raise ValueError(f"{label}無法檢查:{e}") from e
-    if stat.S_ISLNK(info.st_mode):
+    if stat.S_ISLNK(info.st_mode) or compat.is_reparse_point(info):
         raise ValueError(f"{label}不可為 symbolic link")
     if not stat.S_ISDIR(info.st_mode):
         raise ValueError(f"{label}必須是目錄")
@@ -148,7 +149,7 @@ def workspace_file(path: Path, label: str = "workspace 檔案") -> Path:
         return path
     except OSError as e:
         raise ValueError(f"{label}無法檢查:{e}") from e
-    if stat.S_ISLNK(info.st_mode):
+    if stat.S_ISLNK(info.st_mode) or compat.is_reparse_point(info):
         raise ValueError(f"{label}不可為 symbolic link")
     if not stat.S_ISREG(info.st_mode):
         raise ValueError(f"{label}必須是 regular file")
@@ -165,11 +166,63 @@ def _open_regular(path: Path, flags: int, mode: int = 0o600):
         raise ValueError(f"workspace artifact 父目錄不存在:{parent}") from e
     except OSError as e:
         raise ValueError(f"workspace artifact 父目錄無法檢查:{e}") from e
-    if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+    if (stat.S_ISLNK(parent_info.st_mode) or compat.is_reparse_point(parent_info)
+            or not stat.S_ISDIR(parent_info.st_mode)):
         raise ValueError("workspace artifact 父目錄必須是實體目錄")
     nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
+    if nofollow is None and not compat.IS_WINDOWS:
         raise ValueError("此系統不支援安全的 O_NOFOLLOW 檔案操作")
+    if compat.IS_WINDOWS:
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            before = None
+        except OSError as e:
+            raise ValueError(f"無法安全檢查 {path.name}:{e}") from e
+        if before is not None and (stat.S_ISLNK(before.st_mode)
+                                   or compat.is_reparse_point(before)
+                                   or not stat.S_ISREG(before.st_mode)):
+            raise ValueError(f"{path.name}必須是單一 regular file")
+        # O_TRUNC would damage a link target before the post-open identity check.
+        # Delay truncation until both the directory entry and opened handle agree.
+        delayed_truncate = bool(flags & os.O_TRUNC)
+        open_flags = flags & ~os.O_TRUNC
+        try:
+            for attempt in range(6):
+                try:
+                    fd = os.open(path, open_flags, mode)
+                    break
+                except PermissionError:
+                    # os.replace、防毒掃描或索引服務可能留下極短的 Windows
+                    # sharing-violation 窗口；安全檢查不變，只重試同一路徑。
+                    if attempt == 5:
+                        raise
+                    time.sleep(0.02)
+        except OSError as e:
+            if e.errno == getattr(errno, "ENOENT", 2):
+                raise FileNotFoundError(path) from e
+            raise ValueError(f"無法安全開啟 {path.name}:{e}") from e
+        try:
+            after = path.lstat()
+            opened = os.fstat(fd)
+            parent_after = parent.lstat()
+            if (stat.S_ISLNK(after.st_mode) or compat.is_reparse_point(after)
+                    or not stat.S_ISREG(after.st_mode)
+                    or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                    or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+                    or stat.S_ISLNK(parent_after.st_mode) or compat.is_reparse_point(parent_after)
+                    or not stat.S_ISDIR(parent_after.st_mode)
+                    or (parent_info.st_dev, parent_info.st_ino)
+                    != (parent_after.st_dev, parent_after.st_ino)
+                    or (before is not None and (before.st_dev, before.st_ino)
+                        != (after.st_dev, after.st_ino))):
+                raise ValueError(f"{path.name} 在開啟期間被替換或不是安全的 regular file")
+            if delayed_truncate:
+                os.ftruncate(fd, 0)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
     try:
         fd = os.open(path, flags | nofollow, mode)
     except OSError as e:
@@ -421,7 +474,7 @@ def repo_relative_path(repo: Path, rel: str) -> Path:
                 info = current.lstat()
             except FileNotFoundError:
                 break
-            if stat.S_ISLNK(info.st_mode):
+            if stat.S_ISLNK(info.st_mode) or compat.is_reparse_point(info):
                 raise ValueError(f"受保護檔案路徑 {rel!r} 不可經由 symbolic link")
         resolved = (root / candidate).resolve()
         try:
@@ -454,6 +507,28 @@ def workspace_operation_lock(root: Path, name: str, *, blocking=True):
         root.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         raise WorkspaceOperationLockError(f"無法建立 workspace 根目錄:{e}") from e
+    if compat.IS_WINDOWS:
+        lock_file = None
+        try:
+            ensure_real_directory(root, "workspace 根目錄")
+            ops = ensure_real_directory(root / WORKSPACE_OPS_DIR, "workspace operation lock 目錄")
+            lock_fd = _open_regular(ops / f"{name}.lock", os.O_RDWR | os.O_CREAT)
+            lock_file = os.fdopen(lock_fd, "a+b")
+            try:
+                compat.lock_file(lock_file, blocking=blocking)
+            except (BlockingIOError, PermissionError) as e:
+                raise WorkspaceOperationLockError(
+                    f"workspace {name} 正在進行建立或刪除操作") from e
+            yield
+        finally:
+            if lock_file is not None:
+                try:
+                    compat.unlock_file(lock_file)
+                except OSError:
+                    pass
+                lock_file.close()
+        return
+
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         raise WorkspaceOperationLockError("此系統不支援安全的 workspace operation lock")
@@ -482,14 +557,14 @@ def workspace_operation_lock(root: Path, name: str, *, blocking=True):
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise WorkspaceOperationLockError("workspace operation lock 不是安全的 regular file")
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            compat.lock_file(lock_file, blocking=blocking)
         except BlockingIOError as e:
             raise WorkspaceOperationLockError(f"workspace {name} 正在進行建立或刪除操作") from e
         yield
     finally:
         if lock_file is not None:
             try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                compat.unlock_file(lock_file)
             except OSError:
                 pass
             lock_file.close()
@@ -520,7 +595,7 @@ def append_console(path: Path, line: str, *, max_bytes: int = CONSOLE_MAX_BYTES,
     lock_path = path.with_name(f".{path.name}.lock")
     lock_fd = _open_regular(lock_path, os.O_RDWR | os.O_CREAT)
     with _CONSOLE_LOCK, os.fdopen(lock_fd, "a+b", closefd=True) as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        compat.lock_file(lock_file)
         try:
             try:
                 current_size = workspace_file(path, "console.log").lstat().st_size
@@ -543,7 +618,7 @@ def append_console(path: Path, line: str, *, max_bytes: int = CONSOLE_MAX_BYTES,
                 console.flush()
                 os.fsync(console.fileno())
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            compat.unlock_file(lock_file)
 
 
 def _console_line(line: str) -> None:
@@ -577,11 +652,20 @@ def safe_kill(pid, sig):
     """送 signal 給單一 pid 前的最後防線。kernel 對 kill 的特殊語意:pid=0 殺自己
     整個 process group、pid=-1 殺掉所有殺得動的程序——上游 pid 來源(state 檔、
     型別轉換)一旦被污染,走到這裡就是全機屠殺。攔到只記 log 不送,回傳是否已送出。"""
-    pid = int(pid)
+    target = pid
+    pid = int(getattr(pid, "pid", pid))
     if pid <= 1:
         log(f"⛔ 攔截 os.kill({pid}, {sig!r}):pid 為 -1/0/1 會波及整組甚至全機程序,拒絕送出")
         return False
-    os.kill(pid, sig)
+    if compat.IS_WINDOWS and ((hasattr(target, "poll") and target.poll() is not None)
+                              or not compat.process_is_alive(pid)):
+        raise ProcessLookupError(pid)
+    if compat.IS_WINDOWS and sig == signal.SIGINT:
+        compat.interrupt_process_group(target)
+    elif compat.IS_WINDOWS and hasattr(target, "kill"):
+        target.kill()
+    else:
+        os.kill(pid, sig)
     return True
 
 
@@ -590,14 +674,16 @@ def safe_killpg(pgid, sig):
     pgid 等於自己所在 group 代表 start_new_session 沒生效或 pgid 來源被污染,
     這一刀會把 coordinator 連同啟動它的 shell/同 session 程序一起帶走。
     攔到只記 log 不送,回傳是否已送出。"""
-    pgid = int(pgid)
+    target = pgid
+    pgid = int(getattr(pgid, "pid", pgid))
     if pgid <= 1:
         log(f"⛔ 攔截 os.killpg({pgid}, {sig!r}):pgid<=1 等同殺自己整組/全機程序,拒絕送出")
         return False
-    if pgid == os.getpgid(0):
+    if ((compat.IS_WINDOWS and pgid == os.getpid())
+            or (not compat.IS_WINDOWS and pgid == os.getpgid(0))):
         log(f"⛔ 攔截 os.killpg({pgid}, {sig!r}):目標是 coordinator 自己的 process group,拒絕送出")
         return False
-    os.killpg(pgid, sig)
+    compat.signal_process_group(target, sig)
     return True
 
 
@@ -606,7 +692,7 @@ def release_run_locks() -> None:
     while _RUN_LOCKS:
         lock_file = _RUN_LOCKS.pop()
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            compat.unlock_file(lock_file)
         finally:
             lock_file.close()
 
@@ -620,8 +706,8 @@ def acquire_run_lock(path: Path, label: str) -> None:
         fail(f"preflight：{label} 鎖檔不安全或無法建立:{e}")
     lock_file = os.fdopen(lock_fd, "a+b", closefd=True)
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        compat.lock_file(lock_file, blocking=False)
+    except (BlockingIOError, PermissionError):
         lock_file.seek(0)
         owner = lock_file.read().decode("utf-8", errors="replace").strip()
         lock_file.close()
@@ -645,8 +731,8 @@ def active_run_lock_owner(path: Path):
         return None
     with os.fdopen(fd, "rb", closefd=True) as lock_file:
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            compat.lock_file(lock_file, blocking=False)
+        except (BlockingIOError, PermissionError):
             lock_file.seek(0)
             try:
                 owner = json.loads(lock_file.read().decode("utf-8"))
@@ -657,7 +743,7 @@ def active_run_lock_owner(path: Path):
             except (UnicodeDecodeError, json.JSONDecodeError):
                 return None
         else:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            compat.unlock_file(lock_file)
             return None
 
 
@@ -741,9 +827,13 @@ def green_anchor_valid(repo, green, snap_dir, rel_paths) -> bool:
         snap = snap_dir / rel.replace("/", "__")
         if not snap.exists():
             return False
-        r = subprocess.run(["git", "cat-file", "blob", f"{green}:{rel}"],
-                           cwd=str(repo), capture_output=True)
-        if r.returncode != 0 or r.stdout != snap.read_bytes():
+        committed = subprocess.run(
+            ["git", "rev-parse", f"{green}:{rel}"], cwd=str(repo), capture_output=True, text=True)
+        filtered = subprocess.run(
+            ["git", "hash-object", "--stdin", "--path", rel], cwd=str(repo),
+            input=snap.read_bytes(), capture_output=True)
+        if (committed.returncode != 0 or filtered.returncode != 0
+                or committed.stdout.strip() != filtered.stdout.decode("ascii", errors="replace").strip()):
             return False
     return True
 
@@ -767,11 +857,29 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     # tmp 名帶 uuid:同 process 多執行緒(dashboard ThreadingHTTPServer)並發寫同一 state.json
     # 時不再共用 tmp,避免互相 truncate 或 replace 後對方拿到 FileNotFoundError(#3)。
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        # ReplaceFile/MoveFileEx may transiently report sharing violations while
+        # another Windows thread is opening the destination. Serialise local
+        # writers and retry those short-lived violations; POSIX remains one call.
+        with _ATOMIC_REPLACE_LOCK:
+            attempts = 100 if compat.IS_WINDOWS else 1
+            for attempt in range(attempts):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if attempt + 1 == attempts:
+                        raise
+                    time.sleep(0.005)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _stop_after_round_marker_matches(path: Path, pid, session_id) -> bool:
@@ -1254,12 +1362,19 @@ def run_agent(cmd, prompt, repo, env, log_path, timeout_secs, on_started=None):
     回傳 (rc, 秒數, 是否逾時)。"""
     t0 = time.monotonic()
     timed_out = False
+    env = dict(env)
+    if compat.IS_WINDOWS:
+        # The stdin contract is UTF-8 bytes.  Python-based CLIs otherwise use
+        # the active ANSI code page and silently mojibake non-ASCII prompts.
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
     log_fd = _open_regular(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
     prompt_bytes = prompt.encode("utf-8")
     with os.fdopen(log_fd, "w", encoding="utf-8", closefd=True) as lf:
         p = subprocess.Popen(cmd, cwd=str(repo), env=env, stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             start_new_session=True)
+                             **compat.popen_group_kwargs())
+        compat.attach_process_group(p)
         process_group = p.pid  # start_new_session=True → pgid 固定等於 child pid
         reader_errors = []
         writer_errors = []
@@ -1268,7 +1383,7 @@ def run_agent(cmd, prompt, repo, env, log_path, timeout_secs, on_started=None):
         def _kill_group():
             """終止 Agent 的獨立 process group，避免背景子程序持續佔用 pipe。"""
             try:
-                safe_killpg(process_group, signal.SIGKILL)
+                safe_killpg(p, compat.FORCE_SIGNAL)
             except (ProcessLookupError, PermissionError):
                 pass
 
@@ -1309,7 +1424,7 @@ def run_agent(cmd, prompt, repo, env, log_path, timeout_secs, on_started=None):
             if on_started:
                 on_started(p.pid)
             try:
-                p.wait(timeout=timeout_secs if timeout_secs else None)
+                compat.wait_process(p, timeout=timeout_secs if timeout_secs else None)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 _kill_group()
@@ -1348,7 +1463,7 @@ def notify(cmd, status, name):
     if not cmd:
         return
     try:
-        subprocess.run(shlex.split(cmd.replace("{status}", status).replace("{name}", name)),
+        subprocess.run(compat.split_command(cmd.replace("{status}", status).replace("{name}", name)),
                        capture_output=True, timeout=15)
         log(f"🔔 notify 已送出:{status}")
     except Exception as e:  # noqa: BLE001 — 通知永不擋主流程
@@ -1362,7 +1477,8 @@ def run_validate(cmd, repo, timeout_secs=VALIDATE_TIMEOUT_SEC):
     卡死，dashboard 永遠等不到 startup handshake，workspace 也就一直沒有 state.json。"""
     try:
         p = subprocess.Popen(cmd, cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, start_new_session=True)
+                             text=True, **compat.popen_group_kwargs())
+        compat.attach_process_group(p)
     except FileNotFoundError:
         return False, f"找不到 Validate 命令：{cmd[0]}", False
     timed_out = False
@@ -1372,7 +1488,7 @@ def run_validate(cmd, repo, timeout_secs=VALIDATE_TIMEOUT_SEC):
     except subprocess.TimeoutExpired:
         timed_out = True
         try:
-            safe_killpg(os.getpgid(p.pid), signal.SIGKILL)
+            safe_killpg(p, compat.FORCE_SIGNAL)
         except (ProcessLookupError, PermissionError):
             pass
         p.wait()  # SIGKILL 保證直接子行程終止；卡住的只會是下面等孫行程放開 stdout 的讀取
@@ -1391,11 +1507,14 @@ def run_validate(cmd, repo, timeout_secs=VALIDATE_TIMEOUT_SEC):
             p.stdout.close()
     except KeyboardInterrupt:
         try:
-            safe_killpg(os.getpgid(p.pid), signal.SIGKILL)
+            safe_killpg(p, compat.FORCE_SIGNAL)
         except (ProcessLookupError, PermissionError):
             pass
         p.wait()
         raise
+    finally:
+        # Job Object 也必須在正常成功時關閉；逾時路徑已關閉時此操作為 no-op。
+        compat.close_process_group(p)
     out = (out or "").strip()
     tail = "\n".join(out.splitlines()[-VALIDATE_TAIL:])
     if escaped:
@@ -1551,8 +1670,8 @@ def parse_runtime_options(argv=None) -> RuntimeOptions:
         args=args,
         repo=repo,
         workspace_name=workspace_name,
-        agent_cmd=shlex.split(args.agent_cmd) if args.agent_cmd else AGENT_CMD,
-        validate_cmd=shlex.split(args.validate_cmd) if args.validate_cmd else VALIDATE_CMD,
+        agent_cmd=compat.split_command(args.agent_cmd) if args.agent_cmd else AGENT_CMD,
+        validate_cmd=compat.split_command(args.validate_cmd) if args.validate_cmd else VALIDATE_CMD,
         protected=protected,
         plan_doc_display=(str(repo_relative_path(repo, args.plan_doc)) if args.plan_doc
                           else "(未提供——以 goal、現有計畫與實際程式碼為準)"),
@@ -2011,8 +2130,13 @@ def main(argv=None):
                        "validate_timeout": args.validate_timeout,
                        "pause_after_plan": bool(args.pause_after_plan),
                        "notify_cmd": args.notify_cmd,
-                       "repo": str(repo), "agent_cmd": shlex.join(agent_cmd),
-                       "validate_cmd": shlex.join(validate_cmd),
+                       "repo": str(repo),
+                       # Windows 只在實際 spawn 時解析 python/.cmd 等 launcher；state 保留
+                       # Dashboard 傳入的設定值，讓「以此為範本」仍能命中同一個白名單選項。
+                       "agent_cmd": (str(args.agent_cmd).strip() if compat.IS_WINDOWS
+                                     else compat.join_command(agent_cmd)),
+                       "validate_cmd": (str(args.validate_cmd).strip() if compat.IS_WINDOWS
+                                        else compat.join_command(validate_cmd)),
                        "goal": args.goal, "plan_doc": args.plan_doc}
     state["repo_binding"] = str(repo)
     # 舊 session 的停止請求不可跨重啟生效；先清掉，再公開新 pid/session_id。
@@ -2208,6 +2332,11 @@ def main(argv=None):
             state["notes"].append(f"⚠️ 上一輪 agent 超過 {args.round_timeout:g} 分鐘被強制終止,"
                                   "工作可能做到一半——工作區殘留照「收拾現場」步驟判斷。")
 
+        # issue 是給人類看的回報,不參與任何計數;prompt 規定的回報路徑是「issue 後直接
+        # 結束、不送完成訊號」,而竄改/失敗處理都會 clear_signals,所以必須搶在那之前
+        # 收進 state,否則正規回報一律被連坐作廢,dashboard 永遠看不到。
+        ingest_pending_issues(ws, state, round_token, rnd, task_id, phase)
+
         # ---- 協調層竄改偵測:整輪作廢(reset --hard 回輪初 sha) ----
         tampered = []
         # 受保護檔案(goal/plan-doc)被刪或被改 = 最嚴重破壞:整輪 reset + clean,該輪所有變更
@@ -2243,9 +2372,17 @@ def main(argv=None):
             ws.clear_signals()
             log(f"⚠️ 本輪作廢｜偵測到不允許的變更：{', '.join(tampered)}｜相關 signal 已丟棄")
 
+        head_after = head_sha(repo)
+        dirty = is_dirty(repo)
+        changed = dirty or (head_after != head_before)
+        state["stall_rounds"] = 0 if head_after != head_before else state["stall_rounds"] + 1
+
         # 不同 Agent CLI 對 exit code 的定義不一致，因此 rc 只供 log 診斷，不參與
-        # round 成敗。唯一的完成依據是該 phase 的 coordinator 訊號；逾時則仍作廢，
-        # 避免已失控、未按 prompt 在回報後停止的程序被算成完整一輪。
+        # round 成敗。唯一的健康依據是該 phase 的 coordinator 訊號:prompt 契約要求每輪
+        # 正常收尾都要回報——exec 含 commit 輪也必須送 done,done 只代表「agent 正常工作」,
+        # 完成票在有異動的輪次會自動歸零。commit/diff 不能替代訊號:半途 crash 的輪同樣
+        # 會留下異動,分不出是收尾還是失控。逾時則一律作廢，避免已失控、未按 prompt 在
+        # 回報後停止的程序被算成完整一輪。
         agent_failed = not agent_reported_done or timed_out
         if agent_failed:
             state["agent_failure_streak"] = state.get("agent_failure_streak", 0) + 1
@@ -2260,11 +2397,6 @@ def main(argv=None):
             if state.get("agent_failure_streak", 0):
                 log(f"✅ Agent 完成回報已恢復｜連續異常 {state['agent_failure_streak']} 輪後收到有效訊號")
             state["agent_failure_streak"] = 0
-
-        head_after = head_sha(repo)
-        dirty = is_dirty(repo)
-        changed = dirty or (head_after != head_before)
-        state["stall_rounds"] = 0 if head_after != head_before else state["stall_rounds"] + 1
 
         if phase == "plan":
             event = process_plan_round(
@@ -2286,8 +2418,6 @@ def main(argv=None):
             state["current_task_base_sha"] = None
         ensure_current_task_base_sha(state, repo, head_after)
 
-        ingest_pending_issues(ws, state, round_token, rnd, task_id, phase)
-
         will_retry = (agent_failed and state["phase"] != "done" and
                       not (args.max_rounds and state["round"] >= args.max_rounds))
         retry_delay = agent_failure_backoff(state["agent_failure_streak"], args.agent_backoff_max) \
@@ -2297,7 +2427,9 @@ def main(argv=None):
                                           .isoformat(timespec="seconds")) if retry_delay else None
 
         round_finished_at = datetime.now().isoformat(timespec="seconds")
-        if missing_done:
+        # 異常 log 跟著 agent_failed 走:按契約不送 done 的 commit 輪是正常工作輪,
+        # 不得佔用異常保留額度;反之逾時輪即使有送訊號也要留稽核。
+        if agent_failed:
             try:
                 preserve_anomaly_log(
                     ws.dir, ws.dir / "logs" / f"round-{rnd:04d}.log",
@@ -2325,8 +2457,10 @@ def main(argv=None):
             log(f"⏳ Agent 連續未完成 {state['agent_failure_streak']} 輪｜{retry_delay:g} 秒後重試"
                 f"（上限 {args.agent_backoff_max:g} 秒）")
         ws.save_state(state)
-        stop_after_round = ws.take_stop_after_round(os.getpid(), session_id)
-        if retry_delay and not stop_after_round:
+        if retry_delay:
+            # 退避狀態已落盤；從這一刻起的任何中斷(含 Windows CTRL_BREAK 落在 stop 檢查的
+            # 檔案 I/O 期間)都必須清掉等待狀態,否則 state 會永遠顯示不存在的退避。
+            stop_after_round = False
             try:
                 # 退避已位於兩輪之間；此時收到請求應立即停，不必等完退避，更不能再開一輪。
                 deadline = time.monotonic() + retry_delay
@@ -2343,6 +2477,8 @@ def main(argv=None):
                 state["agent_backoff_seconds"] = 0
                 state["agent_backoff_until"] = None
                 ws.save_state(state)
+        else:
+            stop_after_round = ws.take_stop_after_round(os.getpid(), session_id)
         if stop_after_round:
             state["agent_backoff_seconds"] = 0
             state["agent_backoff_until"] = None
@@ -2364,6 +2500,11 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    def _windows_break(*_):
+        """Turn a targeted CTRL+BREAK from Dashboard into the normal stop path."""
+        raise KeyboardInterrupt
+
+    compat.register_windows_break_handler(_windows_break)
     try:
         main()
     except KeyboardInterrupt:

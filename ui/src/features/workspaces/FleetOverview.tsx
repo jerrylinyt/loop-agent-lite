@@ -119,7 +119,7 @@ export default function FleetOverview({ workspaces, fleetHistory, fleetMetrics, 
         </div>
         <div className="fleet-stat fleet-performance" role="listitem" aria-label="全部 workspace 輪次效能">
           <strong>{fleetMetrics?.sample_count ?? 0} 輪</strong>
-          <span>全部 workspace 近 500 輪</span>
+          <span>全部 workspace 近 {fleetMetrics?.limit ?? "—"} 輪</span>
           {fleetMetrics && fleetMetrics.sample_count > 0 ? (
             <div className="fleet-performance-summary" title={`${fleetMetrics.workspace_count} 個 workspace 合併後，取時間最新 ${fleetMetrics.limit} 個已結束輪次；Plan 以 create-plan / plan-ok、Exec 以 done 作為完成回報；有 Git 變更但未回報仍算異常，人工中斷輪不計`}>
               <div className="fleet-performance-grid">

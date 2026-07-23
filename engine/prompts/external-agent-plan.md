@@ -28,4 +28,4 @@
 - 輸出前在內部以 JSON parser 與上述 schema 自檢；不得留下 TODO、`<placeholder>`、虛構路徑或未從 repo 證實的命令。
 - 除非原需求指定其他語言，task 內文使用繁體中文；程式碼、命令、路徑與識別碼維持原文。
 
-合法形狀示意（內容必須改成實際分析結果，不得照抄；注意每個 task 都含目的、證據、交付物與「DoD：」，且驗證命令逐 task 寫全、不指代其他 task）：`[{"order":1,"task":"目的：為訂單查詢 API 建立測試骨架，涵蓋 AC-1、AC-2。證據：現有端點定義於 src/api/orders.py:42。交付物：tests/test_orders_api.py 與可重跑 fixture。DoD：在 repo 根目錄執行 python3 -m unittest tests.test_orders_api -q 通過","ref":"docs/analysis.md#訂單查詢"},{"order":2,"task":"目的：實作訂單查詢的狀態篩選，涵蓋 AC-3。證據：篩選參數契約見 src/api/orders.py:57，既有測試位於 tests/test_orders_api.py。前置：order 1 完成。交付物：src/api/orders.py 的篩選實作。DoD：在 repo 根目錄執行 python3 -m unittest tests.test_orders_api -q 全綠"}]`
+合法形狀示意（內容必須改成實際分析結果，不得照抄；注意每個 task 都含目的、證據、交付物與「DoD：」，且驗證命令逐 task 寫全、不指代其他 task）：`[{"order":1,"task":"目的：為訂單查詢 API 建立測試骨架，涵蓋 AC-1、AC-2。證據：現有端點定義於 src/api/orders.py:42。交付物：tests/test_orders_api.py 與可重跑 fixture。DoD：在 repo 根目錄執行 python -m unittest tests.test_orders_api -q 通過","ref":"docs/analysis.md#訂單查詢"},{"order":2,"task":"目的：實作訂單查詢的狀態篩選，涵蓋 AC-3。證據：篩選參數契約見 src/api/orders.py:57，既有測試位於 tests/test_orders_api.py。前置：order 1 完成。交付物：src/api/orders.py 的篩選實作。DoD：在 repo 根目錄執行 python -m unittest tests.test_orders_api -q 全綠"}]`

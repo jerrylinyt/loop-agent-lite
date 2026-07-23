@@ -5,7 +5,7 @@ export type PromptTemplateMode = "goal" | "plan";
 
 const RESOURCE_PLACEHOLDER_RE = /<<[A-Z][A-Z0-9_]*>>/g;
 const RESOURCE_MARKER_RE = /<<[^\r\n]*?>>/g;
-const REQUIRED_BUNDLE_FIELDS = ["base", "goal", "goal_template", "plan", "missing_requirement", "team_template_example"] as const;
+const REQUIRED_BUNDLE_FIELDS = ["base", "goal", "goal_template", "plan", "goal_plan_bridge", "missing_requirement", "team_template_example"] as const;
 const BASE_PLACEHOLDERS = [
   "<<OUTPUT_NAME>>", "<<ORIGINAL_REQUIREMENT_BLOCK>>", "<<PROJECT_CONTEXT_SECTION>>",
   "<<TEMPLATE_LABEL>>", "<<TEMPLATE_DESCRIPTION>>", "<<TEMPLATE_INSTRUCTIONS>>",
@@ -32,13 +32,13 @@ function hasExactPlaceholders(source: string, expected: readonly string[]) {
 
 export function isPromptTemplateBundleSupported(bundle: PromptTemplateBundle | null | undefined): bundle is PromptTemplateBundle {
   return !!bundle
-    && bundle.schema_version === 3
+    && bundle.schema_version === 4
     && REQUIRED_BUNDLE_FIELDS.every((field) => typeof bundle[field] === "string" && !!bundle[field].trim())
     && hasExactPlaceholders(bundle.base, BASE_PLACEHOLDERS)
     && bundle.base.trimEnd().endsWith("<<MODE_CONTRACT>>")
     && hasExactPlaceholders(bundle.missing_requirement, ["<<OUTPUT_NAME>>", "<<OUTPUT_NAME>>"])
     && hasExactPlaceholders(bundle.goal_template, GOAL_TEMPLATE_PLACEHOLDERS)
-    && [bundle.goal, bundle.plan, bundle.team_template_example]
+    && [bundle.goal, bundle.plan, bundle.goal_plan_bridge, bundle.team_template_example]
       .every((resource) => hasExactPlaceholders(resource, []));
 }
 
@@ -92,17 +92,23 @@ export function buildExternalAgentPrompt({
   bundle,
   mode,
   requirement,
-  projectContext
+  projectContext,
+  includePlanDraft = false
 }: {
   template: PromptTemplate;
   bundle: PromptTemplateBundle;
   mode: PromptTemplateMode;
   requirement: string;
   projectContext: string;
+  /** 只在 goal 模式生效：在 goal 契約後接合併輸出契約與 plan 拆分規則，讓 Agent 一併輸出初版 plan.json。 */
+  includePlanDraft?: boolean;
 }) {
   if (!isPromptTemplateBundleSupported(bundle)) return "";
 
-  const outputName = mode === "goal" ? "goal.md" : "plan.json";
+  const withPlanDraft = mode === "goal" && includePlanDraft;
+  const outputName = mode === "goal"
+    ? (withPlanDraft ? "goal.md 與初版 plan.json" : "goal.md")
+    : "plan.json";
   const requirementText = requirement.trim();
   if (!requirementText) {
     return renderPromptResource(bundle.missing_requirement, {
@@ -110,6 +116,9 @@ export function buildExternalAgentPrompt({
     });
   }
 
+  const modeContract = mode === "goal"
+    ? (withPlanDraft ? [bundle.goal, bundle.goal_plan_bridge, bundle.plan].join("\n\n") : bundle.goal)
+    : bundle.plan;
   return renderPromptResource(bundle.base, {
     "<<OUTPUT_NAME>>": outputName,
     "<<ORIGINAL_REQUIREMENT_BLOCK>>": markdownQuote(requirementText),
@@ -117,7 +126,7 @@ export function buildExternalAgentPrompt({
     "<<TEMPLATE_LABEL>>": inlineText(template.label),
     "<<TEMPLATE_DESCRIPTION>>": normalizedLines(template.description),
     "<<TEMPLATE_INSTRUCTIONS>>": normalizedLines(template.instructions),
-    "<<MODE_CONTRACT>>": mode === "goal" ? bundle.goal : bundle.plan
+    "<<MODE_CONTRACT>>": modeContract
   });
 }
 
@@ -132,10 +141,11 @@ export function buildGoalArtifactTemplate(template: PromptTemplate, bundle: Prom
   });
 }
 
-export function promptDownloadName(template: PromptTemplate, mode: PromptTemplateMode) {
+export function promptDownloadName(template: PromptTemplate, mode: PromptTemplateMode, includePlanDraft = false) {
   // 非安全字元轉成連字號，避免模板 id 產生意外路徑或空檔名。
   const safeId = template.id.replace(/[^a-z0-9._-]+/gi, "-").replace(/^-+|-+$/g, "") || "custom";
-  return `${safeId}-${mode}-prompt.md`;
+  const modeName = mode === "goal" && includePlanDraft ? "goal-plan" : mode;
+  return `${safeId}-${modeName}-prompt.md`;
 }
 
 export function goalTemplateDownloadName(template: PromptTemplate) {

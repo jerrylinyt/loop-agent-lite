@@ -28,6 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from engine import dashboard as D  # noqa: E402
 from engine import loop as L  # noqa: E402
+from engine import platform_compat as compat  # noqa: E402
 from engine import status as S  # noqa: E402
 from engine import work as W  # noqa: E402
 
@@ -35,6 +36,23 @@ WORK_CMD = [sys.executable, "-m", "engine.work"]
 LOOP_CMD = [sys.executable, "-m", "engine.loop"]
 STATUS_CMD = [sys.executable, "-m", "engine.status"]
 WS_ROOT = REPO_ROOT / "workspace"
+
+
+def read_process_lines(process, count, timeout=2):
+    """Read pipe lines without relying on POSIX-only select-on-pipes."""
+    captured = []
+
+    def reader():
+        for _ in range(count):
+            line = process.stdout.readline()
+            if not line:
+                break
+            captured.append(line)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    return captured
 
 
 def git(repo, *a):
@@ -516,6 +534,105 @@ class TestRoundTelemetry(unittest.TestCase):
             self.assertEqual(unrelated_log.read_text(encoding="utf-8"), "do not manage")
 
 
+class TestRoundOutcomeJudgement(unittest.TestCase):
+    """輪末健康判定:coordinator 訊號是唯一健康依據(commit 輪也要送 done);
+    issue 是人類回報通道,不得被失敗處理的 clear_signals 連坐作廢。"""
+
+    def test_issue_only_round_lands_in_state_despite_missing_completion(self):
+        # prompt 契約:回報 issue 後直接結束、不送 create-plan/plan-ok/done。
+        # 該輪雖記為未完成回報(保留退避節流),issue 本身必須落入 state 供 dashboard 檢視。
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = make_repo(root)
+            workspace_root = root / "workspace"
+            agent = root / "issue_agent.py"
+            agent.write_text(
+                "import subprocess, sys\n"
+                "sys.stdin.read()\n"
+                "subprocess.run([sys.executable, '-m', 'engine.work', 'issue',\n"
+                "                'goal contradicts itself'], check=True)\n"
+            )
+            env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+            result = subprocess.run(
+                [*LOOP_CMD, "--repo", str(repo), "--name", "issue-survives",
+                 "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+                 "--validate-cmd", "true", "--agent-backoff-max", "0", "--max-rounds", "1"],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            state = json.loads((workspace_root / "issue-survives" / "state.json").read_text())
+            self.assertEqual([issue["text"] for issue in state["issues"]],
+                             ["goal contradicts itself"],
+                             "issue-only 輪的回報不得被 clear_signals 連坐作廢")
+            self.assertEqual(state["issues"][0]["round"], 1)
+            self.assertEqual(state["issues"][0]["where"], "plan")
+            self.assertEqual(L.unread_issue_count(state), 1)
+            self.assertEqual(state["agent_failure_streak"], 1)
+
+    def _run_exec_round(self, root, name, agent_body):
+        """在 exec 期跑一輪指定 agent 腳本,回傳 (result, state, history, anomaly_logs)。"""
+        repo = make_repo(root)
+        workspace_root = Path(root) / "workspace"
+        plan = Path(root) / "plan.json"
+        plan.write_text('[{"order": 1, "task": "implement feature"}]')
+        agent = Path(root) / "exec_agent.py"
+        agent.write_text(agent_body)
+        env = {**os.environ, "LOOP_AGENT_WORKSPACE_ROOT": str(workspace_root)}
+        result = subprocess.run(
+            [*LOOP_CMD, "--repo", str(repo), "--name", name,
+             "--agent-cmd", shlex.join([sys.executable, str(agent)]),
+             "--validate-cmd", "true", "--import-plan", str(plan),
+             "--start-phase", "exec", "--agent-backoff-max", "0", "--max-rounds", "1"],
+            capture_output=True, text=True, env=env,
+        )
+        state = json.loads((workspace_root / name / "state.json").read_text())
+        history = (workspace_root / name / "history.log").read_text()
+        anomaly_dir = workspace_root / name / "logs" / "anomalies"
+        anomaly_logs = list(anomaly_dir.glob("*.log")) if anomaly_dir.exists() else []
+        return result, state, history, anomaly_logs
+
+    COMMIT_BODY = (
+        "import subprocess, sys\n"
+        "from pathlib import Path\n"
+        "sys.stdin.read()\n"
+        "Path('feature.txt').write_text('implemented')\n"
+        "subprocess.run(['git', 'add', '-A'], check=True)\n"
+        "subprocess.run(['git', 'commit', '-qm', 'task-1 implement feature'], check=True)\n"
+    )
+
+    def test_exec_commit_round_with_done_is_healthy_and_resets_vote(self):
+        # prompt 契約:每輪正常收尾都必須送 done(含 commit 輪)。done 只代表 agent
+        # 正常工作;有 commit/diff 即算異動,完成票歸零、由之後的乾淨輪次獨立驗收。
+        with tempfile.TemporaryDirectory() as d:
+            result, state, history, anomaly_logs = self._run_exec_round(
+                d, "commit-with-done",
+                self.COMMIT_BODY +
+                "subprocess.run([sys.executable, '-m', 'engine.work', 'done', 'task-1'],\n"
+                "               check=True)\n")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(state["agent_failure_streak"], 0,
+                             "commit 輪按契約送 done,不得記為 Agent 異常")
+            self.assertIn("signal=done", history)
+            self.assertIn("agent_ok=True", history)
+            self.assertIn("done_missing=False", history)
+            self.assertNotIn("Agent round 異常", result.stdout)
+            self.assertEqual(state["done_count"], 0, "commit 輪的完成票仍須歸零等待下輪確認")
+            self.assertEqual(anomaly_logs, [], "正常工作輪不得佔用異常 log 保留額度")
+
+    def test_exec_commit_round_without_done_is_agent_failure(self):
+        # commit 而不送 done = 沒按契約收尾,分不出是正常實作還是半途失控,必須記為異常。
+        with tempfile.TemporaryDirectory() as d:
+            result, state, history, anomaly_logs = self._run_exec_round(
+                d, "commit-without-done", self.COMMIT_BODY)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(state["agent_failure_streak"], 1,
+                             "commit 不能替代 done 訊號:未回報收尾必須記為 Agent 異常")
+            self.assertIn("agent_ok=False", history)
+            self.assertIn("done_missing=True", history)
+            self.assertEqual(state["done_count"], 0)
+            self.assertEqual(len(anomaly_logs), 1, "異常輪 log 必須保留供稽核")
+
+
 class TestLiveRoundTiming(unittest.TestCase):
     """進行中 round 可觀測；正常輪末清除，立即停止則保留凍結的中斷上下文。"""
 
@@ -547,6 +664,7 @@ class TestLiveRoundTiming(unittest.TestCase):
                  "--validate-cmd", "true", "--round-timeout", "1",
                  "--agent-backoff-max", "0", "--max-rounds", "1"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+                **compat.popen_group_kwargs(),
             )
             try:
                 deadline = time.monotonic() + 5
@@ -576,7 +694,7 @@ class TestLiveRoundTiming(unittest.TestCase):
                 self.assertGreaterEqual(live_projection["round_elapsed_seconds"], 0)
                 self.assertGreater(live_projection["round_remaining_seconds"], 0)
 
-                process.send_signal(signal.SIGINT)
+                compat.interrupt_process_group(process)
                 output, _ = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 130, output)
                 stopped = json.loads(state_path.read_text())
@@ -653,6 +771,7 @@ class TestInterruptedResume(unittest.TestCase):
             process = subprocess.Popen(
                 common + ["--import-plan", str(plan), "--start-phase", "exec", "--max-rounds", "3"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+                **compat.popen_group_kwargs(),
             )
             state_path = workspace_root / "interrupted-resume" / "state.json"
             try:
@@ -668,7 +787,7 @@ class TestInterruptedResume(unittest.TestCase):
                 else:
                     self.fail("第一輪 Agent 未留下可 Resume 的中斷現場")
 
-                process.send_signal(signal.SIGINT)
+                compat.interrupt_process_group(process)
                 first_output, _ = process.communicate(timeout=8)
                 self.assertEqual(process.returncode, 130, first_output)
                 interrupted = json.loads(state_path.read_text())
@@ -876,7 +995,7 @@ class TestRoundMetrics(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             history = root / "history.log"
-            history.write_text("x" * 256 + "\n" + self.HISTORY)
+            history.write_text("x" * 256 + "\n" + self.HISTORY, newline="\n")
             old_scan = L.ROUND_METRICS_SCAN_BYTES
             try:
                 L.ROUND_METRICS_SCAN_BYTES = 220
@@ -1319,6 +1438,7 @@ class TestAgentFailureBackoff(unittest.TestCase):
                  "--agent-cmd", "false", "--validate-cmd", "true",
                  "--agent-backoff-max", "2", "--max-rounds", "2"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+                **compat.popen_group_kwargs(),
             )
             try:
                 deadline = time.monotonic() + 3
@@ -1337,7 +1457,7 @@ class TestAgentFailureBackoff(unittest.TestCase):
                 self.assertIsNotNone(observed, "退避開始前必須先把等待狀態落進 state.json")
                 self.assertEqual(observed["agent_failure_streak"], 1)
                 self.assertIsNotNone(observed["agent_backoff_until"])
-                process.send_signal(signal.SIGINT)
+                compat.interrupt_process_group(process)
                 output, _ = process.communicate(timeout=3)
                 self.assertEqual(process.returncode, 130, output)
                 stopped = json.loads(state_path.read_text())
@@ -1740,19 +1860,13 @@ class TestStatusCli(unittest.TestCase):
                 process = subprocess.Popen(
                     [*STATUS_CMD, "--name", "watch-status", "--json",
                      "--watch", "--interval", "0.01"],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
-                captured = []
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                    **compat.popen_group_kwargs())
                 try:
                     # 等 CLI 真正進入 watch loop 並輸出兩筆，再驗證 Ctrl-C；固定 sleep
                     # 可能在較慢機器的 Python import 階段就送 SIGINT，造成與產品無關的 -2。
-                    deadline = time.monotonic() + 2
-                    while len(captured) < 2 and time.monotonic() < deadline:
-                        ready, _, _ = select.select([process.stdout], [], [], 0.1)
-                        if ready:
-                            line = process.stdout.readline()
-                            if line:
-                                captured.append(line)
-                    process.send_signal(signal.SIGINT)
+                    captured = read_process_lines(process, 2)
+                    compat.interrupt_process_group(process)
                     output, error = process.communicate(timeout=2)
                     output = "".join(captured) + output
                 finally:
@@ -1779,26 +1893,14 @@ class TestStatusCli(unittest.TestCase):
                 process = subprocess.Popen(
                     [*STATUS_CMD, "--name", "watch-change", "--json",
                      "--watch", "--on-change", "--interval", "0.01"],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
-                captured = []
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                    **compat.popen_group_kwargs())
                 try:
-                    deadline = time.monotonic() + 2
-                    while len(captured) < 1 and time.monotonic() < deadline:
-                        ready, _, _ = select.select([process.stdout], [], [], 0.1)
-                        if ready:
-                            line = process.stdout.readline()
-                            if line:
-                                captured.append(line)
+                    captured = read_process_lines(process, 1)
                     state["round"] = 1
                     ws.save_state(state)
-                    deadline = time.monotonic() + 2
-                    while len(captured) < 2 and time.monotonic() < deadline:
-                        ready, _, _ = select.select([process.stdout], [], [], 0.1)
-                        if ready:
-                            line = process.stdout.readline()
-                            if line:
-                                captured.append(line)
-                    process.send_signal(signal.SIGINT)
+                    captured += read_process_lines(process, 1)
+                    compat.interrupt_process_group(process)
                     output, error = process.communicate(timeout=2)
                     output = "".join(captured) + output
                 finally:
@@ -3069,20 +3171,33 @@ class TestClaimedDrainProjection(unittest.TestCase):
 class TestPortableDashboardConfig(unittest.TestCase):
     """GUI/IDE 沒載入 shell profile 時，個人 PATH 與團隊/個人分層仍應生效。"""
 
+    @unittest.skipUnless(compat.IS_WINDOWS, "Windows command-line parser only")
+    def test_windows_native_command_keeps_backslashes_when_argument_has_apostrophe(self):
+        expected = [sys.executable, "-c", "print('portable-ok')"]
+        self.assertEqual(compat.split_command(subprocess.list2cmdline(expected)), expected)
+
+    @unittest.skipUnless(compat.IS_WINDOWS, "legacy Windows state compatibility only")
+    def test_windows_still_reads_legacy_shlex_joined_state_command(self):
+        expected = [sys.executable, "C:\\Program Files\\Legacy Agent\\agent.py", "--check"]
+        self.assertEqual(compat.split_command(shlex.join(expected)), expected)
+
     def test_home_relative_extra_path_finds_cli(self):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)
             bindir = home / ".local" / "bin"
             bindir.mkdir(parents=True)
-            cli = bindir / "portable-cli"
-            cli.write_text("#!/bin/sh\necho portable-ok\n")
+            cli = bindir / ("portable-cli.cmd" if compat.IS_WINDOWS else "portable-cli")
+            cli.write_text("@echo off\necho portable-ok\n" if compat.IS_WINDOWS
+                           else "#!/bin/sh\necho portable-ok\n")
             cli.chmod(0o755)
             old_home, old_path = os.environ.get("HOME"), os.environ.get("PATH")
             try:
                 os.environ["HOME"] = str(home)
                 os.environ["PATH"] = "/usr/bin:/bin"
                 env = D.command_env({"extra_path_dirs": ["~/.local/bin"]})
-                result = subprocess.run(["portable-cli"], capture_output=True, text=True, env=env)
+                executable = shutil.which("portable-cli", path=env["PATH"])
+                self.assertIsNotNone(executable)
+                result = subprocess.run([executable], capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 0)
                 self.assertIn("portable-ok", result.stdout)
             finally:
@@ -3342,7 +3457,6 @@ class TestWorkspaceDelete(unittest.TestCase):
         return workspace
 
     def test_refuses_running_and_held_lock_then_deletes_full_tree(self):
-        import fcntl
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "workspace"
             workspace = self._seed_workspace(root)
@@ -3363,12 +3477,12 @@ class TestWorkspaceDelete(unittest.TestCase):
                 self.assertTrue(workspace.exists())
 
                 holder = open(workspace / ".run.lock", "a+b")
-                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                compat.lock_file(holder, blocking=False)
                 try:
                     locked = self.ResponseCapture()
                     D.Handler.api_delete_workspace(locked, {"name": "demo"})
                 finally:
-                    fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+                    compat.unlock_file(holder)
                     holder.close()
                 self.assertEqual(locked.response[0], 409, locked.response)
                 self.assertIn("單 writer 鎖", locked.response[1]["error"])
@@ -3383,6 +3497,22 @@ class TestWorkspaceDelete(unittest.TestCase):
                 self.assertTrue((outside / "must-survive.txt").exists())
                 self.assertEqual(D.list_workspaces(), [])
                 self.assertEqual([path for path in root.iterdir() if path.name.startswith(".delete-")], [])
+            finally:
+                D.ROOT = old_root
+
+    def test_deletes_plain_tree_while_holding_transaction_locks(self):
+        """Windows must allow the locked directory to be renamed to its tombstone."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            workspace = self._seed_workspace(root)
+            old_root = D.ROOT
+            D.ROOT = root
+            try:
+                deleted = self.ResponseCapture()
+                D.Handler.api_delete_workspace(deleted, {"name": "demo"})
+                self.assertEqual(deleted.response[0], 200, deleted.response)
+                self.assertFalse(workspace.exists())
+                self.assertEqual(list(root.glob(".delete-*")), [])
             finally:
                 D.ROOT = old_root
 
@@ -3964,14 +4094,13 @@ class TestDashboardPreflight(unittest.TestCase):
                 self.assertFalse((workspace / "dispatch.json").exists())
                 self.assertFalse(list((workspace / "snapshots").iterdir()))
 
-                import fcntl
                 holder = open(workspace / ".run.lock", "a+b")
-                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                compat.lock_file(holder, blocking=False)
                 try:
                     handler = self.ResponseCapture()
                     D.Handler.api_preflight(handler, body)
                 finally:
-                    fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+                    compat.unlock_file(holder)
                     holder.close()
                 self.assertEqual(handler.response[0], 200)
                 self.assertFalse(handler.response[1]["ok"])
@@ -4149,7 +4278,7 @@ class TestTaskDiffProjection(unittest.TestCase):
 class TestFleetHistoryProjection(unittest.TestCase):
     """fleet 事件流投影:回各 workspace history.log 尾段;無 history 的 workspace 跳過,不動 truth。"""
 
-    def test_aggregate_uses_latest_500_samples_across_all_workspaces(self):
+    def test_aggregate_uses_latest_limit_samples_across_all_workspaces(self):
         samples = [{
             "workspace": "alpha" if index % 2 == 0 else "beta",
             "round": index,
@@ -4158,7 +4287,9 @@ class TestFleetHistoryProjection(unittest.TestCase):
             "missing_done": index in {10, 502},
             "timestamp": f"2026-07-10T{index:04d}",
         } for index in range(503)]
-        metrics = D.aggregate_fleet_round_metrics(samples)
+        self.assertEqual(D.aggregate_fleet_round_metrics([])["limit"], 3000,
+                         "不指定 limit 時應採預設 fleet_rounds")
+        metrics = D.aggregate_fleet_round_metrics(samples, limit=500)
         self.assertEqual(metrics["limit"], 500)
         self.assertEqual(metrics["sample_count"], 500)
         self.assertEqual(metrics["workspace_count"], 2)
@@ -4202,7 +4333,7 @@ class TestFleetHistoryProjection(unittest.TestCase):
                 self.assertEqual(entries[0]["metrics"]["p95_seconds"], 2.5)
                 self.assertEqual(entries[0]["metrics"]["missing_done_count"], 1)
                 self.assertEqual(entries[0]["metrics"]["missing_done_rate_pct"], 100)
-                self.assertEqual(projection["metrics"]["limit"], 500)
+                self.assertEqual(projection["metrics"]["limit"], 3000)
                 self.assertEqual(projection["metrics"]["sample_count"], 1)
                 self.assertEqual(projection["metrics"]["average_seconds"], 2.5)
                 self.assertEqual(projection["metrics"]["missing_done_count"], 1)
@@ -4218,6 +4349,138 @@ class TestFleetHistoryProjection(unittest.TestCase):
                 self.assertIsNone(alpha["round_interrupted_at"])
             finally:
                 D.ROOT = old_root
+
+
+class TestDashboardSettings(unittest.TestCase):
+    """統計輪數與團隊設定編輯:壞值 fail-closed、clamp 到投影硬上限、存檔保留其他欄位。"""
+
+    class ResponseCapture:
+        response = None
+
+        def _out(self, code, body, _ctype="application/json; charset=utf-8"):
+            self.response = code, json.loads(body)
+
+        def _err(self, msg, code=400):
+            self.response = code, {"error": msg}
+
+    def test_metrics_settings_defaults_clamp_and_fail_closed(self):
+        self.assertEqual(D.metrics_settings({}), (1000, 3000))
+        self.assertEqual(D.metrics_settings({"metrics": "bad"}), (1000, 3000))
+        self.assertEqual(
+            D.metrics_settings({"metrics": {"workspace_rounds": True, "fleet_rounds": -5}}),
+            (1000, 3000))
+        self.assertEqual(
+            D.metrics_settings({"metrics": {"workspace_rounds": 200, "fleet_rounds": 999999}}),
+            (200, L.ROUND_METRICS_MAX_SAMPLES))
+
+    def test_fleet_metrics_tail_scales_with_rounds_within_history_cap(self):
+        self.assertEqual(D.fleet_metrics_tail_bytes(100), 512 * 1024)
+        self.assertEqual(D.fleet_metrics_tail_bytes(3000), 3000 * 1024)
+        self.assertEqual(D.fleet_metrics_tail_bytes(10 ** 9), L.HISTORY_MAX_BYTES)
+
+    def test_edit_settings_persists_to_project_config_and_keeps_other_fields(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "team.json"
+            project.write_text(json.dumps({"repo_roots": ["~/keep-me"]}), encoding="utf-8")
+            old = (D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE)
+            D.PROJECT_CONFIG_PATH = project
+            D.PERSONAL_CONFIG_PATH = Path(td) / "personal.json"
+            D.CONFIG_OVERRIDE = None
+            try:
+                handler = self.ResponseCapture()
+                D.Handler.api_edit_settings(handler, {
+                    "metrics": {"workspace_rounds": 1200, "fleet_rounds": 3600},
+                    "defaults": {"round_timeout": 45, "stuck_stop": True},
+                    "validate_cmds": [{"label": "unit", "cmd": "python -m unittest -q"}],
+                })
+                self.assertEqual(handler.response[0], 200)
+                self.assertEqual(handler.response[1]["metrics"],
+                                 {"workspace_rounds": 1200, "fleet_rounds": 3600})
+                saved = json.loads(project.read_text(encoding="utf-8"))
+                self.assertEqual(saved["repo_roots"], ["~/keep-me"], "不得覆蓋非本 modal 的欄位")
+                self.assertEqual(saved["metrics"], {"workspace_rounds": 1200, "fleet_rounds": 3600})
+                self.assertEqual(saved["defaults"]["round_timeout"], 45)
+                self.assertTrue(saved["defaults"]["stuck_stop"])
+                self.assertEqual(saved["defaults"]["done_threshold"],
+                                 D.DEFAULT_CONFIG["defaults"]["done_threshold"],
+                                 "未送欄位應以內建預設補齊成完整 defaults")
+                self.assertEqual(saved["validate_cmds"],
+                                 [{"label": "unit", "cmd": "python -m unittest -q"}])
+            finally:
+                D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE = old
+
+    def test_edit_settings_rejects_bad_rounds_defaults_and_commands(self):
+        with tempfile.TemporaryDirectory() as td:
+            old = (D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE)
+            D.PROJECT_CONFIG_PATH = Path(td) / "team.json"
+            D.PERSONAL_CONFIG_PATH = Path(td) / "personal.json"
+            D.CONFIG_OVERRIDE = None
+            base = {"metrics": {"workspace_rounds": 100, "fleet_rounds": 500},
+                    "defaults": {}, "validate_cmds": []}
+            bad_bodies = (
+                {**base, "metrics": {"workspace_rounds": 0, "fleet_rounds": 500}},
+                {**base, "metrics": {"workspace_rounds": 100,
+                                     "fleet_rounds": L.ROUND_METRICS_MAX_SAMPLES + 1}},
+                {**base, "metrics": {"workspace_rounds": True, "fleet_rounds": 500}},
+                {**base, "metrics": "bad"},
+                {**base, "defaults": {"flag_threshold": 0}},
+                {**base, "defaults": {"round_timeout": "bad"}},
+                {**base, "defaults": "bad"},
+                {**base, "validate_cmds": [{"label": "", "cmd": "true"}]},
+                {**base, "validate_cmds": [{"label": "x", "cmd": "'unclosed"}]},
+                {**base, "validate_cmds": "bad"},
+            )
+            try:
+                for body in bad_bodies:
+                    handler = self.ResponseCapture()
+                    D.Handler.api_edit_settings(handler, body)
+                    with self.subTest(body=body):
+                        self.assertEqual(handler.response[0], 400)
+                self.assertFalse(D.PROJECT_CONFIG_PATH.exists(), "驗證失敗不得寫檔")
+            finally:
+                D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE = old
+
+    def test_edit_settings_override_mode_writes_override_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            override = Path(td) / "override.json"
+            override.write_text(json.dumps(D.DEFAULT_CONFIG), encoding="utf-8")
+            old = (D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE)
+            D.PROJECT_CONFIG_PATH = Path(td) / "team.json"
+            D.PERSONAL_CONFIG_PATH = override
+            D.CONFIG_OVERRIDE = str(override)
+            try:
+                handler = self.ResponseCapture()
+                D.Handler.api_edit_settings(handler, {
+                    "metrics": {"workspace_rounds": 300, "fleet_rounds": 900},
+                    "defaults": {}, "validate_cmds": [],
+                })
+                self.assertEqual(handler.response[0], 200)
+                saved = json.loads(override.read_text(encoding="utf-8"))
+                self.assertEqual(saved["metrics"], {"workspace_rounds": 300, "fleet_rounds": 900})
+                self.assertFalse(D.PROJECT_CONFIG_PATH.exists(), "覆寫模式不得動團隊檔")
+            finally:
+                D.PROJECT_CONFIG_PATH, D.PERSONAL_CONFIG_PATH, D.CONFIG_OVERRIDE = old
+
+    def test_round_metrics_endpoint_defaults_to_configured_workspace_rounds(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            workspace = root / "metrics"
+            workspace.mkdir(parents=True)
+            (workspace / "history.log").write_text(
+                "2026-07-10T10:00:00 round=1 phase=exec task=- secs=1.000 timeout=False\n",
+                encoding="utf-8")
+            old_root, old_load = D.ROOT, D.load_config
+            D.ROOT = root
+            D.load_config = lambda: {"metrics": {"workspace_rounds": 7, "fleet_rounds": 9}}
+            try:
+                capture = self.ResponseCapture()
+                capture._ws_dir = D.Handler._ws_dir.__get__(capture)
+                capture.path = "/api/round-metrics?ws=metrics"
+                D.Handler.do_GET(capture)
+                self.assertEqual(capture.response[0], 200)
+                self.assertEqual(capture.response[1]["limit"], 7)
+            finally:
+                D.ROOT, D.load_config = old_root, old_load
 
 
 class TestAnomalyLogProjection(unittest.TestCase):
@@ -4566,20 +4829,21 @@ class TestSafeKillGuards(unittest.TestCase):
     def test_safe_kill_blocks_wildcard_pids(self):
         for pid in (-1, 0, 1):
             with self.subTest(pid=pid):
-                self.assertFalse(L.safe_kill(pid, signal.SIGKILL))
+                self.assertFalse(L.safe_kill(pid, compat.FORCE_SIGNAL))
 
     def test_safe_killpg_blocks_wildcard_and_own_group(self):
         for pgid in (-1, 0, 1):
             with self.subTest(pgid=pgid):
-                self.assertFalse(L.safe_killpg(pgid, signal.SIGKILL))
+                self.assertFalse(L.safe_killpg(pgid, compat.FORCE_SIGNAL))
         # 自己所在的 group = start_new_session 沒生效的災難場景,必須攔下
-        self.assertFalse(L.safe_killpg(os.getpgid(0), signal.SIGKILL))
+        own_group = os.getpid() if compat.IS_WINDOWS else os.getpgid(0)
+        self.assertFalse(L.safe_killpg(own_group, compat.FORCE_SIGNAL))
 
     def test_safe_kill_delivers_to_real_child(self):
         p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         try:
-            self.assertTrue(L.safe_kill(p.pid, signal.SIGKILL))
-            self.assertEqual(p.wait(timeout=5), -signal.SIGKILL)
+            self.assertTrue(L.safe_kill(p, compat.FORCE_SIGNAL))
+            self.assertIsNotNone(p.wait(timeout=5))
         finally:
             if p.poll() is None:
                 p.kill()
@@ -4587,10 +4851,11 @@ class TestSafeKillGuards(unittest.TestCase):
 
     def test_safe_killpg_delivers_to_detached_group(self):
         p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
-                             start_new_session=True)
+                             **compat.popen_group_kwargs())
         try:
-            self.assertTrue(L.safe_killpg(p.pid, signal.SIGKILL))
-            self.assertEqual(p.wait(timeout=5), -signal.SIGKILL)
+            compat.attach_process_group(p)
+            self.assertTrue(L.safe_killpg(p, compat.FORCE_SIGNAL))
+            self.assertIsNotNone(p.wait(timeout=5))
         finally:
             if p.poll() is None:
                 p.kill()
@@ -4598,12 +4863,12 @@ class TestSafeKillGuards(unittest.TestCase):
 
     def test_safe_kill_raises_lookup_error_like_os_kill(self):
         """已死目標仍要丟 ProcessLookupError,呼叫端既有的 except 分支才接得住。"""
-        p = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        p = subprocess.Popen([sys.executable, "-c", "pass"], **compat.popen_group_kwargs())
         p.wait(timeout=10)
         with self.assertRaises(ProcessLookupError):
-            L.safe_kill(p.pid, signal.SIGKILL)
+            L.safe_kill(p, compat.FORCE_SIGNAL)
         with self.assertRaises(ProcessLookupError):
-            L.safe_killpg(p.pid, signal.SIGKILL)
+            L.safe_killpg(p.pid, compat.FORCE_SIGNAL)
 
 
 if __name__ == "__main__":

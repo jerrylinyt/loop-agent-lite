@@ -32,6 +32,7 @@ export default function PromptTemplateModal({
   // 等於範例文字」被誤判成未修改。
   const [requirementTouched, setRequirementTouched] = useState(false);
   const [projectContext, setProjectContext] = useState("");
+  const [includePlanDraft, setIncludePlanDraft] = useState(false);
   const [message, setMessage] = useState("");
   const template = templates.find((item) => item.id === templateId) ?? templates[0];
 
@@ -52,11 +53,14 @@ export default function PromptTemplateModal({
     return [...grouped.entries()];
   }, [templates]);
   const prompt = template
-    ? buildExternalAgentPrompt({ template, bundle, mode, requirement, projectContext })
+    ? buildExternalAgentPrompt({ template, bundle, mode, requirement, projectContext, includePlanDraft })
     : "";
   const hasRequirement = !!requirement.trim();
   const requirementIsUntouchedSeed = hasRequirement && !requirementTouched;
-  const outputName = mode === "goal" ? "goal.md" : "plan.json";
+  const withPlanDraft = mode === "goal" && includePlanDraft;
+  const outputName = mode === "goal"
+    ? (withPlanDraft ? "goal.md 與初版 plan.json" : "goal.md")
+    : "plan.json";
 
   const copyPrompt = async () => {
     try {
@@ -69,8 +73,8 @@ export default function PromptTemplateModal({
 
   const downloadPrompt = () => {
     if (!template) return;
-    downloadPromptFile(prompt, promptDownloadName(template, mode));
-    setMessage(`成功：已下載 ${promptDownloadName(template, mode)}`);
+    downloadPromptFile(prompt, promptDownloadName(template, mode, withPlanDraft));
+    setMessage(`成功：已下載 ${promptDownloadName(template, mode, withPlanDraft)}`);
   };
 
   const footer = (
@@ -124,6 +128,16 @@ export default function PromptTemplateModal({
             ))}
           </select>
         </label>
+        {mode === "goal" && (
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={includePlanDraft}
+              onChange={(event) => { setIncludePlanDraft(event.target.checked); setMessage(""); }}
+            />
+            同時產生初版 plan.json：在 goal.md 契約後附上拆分規則，Agent 會接著輸出可人工拆檔的初版 plan.json
+          </label>
+        )}
       </div>
 
       {!!warnings?.length && (

@@ -14,7 +14,7 @@ TEMPLATE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 PROMPT_PLACEHOLDER_RE = re.compile(r"<<[A-Z][A-Z0-9_]*>>")
 PROMPT_MARKER_RE = re.compile(r"<<[^\r\n]*?>>")
 MAX_PROMPT_RESOURCE_CHARS = 100_000
-PROMPT_TEMPLATE_BUNDLE_SCHEMA_VERSION = 3
+PROMPT_TEMPLATE_BUNDLE_SCHEMA_VERSION = 4
 GOAL_TEMPLATE_HEADINGS = [
     "## 目標",
     "## 背景與現況",
@@ -51,6 +51,7 @@ PROMPT_RESOURCE_SPECS = {
         False,
     ),
     "plan": ("external-agent-plan.md", {}, False),
+    "goal_plan_bridge": ("external-agent-goal-plan.md", {}, False),
     "missing_requirement": ("external-agent-missing.md", {"<<OUTPUT_NAME>>": 2}, False),
     "team_template_example": ("external-agent-team-template-example.md", {}, False),
 }

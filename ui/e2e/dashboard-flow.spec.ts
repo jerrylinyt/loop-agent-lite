@@ -88,6 +88,10 @@ test("Goal 產生器 Prompt 與 Goal 成果模板分開，且 Plan 仍可使用"
   expect(await promptPreview.textContent()).not.toContain("## 已知專案資訊與限制");
   await expect(promptPreview).not.toContainText("_json");
   await expect(promptTemplates.getByText("需求仍是模板範例", { exact: false })).toBeVisible();
+  // Goal 模式提供「同時產生初版 plan.json」勾選；預設關閉，prompt 不含 plan 契約
+  const planDraftToggle = promptTemplates.getByLabel(/同時產生初版 plan\.json/);
+  await expect(planDraftToggle).not.toBeChecked();
+  await expect(promptPreview).not.toContainText("最終輸出契約：plan.json");
   // 清空後仍維持輸入不足的 fail-closed 契約
   await promptRequirement.fill("");
   await expect(promptPreview).toContainText("外部 Agent 任務：輸入不足");
@@ -125,6 +129,22 @@ test("Goal 產生器 Prompt 與 Goal 成果模板分開，且 Plan 仍可使用"
   expect(renderedPrompt).not.toContain("<template_instructions_json>");
   expect(renderedPrompt).not.toContain("\\u003c");
 
+  // 勾選後 prompt 依序帶出 goal 契約、合併輸出契約與 plan 拆分規則，下載檔名也標示合併模式
+  await planDraftToggle.check();
+  await expect(promptPreview).toContainText("分析需求並產生 goal.md 與初版 plan.json");
+  await expect(promptPreview).toContainText("最終輸出契約：goal.md");
+  await expect(promptPreview).toContainText("合併輸出契約：goal.md 加初版 plan.json");
+  await expect(promptPreview).toContainText("===== plan.json =====");
+  await expect(promptPreview).toContainText("最終輸出契約：plan.json");
+  await expect(promptPreview).toContainText("只能有 `order`、`task`、選填的 `ref`");
+  const goalPlanDownloadPromise = page.waitForEvent("download");
+  await downloadPromptButton.click();
+  const goalPlanDownload = await goalPlanDownloadPromise;
+  expect(goalPlanDownload.suggestedFilename()).toBe("project-logic-analysis-goal-plan-prompt.md");
+  await planDraftToggle.uncheck();
+  await expect(promptPreview).toContainText("分析需求並產生 goal.md");
+  await expect(promptPreview).not.toContainText("最終輸出契約：plan.json");
+
   await promptType.selectOption("e2e-team-analysis");
   // 使用者改過的需求在切換模板時不被預填覆蓋
   await expect(promptRequirement).toHaveValue(/保留 literal/);
@@ -135,6 +155,9 @@ test("Goal 產生器 Prompt 與 Goal 成果模板分開，且 Plan 仍可使用"
   await expect(promptPreview).toContainText("分析需求並產生 plan.json");
   await expect(promptPreview).toContainText("只輸出一個合法 JSON array");
   await expect(promptPreview).toContainText("只能有 `order`、`task`、選填的 `ref`");
+  // Plan 模式沒有合併勾選，也不得殘留合併契約
+  await expect(promptTemplates.getByLabel(/同時產生初版 plan\.json/)).toHaveCount(0);
+  await expect(promptPreview).not.toContainText("合併輸出契約");
   const promptDownloadPromise = page.waitForEvent("download");
   await downloadPromptButton.click();
   const promptDownload = await promptDownloadPromise;
@@ -239,6 +262,23 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   await theme.selectOption("dark");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+
+  // Dashboard 全域設定：統計輪數等團隊設定可從工具列編輯並持久化（改完復原，不影響後續流程）。
+  await page.getByRole("button", { name: "Dashboard 設定" }).click();
+  const dashboardSettings = page.getByRole("dialog", { name: "Dashboard 設定" });
+  await expect(dashboardSettings).toBeVisible();
+  const workspaceRounds = dashboardSettings.getByLabel(/單 workspace 統計輪數/);
+  await expect(workspaceRounds).toHaveValue("1000");
+  await expect(dashboardSettings.getByLabel(/全部 workspace 合併筆數/)).toHaveValue("3000");
+  await workspaceRounds.fill("999");
+  await dashboardSettings.getByRole("button", { name: "儲存設定" }).click();
+  await expect(dashboardSettings).toBeHidden();
+  await page.getByRole("button", { name: "Dashboard 設定" }).click();
+  const reopenedDashboardSettings = page.getByRole("dialog", { name: "Dashboard 設定" });
+  await expect(reopenedDashboardSettings.getByLabel(/單 workspace 統計輪數/)).toHaveValue("999");
+  await reopenedDashboardSettings.getByLabel(/單 workspace 統計輪數/).fill("1000");
+  await reopenedDashboardSettings.getByRole("button", { name: "儲存設定" }).click();
+  await expect(reopenedDashboardSettings).toBeHidden();
 
   await page.getByRole("button", { name: "＋ 啟動第一個 loop" }).click();
   const launcher = page.getByRole("dialog", { name: "啟動與管理" });
@@ -362,8 +402,9 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   const templateRepoValue = await templateLauncher.getByRole("combobox", { name: "Repo" }).inputValue();
   if (templateRepoValue === "__custom__") {
     // state.config.repo 是 loop.py resolve() 過的絕對路徑；本機 /tmp 若走 symlink（如 macOS）
-    // 可能與 config.repos 掃到的未 resolve 字串不同，此時預填會落到手動輸入欄，仍指向同一個 repo。
-    await expect(templateLauncher.getByLabel("Repo 路徑")).toHaveValue(/\/demo-repo$/);
+    // 或 Windows 的 8.3 短檔名展開，可能與 config.repos 掃到的字串不同，此時預填會落到
+    // 手動輸入欄，仍指向同一個 repo（分隔符依平台可能是 / 或 \）。
+    await expect(templateLauncher.getByLabel("Repo 路徑")).toHaveValue(/[\\/]demo-repo$/);
   } else {
     expect(templateRepoValue).toBe(originalRepo);
   }
@@ -391,7 +432,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(overview.getByText("執行中", { exact: true })).toBeVisible();
   const fleetMetrics = overview.getByRole("listitem", { name: "全部 workspace 輪次效能" });
   await expect(fleetMetrics).toBeVisible();
-  await expect(fleetMetrics).toContainText("全部 workspace 近 500 輪");
+  await expect(fleetMetrics).toContainText("全部 workspace 近 3000 輪");
   await expect(fleetMetrics).toContainText("平均");
   await expect(fleetMetrics).toContainText("P50");
   await expect(fleetMetrics).toContainText("P95");
@@ -600,13 +641,13 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(page.getByRole("dialog", { name: "啟動與管理" })).toContainText("已結束");
   await page.getByRole("dialog", { name: "啟動與管理" }).getByRole("button", { name: "關閉", exact: true }).click();
 
-  await page.getByRole("button", { name: "設定" }).click();
+  await page.getByRole("button", { name: "設定", exact: true }).click();
   let settings = page.getByRole("dialog", { name: "Workspace 設定" });
   await expect(settings).toBeVisible();
   await settings.getByRole("button", { name: "取消" }).click();
   await expect(settings).toBeHidden();
 
-  await page.getByRole("button", { name: "設定" }).click();
+  await page.getByRole("button", { name: "設定", exact: true }).click();
   settings = page.getByRole("dialog", { name: "Workspace 設定" });
   await settings.getByLabel("Agent 命令").selectOption("0");
   await settings.getByRole("button", { name: "管理 Agent CLI" }).click();
@@ -627,7 +668,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(settings).toBeHidden();
   await expect(loopConsole).toContainText("Dashboard｜更新 Workspace 設定");
 
-  await page.getByRole("button", { name: "設定" }).click();
+  await page.getByRole("button", { name: "設定", exact: true }).click();
   settings = page.getByRole("dialog", { name: "Workspace 設定" });
   await expect(settings.getByLabel("flag 收斂（>）")).toHaveValue("7");
   await expect(settings.getByLabel("done 收斂（≥）")).toHaveValue("888");
@@ -775,7 +816,7 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await page.getByRole("button", { name: "立即停止" }).click();
   await expect(page.getByRole("button", { name: "運行" })).toBeVisible();
 
-  await page.getByRole("button", { name: "設定" }).click();
+  await page.getByRole("button", { name: "設定", exact: true }).click();
   settings = page.getByRole("dialog", { name: "Workspace 設定" });
   await settings.getByLabel("done 收斂（≥）").fill("1");
   await settings.getByRole("button", { name: "儲存設定" }).click();

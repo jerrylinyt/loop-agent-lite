@@ -1,12 +1,13 @@
 /** 檢查 production HTML/CSS 不引用外部網路資產，確保 Dashboard 可在離線環境執行。 */
 import { readFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
 
 const dist = new URL("../../engine/ui/", import.meta.url);
 const index = await readFile(new URL("index.html", dist), "utf8");
-const assetNames = await readdir(new URL("assets/", dist));
+const assets = new URL("assets/", dist);
+const assetNames = await readdir(assets);
 const cssFiles = await Promise.all(
-  assetNames.filter((name) => name.endsWith(".css")).map((name) => readFile(join(dist.pathname, "assets", name), "utf8"))
+  assetNames.filter((name) => name.endsWith(".css"))
+    .map((name) => readFile(new URL(name, assets), "utf8"))
 );
 
 const externalHtmlAsset = /<(?:script|link|img)\b[^>]*(?:src|href)=["'](?:https?:)?\/\//i.test(index);

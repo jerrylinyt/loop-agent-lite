@@ -1,6 +1,5 @@
 """專案內 Python 入口、單 workspace CLI 與固定 runtime 路徑回歸測試。"""
 import contextlib
-import fcntl
 import io
 import json
 import shlex
@@ -14,7 +13,7 @@ from unittest import mock
 
 import dashboard as dashboard_launcher
 import loop as loop_launcher
-from engine import cli, dashboard, loop as loop_engine, paths
+from engine import cli, dashboard, loop as loop_engine, paths, platform_compat as compat
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -151,9 +150,16 @@ class TestSingleWorkspaceCli(unittest.TestCase):
             self.assertEqual(options.workspace_name, "replay")
             self.assertEqual(options.repo, repo.resolve())
             self.assertEqual(options.agent_cmd, ["agent", "--profile", "night shift"])
+            # Windows 上裸 sh 會被釘成絕對路徑(CreateProcess 先搜 System32 的 WSL stub)。
+            if compat.IS_WINDOWS:
+                self.assertTrue(Path(options.validate_cmd[0]).is_absolute())
+                self.assertIn(Path(options.validate_cmd[0]).name.casefold(),
+                              {"sh.exe", "bash.exe"})
+            else:
+                self.assertEqual(options.validate_cmd[0], "sh")
             self.assertEqual(
-                options.validate_cmd,
-                ["sh", "-c", "python -m unittest && echo green"],
+                options.validate_cmd[1:],
+                ["-c", "python -m unittest && echo green"],
             )
             self.assertEqual(options.args.goal, "specs/goal.md")
             self.assertEqual(options.args.plan_doc, "docs/PLAN.md")
@@ -264,7 +270,7 @@ class TestSingleWorkspaceCli(unittest.TestCase):
             before_locked_attempt = primary
             lock_path = workspace_dir / ".run.lock"
             with lock_path.open("a+b") as held_lock:
-                fcntl.flock(held_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                compat.lock_file(held_lock, blocking=False)
                 locked = subprocess.run(
                     [
                         sys.executable, str(REPO_ROOT / "loop.py"),
@@ -276,7 +282,7 @@ class TestSingleWorkspaceCli(unittest.TestCase):
                     text=True,
                     check=False,
                 )
-                fcntl.flock(held_lock.fileno(), fcntl.LOCK_UN)
+                compat.unlock_file(held_lock)
 
             self.assertEqual(locked.returncode, 1, locked.stdout + locked.stderr)
             self.assertIn("已有另一個 loop", locked.stdout + locked.stderr)

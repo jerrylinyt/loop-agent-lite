@@ -36,6 +36,10 @@ export interface WorkspaceSummary {
   current_order?: number | null;
   current_task?: string;
   resume_available?: boolean;
+  /** 缺省＝舊 loop coordinator；"ralph" 走 Ralph runner 投影與 UI。 */
+  runner?: WorkspaceRunner;
+  /** 僅 runner==="ralph" 時提供的 fleet 摘要。 */
+  ralph?: RalphSummary;
 }
 
 export interface FleetHealth {
@@ -202,8 +206,16 @@ export interface DashboardConfig {
   validate_timeout?: number;
   red_limit?: number;
   stall_limit?: number;
+  stuck_stop?: boolean;
+  stuck_stop_count?: number;
   /** 規劃收斂後暫停：不自動進入執行期，需人工按「運行」。 */
   pause_after_plan?: boolean;
+}
+
+/** 統計輪數設定：history.log 即時投影的讀取上限，不影響硬碟用量。 */
+export interface MetricsSettings {
+  workspace_rounds: number;
+  fleet_rounds: number;
 }
 
 export interface StartupResponse {
@@ -252,7 +264,12 @@ export interface WorkspaceState {
   issues?: Issue[];
   issues_acknowledged_round?: number;
   task_reset_counts?: Record<string, number>;
-  config?: DashboardConfig;
+  /** loop 用 DashboardConfig；ralph runner 另帶 RalphConfig 欄位（皆為可選，不影響 loop 讀取）。 */
+  config?: DashboardConfig & RalphConfig;
+  /** 缺省＝loop coordinator；"ralph" 時 RalphView 只讀 state.ralph 與 state.config。 */
+  runner?: WorkspaceRunner;
+  /** runner==="ralph" 的 state.ralph 區塊（見 RALPH_CONTRACT §A + §I）。 */
+  ralph?: RalphState;
 }
 
 export interface SelectCommand {
@@ -271,11 +288,13 @@ export interface PromptTemplate {
 }
 
 export interface PromptTemplateBundle {
-  schema_version: 3;
+  schema_version: 4;
   base: string;
   goal: string;
   goal_template: string;
   plan: string;
+  /** Goal 模式勾選「同時產生初版 plan.json」時，插在 goal 與 plan 契約之間的合併輸出契約。 */
+  goal_plan_bridge: string;
   missing_requirement: string;
   team_template_example: string;
 }
@@ -286,6 +305,7 @@ export interface ConfigResponse {
   validate_cmds: SelectCommand[];
   repos: string[];
   defaults: DashboardConfig;
+  metrics?: MetricsSettings;
   extra_path_dirs?: string[];
   resolved_extra_path_dirs?: string[];
   config_path?: string;
@@ -298,6 +318,8 @@ export interface ConfigResponse {
   prompt_template_bundle?: PromptTemplateBundle | null;
   prompt_template_bundle_error?: string | null;
   prompt_template_warnings?: string[];
+  /** Ralph runner 啟動投影（RALPH_CONTRACT §G + §I）；缺省＝後端尚未提供 ralph 支援。 */
+  ralph?: RalphConfigProjection;
 }
 
 export interface JobInfo {
@@ -320,4 +342,153 @@ export interface IncrementalResponse {
 export interface BootstrapResponse {
   readonly: boolean;
   preselect: string;
+}
+
+/* ------------------------------------------------------------------ *
+ * Ralph runner（RALPH_CONTRACT）：第二種 workspace runner 的 JSON 契約。
+ * 全部欄位皆為可選，反映後端可能尚未提供 ralph 支援或錯誤投影缺欄位。
+ * ------------------------------------------------------------------ */
+
+export type WorkspaceRunner = "loop" | "ralph";
+/** ralph.sh 退出後的終態原因（RALPH_CONTRACT §A）。 */
+export type RalphExitReason =
+  | "completed"
+  | "iterations_exhausted"
+  | "failed"
+  | "interrupted"
+  | "usage_limit_giveup";
+export type RalphArgsStyle = "positional" | "snarktank" | "custom";
+export type RalphUsageLimitAction = "restart" | "downgrade" | "off";
+export type RalphPrdFormat = "json" | "md";
+
+/** state.config（ralph runner）追加欄位；與 DashboardConfig 交集使用，皆可選避免影響 loop。 */
+export interface RalphConfig {
+  runner?: WorkspaceRunner;
+  ralph_cmd?: string;
+  ralph_dir?: string;
+  iterations?: number;
+  tool?: string;
+  model?: string;
+  args_template?: string[];
+  prd_path?: string;
+  notify_cmd?: string;
+  /** usage-limit 自動重啟／降級（RALPH_CONTRACT §I）。 */
+  usage_limit_action?: RalphUsageLimitAction;
+  fallback_models?: string[];
+  auto_restart_max?: number;
+  usage_limit_patterns?: string[];
+  auto_restart_backoff_max_sec?: number;
+}
+
+/** state.ralph.stories 與 /api/ralph/prd 的 story；state 版只帶 id/title/passes/priority。 */
+export interface RalphStory {
+  id: string;
+  title: string;
+  passes: boolean;
+  priority?: number;
+  description?: string;
+  acceptanceCriteria?: string[];
+  notes?: string;
+}
+
+/** state.ralph.usage_limit（命中時，RALPH_CONTRACT §I）。 */
+export interface RalphUsageLimit {
+  detected_at?: string;
+  matched?: string;
+  action: "waiting" | "downgraded" | "giveup";
+  resume_at?: string | null;
+  reset_source?: "parsed" | "backoff";
+  wait_seconds?: number;
+  from_model?: string;
+  to_model?: string;
+}
+
+/** state.ralph 區塊（RALPH_CONTRACT §A + §I）。 */
+export interface RalphState {
+  prd_format?: RalphPrdFormat | null;
+  prd_path?: string;
+  project?: string;
+  branch_name?: string;
+  stories?: RalphStory[];
+  stories_total?: number;
+  stories_done?: number;
+  iteration?: number;
+  max_iterations?: number;
+  base_sha?: string;
+  head_sha?: string;
+  commit_count?: number;
+  last_commit?: string;
+  progress_bytes?: number;
+  sentinel_complete?: boolean;
+  stalled?: boolean;
+  exit_code?: number | null;
+  exit_reason?: RalphExitReason | null;
+  prd_error?: string | null;
+  updated_at?: string;
+  active_model?: string;
+  restart_attempt?: number;
+  usage_limit?: RalphUsageLimit | null;
+}
+
+/** WorkspaceSummary.ralph（RALPH_CONTRACT §B）；usage_limit 供 fleet ⏳ 標記（§I）。 */
+export interface RalphSummary {
+  stories_done?: number;
+  stories_total?: number;
+  iteration?: number;
+  max_iterations?: number;
+  sentinel_complete?: boolean;
+  stalled?: boolean;
+  exit_reason?: RalphExitReason | null;
+  usage_limit?: RalphUsageLimit | null;
+}
+
+/** GET /api/ralph/prd 回應（RALPH_CONTRACT §E）。 */
+export interface RalphPrdResponse {
+  error?: string;
+  prd_format?: RalphPrdFormat | null;
+  prd_path?: string;
+  project?: string;
+  branch_name?: string;
+  stories?: RalphStory[];
+  stories_total?: number;
+  stories_done?: number;
+  raw?: string;
+}
+
+/** config_projection.ralph（RALPH_CONTRACT §G + §I）。 */
+export interface RalphScript {
+  label: string;
+  cmd: string;
+}
+export interface RalphConfigProjection {
+  scripts: RalphScript[];
+  tools: string[];
+  default_iterations: number;
+  prd_filenames: string[];
+  default_args_style: RalphArgsStyle;
+  default_usage_limit_action?: RalphUsageLimitAction;
+  default_fallback_models?: string[];
+  default_auto_restart_max?: number;
+}
+
+/** POST /api/launch（runner:"ralph"）請求（RALPH_CONTRACT §C + §I）。 */
+export interface RalphLaunchRequest {
+  runner: "ralph";
+  repo: string;
+  name?: string;
+  ralph_idx?: number;
+  ralph_custom?: string;
+  ralph_dir?: string;
+  iterations: number;
+  tool: string;
+  model?: string;
+  args_style: RalphArgsStyle;
+  args_template?: string[];
+  prd_content?: string;
+  prd_format?: RalphPrdFormat;
+  prd_path?: string;
+  new_branch?: boolean;
+  usage_limit_action?: RalphUsageLimitAction;
+  fallback_models?: string[];
+  auto_restart_max?: number;
 }

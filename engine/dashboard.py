@@ -13,7 +13,6 @@ stdlib only,綁 127.0.0.1。
 """
 import argparse
 import difflib
-import fcntl
 import functools
 import json
 import math
@@ -39,6 +38,8 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from engine import loop as loop_mod  # 共用 Workspace/fresh_state,匯入計畫時建 state 不自己發明 schema
+from engine import platform_compat as compat
+from engine import ralph as ralph_mod  # ralph runner 監督層:PRD 解析、argv 組裝與 spawn 引數
 from engine.paths import (default_personal_config, default_workspace_root, expose_project_package,
                           legacy_config_path)
 from engine.prompt_templates import prompt_template_bundle, prompt_template_projection
@@ -64,10 +65,10 @@ DEFAULT_CONFIG = {
         {"label": "claude", "cmd": "claude -p"},
     ],
     "validate_cmds": [
-        {"label": "python unittest", "cmd": "python3 -m unittest discover -s tests -t . -q"},
+        {"label": "python unittest", "cmd": "python -m unittest discover -s tests -t . -q"},
         {"label": "mvn compile", "cmd": "mvn -q compile"},
         {"label": "mvn test", "cmd": "mvn -q test"},
-        {"label": "react build+test+e2e", "cmd": "sh -c 'npm run build && npm test -- --run && npx playwright test'"},
+        {"label": "react build+test+e2e", "cmd": "npm run check:all"},
     ],
     "repo_roots": ["~/IdeaProjects"],
     # GUI/IDE 啟動時通常不會載入 shell profile；用可攜式 home-relative 路徑補 CLI。
@@ -79,6 +80,24 @@ DEFAULT_CONFIG = {
         "validate_timeout": 120,
         "red_limit": 20, "stall_limit": 300, "stuck_stop": False, "stuck_stop_count": 100,
         "pause_after_plan": False,
+    },
+    # 統計輪數只是讀取/聚合上限（history.log 即時投影），不影響硬碟用量；可在 Dashboard 設定 modal 調整。
+    "metrics": {
+        "workspace_rounds": 1000,  # 單 workspace 近期輪數（fleet 卡片、輪次紀錄、Run 對比）
+        "fleet_rounds": 3000,      # 全 workspace 依時間合併後保留的最新筆數（總覽聚合）
+    },
+    # ralph runner:公司內既有的 ralph.sh 迴圈。scripts 是團隊白名單(方便選),
+    # 但 Launcher 也允許自訂 base command(ralph_custom),語意同 validate_custom。
+    "ralph": {
+        "scripts": [],                      # [{"label": "公司 ralph", "cmd": "sh /opt/tools/ralph.sh"}]
+        "tools": ["opencode", "claude", "amp"],
+        "default_iterations": 100,
+        "default_args_style": ralph_mod.DEFAULT_ARGS_STYLE,
+        "prd_filenames": ["prd.json", "prd.md"],
+        "default_usage_limit_action": "restart",
+        "default_fallback_models": [],
+        "default_auto_restart_max": 6,
+        "usage_limit_patterns": [],         # team 補 opencode 專屬訊息(regex)
     },
 }
 
@@ -107,7 +126,16 @@ def configured_path_dirs(cfg):
     if not isinstance(raw_dirs, list):
         raw_dirs = DEFAULT_CONFIG["extra_path_dirs"]
     raw = [str(value).strip() for value in raw_dirs if str(value).strip()]
-    resolved = [os.path.expanduser(os.path.expandvars(value)) for value in raw]
+    resolved = []
+    for value in raw:
+        expanded = os.path.expandvars(value)
+        if compat.IS_WINDOWS and (expanded == "~" or expanded.startswith(("~/", "~\\"))):
+            configured_home = os.environ.get("HOME")
+            expanded = (str(Path(configured_home) / expanded[2:]) if configured_home else
+                        os.path.expanduser(expanded))
+        else:
+            expanded = os.path.expanduser(expanded)
+        resolved.append(expanded)
     return raw, resolved
 
 
@@ -125,20 +153,25 @@ def command_not_found(label, executable, cfg):
     raw, resolved = configured_path_dirs(cfg)
     shown = ", ".join(raw) or "（未設定）"
     resolved_shown = os.pathsep.join(resolved) or "（無）"
-    return (f"找不到 {label}：{executable}。請先在終端執行 `command -v {shlex.quote(Path(executable).name)}`，"
+    lookup = (f"Get-Command {subprocess.list2cmdline([Path(executable).name])}"
+              if compat.IS_WINDOWS else f"command -v {shlex.quote(Path(executable).name)}")
+    return (f"找不到 {label}：{executable}。請先在終端執行 `{lookup}`，"
             f"再用 Agent CLI 管理器把所在目錄加入個人設定 {PERSONAL_CONFIG_PATH.name} 的 "
-            f"`extra_path_dirs`（支援 ~ / $HOME）。"
+            f"`extra_path_dirs`（支援 ~、$HOME 與 Windows %USERPROFILE%）。"
             f"目前設定：{shown}；展開後：{resolved_shown}")
 
 
 def command_error(raw, label, cfg):
     """啟動前先給可操作的 CLI 路徑錯誤，避免 child 只留下 FileNotFoundError。"""
     try:
-        cmd = shlex.split(str(raw))
+        cmd = compat.split_command(str(raw))
     except ValueError as e:
         return f"{label} 格式錯誤：{e}"
     if not cmd:
         return f"{label} 不可為空"
+    if (Path(cmd[0]).name.casefold() in {"python", "python3", "python.exe", "python3.exe"}
+            and shutil.which(cmd[0], path=command_env(cfg).get("PATH")) is None):
+        cmd[0] = sys.executable
     if shutil.which(cmd[0], path=command_env(cfg).get("PATH")) is None:
         return command_not_found(label, cmd[0], cfg)
     return None
@@ -196,6 +229,28 @@ def directory_fd(path, label: str, *, dir_fd=None):
 @contextmanager
 def exclusive_file_lock(path, label: str, *, dir_fd=None):
     """以 descriptor-relative O_NOFOLLOW regular file + flock 取得跨 dashboard 鎖。"""
+    if compat.IS_WINDOWS:
+        if dir_fd is not None:
+            raise WorkspaceDeleteError("Windows 鎖定必須使用完整安全路徑", 409)
+        try:
+            fd = loop_mod._open_regular(Path(path), os.O_RDWR | os.O_CREAT)
+        except (OSError, ValueError) as e:
+            raise WorkspaceDeleteError(f"無法取得{label}:{e}", 409) from e
+        lock_file = os.fdopen(fd, "a+b")
+        try:
+            try:
+                compat.lock_file(lock_file, blocking=False)
+            except (BlockingIOError, PermissionError) as e:
+                raise WorkspaceDeleteError(f"{label}仍被持有，請稍後再試", 409) from e
+            yield lock_file
+        finally:
+            try:
+                compat.unlock_file(lock_file)
+            except OSError:
+                pass
+            lock_file.close()
+        return
+
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         raise WorkspaceDeleteError("此系統不支援安全的 O_NOFOLLOW 鎖定，已拒絕刪除 workspace")
@@ -211,13 +266,13 @@ def exclusive_file_lock(path, label: str, *, dir_fd=None):
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise WorkspaceDeleteError(f"{label}必須是單一 regular file", 409)
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as e:
+            compat.lock_file(lock_file, blocking=False)
+        except (BlockingIOError, PermissionError) as e:
             raise WorkspaceDeleteError(f"{label}仍被持有，請稍後再試", 409) from e
         yield lock_file
     finally:
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            compat.unlock_file(lock_file)
         except OSError:
             pass
         lock_file.close()
@@ -261,6 +316,75 @@ def _remove_tree_at(parent_fd, name: str, label: str):
         os.rmdir(name, dir_fd=parent_fd)
     except OSError as e:
         raise WorkspaceDeleteError(f"無法移除{label}:{e}", 409) from e
+
+
+def _remove_tree_path(path: Path, label: str):
+    """Windows path-based tree removal that never traverses reparse points."""
+    try:
+        entries = list(os.scandir(path))
+    except OSError as e:
+        raise WorkspaceDeleteError(f"無法讀取{label}:{e}", 409) from e
+    for entry in entries:
+        entry_path = path / entry.name
+        try:
+            info = entry.stat(follow_symlinks=False)
+            linked = stat.S_ISLNK(info.st_mode) or compat.is_reparse_point(info)
+            if stat.S_ISDIR(info.st_mode) and not linked:
+                _remove_tree_path(entry_path, f"{label}/{entry.name}")
+            else:
+                entry_path.unlink()
+        except OSError as e:
+            raise WorkspaceDeleteError(f"無法移除{label}/{entry.name}:{e}", 409) from e
+    try:
+        path.rmdir()
+    except OSError as e:
+        raise WorkspaceDeleteError(f"無法移除{label}:{e}", 409) from e
+
+
+def _delete_workspace_windows(root: Path, name: str) -> None:
+    """Windows equivalent of the descriptor-relative delete transaction."""
+    root = Path(root)
+    workspace = root / name
+    try:
+        root_info = root.lstat()
+        workspace_info = workspace.lstat()
+    except FileNotFoundError as e:
+        raise WorkspaceDeleteError(f"workspace {name} 不存在", 404) from e
+    if (not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode)
+            or compat.is_reparse_point(root_info)):
+        raise WorkspaceDeleteError("workspace 根目錄必須是實體目錄", 409)
+    if (not stat.S_ISDIR(workspace_info.st_mode) or stat.S_ISLNK(workspace_info.st_mode)
+            or compat.is_reparse_point(workspace_info)):
+        raise WorkspaceDeleteError(f"workspace {name} 必須是實體目錄", 409)
+
+    lock_path = workspace / ".run.lock"
+    with exclusive_file_lock(lock_path, f"{name} 的單 writer 鎖"):
+        current = workspace.lstat()
+        if (stat.S_ISLNK(current.st_mode) or compat.is_reparse_point(current)
+                or not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino)
+                != (workspace_info.st_dev, workspace_info.st_ino)):
+            raise WorkspaceDeleteError(f"workspace {name} 在操作期間變更，已拒絕刪除", 409)
+    # Windows 不允許 rename 含有任何已開啟子檔的目錄。root operation lock 仍持有；
+    # 若外部 loop 恰在此刻取得 .run.lock，其未共享 delete 的 handle 會使 rename 安全失敗。
+    current = workspace.lstat()
+    if (stat.S_ISLNK(current.st_mode) or compat.is_reparse_point(current)
+            or not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (workspace_info.st_dev, workspace_info.st_ino)):
+        raise WorkspaceDeleteError(f"workspace {name} 在鎖定後變更，已拒絕刪除", 409)
+    tombstone = root / f".delete-{name}-{uuid.uuid4().hex}"
+    if tombstone.exists() or tombstone.is_symlink():
+        raise WorkspaceDeleteError("workspace 刪除暫存項目已存在，已拒絕覆寫", 409)
+    try:
+        workspace.rename(tombstone)
+    except OSError as e:
+        raise WorkspaceDeleteError(f"準備刪除 workspace 失敗:{e}", 409) from e
+    moved = tombstone.lstat()
+    if (stat.S_ISLNK(moved.st_mode) or compat.is_reparse_point(moved)
+            or not stat.S_ISDIR(moved.st_mode)
+            or (moved.st_dev, moved.st_ino) != (workspace_info.st_dev, workspace_info.st_ino)):
+        raise WorkspaceDeleteError("workspace 刪除暫存項目身分不符，已停止移除", 409)
+    _remove_tree_path(tombstone, f"workspace 刪除暫存項目 {tombstone.name}")
 
 MAX_FINISHED_JOBS = 50  # 長跑 dashboard 只保留最近已結束 job；活躍 job 不受限制
 JOBS = {}          # name -> Job(由本 dashboard 啟動的 loop)
@@ -335,6 +459,14 @@ class Job:
         t = threading.Thread(target=self._reader, daemon=True)
         self.reader = t
         t.start()
+        reaper = threading.Thread(target=self._reap, daemon=True)
+        self.reaper = reaper
+        reaper.start()
+
+    def _reap(self):
+        """主程序結束即關閉 Windows Job Object，避免 handle／背景子孫殘留。"""
+        self.popen.wait()
+        compat.close_process_group(self.popen)
 
     def _reader(self):
         """持續讀取 stdout 到固定長度 deque，process 結束後關閉 pipe。"""
@@ -359,15 +491,15 @@ class Job:
         if not self.alive():
             return True
         try:
-            self.popen.send_signal(signal.SIGINT)
-        except ProcessLookupError:
+            compat.interrupt_process_group(self.popen)
+        except (ProcessLookupError, OSError):
             return True
 
         def _force():
             """SIGINT 寬限期後仍存活時終止整個 process group。"""
             if self.alive():
                 try:
-                    loop_mod.safe_killpg(os.getpgid(self.popen.pid), signal.SIGKILL)
+                    loop_mod.safe_killpg(self.popen, compat.FORCE_SIGNAL)
                 except (ProcessLookupError, PermissionError):
                     pass
         t = threading.Timer(8, _force)
@@ -383,20 +515,23 @@ class Job:
 
 
 def loop_pid_alive(pid):
-    """state.json 記的 pid 是否仍是 coordinator；同時支援舊檔案入口與 package module。"""
+    """state.json 記的 pid 是否仍是 runner(loop 或 ralph)；同時支援舊檔案入口與 package module。"""
     try:
         pid = int(pid)
-        os.kill(pid, 0)
+        if not compat.process_looks_like_python(pid):
+            return False
     except (TypeError, ValueError, ProcessLookupError, PermissionError):
         return False
+    if compat.IS_WINDOWS:
+        return True
     r = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
-    return "loop.py" in r.stdout or "engine.loop" in r.stdout
+    return any(marker in r.stdout for marker in ("loop.py", "engine.loop", "engine.ralph"))
 
 
 def norm_cmd(s):
     """shlex 正規化,供命令白名單比對。"""
     try:
-        return shlex.join(shlex.split(str(s)))
+        return compat.join_command(compat.split_command(str(s)))
     except ValueError:
         return None
 
@@ -424,9 +559,9 @@ def suggested_validate_command(repo: Path):
     if (repo / "pom.xml").is_file():
         return "mvn -q compile"
     if (repo / "package.json").is_file():
-        return "sh -c 'npm run build && npm test -- --run && npx playwright test'"
+        return "npm run check:all"
     if (repo / "tests").is_dir():
-        return "python3 -m unittest discover -s tests -t . -q"
+        return "python -m unittest discover -s tests -t . -q"
     return None
 
 
@@ -481,7 +616,36 @@ def spawn_loop(name, repo, agent_cmd, validate_cmd, ft, dt, rt, validate_timeout
     if not import_plan:
         (workspace_dir / "import-plan.pending.json").unlink(missing_ok=True)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, bufsize=1, start_new_session=True, env=env)
+                         text=True, bufsize=1, env=env, **compat.popen_group_kwargs())
+    compat.attach_process_group(p)
+    _prune_finished_jobs_locked()
+    JOBS[name] = Job(name, str(repo), p)
+    return p
+
+
+def spawn_ralph(name, repo, *, ralph_cmd, ralph_dir, iterations, tool, model, args_template,
+                prd_path="prd.json", notify_cmd="", usage_limit_action="restart",
+                fallback_models=None, auto_restart_max=ralph_mod.DEFAULT_AUTO_RESTART_MAX,
+                usage_limit_patterns=None, env=None):
+    """spawn engine.ralph 監督層並登記進 JOBS(呼叫方需持 JOBS_LOCK)。ralph 自成迴圈引擎,
+    這支監督層只 spawn/監控/投影,與 loop coordinator 共用 Job 註冊表與停止流程。"""
+    loop_mod.require_workspace_name(name)
+    workspace_dir = safe_workspace_dir(name)
+    cmd = [sys.executable, "-m", "engine.ralph", "--repo", str(repo), "--name", name,
+           "--ralph-cmd", str(ralph_cmd), "--ralph-dir", str(ralph_dir),
+           "--iterations", str(iterations), "--tool", str(tool), "--model", str(model or ""),
+           "--prd-path", str(prd_path),
+           "--args-template", json.dumps(list(args_template)),
+           "--usage-limit-action", str(usage_limit_action),
+           "--auto-restart-max", str(auto_restart_max),
+           "--fallback-models", json.dumps(list(fallback_models or [])),
+           "--usage-limit-patterns", json.dumps(list(usage_limit_patterns or []))]
+    if notify_cmd:
+        cmd += ["--notify-cmd", notify_cmd]
+    (workspace_dir / "startup_ready.json").unlink(missing_ok=True)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, bufsize=1, env=env, **compat.popen_group_kwargs())
+    compat.attach_process_group(p)
     _prune_finished_jobs_locked()
     JOBS[name] = Job(name, str(repo), p)
     return p
@@ -493,13 +657,14 @@ def run_command_check(cmd, cwd, prompt="", timeout=60, env=None):
     stdout，收尾讀取最多再等 5 秒，逾時就放棄剩餘輸出而非讓 HTTP 請求永久卡住。"""
     p = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, start_new_session=True, env=env)
+                         text=True, env=env, **compat.popen_group_kwargs())
+    compat.attach_process_group(p)
     try:
         output, _ = p.communicate(prompt, timeout=timeout)
         return p.returncode, output or "", False
     except subprocess.TimeoutExpired:
         try:
-            loop_mod.safe_killpg(os.getpgid(p.pid), signal.SIGKILL)
+            loop_mod.safe_killpg(p, compat.FORCE_SIGNAL)
         except (ProcessLookupError, PermissionError):
             pass
         p.wait()  # SIGKILL 保證直接子行程終止；卡住的只會是下面等孫行程放開 stdout 的讀取
@@ -523,6 +688,8 @@ def run_command_check(cmd, cwd, prompt="", timeout=60, env=None):
         else:
             p.stdout.close()
         return p.returncode, output, True
+    finally:
+        compat.close_process_group(p)
 
 
 def job_startup_status(name, pid):
@@ -601,6 +768,56 @@ def _load_state_or_err(handler, name, *, repair=True):
         handler._err(err)
         return None
     return st
+
+
+RALPH_PRD_RAW_MAX = 512 * 1024   # /api/ralph/prd 原文投影上限
+
+
+def _ralph_config_or_error(name):
+    """回傳 (ralph_dir, prd_path, error)；非 ralph workspace 或缺設定時給可讀錯誤。"""
+    st, err = read_state(name, repair=False)
+    if err:
+        return None, None, err
+    if (st.get("runner") or "loop") != "ralph":
+        return None, None, f"workspace {name} 不是 ralph runner"
+    cfg = st.get("config") or {}
+    ralph_dir = cfg.get("ralph_dir")
+    prd_path = cfg.get("prd_path") or "prd.json"
+    if not ralph_dir:
+        return None, None, f"workspace {name} 的 state 缺 ralph_dir 設定"
+    return Path(ralph_dir), prd_path, None
+
+
+def ralph_prd_projection(name):
+    """投影 ralph 的 PRD:解析後的 story 清單 + 原文(bounded)。純唯讀,不改任何檔案。"""
+    ralph_dir, prd_path, err = _ralph_config_or_error(name)
+    if err:
+        return {"error": err}
+    projection = ralph_mod.load_prd(ralph_dir, prd_path)
+    raw = ""
+    try:
+        resolved = ralph_mod.safe_prd_path(ralph_dir, prd_path)
+        data = loop_mod.read_regular_bytes(resolved, "prd")[:RALPH_PRD_RAW_MAX]
+        raw = data.decode("utf-8", errors="replace")
+    except (FileNotFoundError, OSError, ValueError):
+        raw = ""
+    projection["raw"] = raw
+    return projection
+
+
+def ralph_progress_projection(name, offset):
+    """以 read_incremental 投影 ralph 的 progress.txt(append-only 學習紀錄)。"""
+    ralph_dir, prd_path, err = _ralph_config_or_error(name)
+    if err:
+        return {"error": err, "size": 0, "data": ""}
+    try:
+        progress_path = ralph_mod.safe_prd_path(ralph_dir, "progress.txt")
+    except (OSError, ValueError) as e:
+        return {"error": f"progress 路徑不安全:{e}", "size": 0, "data": ""}
+    try:
+        return read_incremental(progress_path, offset)
+    except FileNotFoundError:
+        return {"size": 0, "data": "", "truncated": False}
 
 
 def _run_git_projection(repo: Path, *args, max_bytes=None) -> tuple[str, bool]:
@@ -868,19 +1085,45 @@ def read_report(name):
 
 
 FLEET_HISTORY_TAIL = 16 * 1024  # 每個 workspace 事件流尾段上限
-FLEET_METRICS_TAIL = 512 * 1024  # 足以 bounded 掃描單 workspace 近期 500 輪
-FLEET_METRICS_LIMIT = 100
-FLEET_AGGREGATE_LIMIT = 500      # 全 workspace 合併後只取時間最新 500 筆
 SSE_PUSH_INTERVAL = 3.0          # 內網環境最多每三秒整理／推送一批變更
 SSE_CONSOLE_MAX_BYTES = 64 * 1024  # console 單次只送最新 64 KiB，避免慢連線累積 backlog
 FLEET_HISTORY_SSE_INTERVAL = SSE_PUSH_INTERVAL
 ANOMALY_ID_RE = loop_mod.ANOMALY_ID_RE
 
 
-def aggregate_fleet_round_metrics(samples, *, history_truncated=False):
-    """依時間合併各 workspace，精確聚合全體最新 500 筆。"""
+def metrics_settings(cfg):
+    """回傳 (workspace_rounds, fleet_rounds)；缺欄或格式錯誤回退預設，並 clamp 到投影硬上限。"""
+    raw = cfg.get("metrics")
+    raw = raw if isinstance(raw, dict) else {}
+
+    def pick(key):
+        fallback = DEFAULT_CONFIG["metrics"][key]
+        try:
+            value = parse_numeric_setting(raw.get(key, fallback), integer=True, minimum=1)
+        except (TypeError, ValueError):
+            return fallback
+        return min(value, loop_mod.ROUND_METRICS_MAX_SAMPLES)
+
+    return pick("workspace_rounds"), pick("fleet_rounds")
+
+
+def loaded_metrics_settings():
+    """讀取目前設定的統計輪數；設定檔讀取失敗時退回預設值，讓唯讀投影不因壞檔停擺。"""
+    cfg = load_config()
+    return metrics_settings({} if "error" in cfg else cfg)
+
+
+def fleet_metrics_tail_bytes(rounds):
+    """依統計輪數推 bounded 掃描視窗：每輪預留 1 KiB，維持舊 512 KiB 下限、history 上限封頂。"""
+    return min(loop_mod.HISTORY_MAX_BYTES, max(512 * 1024, rounds * 1024))
+
+
+def aggregate_fleet_round_metrics(samples, *, limit=None, history_truncated=False):
+    """依時間合併各 workspace，精確聚合全體最新 limit 筆（預設取設定檔 fleet_rounds）。"""
+    if limit is None:
+        limit = DEFAULT_CONFIG["metrics"]["fleet_rounds"]
     samples = sorted(samples, key=lambda sample: (
-        sample["timestamp"], sample["workspace"], sample["round"]))[-FLEET_AGGREGATE_LIMIT:]
+        sample["timestamp"], sample["workspace"], sample["round"]))[-limit:]
     durations = sorted(sample["seconds"] for sample in samples)
 
     def percentile(percent):
@@ -895,7 +1138,7 @@ def aggregate_fleet_round_metrics(samples, *, history_truncated=False):
     slowest = max(samples, key=lambda sample: (
         sample["seconds"], sample["workspace"], sample["round"])) if samples else None
     return {
-        "limit": FLEET_AGGREGATE_LIMIT,
+        "limit": limit,
         "workspace_count": len({sample["workspace"] for sample in samples}),
         "sample_count": len(samples),
         "average_seconds": round(sum(durations) / len(durations), 3) if durations else None,
@@ -913,12 +1156,14 @@ def aggregate_fleet_round_metrics(samples, *, history_truncated=False):
 
 
 def read_fleet_observability():
-    """一次 bounded read 投影事件尾段、各 workspace 與全體效能摘要。"""
+    """一次 bounded read 投影事件尾段、各 workspace 與全體效能摘要；輪數取自設定檔。"""
     out = []
     all_samples = []
     any_truncated = False
+    workspace_rounds, fleet_rounds = loaded_metrics_settings()
+    metrics_tail = fleet_metrics_tail_bytes(max(workspace_rounds, fleet_rounds))
     if not ROOT.is_dir():
-        return {"entries": out, "metrics": aggregate_fleet_round_metrics([])}
+        return {"entries": out, "metrics": aggregate_fleet_round_metrics([], limit=fleet_rounds)}
     for d in sorted(ROOT.iterdir()):
         if not loop_mod.valid_workspace_name(d.name) or d.is_symlink() or not d.is_dir():
             continue
@@ -928,9 +1173,9 @@ def read_fleet_observability():
             with os.fdopen(fd, "rb", closefd=True) as stream:
                 stream.seek(0, os.SEEK_END)
                 size = stream.tell()
-                metrics_start = max(0, size - FLEET_METRICS_TAIL)
+                metrics_start = max(0, size - metrics_tail)
                 stream.seek(metrics_start)
-                metrics_data = stream.read(FLEET_METRICS_TAIL)
+                metrics_data = stream.read(metrics_tail)
         except FileNotFoundError:
             continue
         except (OSError, ValueError):
@@ -945,9 +1190,9 @@ def read_fleet_observability():
             newline = tail.find("\n")
             tail = tail[newline + 1:] if newline != -1 else tail
         aggregate_metrics = loop_mod.round_metrics_from_history(
-            metrics_text, FLEET_AGGREGATE_LIMIT, history_truncated=metrics_start > 0)
+            metrics_text, fleet_rounds, history_truncated=metrics_start > 0)
         metrics = loop_mod.round_metrics_from_history(
-            metrics_text, FLEET_METRICS_LIMIT, history_truncated=metrics_start > 0)
+            metrics_text, workspace_rounds, history_truncated=metrics_start > 0)
         samples = aggregate_metrics["samples"]
         metrics.pop("samples")
         all_samples.extend({**sample, "workspace": d.name} for sample in samples)
@@ -956,7 +1201,7 @@ def read_fleet_observability():
     return {
         "entries": out,
         "metrics": aggregate_fleet_round_metrics(
-            all_samples, history_truncated=any_truncated),
+            all_samples, limit=fleet_rounds, history_truncated=any_truncated),
     }
 
 
@@ -1016,9 +1261,10 @@ def anomaly_records_for_workspace(workspace_dir: Path, *, run="current", round_l
 
 
 def read_anomaly_records(workspace_dir: Path = None, *, run="current"):
-    """列出與 workspace 100 輪／Overview 全域 500 輪統計一致的異常，最多回 100 筆。"""
+    """列出與 workspace／Overview 統計輪數設定一致的異常，最多回 100 筆。"""
+    workspace_rounds, fleet_rounds = loaded_metrics_settings()
     if workspace_dir is not None:
-        records = anomaly_records_for_workspace(workspace_dir, run=run, round_limit=100)
+        records = anomaly_records_for_workspace(workspace_dir, run=run, round_limit=workspace_rounds)
     else:
         samples = []
         if ROOT.is_dir():
@@ -1028,7 +1274,7 @@ def read_anomaly_records(workspace_dir: Path = None, *, run="current"):
                     continue
                 try:
                     metrics = loop_mod.read_round_metrics(
-                        directory / "history.log", FLEET_AGGREGATE_LIMIT)
+                        directory / "history.log", fleet_rounds)
                     preserved = {
                         (item["timestamp"], item["round"]): item
                         for item in read_preserved_anomaly_metadata(directory)
@@ -1044,7 +1290,7 @@ def read_anomaly_records(workspace_dir: Path = None, *, run="current"):
                         "log_truncated": bool(saved.get("truncated")) if saved else False,
                     })
         samples = sorted(samples, key=lambda item: (
-            item["timestamp"], item["workspace"], item["round"]))[-FLEET_AGGREGATE_LIMIT:]
+            item["timestamp"], item["workspace"], item["round"]))[-fleet_rounds:]
         records = [sample for sample in samples if sample["missing_done"]]
     records.sort(key=lambda item: (
         item["timestamp"], item["workspace"], item["round"]), reverse=True)
@@ -1127,14 +1373,21 @@ def read_goal(name):
     previous_content = None
     for commit in history.stdout.splitlines():
         try:
-            shown = subprocess.run(
-                ["git", "-C", str(Path(repo).expanduser()), "show", f"{commit}:{goal_rel}"],
+            raw = subprocess.run(
+                ["git", "-C", str(Path(repo).expanduser()), "cat-file", "blob",
+                 f"{commit}:{goal_rel}"], capture_output=True, timeout=5)
+            filtered = subprocess.run(
+                ["git", "-C", str(Path(repo).expanduser()), "cat-file", "--filters",
+                 f"--path={goal_rel}", f"{commit}:{goal_rel}"],
                 capture_output=True, timeout=5)
         except (OSError, subprocess.TimeoutExpired):
             continue
-        if shown.returncode == 0 and loop_mod.sha256_bytes(shown.stdout) == previous_hash:
+        matching = next((candidate.stdout for candidate in (raw, filtered)
+                         if candidate.returncode == 0
+                         and loop_mod.sha256_bytes(candidate.stdout) == previous_hash), None)
+        if matching is not None:
             try:
-                previous_content = shown.stdout.decode("utf-8")
+                previous_content = matching.decode("utf-8")
             except UnicodeDecodeError:
                 projection["diff_error"] = "舊 goal 不是 UTF-8，無法顯示差異"
                 return projection
@@ -1294,9 +1547,11 @@ def config_projection(cfg):
     raw_paths, resolved_paths = configured_path_dirs(cfg)
     prompt_templates, prompt_template_warnings = prompt_template_projection(cfg)
     prompt_bundle, prompt_bundle_error = prompt_template_bundle()
+    workspace_rounds, fleet_rounds = metrics_settings(cfg)
     return {"agent_cmds": cfg.get("agent_cmds", []),
             "validate_cmds": cfg.get("validate_cmds", []),
             "defaults": cfg.get("defaults") or {},
+            "metrics": {"workspace_rounds": workspace_rounds, "fleet_rounds": fleet_rounds},
             "extra_path_dirs": raw_paths,
             "resolved_extra_path_dirs": resolved_paths,
             "config_path": str(PERSONAL_CONFIG_PATH),
@@ -1306,6 +1561,7 @@ def config_projection(cfg):
             "notify_cmd": str(cfg.get("notify_cmd") or ""),
             "repo_roots": cfg.get("repo_roots", DEFAULT_CONFIG["repo_roots"]),
             "repos": scan_repos(cfg),
+            "ralph": cfg.get("ralph") or DEFAULT_CONFIG["ralph"],
             "prompt_templates": prompt_templates,
             "prompt_template_bundle": prompt_bundle,
             "prompt_template_bundle_error": prompt_bundle_error,
@@ -1330,6 +1586,25 @@ def save_personal_config(updates):
         current = {key: value for key, value in current.items() if key in PERSONAL_CONFIG_KEYS}
     loop_mod.atomic_write_bytes(
         PERSONAL_CONFIG_PATH,
+        json.dumps(current, ensure_ascii=False, indent=2).encode("utf-8"),
+    )
+
+
+def save_project_config(updates):
+    """寫團隊設定檔（Dashboard 設定 modal 專用）；保留檔內其他欄位，缺檔視為空設定。"""
+    try:
+        current_text = loop_mod.read_regular_text(
+            PROJECT_CONFIG_PATH, f"團隊設定檔 {PROJECT_CONFIG_PATH.name}")
+        current = json.loads(current_text)
+    except FileNotFoundError:
+        current = {}
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"團隊設定檔無法讀取:{e}") from e
+    if not isinstance(current, dict):
+        raise ValueError("團隊設定檔頂層必須是 JSON object")
+    current.update(updates)
+    loop_mod.atomic_write_bytes(
+        PROJECT_CONFIG_PATH,
         json.dumps(current, ensure_ascii=False, indent=2).encode("utf-8"),
     )
 
@@ -1446,8 +1721,33 @@ def list_workspaces():
                         draining=drain_claimed or (running and loop_mod.stop_after_round_requested(
                             d, loop_state.get("pid"), loop_state.get("session_id"))),
                         drain_claimed=drain_claimed)
+            runner = st.get("runner") or "loop"
+            info["runner"] = runner
+            if runner == "ralph":
+                rb = st.get("ralph") or {}
+                info["ralph"] = {
+                    "stories_done": rb.get("stories_done", 0),
+                    "stories_total": rb.get("stories_total", 0),
+                    "iteration": rb.get("iteration", 0),
+                    "max_iterations": rb.get("max_iterations", 0),
+                    "sentinel_complete": bool(rb.get("sentinel_complete")),
+                    "stalled": bool(rb.get("stalled")),
+                    "exit_reason": rb.get("exit_reason"),
+                    "usage_limit_active": bool(rb.get("usage_limit")),
+                    "usage_limit_action": (rb.get("usage_limit") or {}).get("action"),
+                    "active_model": rb.get("active_model", ""),
+                    "restart_attempt": rb.get("restart_attempt", 0),
+                    "prd_error": rb.get("prd_error"),
+                }
+                # ralph 沒有 loop 的 task 指標；以「下一個未完成 story」作為 fleet 顯示。
+                info["current_task"] = next(
+                    (s.get("title", "") for s in (rb.get("stories") or [])
+                     if not s.get("passes")), "")
             if not running:
-                info["resume_available"] = interrupted_resume_block_reason(d.name, st) is None
+                if runner == "ralph":
+                    info["resume_available"] = st.get("phase") != "done"
+                else:
+                    info["resume_available"] = interrupted_resume_block_reason(d.name, st) is None
         out.append(info)
     return out
 
@@ -1458,6 +1758,18 @@ def _workspace_needs_attention(info):
         return True
     unread_issues = info.get("unread_issues", info.get("issues", 0)) or 0
     completed = info.get("phase") == "done"
+    if info.get("runner") == "ralph":
+        # ralph 不套用 loop 的 red/stall/agent-failure 語意；只在 PRD 壞、停滯、
+        # 撞用量上限或以失敗/放棄收場時提示。
+        rb = info.get("ralph") or {}
+        if rb.get("prd_error"):
+            return True
+        # 只在「目前正等待重啟」時提示;已降級但仍在正常執行的 run 不算需關注。
+        if not completed and (rb.get("stalled") or rb.get("usage_limit_action") == "waiting"):
+            return True
+        if rb.get("exit_reason") in ("failed", "usage_limit_giveup"):
+            return True
+        return bool(unread_issues > 0 or info.get("stale_loop_pid"))
     return bool(
         unread_issues > 0 or
         info.get("state_recovery_pending") or
@@ -1522,7 +1834,7 @@ def read_incremental(path: Path, offset: int, *, max_bytes=MAX_CHUNK, tail_if_ov
                         # 否則前端會把 Agent 殘行誤歸類到「其他」。
                         offset = size
                         data = b""
-                return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace"),
+                return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace").replace("\r\n", "\n"),
                         "truncated": truncated}
             if offset > size:
                 offset = 0
@@ -1541,7 +1853,7 @@ def read_incremental(path: Path, offset: int, *, max_bytes=MAX_CHUNK, tail_if_ov
                 else:
                     offset += nl + 1
                     data = data[nl + 1:]
-        return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace"),
+        return {"size": offset + len(data), "data": data.decode("utf-8", errors="replace").replace("\r\n", "\n"),
                 "truncated": truncated}
     except FileNotFoundError:
         return {"size": 0, "data": ""}
@@ -1662,11 +1974,18 @@ class Handler(BaseHTTPRequestHandler):
         "/api/test-cli": "api_test_cli",
         "/api/edit-cli-config": "api_edit_cli_config",
         "/api/edit-repo-roots": "api_edit_repo_roots",
+        "/api/edit-settings": "api_edit_settings",
         "/api/edit-notify": "api_edit_notify",
         "/api/test-notify": "api_test_notify",
         "/api/phase": "api_phase",
         "/api/set-task": "api_set_task",
         "/api/delete-workspace": "api_delete_workspace",
+    }
+
+    # coordinator(loop)專屬操作;ralph runner 的計畫/流程由 ralph.sh 自管,一律拒絕。
+    LOOP_ONLY_ROUTES = {
+        "/api/drain", "/api/cancel-drain", "/api/edit-state", "/api/import-plan",
+        "/api/edit-config", "/api/phase", "/api/set-task",
     }
 
     def log_message(self, *a):
@@ -1931,8 +2250,10 @@ class Handler(BaseHTTPRequestHandler):
                 if run not in ("current", "previous"):
                     self._err("round metrics run 必須是 current 或 previous")
                     return
+                raw_limit = q.get("limit", [None])[0]
                 try:
-                    limit = int(q.get("limit", ["50"])[0])
+                    # 不帶 limit 時跟隨 Dashboard 設定的單 workspace 統計輪數。
+                    limit = loaded_metrics_settings()[0] if raw_limit is None else int(raw_limit)
                 except (TypeError, ValueError):
                     self._err(f"round metrics limit 必須介於 1～{loop_mod.ROUND_METRICS_MAX_SAMPLES}")
                     return
@@ -1962,6 +2283,17 @@ class Handler(BaseHTTPRequestHandler):
                 if d is None:
                     return
                 self._out(200, json.dumps(read_prompt(d.name), ensure_ascii=False))
+            elif u.path == "/api/ralph/prd":
+                d = self._ws_dir(q)
+                if d is None:
+                    return
+                self._out(200, json.dumps(ralph_prd_projection(d.name), ensure_ascii=False))
+            elif u.path == "/api/ralph/progress":
+                d = self._ws_dir(q)
+                if d is None:
+                    return
+                off = int(q.get("offset", ["0"])[0])
+                self._out(200, json.dumps(ralph_progress_projection(d.name, off), ensure_ascii=False))
             elif u.path == "/api/fleet-history":
                 self._out(200, json.dumps(read_fleet_history(), ensure_ascii=False))
             elif u.path == "/api/fleet-round-metrics":
@@ -2030,6 +2362,14 @@ class Handler(BaseHTTPRequestHandler):
             if handler_name is None:
                 self._err("not found", 404)
                 return
+            if u.path in Handler.LOOP_ONLY_ROUTES:
+                name = str(body.get("name") or "")
+                if loop_mod.valid_workspace_name(name):
+                    st, _ = read_state(name, repair=False)
+                    if st and (st.get("runner") or "loop") == "ralph":
+                        self._err(f"{u.path} 不適用於 ralph runner"
+                                  "（ralph 的計畫與流程由 ralph.sh 自行管理）")
+                        return
             # 以 Handler 取未綁定 method，測試可繼續用輕量 fake handler 驗證 request 邊界。
             getattr(Handler, handler_name)(self, body)
         except (BrokenPipeError, ConnectionResetError):
@@ -2038,6 +2378,9 @@ class Handler(BaseHTTPRequestHandler):
     @with_state_lock(repo_fallback=True)
     def api_launch(self, body):
         """交易式啟動/重置 loop：完成所有可失敗 preflight 後才提交 state 與 spawn。"""
+        if str(body.get("runner") or "loop") == "ralph":
+            # ralph runner 走獨立分支;沿用同一把 state lock(不另加 decorator 以免重入死鎖)。
+            return self.api_launch_ralph(body)
         cfg = load_config()
         if "error" in cfg:
             self._err(cfg["error"])
@@ -2199,6 +2542,176 @@ class Handler(BaseHTTPRequestHandler):
         self._out(200, json.dumps({"ok": True, "starting": True, "name": name, "pid": p.pid,
                                    "startup_timeout": vt + 15}, ensure_ascii=False))
 
+    def api_launch_ralph(self, body):
+        """交易式啟動 ralph runner：完成可失敗檢查後才 spawn 監督層。與 api_launch 共用 state lock。"""
+        cfg = load_config()
+        if "error" in cfg:
+            self._err(cfg["error"])
+            return
+        ralph_cfg = cfg.get("ralph") or {}
+        # base command：優先自訂(同 validate_custom 語意)，否則從團隊白名單 scripts 選 index
+        ralph_custom = (body.get("ralph_custom") or "").strip()
+        if ralph_custom:
+            ralph_cmd = ralph_custom
+        else:
+            scripts = ralph_cfg.get("scripts") or []
+            try:
+                ralph_cmd = scripts[int(body.get("ralph_idx"))]["cmd"]
+            except (TypeError, ValueError, IndexError, KeyError):
+                self._err(f"ralph_idx 不合法（合法值 0..{len(scripts) - 1}），"
+                          "或改用 ralph_custom 手填 ralph.sh 命令")
+                return
+        problem = command_error(ralph_cmd, "ralph 命令", cfg)
+        if problem:
+            self._err(problem)
+            return
+        repo = Path(str(body.get("repo") or "")).expanduser()
+        if not (repo / ".git").exists():
+            self._err(f"{repo} 不是 git repo")
+            return
+        name = (body.get("name") or "").strip() or repo.name
+        if not loop_mod.valid_workspace_name(name):
+            self._err(f"workspace 名稱 {name} 不合法：{loop_mod.WORKSPACE_NAME_RULE}")
+            return
+        try:
+            safe_workspace_dir(name)
+        except ValueError as e:
+            self._err(str(e))
+            return
+        try:
+            iterations = parse_numeric_setting(
+                body.get("iterations") if body.get("iterations") is not None
+                else ralph_cfg.get("default_iterations", 100), integer=True, minimum=1)
+        except (TypeError, ValueError):
+            self._err("iterations 必須是 ≥1 的整數")
+            return
+        if iterations > ralph_mod.ITERATIONS_MAX:
+            self._err(f"iterations 不可超過 {ralph_mod.ITERATIONS_MAX}")
+            return
+        tool = str(body.get("tool") or "").strip()
+        if not ralph_mod.TOOL_RE.fullmatch(tool) or tool.startswith("-"):
+            self._err("tool 只能是英數與 . _ -，且不可以 - 開頭（例：opencode / claude / amp）")
+            return
+        model = str(body.get("model") or "").strip()
+        if len(model) > ralph_mod.MODEL_MAX_CHARS or any(ord(ch) < 32 for ch in model) \
+                or model.startswith("-"):
+            self._err(f"model 需 ≤{ralph_mod.MODEL_MAX_CHARS} 字、不含控制字元且不可以 - 開頭")
+            return
+        args_style = str(body.get("args_style") or ralph_cfg.get("default_args_style")
+                         or ralph_mod.DEFAULT_ARGS_STYLE)
+        try:
+            args_template = ralph_mod.resolve_args_template(args_style, body.get("args_template"))
+        except ValueError as e:
+            self._err(str(e))
+            return
+        prd_path = (str(body.get("prd_path") or "").strip() or "prd.json")
+        ralph_dir_raw = str(body.get("ralph_dir") or "").strip()
+        if ralph_dir_raw:
+            ralph_dir = Path(ralph_dir_raw).expanduser().resolve()
+            if not ralph_dir.is_dir():
+                self._err(f"ralph_dir 不是目錄：{ralph_dir}")
+                return
+        else:
+            ralph_dir = Path(ralph_mod.default_ralph_dir(ralph_cmd, repo)).resolve()
+        ul_action = str(body.get("usage_limit_action")
+                        or ralph_cfg.get("default_usage_limit_action") or "restart")
+        if ul_action not in ("restart", "downgrade", "off"):
+            self._err("usage_limit_action 只能是 restart / downgrade / off")
+            return
+        fallback_models = body.get("fallback_models")
+        if fallback_models is None:
+            fallback_models = ralph_cfg.get("default_fallback_models") or []
+        if not isinstance(fallback_models, list) or not all(isinstance(m, str) for m in fallback_models):
+            self._err("fallback_models 必須是字串陣列")
+            return
+        fallback_models = [m.strip() for m in fallback_models if m.strip()][:10]
+        try:
+            auto_restart_max = parse_numeric_setting(
+                body.get("auto_restart_max") if body.get("auto_restart_max") is not None
+                else ralph_cfg.get("default_auto_restart_max", ralph_mod.DEFAULT_AUTO_RESTART_MAX),
+                integer=True, minimum=0)
+        except (TypeError, ValueError):
+            self._err("auto_restart_max 必須是 ≥0 的整數")
+            return
+        usage_limit_patterns = ralph_cfg.get("usage_limit_patterns")
+        if not isinstance(usage_limit_patterns, list):
+            usage_limit_patterns = []
+        prd_content = body.get("prd_content")
+        prd_target = None
+        if isinstance(prd_content, str) and prd_content.strip():
+            try:
+                prd_target = ralph_mod.safe_prd_path(ralph_dir, prd_path)
+            except (OSError, ValueError) as e:
+                self._err(f"PRD 路徑不安全：{e}")
+                return
+        with JOBS_LOCK:
+            st, _ = read_state(name)
+            if st and loop_pid_alive((st.get("loop") or {}).get("pid")):
+                self._err(f"workspace {name} 已有 runner 在跑，先停掉再啟動")
+                return
+            for j in JOBS.values():
+                if j.alive() and j.name == name:
+                    self._err(f"workspace {name} 已有 runner 在跑(pid {j.popen.pid})，先停掉再啟動")
+                    return
+                if j.alive() and Path(j.repo) == repo:
+                    self._err(f"repo {repo} 已有 runner 在跑({j.name})，同一 repo 不能同時跑兩個")
+                    return
+                # ralph 的 prd/progress 位於 ralph_dir；兩個 ralph 共用同一 ralph_dir+prd 會互相覆蓋
+                # （ralph.sh 依 SCRIPT_DIR 讀寫，預設 ralph_dir 就是 ralph.sh 所在目錄，容易共用）。
+                if j.alive():
+                    other_state, _ = read_state(j.name)
+                    other_cfg = (other_state or {}).get("config") or {}
+                    if ((other_state or {}).get("runner") == "ralph" and other_cfg.get("ralph_dir")
+                            and str(Path(other_cfg["ralph_dir"]).expanduser().resolve()) == str(ralph_dir)
+                            and (other_cfg.get("prd_path") or "prd.json") == prd_path):
+                        self._err(f"另一個 ralph run（{j.name}）正在使用相同的 ralph 目錄與 PRD"
+                                  f"（{ralph_dir}/{prd_path}），會互相覆蓋；請用不同的 ralph_dir")
+                        return
+            if body.get("new_branch"):
+                br = f"ralph/{name}"
+                exists = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", br],
+                                        capture_output=True, text=True).returncode == 0
+                r = subprocess.run(["git", "-C", str(repo), "checkout", "-q"] + ([br] if exists else ["-b", br]),
+                                   capture_output=True, text=True)
+                if r.returncode != 0:
+                    self._err(f"切換 branch {br} 失敗：" + (r.stdout + r.stderr).strip()[-300:])
+                    return
+                workspace_console_log(name, f"已切換 Git branch｜{br}")
+            if prd_target is not None:
+                try:
+                    prd_target.parent.mkdir(parents=True, exist_ok=True)
+                    loop_mod.atomic_write_bytes(prd_target, prd_content.encode("utf-8"))
+                except (OSError, ValueError) as e:
+                    self._err(f"PRD 寫入失敗：{e}")
+                    return
+                try:
+                    rel = prd_target.resolve().relative_to(repo.resolve())
+                    inside_repo = True
+                except ValueError:
+                    inside_repo = False
+                if inside_repo:
+                    subprocess.run(["git", "-C", str(repo), "add", "--", str(rel)],
+                                   capture_output=True, text=True)
+                    staged = subprocess.run(
+                        ["git", "-C", str(repo), "diff", "--cached", "--quiet", "--", str(rel)],
+                        capture_output=True, text=True)
+                    if staged.returncode != 0:
+                        subprocess.run(["git", "-C", str(repo), "commit", "-m",
+                                        f"ralph: 匯入 {rel}", "--", str(rel)],
+                                       capture_output=True, text=True)
+                        workspace_console_log(name, f"已匯入並 commit {rel}")
+            p = spawn_ralph(name, repo, ralph_cmd=ralph_cmd, ralph_dir=ralph_dir,
+                            iterations=iterations, tool=tool, model=model,
+                            args_template=args_template, prd_path=prd_path,
+                            notify_cmd=str(cfg.get("notify_cmd") or ""),
+                            usage_limit_action=ul_action, fallback_models=fallback_models,
+                            auto_restart_max=auto_restart_max,
+                            usage_limit_patterns=usage_limit_patterns,
+                            env=command_env(cfg))
+        workspace_console_log(name, f"啟動 ralph｜pid={p.pid}｜repo={repo}｜iterations={iterations}")
+        self._out(200, json.dumps({"ok": True, "starting": True, "name": name, "pid": p.pid,
+                                   "startup_timeout": 30}, ensure_ascii=False))
+
     @with_state_lock
     def api_run(self, body):
         """一般重跑既有 workspace：保留原本完整 preflight 與啟動 Validate。"""
@@ -2209,12 +2722,72 @@ class Handler(BaseHTTPRequestHandler):
         """可補登開始時間/SHA 的 Resume；通過最小驗證後略過啟動 Validate。"""
         return Handler._start_existing_workspace(self, body, resume_interrupted=True)
 
+    def _start_existing_ralph(self, name, st):
+        """依保存的 ralph config 重新 spawn 監督層（重跑＝續跑 PRD 未完成項）。"""
+        c = st.get("config") or {}
+        repo = c.get("repo")
+        ralph_cmd = c.get("ralph_cmd")
+        if not (repo and ralph_cmd):
+            self._err("state 缺 ralph 設定（舊版 state）——請用「啟動」表單重新啟動")
+            return
+        if st.get("phase") == "done":
+            self._err(f"{name} 已結束；請在啟動表單重新啟動一個 ralph run")
+            return
+        if not (Path(repo) / ".git").exists():
+            self._err(f"{repo} 不是 git repo（repo 被移走了?）")
+            return
+        cfg = load_config()
+        if "error" in cfg:
+            self._err(cfg["error"])
+            return
+        problem = command_error(ralph_cmd, "ralph 命令", cfg)
+        if problem:
+            self._err(problem)
+            return
+        if loop_pid_alive((st.get("loop") or {}).get("pid")):
+            self._err(f"{name} 已在執行中")
+            return
+        repo_path = Path(repo).expanduser()
+        try:
+            iterations = int(c.get("iterations", 100))
+            auto_restart_max = int(c.get("auto_restart_max", ralph_mod.DEFAULT_AUTO_RESTART_MAX))
+        except (TypeError, ValueError):
+            self._err("state 的 ralph 設定含非法數值，請用啟動表單重新啟動")
+            return
+        with JOBS_LOCK:
+            j = JOBS.get(name)
+            if j is not None and j.alive():
+                self._err(f"{name} 已在執行中(pid {j.popen.pid})")
+                return
+            for jj in JOBS.values():
+                if jj.alive() and Path(jj.repo) == repo_path:
+                    self._err(f"repo {repo} 已有 runner 在跑({jj.name})")
+                    return
+            p = spawn_ralph(
+                name, repo_path, ralph_cmd=ralph_cmd,
+                ralph_dir=c.get("ralph_dir") or str(ralph_mod.default_ralph_dir(ralph_cmd, repo)),
+                iterations=iterations, tool=c.get("tool", "claude"), model=c.get("model", ""),
+                args_template=(c.get("args_template")
+                               or list(ralph_mod.ARGS_STYLES[ralph_mod.DEFAULT_ARGS_STYLE])),
+                prd_path=c.get("prd_path", "prd.json"), notify_cmd=c.get("notify_cmd", ""),
+                usage_limit_action=c.get("usage_limit_action", "restart"),
+                fallback_models=c.get("fallback_models") or [],
+                auto_restart_max=auto_restart_max,
+                usage_limit_patterns=(cfg.get("ralph") or {}).get("usage_limit_patterns") or [],
+                env=command_env(cfg))
+        workspace_console_log(name, f"重新啟動 ralph｜pid={p.pid}")
+        self._out(200, json.dumps({"ok": True, "starting": True, "name": name, "pid": p.pid,
+                                   "startup_timeout": 30}, ensure_ascii=False))
+
     def _start_existing_workspace(self, body, *, resume_interrupted):
         """run/resume 共用設定白名單、單 writer 與 spawn 流程。"""
         name = str(body.get("name") or "")
         st = _load_state_or_err(self, name)
         if st is None:
             return
+        if (st.get("runner") or "loop") == "ralph":
+            # ralph 天然可續跑（未完成 story 即續跑點）；重跑＝依保存設定重新 spawn 監督層。
+            return Handler._start_existing_ralph(self, name, st)
         c = st.get("config") or {}
         repo, agent_cmd, validate_cmd = c.get("repo"), c.get("agent_cmd"), c.get("validate_cmd")
         if not (repo and agent_cmd and validate_cmd):
@@ -2509,7 +3082,7 @@ class Handler(BaseHTTPRequestHandler):
             self._err("Validate 命令不可為空")
             return
         try:
-            cmd = shlex.split(raw)
+            cmd = compat.split_command(raw)
         except ValueError as e:
             self._err(f"Validate 命令格式錯誤：{e}")
             return
@@ -2635,7 +3208,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             raw = match
         try:
-            cmd = shlex.split(raw)
+            cmd = compat.split_command(raw)
             command_problem = command_error(raw, "Agent CLI", cfg)
             if command_problem:
                 self._err(command_problem)
@@ -2690,7 +3263,7 @@ class Handler(BaseHTTPRequestHandler):
         if command_problem:
             self._err(command_problem)
             return
-        cmd = shlex.split(raw)
+        cmd = compat.split_command(raw)
         try:
             rc, output, timed_out = run_command_check(
                 cmd, repo, prompt="test\n", timeout=60, env=command_env(cfg)
@@ -2723,7 +3296,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._err(f"Agent CLI #{index} 內容過長")
                 return
             try:
-                shlex.split(cmd)
+                compat.split_command(cmd)
             except ValueError as e:
                 self._err(f"Agent CLI #{index} command 格式錯誤：{e}")
                 return
@@ -2795,7 +3368,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = raw.strip()
         if raw:
             try:
-                shlex.split(raw.replace("{status}", "test").replace("{name}", "test"))
+                compat.split_command(raw.replace("{status}", "test").replace("{name}", "test"))
             except ValueError as e:
                 self._err(f"通知命令格式錯誤:{e}")
                 return
@@ -2807,6 +3380,90 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 save_personal_config({"notify_cmd": raw})
             except ValueError as e:
+                self._err(str(e))
+                return
+            cfg = load_config()
+        self._out(200, json.dumps(config_projection(cfg), ensure_ascii=False))
+
+    def api_edit_settings(self, body):
+        """Dashboard 設定 modal：一次儲存統計輪數、launch 預設值與 Validate 命令清單（團隊設定）。"""
+        raw_metrics = body.get("metrics")
+        if not isinstance(raw_metrics, dict):
+            self._err("metrics 必須是 object")
+            return
+        metrics = {}
+        for key in ("workspace_rounds", "fleet_rounds"):
+            try:
+                value = parse_numeric_setting(raw_metrics.get(key), integer=True, minimum=1)
+            except (TypeError, ValueError):
+                value = 0
+            if not 1 <= value <= loop_mod.ROUND_METRICS_MAX_SAMPLES:
+                self._err(f"{key} 必須是 1～{loop_mod.ROUND_METRICS_MAX_SAMPLES} 的整數")
+                return
+            metrics[key] = value
+        raw_defaults = body.get("defaults")
+        if not isinstance(raw_defaults, dict):
+            self._err("defaults 必須是 object")
+            return
+        default_updates = {}
+        # 數字欄位規則與 workspace 設定一致:round_timeout/agent_backoff_max ≥0,其餘 ≥1。
+        for key, minimum, integer in (
+                ("flag_threshold", 1, True), ("done_threshold", 1, True),
+                ("round_timeout", 0, False), ("agent_backoff_max", 0, False),
+                ("validate_timeout", 1, False), ("red_limit", 1, True),
+                ("stall_limit", 1, True), ("stuck_stop_count", 1, True)):
+            if raw_defaults.get(key) is None:
+                continue
+            try:
+                default_updates[key] = parse_numeric_setting(
+                    raw_defaults[key], integer=integer, minimum=minimum)
+            except (TypeError, ValueError):
+                self._err(f"defaults.{key} 不合法(round_timeout/agent_backoff_max 需 ≥0，其餘需 ≥1)")
+                return
+        for key in ("stuck_stop", "pause_after_plan"):
+            if raw_defaults.get(key) is not None:
+                default_updates[key] = bool(raw_defaults[key])
+        raw_validates = body.get("validate_cmds")
+        if not isinstance(raw_validates, list) or len(raw_validates) > 50:
+            self._err("Validate 命令必須是最多 50 個項目的清單")
+            return
+        validates = []
+        for index, item in enumerate(raw_validates, 1):
+            if not isinstance(item, dict):
+                self._err(f"Validate 命令 #{index} 格式錯誤")
+                return
+            label = str(item.get("label") or "").strip()
+            cmd = str(item.get("cmd") or "").strip()
+            if not label or not cmd:
+                self._err(f"Validate 命令 #{index} 的名稱與 command 不可為空")
+                return
+            if len(label) > 80 or len(cmd) > 2000:
+                self._err(f"Validate 命令 #{index} 內容過長")
+                return
+            try:
+                compat.split_command(cmd)
+            except ValueError as e:
+                self._err(f"Validate 命令 #{index} command 格式錯誤：{e}")
+                return
+            validates.append({"label": label, "cmd": cmd})
+        with CONFIG_LOCK:
+            cfg = load_config()
+            if "error" in cfg:
+                self._err(cfg["error"])
+                return
+            # defaults 以「內建 → 檔內既有 → 本次更新」疊合後整份存回,存檔永遠是完整欄位。
+            defaults = dict(DEFAULT_CONFIG["defaults"])
+            stored_defaults = cfg.get("defaults")
+            if isinstance(stored_defaults, dict):
+                defaults.update(stored_defaults)
+            defaults.update(default_updates)
+            updates = {"metrics": metrics, "defaults": defaults, "validate_cmds": validates}
+            try:
+                if CONFIG_OVERRIDE:
+                    save_personal_config(updates)
+                else:
+                    save_project_config(updates)
+            except (OSError, ValueError) as e:
                 self._err(str(e))
                 return
             cfg = load_config()
@@ -2827,7 +3484,7 @@ class Handler(BaseHTTPRequestHandler):
         if command_problem:
             self._err(command_problem)
             return
-        rc, output, timed_out = run_command_check(shlex.split(rendered), HERE,
+        rc, output, timed_out = run_command_check(compat.split_command(rendered), HERE,
                                                   timeout=15, env=command_env(cfg))
         tail = "\n".join(output.strip().splitlines()[-20:])[-4000:]
         self._out(200, json.dumps({"ok": rc == 0 and not timed_out, "rc": rc,
@@ -2914,7 +3571,7 @@ class Handler(BaseHTTPRequestHandler):
                 timeout = float(c.get("validate_timeout", 120))
                 if not (0 < timeout < float("inf")):
                     raise ValueError
-                command = shlex.split(vcmd)
+                command = compat.split_command(vcmd)
                 if not command:
                     raise ValueError
                 rc, output, timed_out = run_command_check(
@@ -2979,25 +3636,28 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             with loop_mod.workspace_operation_lock(ROOT, name, blocking=False):
-                with directory_fd(ROOT, "workspace 根目錄") as root_fd:
-                    with directory_fd(name, f"workspace {name}", dir_fd=root_fd) as workspace_fd:
-                        current, current_error = read_state(name, repair=False)
-                        if current_error or ws_running(name, current):
-                            raise WorkspaceDeleteError(f"{name} 的停止狀態無法確認，不能刪除", 409)
-                        with JOBS_LOCK:
-                            job = JOBS.get(name)
-                            if job is not None and job.alive():
-                                raise WorkspaceDeleteError(f"{name} 仍有執行中的 job，不能刪除", 409)
-                        # pid 偵測可能失準；.run.lock 是 loop 單 writer 的機械真相。鎖檔本身也必須非 symlink。
-                        with exclusive_file_lock(".run.lock", f"{name} 的單 writer 鎖", dir_fd=workspace_fd):
-                            _require_same_directory_entry(root_fd, name, workspace_fd, f"workspace {name}")
-                            tombstone = f".delete-{name}-{uuid.uuid4().hex}"
-                            _require_absent_entry(root_fd, tombstone, "workspace 刪除暫存項目")
-                            try:
-                                os.rename(name, tombstone, src_dir_fd=root_fd, dst_dir_fd=root_fd)
-                            except OSError as e:
-                                raise WorkspaceDeleteError(f"準備刪除 workspace 失敗:{e}", 409) from e
-                    _remove_tree_at(root_fd, tombstone, f"workspace 刪除暫存項目 {tombstone}")
+                current, current_error = read_state(name, repair=False)
+                if current_error or ws_running(name, current):
+                    raise WorkspaceDeleteError(f"{name} 的停止狀態無法確認，不能刪除", 409)
+                with JOBS_LOCK:
+                    job = JOBS.get(name)
+                    if job is not None and job.alive():
+                        raise WorkspaceDeleteError(f"{name} 仍有執行中的 job，不能刪除", 409)
+                if compat.IS_WINDOWS:
+                    _delete_workspace_windows(ROOT, name)
+                else:
+                    with directory_fd(ROOT, "workspace 根目錄") as root_fd:
+                        with directory_fd(name, f"workspace {name}", dir_fd=root_fd) as workspace_fd:
+                            # pid 偵測可能失準；.run.lock 是 loop 單 writer 的機械真相。鎖檔本身也必須非 symlink。
+                            with exclusive_file_lock(".run.lock", f"{name} 的單 writer 鎖", dir_fd=workspace_fd):
+                                _require_same_directory_entry(root_fd, name, workspace_fd, f"workspace {name}")
+                                tombstone = f".delete-{name}-{uuid.uuid4().hex}"
+                                _require_absent_entry(root_fd, tombstone, "workspace 刪除暫存項目")
+                                try:
+                                    os.rename(name, tombstone, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+                                except OSError as e:
+                                    raise WorkspaceDeleteError(f"準備刪除 workspace 失敗:{e}", 409) from e
+                        _remove_tree_at(root_fd, tombstone, f"workspace 刪除暫存項目 {tombstone}")
         except WorkspaceDeleteError as e:
             self._err(str(e), e.status)
             return
@@ -3130,7 +3790,7 @@ class Handler(BaseHTTPRequestHandler):
                 """外部 loop 在八秒寬限後仍存活時送 SIGKILL。"""
                 if loop_pid_alive(pid):
                     try:
-                        loop_mod.safe_kill(int(pid), signal.SIGKILL)
+                        loop_mod.safe_kill(int(pid), compat.FORCE_SIGNAL)
                     except (ProcessLookupError, PermissionError):
                         pass
             t = threading.Timer(8, _force)
@@ -3167,6 +3827,7 @@ def run_dashboard(*, name="", port=8765, read_only=False) -> int:
         """將服務管理器 SIGTERM 轉成既有 KeyboardInterrupt 關閉流程。"""
         raise KeyboardInterrupt  # 走與 Ctrl-C 相同的優雅關閉路徑(stop_all_jobs)
     signal.signal(signal.SIGTERM, _sigterm)
+    compat.register_windows_break_handler(_sigterm)
 
     srv = None
     for _ in range(20):

@@ -147,7 +147,7 @@ def cmd_done(ws, argv):
         die(f"任務編號不符:目前派發的是 {cur_id},你給的是 {argv[0]}。"
             f"若你認為派工有誤,什麼都不要做直接結束,交由下一輪處理")
     write_marker(signal_path(ws, "signal_done", token))
-    print(f"✅ 已記錄 {cur_id} 完成宣告;若本輪無 commit/工作區異動且驗證為綠,done +1。")
+    print(f"✅ 已記錄 {cur_id} 完成回報(本輪正常收尾);若本輪無 commit/工作區異動且驗證為綠,done +1。")
 
 
 def cmd_issue(ws, argv):

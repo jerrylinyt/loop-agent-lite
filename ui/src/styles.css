@@ -382,6 +382,7 @@ tr.flash td { animation: flash 2.4s ease-out; }
 
 .prompt-template-toolbar { display: grid; grid-template-columns: auto minmax(260px, 1fr); align-items: end; gap: 12px; margin-bottom: 12px; }
 .prompt-template-toolbar .segmented-tabs { margin: 0; }
+.prompt-template-toolbar .checkbox-row { grid-column: 1 / -1; }
 .prompt-template-toolbar label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
 .prompt-template-toolbar select { width: 100%; min-height: 32px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); }
 .prompt-template-warning { margin-bottom: 10px; padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent); border-radius: 8px; background: var(--warning-soft); color: var(--warning); font-size: 12px; }
@@ -716,3 +717,48 @@ tr.flash td { animation: flash 2.4s ease-out; }
 .plan-editor-diff.safe { color: var(--success); }
 .plan-editor-diff span { overflow-wrap: anywhere; }
 @media (max-width: 820px) { .plan-editor-layout { grid-template-columns: 1fr; overflow: auto; } .plan-editor-list { overflow: visible; } }
+
+/* Ralph runner：狀態列徽章、usage-limit 橫幅、PRD 檢核表與 progress viewer；沿用共用 token 支援深／淺色。 */
+.ralph-runner-tag { color: var(--accent) !important; background: var(--accent-soft) !important; }
+.ralph-exit-success { color: var(--success); background: var(--success-soft); }
+.ralph-exit-warning { color: var(--warning); background: var(--warning-soft); }
+.ralph-exit-danger { color: var(--danger); background: var(--danger-soft); }
+.ralph-exit-muted { color: var(--muted); background: var(--surface-subtle); }
+.ralph-stories-progress { min-width: 150px; height: 16px; }
+.fleet-card-ralph { border-left-color: var(--accent); }
+
+.ralph-usage-banner { display: flex; align-items: flex-start; gap: 10px; margin-top: 8px; padding: 9px 12px; border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent); border-radius: 8px; background: var(--warning-soft); color: var(--warning); }
+.ralph-usage-banner.ralph-usage-downgraded { border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: var(--accent-soft); color: var(--accent); }
+.ralph-usage-banner.ralph-usage-giveup { border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: var(--danger-soft); color: var(--danger); }
+.ralph-usage-icon { flex: none; font-size: 18px; line-height: 1.4; }
+.ralph-usage-text { min-width: 0; }
+.ralph-usage-text p { margin: 0; line-height: 1.5; }
+.ralph-usage-text strong { font-variant-numeric: tabular-nums; }
+.ralph-usage-matched { overflow: hidden; margin-top: 3px !important; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+
+.ralph-checklist .pane-header .secondary-button { min-height: 26px; }
+.ralph-story-list { padding: 6px 10px; }
+.ralph-prd-error { margin-bottom: 8px; padding: 8px 10px; border-radius: 7px; background: var(--danger-soft); color: var(--danger); font-size: 12px; }
+.ralph-story-empty { padding: 26px 12px; color: var(--muted); text-align: center; }
+.ralph-story { border-bottom: 1px solid var(--border-soft); }
+.ralph-story > summary { display: flex; align-items: center; gap: 8px; padding: 8px 6px; cursor: pointer; list-style: none; }
+.ralph-story > summary::-webkit-details-marker { display: none; }
+.ralph-story > summary::before { content: "▸"; flex: none; color: var(--muted); font-size: 10px; transition: transform .15s; }
+.ralph-story[open] > summary::before { transform: rotate(90deg); }
+.ralph-story > summary:hover { background: var(--surface-subtle); }
+.ralph-story-check { display: inline-grid; width: 20px; height: 20px; flex: none; place-items: center; border-radius: 50%; font-size: 12px; font-weight: 700; }
+.ralph-story-check.pass { background: var(--success-soft); color: var(--success); }
+.ralph-story-check.fail { background: var(--surface-subtle); color: var(--muted); }
+.ralph-story-id { flex: none; color: var(--muted); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.ralph-story-priority { flex: none; }
+.ralph-story-title { overflow: hidden; min-width: 0; flex: 1; text-overflow: ellipsis; white-space: nowrap; }
+.ralph-story[open] .ralph-story-title { white-space: normal; }
+.ralph-story-body { padding: 2px 6px 12px 34px; color: var(--muted); }
+.ralph-story-body p { margin: 0 0 6px; line-height: 1.5; }
+.ralph-criteria { display: grid; gap: 3px; margin: 4px 0 6px; padding-left: 18px; }
+.ralph-criteria li { line-height: 1.45; }
+
+.ralph-prd-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-bottom: 10px; color: var(--muted); font-size: 12px; }
+.ralph-prd-raw { max-height: 52vh; margin: 0; overflow: auto; padding: 12px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--bg); color: var(--text); font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+.form-grid .ralph-inline-select { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; }
+.form-grid .ralph-inline-select select { width: auto; min-height: 26px; }

@@ -35,14 +35,28 @@ class TestPromptTemplateResources(unittest.TestCase):
         self.assertEqual(
             set(bundle),
             {
-                "schema_version", "base", "goal", "goal_template", "plan", "missing_requirement",
-                "team_template_example",
+                "schema_version", "base", "goal", "goal_template", "plan", "goal_plan_bridge",
+                "missing_requirement", "team_template_example",
             },
         )
         self.assertTrue(bundle["base"].endswith("<<MODE_CONTRACT>>"))
         self.assertNotIn("_json", bundle["base"])
         self.assertIn("最終輸出契約：goal.md", bundle["goal"])
         self.assertIn("最終輸出契約：plan.json", bundle["plan"])
+
+    def test_goal_plan_bridge_merges_both_contracts_into_one_pass(self):
+        bundle, error = P.prompt_template_bundle()
+        self.assertIsNone(error)
+        bridge = bundle["goal_plan_bridge"]
+        # 橋接段落必須明確改寫兩份契約的單一輸出限制，否則合併 prompt 會自相矛盾。
+        self.assertIn("合併輸出契約", bridge)
+        self.assertIn("不要加 plan JSON", bridge)
+        self.assertIn("只輸出一個合法 JSON array", bridge)
+        self.assertIn("===== plan.json =====", bridge)
+        self.assertIn("初版", bridge)
+        self.assertIn("human gate", bridge)
+        # 拆分依據必須是剛輸出的 goal.md，維持 ID 雙向可追蹤。
+        self.assertIn("goal.md 為唯一依據", bridge)
 
     def test_plan_prompts_bound_task_context_and_submit_long_json_by_file(self):
         bundle, error = P.prompt_template_bundle()
@@ -275,7 +289,10 @@ class TestPromptTemplateCatalog(unittest.TestCase):
         })
         self.assertEqual(len(projected["prompt_templates"]), len(P.BUILTIN_PROMPT_TEMPLATES))
         self.assertTrue(projected["prompt_template_warnings"])
-        self.assertEqual(projected["prompt_template_bundle"]["schema_version"], 3)
+        self.assertEqual(
+            projected["prompt_template_bundle"]["schema_version"],
+            P.PROMPT_TEMPLATE_BUNDLE_SCHEMA_VERSION,
+        )
         self.assertIsNone(projected["prompt_template_bundle_error"])
 
     def test_config_projection_keeps_dashboard_usable_when_fixed_bundle_fails(self):

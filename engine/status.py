@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from engine import loop
+from engine import platform_compat as compat
 
 STATUS_SCHEMA_VERSION = 1
 
@@ -59,9 +60,12 @@ def pid_is_loop_alive(pid) -> bool:
     """確認 state 記錄的 pid 仍是 coordinator，兼容舊檔案入口與新 module 入口。"""
     try:
         pid = int(pid)
-        os.kill(pid, 0)
+        if not compat.process_looks_like_python(pid):
+            return False
     except (TypeError, ValueError, ProcessLookupError, PermissionError):
         return False
+    if compat.IS_WINDOWS:
+        return True
     try:
         command = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
                                  capture_output=True, text=True, check=False).stdout
@@ -433,4 +437,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    def _windows_break(*_):
+        raise KeyboardInterrupt
+
+    compat.register_windows_break_handler(_windows_break)
     raise SystemExit(main())
