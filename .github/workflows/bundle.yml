@@ -36,7 +36,8 @@ jobs:
           # workflow_dispatch 可能跑在非 main;固定以遠端 main 為打包來源。
           git fetch -q origin main
           git checkout -q -B main FETCH_HEAD
-          git bundle create "$RUNNER_TEMP/loop-lite.bundle" main
+          # 帶上 HEAD:少了它,首次 git clone 會因不知道要 checkout 哪個 ref 而停在空 working tree。
+          git bundle create "$RUNNER_TEMP/loop-lite.bundle" HEAD main
           git bundle verify "$RUNNER_TEMP/loop-lite.bundle"
 
       - name: Force-push single-commit bundle branch
