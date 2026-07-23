@@ -271,6 +271,17 @@ test("完整操作流程：launch、SSE、stop/run、設定、計畫、issues、
   await expect(workspaceRounds).toHaveValue("1000");
   await expect(dashboardSettings.getByLabel(/全部 workspace 合併筆數/)).toHaveValue("3000");
   await workspaceRounds.fill("999");
+  // Agent CLI 區：以個人設定預填,可就地測試;Validate 區可收合再展開。
+  await expect(dashboardSettings.getByLabel("Agent CLI 1 名稱")).toHaveValue("fake agent");
+  await dashboardSettings.locator("#settings-agent-list").getByRole("button", { name: "執行測試" }).first().click();
+  const settingsAgentCheck = page.getByRole("dialog", { name: "Agent CLI 執行確認" });
+  await expect(settingsAgentCheck.getByRole("status")).toContainText("E2E Agent CLI test result");
+  await settingsAgentCheck.getByRole("button", { name: "關閉", exact: true }).click();
+  await expect(dashboardSettings.getByLabel("Validate 1 名稱")).toHaveValue("always green");
+  await dashboardSettings.getByRole("button", { name: "收合 Validate 清單" }).click();
+  await expect(dashboardSettings.getByLabel("Validate 1 名稱")).toBeHidden();
+  await dashboardSettings.getByRole("button", { name: "展開 Validate 清單" }).click();
+  await expect(dashboardSettings.getByLabel("Validate 1 名稱")).toBeVisible();
   await dashboardSettings.getByRole("button", { name: "儲存設定" }).click();
   await expect(dashboardSettings).toBeHidden();
   await page.getByRole("button", { name: "Dashboard 設定" }).click();
