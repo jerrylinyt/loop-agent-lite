@@ -1,0 +1,54 @@
+# 離線同步:每次 main 更新後,把完整 git 歷史打包成單一 bundle 檔,
+# force-push 到 orphan 的 `bundle` branch(該 branch 永遠只有一個 commit,不累積)。
+#
+# 離線環境(只能從 GitHub 下載 ZIP)的使用方式:
+#   1. 下載 https://github.com/jerrylinyt/loop-agent-lite/archive/refs/heads/bundle.zip
+#   2. 解壓取得 loop-lite.bundle(可先 `git bundle verify loop-lite.bundle` 驗證)
+#   3. 第一次:`git clone loop-lite.bundle loop-agent-lite`
+#      之後每次:在 repo 內 `git pull <新bundle路徑>/loop-lite.bundle main`
+#
+# bundle 一律是完整歷史:公司端不需要記上次同步到哪個 commit,pull 只會套用新的部分,
+# 本地修改照常走三方合併。main 本身絕不 commit bundle 檔,避免 repo 雪球式膨脹。
+name: bundle
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bundle
+  cancel-in-progress: true
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # bundle 需要完整歷史
+
+      - name: Create and verify bundle
+        run: |
+          # workflow_dispatch 可能跑在非 main;固定以遠端 main 為打包來源。
+          git fetch -q origin main
+          git checkout -q -B main FETCH_HEAD
+          git bundle create "$RUNNER_TEMP/loop-lite.bundle" main
+          git bundle verify "$RUNNER_TEMP/loop-lite.bundle"
+
+      - name: Force-push single-commit bundle branch
+        run: |
+          short_sha=$(git rev-parse --short main)
+          work=$(mktemp -d)
+          cp "$RUNNER_TEMP/loop-lite.bundle" "$work/"
+          git -C "$work" init -q -b bundle
+          git -C "$work" config user.name "github-actions[bot]"
+          git -C "$work" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$work" add loop-lite.bundle
+          git -C "$work" commit -qm "bundle of main@${short_sha}"
+          git -C "$work" push -f \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            bundle:bundle
